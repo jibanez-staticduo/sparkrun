@@ -299,6 +299,13 @@ class EugrBuilder(BuilderPlugin):
         build_args = recipe.runtime_config.get("build_args", [])
         needs_build = False  # assume False at first
 
+        # `builder_config.rebuild` (set directly in a recipe or via `sparkrun run
+        # --rebuild`) requests the freshest possible image: a from-scratch rebuild
+        # for locally-built images, and a fresh `docker pull` for pullable registry
+        # images. Applied identically for local/push (non-delegated, on the control
+        # machine) and delegated (on the head) transfer modes.
+        force_rebuild = bool(recipe.builder_config.get("rebuild")) if recipe.builder_config else False
+
         # Builder-level user defaults from `defaults.builders.eugr` in the user config.
         # `use_sentinel_image` (default True) controls whether ":latest" tags on the
         # eugr nightly GHCR images are interpreted as "build locally from upstream
@@ -341,23 +348,40 @@ class EugrBuilder(BuilderPlugin):
         # If the image references a known public registry, it's pullable — never build it.
         is_pullable = any(image.startswith(prefix) for prefix in PULLABLE_REGISTRY_PREFIXES)
         if is_pullable and not needs_build:
-            logger.info("image '%s' is from a known registry; skipping build (will be pulled at runtime)", image)
+            if force_rebuild:
+                # Registry images can't be rebuilt, so honor `rebuild` by pulling a
+                # fresh copy (bypassing any stale local/head image of the same tag).
+                self._force_pull_image(image, head if delegated else None, ssh_kwargs if delegated else None, dry_run=dry_run)
+            else:
+                logger.info("image '%s' is from a known registry; skipping build (will be pulled at runtime)", image)
             needs_build = False
         elif not needs_build:
-            # Check if image already exists — skip build if specifically named and already present
-            if delegated:
-                image_found = self._image_exists_on_host(image, head, ssh_kwargs)
-            else:
-                from sparkrun.containers.registry import image_exists_locally
-
-                image_found = image_exists_locally(image)
-
-            if not image_found:
+            if force_rebuild:
+                # Rebuild requested for a locally-built image — build regardless of
+                # whether a copy is already present.
                 needs_build = True
+            else:
+                # Check if image already exists — skip build if specifically named and already present
                 if delegated:
-                    logger.info("image '%s' not found on head '%s'; will build remotely", image, head)
+                    image_found = self._image_exists_on_host(image, head, ssh_kwargs)
                 else:
-                    logger.info("image '%s' not found locally; will build", image)
+                    from sparkrun.containers.registry import image_exists_locally
+
+                    image_found = image_exists_locally(image)
+
+                if not image_found:
+                    needs_build = True
+                    if delegated:
+                        logger.info("image '%s' not found on head '%s'; will build remotely", image, head)
+                    else:
+                        logger.info("image '%s' not found locally; will build", image)
+
+        # Single confirmation that an explicit rebuild is forcing a from-scratch
+        # build. Covers both the sentinel-remapped path (needs_build already set
+        # above) and the plain locally-built path; pullable images took the
+        # force-pull branch above and are excluded here.
+        if force_rebuild and needs_build and not is_pullable:
+            logger.info("rebuild requested; will rebuild image '%s'", image)
 
         # nothing eugr-specific to prepare -- no build
         if not needs_build:
@@ -376,8 +400,9 @@ class EugrBuilder(BuilderPlugin):
                 registry_cache_root = Path(config.cache_dir) / "registries"
             self._repo_dir = self.ensure_repo(registry_cache_root=registry_cache_root, branch=branch)
 
-        # Check build cache — skip rebuild if upstream wheels haven't changed
-        if needs_build and not dry_run:
+        # Check build cache — skip rebuild if upstream wheels haven't changed.
+        # An explicit `rebuild` request bypasses the cache and always rebuilds.
+        if needs_build and not dry_run and not force_rebuild:
             skip_host = head if delegated else None
             skip_ssh = ssh_kwargs if delegated else None
             if self._can_skip_build(image, build_args, config, host=skip_host, ssh_kwargs=skip_ssh):
@@ -1026,6 +1051,36 @@ class EugrBuilder(BuilderPlugin):
         script = "docker image inspect %s >/dev/null 2>&1" % quote(image)
         result = run_script_on_host(host, script, ssh_kwargs=ssh_kwargs, timeout=30)
         return result.success
+
+    @staticmethod
+    def _force_pull_image(image: str, host: str | None = None, ssh_kwargs: dict | None = None, dry_run: bool = False) -> None:
+        """Force a fresh ``docker pull`` of *image*.
+
+        When *host* is ``None`` (local/push transfer modes) the pull runs on the
+        control machine; otherwise it runs on the head node over SSH (delegated
+        mode). A failed pull is logged as a warning rather than raised — a stale
+        local copy of the tag, if any, remains usable as a fallback.
+        """
+        if host:
+            from sparkrun.orchestration.primitives import run_script_on_host
+
+            if dry_run:
+                logger.info("[dry-run] Would force-pull fresh image '%s' on host '%s'", image, host)
+                return
+            logger.info("rebuild requested; pulling fresh registry image '%s' on host '%s'", image, host)
+            script = "docker pull %s" % quote(image)
+            result = run_script_on_host(host, script, ssh_kwargs=ssh_kwargs, timeout=1800)
+            if not result.success:
+                logger.warning("Force pull of '%s' on host '%s' failed", image, host)
+        else:
+            from sparkrun.containers.registry import ensure_image
+
+            if dry_run:
+                logger.info("[dry-run] Would force-pull fresh image '%s'", image)
+                return
+            logger.info("rebuild requested; pulling fresh registry image '%s'", image)
+            if ensure_image(image, dry_run=dry_run, force_pull=True) != 0:
+                logger.warning("Force pull of '%s' failed", image)
 
     def _ensure_repo_remote(
         self,

@@ -485,6 +485,7 @@ class TestPrepareImageCacheIntegration:
         builder = EugrBuilder()
         recipe = mock.MagicMock()
         recipe.runtime_config = {"build_args": [], "mods": []}
+        recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
 
@@ -510,6 +511,7 @@ class TestPrepareImageCacheIntegration:
         builder = EugrBuilder()
         recipe = mock.MagicMock()
         recipe.runtime_config = {"build_args": [], "mods": []}
+        recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
 
@@ -538,6 +540,7 @@ class TestPrepareImageCacheIntegration:
         builder = EugrBuilder()
         recipe = mock.MagicMock()
         recipe.runtime_config = {"build_args": [], "mods": []}
+        recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
 
@@ -562,6 +565,7 @@ class TestPrepareImageCacheIntegration:
         builder = EugrBuilder()
         recipe = mock.MagicMock()
         recipe.runtime_config = {"build_args": ["--tf5"], "mods": []}
+        recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
 
@@ -598,6 +602,7 @@ class TestPrepareImageCacheIntegration:
         builder = EugrBuilder()
         recipe = mock.MagicMock()
         recipe.runtime_config = {"build_args": [], "mods": []}
+        recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
 

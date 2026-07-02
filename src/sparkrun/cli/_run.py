@@ -160,6 +160,14 @@ def _summarize_platforms(
     help="Registered scheduler name (e.g. 'greedy', 'occupancy-sparse', 'occupancy-dense'). Defaults to the recipe's scheduler field, then 'greedy'.",
     hidden=HIDE_ADVANCED_OPTIONS,
 )
+@click.option(
+    "--rebuild/--no-rebuild",
+    "rebuild",
+    default=None,
+    help="Force the builder to produce a fresh image (no-op for docker-pull; forces a rebuild/fresh pull for eugr). "
+    "Overrides the recipe's builder_config.rebuild setting.",
+    hidden=HIDE_ADVANCED_OPTIONS,
+)
 @click.option("--label", "labels_override", multiple=True, help="Set meta data on a container (e.g., --label com.example.key=value)")
 @click.option(
     "--executor-args",
@@ -203,6 +211,7 @@ def run(
     diagnostics_path,
     trust,
     scheduler_name,
+    rebuild,
     labels_override,
     options,
     executor_args,
@@ -273,6 +282,13 @@ def run(
         port=port,
         served_model_name=served_model_name,
     )
+
+    # --rebuild/--no-rebuild is a builder-agnostic override carried in
+    # builder_config so any builder (present or future) can honor it. Only
+    # override the recipe's own builder_config.rebuild when the flag was given
+    # explicitly (tri-state default None leaves the recipe value untouched).
+    if rebuild is not None:
+        recipe.builder_config["rebuild"] = rebuild
 
     # Validate recipe (after resolve so runtime is populated)
     issues = recipe.validate()

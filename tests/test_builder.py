@@ -446,6 +446,208 @@ class TestEugrPrepareImage:
         mock_build.assert_called_once()
 
 
+class TestEugrRebuild:
+    """`builder_config.rebuild` — force a fresh image (rebuild or fresh pull)."""
+
+    def test_rebuild_forces_build_when_image_exists(self, eugr_builder_with_repo):
+        """rebuild=True builds a locally-built image even when it already exists."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "my-image",
+                "builder_config": {"rebuild": True},
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=True):
+            with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
+                with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                    with mock.patch.object(builder, "_verify_image_imports"):
+                        with mock.patch.object(builder, "_save_build_metadata"):
+                            result = builder.prepare_image("my-image", recipe, ["10.0.0.1"])
+
+        assert result == "my-image"
+        mock_build.assert_called_once()
+
+    def test_rebuild_bypasses_build_cache(self, eugr_builder_with_repo):
+        """rebuild=True builds even when the build cache would otherwise skip it."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "my-image",
+                "builder_config": {"rebuild": True},
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
+            with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
+                # _can_skip_build would return True (cache hit) — rebuild must ignore it.
+                with mock.patch.object(builder, "_can_skip_build", return_value=True) as mock_skip:
+                    with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                        with mock.patch.object(builder, "_verify_image_imports"):
+                            with mock.patch.object(builder, "_save_build_metadata"):
+                                builder.prepare_image("my-image", recipe, ["10.0.0.1"])
+
+        mock_skip.assert_not_called()
+        mock_build.assert_called_once()
+
+    def test_no_rebuild_honors_build_cache(self, eugr_builder_with_repo):
+        """Without rebuild, a cache hit skips the build (baseline for the bypass test)."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "my-image",
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
+            with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
+                with mock.patch.object(builder, "_can_skip_build", return_value=True):
+                    with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                        builder.prepare_image("my-image", recipe, ["10.0.0.1"])
+
+        mock_build.assert_not_called()
+
+    def test_rebuild_pullable_image_force_pulls_local(self, eugr_builder_with_repo):
+        """rebuild=True on a pullable registry image force-pulls locally and does not build."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "ghcr.io/someorg/vllm:latest",
+                "builder_config": {"rebuild": True},
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.ensure_image", return_value=0) as mock_ensure:
+            with mock.patch("sparkrun.builders.eugr._run_build_capturing") as mock_build:
+                result = builder.prepare_image("ghcr.io/someorg/vllm:latest", recipe, ["10.0.0.1"])
+
+        assert result == "ghcr.io/someorg/vllm:latest"
+        mock_build.assert_not_called()
+        mock_ensure.assert_called_once()
+        # ensure_image(image, dry_run=..., force_pull=True)
+        assert mock_ensure.call_args.kwargs.get("force_pull") is True
+
+    def test_rebuild_pullable_image_force_pulls_delegated(self, eugr_builder_with_repo):
+        """In delegated mode, a pullable rebuild runs `docker pull` on the head, not locally."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "ghcr.io/someorg/vllm:latest",
+                "builder_config": {"rebuild": True},
+            }
+        )
+        remote_result = mock.Mock(success=True)
+        with mock.patch("sparkrun.orchestration.primitives.run_script_on_host", return_value=remote_result) as mock_remote:
+            with mock.patch("sparkrun.containers.registry.ensure_image") as mock_ensure:
+                result = builder.prepare_image(
+                    "ghcr.io/someorg/vllm:latest",
+                    recipe,
+                    ["10.0.0.1"],
+                    transfer_mode="delegated",
+                    ssh_kwargs={},
+                )
+
+        assert result == "ghcr.io/someorg/vllm:latest"
+        mock_ensure.assert_not_called()
+        mock_remote.assert_called_once()
+        assert "docker pull" in mock_remote.call_args[0][1]
+
+    def test_rebuild_pullable_dry_run_delegated_no_pull(self, eugr_builder_with_repo):
+        """Delegated dry-run rebuild of a pullable image performs no remote pull."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "ghcr.io/someorg/vllm:latest",
+                "builder_config": {"rebuild": True},
+            }
+        )
+        with mock.patch("sparkrun.orchestration.primitives.run_script_on_host") as mock_remote:
+            builder.prepare_image(
+                "ghcr.io/someorg/vllm:latest",
+                recipe,
+                ["10.0.0.1"],
+                transfer_mode="delegated",
+                ssh_kwargs={},
+                dry_run=True,
+            )
+
+        mock_remote.assert_not_called()
+
+    def test_rebuild_pullable_dry_run_local_no_pull(self, eugr_builder_with_repo):
+        """Local dry-run rebuild of a pullable image performs no actual pull."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "ghcr.io/someorg/vllm:latest",
+                "builder_config": {"rebuild": True},
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.pull_image") as mock_pull:
+            result = builder.prepare_image("ghcr.io/someorg/vllm:latest", recipe, ["10.0.0.1"], dry_run=True)
+
+        assert result == "ghcr.io/someorg/vllm:latest"
+        mock_pull.assert_not_called()
+
+    def test_no_rebuild_suppresses_recipe_rebuild(self, eugr_builder_with_repo):
+        """builder_config.rebuild=False (from --no-rebuild) suppresses a rebuild.
+
+        With an image already present and no rebuild forced, prepare_image must
+        stay a no-op even though a recipe could otherwise have requested rebuild.
+        """
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "my-image",
+                "builder_config": {"rebuild": False},
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=True):
+            with mock.patch("sparkrun.builders.eugr._run_build_capturing") as mock_build:
+                result = builder.prepare_image("my-image", recipe, ["10.0.0.1"])
+
+        assert result == "my-image"
+        mock_build.assert_not_called()
+
+    def test_docker_pull_rebuild_is_noop(self):
+        """docker-pull ignores rebuild — prepare_image stays a pure no-op."""
+        from sparkrun.builders.docker_pull import DockerPullBuilder
+
+        builder = DockerPullBuilder()
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "vllm",
+                "builder_config": {"rebuild": True},
+            }
+        )
+        with mock.patch("subprocess.run") as mock_run:
+            result = builder.prepare_image("docker-image:latest", recipe, ["10.0.0.1"])
+        assert result == "docker-image:latest"
+        mock_run.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap integration — get_builder / list_builders
 # ---------------------------------------------------------------------------

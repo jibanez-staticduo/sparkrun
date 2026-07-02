@@ -487,9 +487,19 @@ builder: eugr
 builder_config:
   repo_url: https://github.com/eugr/spark-vllm-docker.git
   branch: main
+  rebuild: true   # force a fresh image (see below)
 ```
 
-`builder_config` is passed directly to the builder plugin's `prepare_image()`. Contents are builder-specific.
+`builder_config` is passed directly to the builder plugin's `prepare_image()`. Most contents are
+builder-specific, with one standard cross-builder key:
+
+- **`rebuild`** (bool) — request the freshest possible image. It is a no-op for `docker-pull` (the
+  distribution phase already handles pulling). For `eugr` it forces a from-scratch rebuild of
+  locally-built images (bypassing the build cache) and a fresh `docker pull` of pullable registry
+  images. It behaves identically across `local`, `push`, and `delegated` transfer modes.
+
+The `rebuild` key can also be set per-invocation with `sparkrun run --rebuild <recipe>`
+(or `--no-rebuild` to force it off); the CLI flag overrides the recipe's `builder_config.rebuild`.
 
 ### eugr Builder (v1 Compatibility, Legacy)
 
