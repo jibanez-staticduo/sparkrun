@@ -28,9 +28,11 @@ import json
 from sparkrun.orchestration.executors._base import (
     LABEL_CLUSTER_ID,
     LABEL_INTENT_ID,
+    LABEL_MODEL,
     LABEL_RANK,
     LABEL_RECIPE,
     LABEL_RUNTIME,
+    LABEL_SERVED_MODEL_NAME,
     Executor,
     ExecutorConfig,
 )
@@ -48,8 +50,11 @@ from sparkrun.orchestration.executors.local import LocalExecutor
 
 
 class _StubRecipe:
-    def __init__(self, qualified_name: str):
+    def __init__(self, qualified_name: str, model: str = "", served_model_name: str = ""):
         self.qualified_name = qualified_name
+        self.model = model
+        # Mirror Recipe.effective_served_model_name: fall back to model id.
+        self.effective_served_model_name = served_model_name or model
 
 
 class _StubRuntime:
@@ -65,7 +70,7 @@ class _StubRuntime:
 def test_workload_labels_for_cluster_full_set():
     labels = Executor.workload_labels_for_cluster(
         cluster_id="sparkrun_abc123abc123abc1_def456abcdef",
-        recipe=_StubRecipe("@arena/qwen3-1.7b-vllm"),
+        recipe=_StubRecipe("@arena/qwen3-1.7b-vllm", model="Qwen/Qwen3-1.7B", served_model_name="qwen3"),
         runtime=_StubRuntime("vllm"),
         rank=2,
     )
@@ -74,6 +79,19 @@ def test_workload_labels_for_cluster_full_set():
     assert labels[LABEL_RECIPE] == "@arena/qwen3-1.7b-vllm"
     assert labels[LABEL_RUNTIME] == "vllm"
     assert labels[LABEL_RANK] == "2"
+    assert labels[LABEL_MODEL] == "Qwen/Qwen3-1.7B"
+    assert labels[LABEL_SERVED_MODEL_NAME] == "qwen3"
+
+
+def test_workload_labels_for_cluster_served_name_defaults_to_model():
+    """When no served_model_name override is set, the label falls back to the model id."""
+    labels = Executor.workload_labels_for_cluster(
+        cluster_id="sparkrun_abc123abc123abc1_def456abcdef",
+        recipe=_StubRecipe("@arena/qwen3-vllm", model="Qwen/Qwen3-1.7B"),
+        runtime=_StubRuntime("vllm"),
+    )
+    assert labels[LABEL_MODEL] == "Qwen/Qwen3-1.7B"
+    assert labels[LABEL_SERVED_MODEL_NAME] == "Qwen/Qwen3-1.7B"
 
 
 def test_workload_labels_for_cluster_no_rank_omits_rank_label():

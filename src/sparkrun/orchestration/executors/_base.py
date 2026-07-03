@@ -39,6 +39,8 @@ LABEL_INTENT_ID = "sparkrun.intent_id"
 LABEL_RECIPE = "sparkrun.recipe"
 LABEL_RANK = "sparkrun.rank"
 LABEL_RUNTIME = "sparkrun.runtime"
+LABEL_MODEL = "sparkrun.model"
+LABEL_SERVED_MODEL_NAME = "sparkrun.served_model_name"
 
 
 def _registered_executor_names() -> set[str]:
@@ -437,7 +439,8 @@ class Executor(Plugin):
         Args:
             cluster_id: Full sparkrun cluster identifier.
             recipe: Optional :class:`Recipe` — :attr:`Recipe.qualified_name`
-                becomes ``sparkrun.recipe`` when truthy.
+                becomes ``sparkrun.recipe`` when truthy, and
+                :attr:`Recipe.model` becomes ``sparkrun.model``.
             runtime: Optional :class:`RuntimePlugin` —
                 ``runtime.runtime_name`` becomes ``sparkrun.runtime``.
             rank: Optional rank index.
@@ -445,12 +448,16 @@ class Executor(Plugin):
         if not cluster_id:
             return {}
         recipe_name = getattr(recipe, "qualified_name", None) if recipe is not None else None
+        model = getattr(recipe, "model", None) if recipe is not None else None
+        served_model_name = getattr(recipe, "effective_served_model_name", None) if recipe is not None else None
         runtime_name = getattr(runtime, "runtime_name", None) if runtime is not None else None
         return cls.workload_labels(
             cluster_id=cluster_id,
             recipe_name=recipe_name,
             runtime_name=runtime_name,
             rank=rank,
+            model=model,
+            served_model_name=served_model_name,
         )
 
     @classmethod
@@ -461,6 +468,8 @@ class Executor(Plugin):
         runtime_name: str | None = None,
         rank: int | None = None,
         intent_id: str | None = None,
+        model: str | None = None,
+        served_model_name: str | None = None,
     ) -> dict[str, str]:
         """Return the canonical sparkrun label set for a workload.
 
@@ -482,6 +491,9 @@ class Executor(Plugin):
                 the canonical ``sparkrun_<intent>_<token>`` shape) so
                 callers that already carry a cluster_id get the label
                 for free.
+            model: HuggingFace model ID (omitted when falsy).
+            served_model_name: Name the model is served under via the
+                inference API (omitted when falsy).
         """
         labels: dict[str, str] = {LABEL_CLUSTER_ID: cluster_id}
         if intent_id is None:
@@ -494,6 +506,10 @@ class Executor(Plugin):
             labels[LABEL_RUNTIME] = runtime_name
         if rank is not None:
             labels[LABEL_RANK] = str(rank)
+        if model:
+            labels[LABEL_MODEL] = model
+        if served_model_name:
+            labels[LABEL_SERVED_MODEL_NAME] = served_model_name
         return labels
 
     # --- Naming helpers (concrete, shared across executors) ---

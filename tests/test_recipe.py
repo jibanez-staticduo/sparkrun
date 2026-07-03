@@ -254,6 +254,25 @@ def test_qualified_name_with_registry():
     assert recipe.qualified_name == "@my-registry/unnamed"
 
 
+def test_effective_served_model_name_falls_back_to_model():
+    """With no served_model_name set, the effective name is the model id."""
+    recipe = Recipe.from_dict({"model": "org/model", "runtime": "vllm"})
+    assert recipe.effective_served_model_name == "org/model"
+
+
+def test_effective_served_model_name_from_defaults():
+    """A recipe default for served_model_name is used when present."""
+    recipe = Recipe.from_dict({"model": "org/model", "runtime": "vllm", "defaults": {"served_model_name": "friendly"}})
+    assert recipe.effective_served_model_name == "friendly"
+
+
+def test_effective_served_model_name_cli_override_wins():
+    """A CLI override (applied via resolve) takes precedence over defaults."""
+    recipe = Recipe.from_dict({"model": "org/model", "runtime": "vllm", "defaults": {"served_model_name": "friendly"}})
+    recipe.resolve({"served_model_name": "cli-name"})
+    assert recipe.effective_served_model_name == "cli-name"
+
+
 def test_qualified_name_with_path(tmp_path):
     """qualified_name returns filesystem path for path-loaded recipes."""
     recipe_file = tmp_path / "my-recipe.yaml"

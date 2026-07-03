@@ -348,9 +348,7 @@ def _resolve_v1_migration(recipe: Recipe) -> None:
         # (e.g. a JSON-valued flag default).  Collapse them for string values
         # only; non-string defaults (numeric port, max_num_seqs,
         # gpu_memory_utilization, ...) are passed through untouched.
-        recipe.defaults = {
-            k: (_collapse_brace_escapes(v) if isinstance(v, str) else v) for k, v in recipe.defaults.items()
-        }
+        recipe.defaults = {k: (_collapse_brace_escapes(v) if isinstance(v, str) else v) for k, v in recipe.defaults.items()}
 
 
 def _resolve_eugr_signals(recipe: Recipe) -> None:
@@ -932,6 +930,16 @@ class Recipe:
     def get_default(self, key: str, fallback: Any = None) -> Any:
         """Get a value from defaults with optional fallback."""
         return self.defaults.get(key, fallback)
+
+    @property
+    def effective_served_model_name(self) -> str:
+        """Resolved served-model name: CLI override → recipe default → model id.
+
+        Mirrors the runtime serve-argument resolution (``--served-model-name``
+        falls back to the model id when unset) so observers can read the name a
+        workload is actually served under off the container labels.
+        """
+        return self._effective_default("served_model_name") or self.model
 
     def build_config_chain(self, cli_overrides: dict[str, Any] | None = None, user_config: dict[str, Any] | None = None) -> Variables:
         """Build cascading config: CLI overrides -> user config -> recipe defaults.

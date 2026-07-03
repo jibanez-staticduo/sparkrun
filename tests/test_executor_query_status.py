@@ -24,9 +24,11 @@ from sparkrun.core.hardware import AcceleratorSpec, HostHardware
 from sparkrun.orchestration.executors._base import (
     LABEL_CLUSTER_ID,
     LABEL_INTENT_ID,
+    LABEL_MODEL,
     LABEL_RANK,
     LABEL_RECIPE,
     LABEL_RUNTIME,
+    LABEL_SERVED_MODEL_NAME,
     Executor,
 )
 from sparkrun.orchestration.executors.docker import (
@@ -68,12 +70,23 @@ def test_workload_labels_full_set():
         recipe_name="@arena/qwen3-1.7b-vllm",
         runtime_name="vllm",
         rank=3,
+        model="Qwen/Qwen3-1.7B",
+        served_model_name="qwen3",
     )
     assert labels[LABEL_CLUSTER_ID] == "sparkrun_abc123abc123abc1_def456abcdef"
     assert labels[LABEL_INTENT_ID] == "abc123abc123abc1"
     assert labels[LABEL_RECIPE] == "@arena/qwen3-1.7b-vllm"
     assert labels[LABEL_RUNTIME] == "vllm"
     assert labels[LABEL_RANK] == "3"
+    assert labels[LABEL_MODEL] == "Qwen/Qwen3-1.7B"
+    assert labels[LABEL_SERVED_MODEL_NAME] == "qwen3"
+
+
+def test_workload_labels_skips_empty_model_and_served_name():
+    """Falsy model / served_model_name are omitted (consistent with recipe/runtime)."""
+    labels = Executor.workload_labels("sparkrun_x", model="", served_model_name="")
+    assert LABEL_MODEL not in labels
+    assert LABEL_SERVED_MODEL_NAME not in labels
 
 
 def test_workload_labels_explicit_intent_id():
