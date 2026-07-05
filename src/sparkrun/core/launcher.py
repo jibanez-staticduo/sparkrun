@@ -371,7 +371,7 @@ def launch_inference(
     # Runtime-specific kwargs forwarded to runtime.run()
     ray_port: int | None = None,
     dashboard_port: int | None = None,
-    dashboard: bool = False,
+    dashboard: bool | None = None,
     init_port: int | None = None,
     topology: str | None = None,
     cluster_id_override: str | None = None,
@@ -434,7 +434,10 @@ def launch_inference(
         follow: whether to follow logs
         ray_port: Ray GCS port (forwarded to runtime.run).
         dashboard_port: Ray dashboard port (forwarded to runtime.run).
-        dashboard: Enable Ray dashboard (forwarded to runtime.run).
+        dashboard: Tri-state Ray dashboard toggle, forwarded verbatim to
+            runtime.run. ``True``/``False`` force it; ``None`` lets the Ray
+            runtime resolve it against ``recipe.runtime_config.dashboard``
+            (defaulting on).
         init_port: Distributed init port (forwarded to runtime.run).
         executor_config: Executor config
         rootless: Run containers in rootless mode (applies defaults to executor_config)
@@ -856,8 +859,10 @@ def launch_inference(
         run_kwargs["ray_port"] = ray_port
     if dashboard_port is not None:
         run_kwargs["dashboard_port"] = dashboard_port
-    if dashboard:
-        run_kwargs["dashboard"] = dashboard
+    # Forward the tri-state dashboard toggle verbatim (True / False / None). The
+    # Ray runtime resolves None against the recipe and emits --include-dashboard
+    # accordingly; non-Ray runtimes ignore it via run()'s **kwargs.
+    run_kwargs["dashboard"] = dashboard
     if init_port is not None:
         run_kwargs["init_port"] = init_port
     if topology is not None:

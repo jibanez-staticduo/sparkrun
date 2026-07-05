@@ -84,7 +84,10 @@ def test_generate_container_launch_script_with_volumes():
 
 
 def test_generate_ray_head_script():
-    """Contains ray start --head, port, no dashboard by default."""
+    """The primitive defaults to dashboard off, emitting --include-dashboard=False.
+
+    Ray starts the dashboard when the flag is absent, so 'off' must be explicit.
+    """
     script = generate_ray_head_script(
         image="ray-image:latest",
         container_name="ray-head",
@@ -97,12 +100,28 @@ def test_generate_ray_head_script():
     assert "NODE_IP" in script
     assert "docker rm -f ray-head" in script
 
-    expected_cmd = "ray start --block --head --port 46379 --node-ip-address $NODE_IP --disable-usage-stats"
+    expected_cmd = "ray start --block --head --port 46379 --node-ip-address $NODE_IP --include-dashboard=False --disable-usage-stats"
+    assert b64_encode_cmd(expected_cmd) in script
+
+
+def test_generate_ray_head_script_dashboard_off_explicit():
+    """dashboard=False emits --include-dashboard=False (no host/port flags)."""
+    script = generate_ray_head_script(
+        image="ray-image:latest",
+        container_name="ray-head",
+        ray_port=46379,
+        dashboard_port=8265,
+        dashboard=False,
+    )
+
+    # The exact b64-encoded command already asserts the absence of any
+    # --dashboard-host/--dashboard-port flags in the off state.
+    expected_cmd = "ray start --block --head --port 46379 --node-ip-address $NODE_IP --include-dashboard=False --disable-usage-stats"
     assert b64_encode_cmd(expected_cmd) in script
 
 
 def test_generate_ray_head_script_with_dashboard():
-    """With dashboard=True, includes dashboard flags."""
+    """With dashboard=True, includes dashboard flags bound to 0.0.0.0."""
     script = generate_ray_head_script(
         image="ray-image:latest",
         container_name="ray-head",

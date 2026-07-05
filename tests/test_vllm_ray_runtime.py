@@ -111,3 +111,36 @@ class TestRayNonCarryOver:
         assert "NCCL_IB_HCA" in script_arg
         assert "UCX_NET_DEVICES" in script_arg
         assert "NCCL_SOCKET_IFNAME" in script_arg
+
+
+class _StubRecipe:
+    def __init__(self, runtime_config=None):
+        self.runtime_config = runtime_config or {}
+
+
+class TestResolveDashboard:
+    """VllmRayRuntime._resolve_dashboard tri-state resolution."""
+
+    def test_explicit_true_wins(self):
+        assert VllmRayRuntime._resolve_dashboard(True, _StubRecipe({"dashboard": False})) is True
+
+    def test_explicit_false_wins(self):
+        # Explicit --no-dashboard overrides a recipe that asks for the dashboard.
+        assert VllmRayRuntime._resolve_dashboard(False, _StubRecipe({"dashboard": True})) is False
+
+    def test_none_defaults_on_when_recipe_silent(self):
+        assert VllmRayRuntime._resolve_dashboard(None, _StubRecipe()) is True
+
+    def test_none_uses_recipe_bool_false(self):
+        assert VllmRayRuntime._resolve_dashboard(None, _StubRecipe({"dashboard": False})) is False
+
+    def test_none_uses_recipe_bool_true(self):
+        assert VllmRayRuntime._resolve_dashboard(None, _StubRecipe({"dashboard": True})) is True
+
+    def test_none_coerces_recipe_string(self):
+        # runtime_config values may arrive as strings; ext_parse_bool handles them.
+        assert VllmRayRuntime._resolve_dashboard(None, _StubRecipe({"dashboard": "off"})) is False
+        assert VllmRayRuntime._resolve_dashboard(None, _StubRecipe({"dashboard": "yes"})) is True
+
+    def test_none_recipe_is_safe(self):
+        assert VllmRayRuntime._resolve_dashboard(None, None) is True

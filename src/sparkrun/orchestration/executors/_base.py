@@ -633,9 +633,13 @@ class Executor(Plugin):
 
         all_env = merge_env({"RAY_memory_monitor_refresh_ms": "0"}, nccl_env, env)
 
-        dashboard_flags = ""
+        # Ray starts the dashboard by default when --include-dashboard is absent,
+        # so disabling it must be explicit. When on, bind 0.0.0.0 so the dashboard
+        # is reachable at the head IP (the container runs with host networking).
         if dashboard:
             dashboard_flags = "--include-dashboard=True --dashboard-host 0.0.0.0 --dashboard-port %d " % dashboard_port
+        else:
+            dashboard_flags = "--include-dashboard=False "
 
         cleanup = self.stop_cmd(container_name)
         run = self.run_cmd(

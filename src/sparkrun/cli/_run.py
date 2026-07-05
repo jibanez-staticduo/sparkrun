@@ -118,7 +118,14 @@ def _summarize_platforms(
 @click.option("--served-model-name", default=None, help="Override served model name")
 @click.option("--ray-port", type=int, default=46379, help="Ray GCS port (vllm-ray)", hidden=HIDE_ADVANCED_OPTIONS)
 @click.option("--init-port", type=int, default=25000, help="vllm/SGLang distributed init port", hidden=HIDE_ADVANCED_OPTIONS)
-@click.option("--dashboard", is_flag=True, help="Enable Ray dashboard on head node", hidden=HIDE_ADVANCED_OPTIONS)
+@click.option(
+    "--dashboard/--no-dashboard",
+    "dashboard",
+    default=None,
+    help="Enable/disable the Ray dashboard on the head node (Ray runtimes only; binds 0.0.0.0 when on). "
+    "Overrides the recipe's runtime_config.dashboard; defaults to on.",
+    hidden=HIDE_ADVANCED_OPTIONS,
+)
 @click.option("--dashboard-port", type=int, default=8265, help="Ray dashboard port", hidden=HIDE_ADVANCED_OPTIONS)
 @dry_run_option
 @click.option("--foreground", is_flag=True, help="Run in foreground (don't detach)")

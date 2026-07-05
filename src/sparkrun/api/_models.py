@@ -84,8 +84,12 @@ class RunOptions:
     """Ray GCS port (vllm-ray runtime)."""
     dashboard_port: int = 8265
     """Ray dashboard port."""
-    dashboard: bool = False
-    """Enable Ray dashboard on head node."""
+    dashboard: bool | None = None
+    """Enable the Ray dashboard on the head node (Ray runtimes only).
+
+    Tri-state: ``True``/``False`` force the toggle; ``None`` (default) defers to
+    the recipe's ``runtime_config.dashboard``, falling back to on. When off, the
+    runtime emits ``--include-dashboard=False`` to override Ray's on-by-default."""
     init_port: int = 25000
     """vLLM/SGLang distributed init port."""
 

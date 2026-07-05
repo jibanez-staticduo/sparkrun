@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, TYPE_CHECKING
 
+from scitrera_app_framework import ext_parse_bool
+
 from sparkrun.runtimes.base import RuntimePlugin
 from sparkrun.runtimes._vllm_common import VllmMixin, VLLM_FLAG_MAP, VLLM_BOOL_FLAGS
 
@@ -205,6 +207,24 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         logger.info("Cluster '%s' stopped on %d host(s)", cluster_id, len(hosts))
         return 0
 
+    @staticmethod
+    def _resolve_dashboard(dashboard: bool | None, recipe) -> bool:
+        """Resolve the tri-state Ray dashboard toggle to a concrete bool.
+
+        Precedence: an explicit ``True``/``False`` (from ``--dashboard`` /
+        ``--no-dashboard`` or the API) wins; otherwise the recipe's
+        ``runtime_config.dashboard`` (a YAML bool or ``"true"``/``"on"`` string,
+        coerced via SAF's ``ext_parse_bool``) applies; failing that, the
+        dashboard defaults on (Ray starts it when ``--include-dashboard`` is
+        absent).
+        """
+        if dashboard is not None:
+            return dashboard
+        value = (getattr(recipe, "runtime_config", None) or {}).get("dashboard")
+        if value is None:
+            return True
+        return ext_parse_bool(value)
+
     def _run_cluster(
         self,
         hosts: list[str],
@@ -222,7 +242,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         comm_env: "ClusterCommEnv | None" = None,
         ray_port: int = 46379,
         dashboard_port: int = 8265,
-        dashboard: bool = False,
+        dashboard: bool | None = None,
         extra_docker_opts: list[str] | None = None,
         **kwargs,
     ) -> int:
@@ -254,6 +274,10 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         trust = kwargs.pop("trust", False)
         placement = kwargs.pop("placement", None)
         combined_docker_opts = (self.get_extra_docker_opts() or []) + (extra_docker_opts or [])
+
+        # Resolve the tri-state dashboard toggle now so the rest of the cluster
+        # launch works with a concrete bool.
+        dashboard = self._resolve_dashboard(dashboard, recipe)
 
         ctx = ClusterContext.build(
             self,
@@ -517,7 +541,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             sparkrun_labels=head_labels or None,
         )
 
-        self._print_connection_info(hosts, cluster_id, head_ip=head_ip, dashboard_port=dashboard_port)
+        self._print_connection_info(hosts, cluster_id, head_ip=head_ip, dashboard_port=dashboard_port, dashboard=dashboard)
 
         exec_result = run_remote_script(
             ctx.head_host,
@@ -546,13 +570,13 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             return 1
         return 0
 
-    def _print_connection_info(self, hosts, cluster_id, head_ip=None, dashboard_port=8265):
+    def _print_connection_info(self, hosts, cluster_id, head_ip=None, dashboard_port=8265, dashboard=True):
         """Print vLLM-specific connection info including Dashboard URL."""
         logger.info("=" * 60)
         logger.info("Cluster launched successfully. Nodes: %d", len(hosts))
         logger.info("")
         logger.info("To view logs:    sparkrun logs <recipe> --hosts %s", ",".join(hosts))
         logger.info("To stop cluster: sparkrun stop <recipe> --hosts %s", ",".join(hosts))
-        if head_ip:
+        if head_ip and dashboard:
             logger.info("Dashboard:       http://%s:%d", head_ip, dashboard_port)
         logger.info("=" * 60)
