@@ -23,6 +23,10 @@
 #     run is retargeted at it; secrets stay in the .env via ${VAR} references.
 #   * --build-only / --download-only have no isolated phase under sparkrun
 #     (images/models are synced automatically during `run`).
+#   * No-Ray is the default multi-node backend (matching upstream). `--ray`
+#     opts into Ray (-> -o distributed_executor_backend=ray, i.e. vllm-ray);
+#     `--no-ray` is accepted for compatibility (-> vllm-distributed, the
+#     default). The two are mutually exclusive and both are rejected with --solo.
 #
 # Hidden testing hook:
 #   RUN_RECIPE_DEBUG=1  -> print the assembled `sparkrun` argv to stderr and
@@ -75,7 +79,8 @@ Common options (mapped onto \`sparkrun run\`):
   --name NAME                   Container name (-> --container-name)
   --solo                        Single-node mode (implies --tp 1 if unset)
   -d, --daemon                  Detach (default here is foreground)
-  --no-ray                      -> -o distributed_executor_backend=mp
+  --ray                         Opt into Ray for multi-node (-> -o distributed_executor_backend=ray)
+  --no-ray                      Default multi-node backend; accepted for compat (-> -o distributed_executor_backend=mp)
   -e, --env VAR=VAL             Container env var (repeatable)
   -p, --publish H:C             Publish port, solo only (repeatable)
   --nccl-debug LEVEL            -> -e NCCL_DEBUG=LEVEL
@@ -136,6 +141,7 @@ resolve_runner() {
 RECIPE=""
 WANT_LIST=0
 SOLO=0
+RAY=0
 NO_RAY=0
 DAEMON=0
 TP_SET=0
@@ -220,6 +226,7 @@ parse_args() {
 
             # ----- boolean / mode flags -----
             --solo)            SOLO=1; ARGS+=(--solo); shift; continue ;;
+            --ray)             RAY=1; ARGS+=(-o distributed_executor_backend=ray); shift; continue ;;
             --no-ray)          NO_RAY=1; ARGS+=(-o distributed_executor_backend=mp); shift; continue ;;
             -d|--daemon)       DAEMON=1; shift; continue ;;
             --dry-run)         ARGS+=(--dry-run); shift; continue ;;
@@ -317,8 +324,11 @@ main() {
     fi
 
     # ----- pre-flight compatibility checks (mirror the legacy tool) -----
-    if [[ $NO_RAY -eq 1 && $SOLO -eq 1 ]]; then
-        die "--no-ray is incompatible with --solo (solo already runs without Ray)."
+    if [[ $RAY -eq 1 && $NO_RAY -eq 1 ]]; then
+        die "--ray and --no-ray are mutually exclusive."
+    fi
+    if [[ $SOLO -eq 1 && ( $RAY -eq 1 || $NO_RAY -eq 1 ) ]]; then
+        die "--ray/--no-ray are incompatible with --solo or a single-node configuration."
     fi
     if [[ $HAVE_PUBLISH -eq 1 && $SOLO -eq 0 ]]; then
         die "-p/--publish is only supported in solo mode; add --solo or drop the port mapping."
