@@ -27,10 +27,11 @@ from sparkrun.orchestration.k8s.errors import (
     KubectlNotFoundError,
     ServiceAccountSetupError,
 )
+from sparkrun.orchestration.k8s.job import LauncherJobResult, LauncherJobSpec
 from sparkrun.orchestration.k8s.kubectl import normalize_release_version
 from sparkrun.orchestration.k8s.serviceaccount import ServiceAccountSpec, DEFAULT_SA_NAME
 
-from ._errors import ClusterUnreachable, KubectlUnavailable, ServiceAccountError
+from ._errors import ClusterUnreachable, KubectlUnavailable, LauncherJobError, ServiceAccountError
 
 if TYPE_CHECKING:
     from sparkrun.core.context import SparkrunContext
@@ -162,4 +163,83 @@ def configure_service_account(
         raise ServiceAccountError(str(exc)) from exc
 
 
-__all__ = ["ensure_kubectl", "make_client", "cluster_info", "configure_service_account"]
+def run_launcher_job(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    name: str,
+    image: str | None = None,
+    command: list[str] | None = None,
+    script: str | None = None,
+    namespace: str | None = None,
+    service_account: str = DEFAULT_SA_NAME,
+    env: dict[str, str] | None = None,
+    ttl_seconds: int | None = None,
+    active_deadline_seconds: int | None = None,
+    kubeconfig: str | None = None,
+    context: str | None = None,
+    follow: bool = False,
+    dry_run: bool = False,
+) -> LauncherJobResult:
+    """Apply an in-cluster launcher Job that runs *command* or *script*.
+
+    The Job runs under the sparkrun service account and survives a CLI
+    disconnect.  Exactly one of *command* / *script* must be given.  The
+    image resolves from *image* or ``config.k8s_launcher_image``; missing
+    both raises :class:`LauncherJobError`.  When *follow*, launcher logs
+    stream to the terminal until interrupted (the Job keeps running).
+    """
+    from sparkrun.orchestration.k8s.job import DEFAULT_TTL_SECONDS
+
+    sctx = resolve_sctx(sctx)
+    ns = namespace or DEFAULT_SA_NAME
+    resolved_image = image or sctx.config.k8s_launcher_image
+    if not resolved_image:
+        raise LauncherJobError("No launcher image: pass image= or set k8s.launcher_image in config.yaml.")
+
+    try:
+        spec = LauncherJobSpec(
+            name=name,
+            image=resolved_image,
+            namespace=ns,
+            service_account=service_account,
+            command=command,
+            script=script,
+            env=dict(env or {}),
+            ttl_seconds=DEFAULT_TTL_SECONDS if ttl_seconds is None else ttl_seconds,
+            active_deadline_seconds=active_deadline_seconds,
+        )
+    except ValueError as exc:
+        raise LauncherJobError(str(exc)) from exc
+
+    from sparkrun.orchestration.k8s.job import render_launcher_manifests
+
+    manifests_yaml = render_launcher_manifests(spec)
+    result = LauncherJobResult(
+        job_name=name,
+        namespace=ns,
+        image=resolved_image,
+        manifests_yaml=manifests_yaml,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        return result
+
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context, namespace=ns)
+    apply_res = client.run_launcher_job(spec)
+    if not apply_res.success:
+        raise LauncherJobError("Failed to apply launcher Job %s: %s" % (name, apply_res.stderr.strip()[:400]))
+    result.applied = True
+
+    if follow:
+        client.follow_job_logs(name)
+
+    return result
+
+
+__all__ = [
+    "ensure_kubectl",
+    "make_client",
+    "cluster_info",
+    "configure_service_account",
+    "run_launcher_job",
+]

@@ -23,4 +23,8 @@ class ServiceAccountError(SparkrunError):
     """Configuring the sparkrun service account failed."""
 
 
-__all__ = ["KubectlUnavailable", "ClusterUnreachable", "ServiceAccountError"]
+class LauncherJobError(SparkrunError):
+    """Building or applying an in-cluster launcher Job failed."""
+
+
+__all__ = ["KubectlUnavailable", "ClusterUnreachable", "ServiceAccountError", "LauncherJobError"]

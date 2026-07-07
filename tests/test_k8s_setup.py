@@ -530,6 +530,120 @@ def test_resolve_executor_wires_kubectl_path(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Launcher Job (job-driven launch, Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def test_launcher_job_command_form():
+    from sparkrun.orchestration.k8s.job import LauncherJobSpec, build_launcher_manifests
+
+    spec = LauncherJobSpec(
+        name="cl-abc",
+        image="ghcr.io/x/sparkrun:latest",
+        namespace="sparkrun",
+        command=["sparkrun", "run", "qwen"],
+        env={"HF_TOKEN": "x"},
+    )
+    docs = build_launcher_manifests(spec)
+    assert len(docs) == 1  # no ConfigMap for command form
+    job = docs[0]
+    assert job["kind"] == "Job"
+    assert job["spec"]["backoffLimit"] == 0
+    assert job["spec"]["ttlSecondsAfterFinished"] == 3600
+    pod = job["spec"]["template"]["spec"]
+    assert pod["serviceAccountName"] == "sparkrun"
+    assert pod["restartPolicy"] == "Never"
+    assert pod["containers"][0]["command"] == ["sparkrun", "run", "qwen"]
+    assert {"name": "HF_TOKEN", "value": "x"} in pod["containers"][0]["env"]
+
+
+def test_launcher_job_script_form_mounts_configmap():
+    from sparkrun.orchestration.k8s.job import LauncherJobSpec, build_launcher_manifests
+
+    spec = LauncherJobSpec(name="cl-def", image="kubectl:1", namespace="ns", script="echo hi")
+    docs = build_launcher_manifests(spec)
+    assert docs[0]["kind"] == "ConfigMap"
+    assert docs[0]["data"]["launch.sh"] == "echo hi"
+    assert docs[0]["metadata"]["name"] == "cl-def-script"
+    pod = docs[1]["spec"]["template"]["spec"]
+    assert pod["containers"][0]["command"] == ["bash", "/sparkrun/launch.sh"]
+    assert pod["volumes"][0]["configMap"]["name"] == "cl-def-script"
+
+
+def test_launcher_job_requires_exactly_one_payload():
+    from sparkrun.orchestration.k8s.job import LauncherJobSpec
+
+    with pytest.raises(ValueError, match="exactly one"):
+        LauncherJobSpec(name="x", image="i")
+    with pytest.raises(ValueError, match="exactly one"):
+        LauncherJobSpec(name="x", image="i", command=["a"], script="b")
+
+
+def test_launcher_job_active_deadline_optional():
+    from sparkrun.orchestration.k8s.job import LauncherJobSpec, job_manifest
+
+    without = job_manifest(LauncherJobSpec(name="j", image="i", command=["a"]))
+    assert "activeDeadlineSeconds" not in without["spec"]
+    with_deadline = job_manifest(LauncherJobSpec(name="j", image="i", command=["a"], active_deadline_seconds=300))
+    assert with_deadline["spec"]["activeDeadlineSeconds"] == 300
+
+
+def test_client_run_launcher_job_applies(monkeypatch):
+    from sparkrun.orchestration.k8s.job import LauncherJobSpec
+
+    client = KubectlClient("/usr/bin/kubectl", namespace="ns")
+    captured = {}
+
+    def _apply(manifest_yaml, **k):
+        captured["yaml"] = manifest_yaml
+        return RemoteResult(host="k8s", returncode=0, stdout="created", stderr="")
+
+    monkeypatch.setattr(client, "apply", _apply)
+    spec = LauncherJobSpec(name="cl-1", image="img", command=["sparkrun", "run"])
+    res = client.run_launcher_job(spec)
+    assert res.success
+    assert "kind: Job" in captured["yaml"]
+
+
+def test_client_follow_job_logs_dry_run_noop():
+    client = KubectlClient("/usr/bin/kubectl", dry_run=True)
+    assert client.follow_job_logs("cl-1") == 0
+
+
+def test_api_run_launcher_job_requires_image(tmp_path):
+    from sparkrun import api
+
+    sctx = _sctx(tmp_path)
+    with pytest.raises(api.k8s.LauncherJobError, match="launcher image"):
+        api.k8s.run_launcher_job(sctx, name="cl-1", command=["sparkrun"], dry_run=True)
+
+
+def test_api_run_launcher_job_uses_config_image(tmp_path):
+    from sparkrun import api
+
+    sctx = _sctx(tmp_path)
+    sctx.config.set("k8s", {"launcher_image": "ghcr.io/x/sparkrun:pinned"})
+    result = api.k8s.run_launcher_job(sctx, name="cl-1", command=["sparkrun", "run"], dry_run=True)
+    assert result.dry_run and not result.applied
+    assert result.image == "ghcr.io/x/sparkrun:pinned"
+    assert "kind: Job" in result.manifests_yaml
+
+
+def test_api_run_launcher_job_dry_run_does_not_build_client(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+
+    sctx = _sctx(tmp_path)
+
+    def _boom(*a, **k):
+        raise AssertionError("dry-run must not build a client / resolve kubectl")
+
+    monkeypatch.setattr(apik8s._ops, "make_client", _boom)
+    result = api.k8s.run_launcher_job(sctx, name="cl-1", image="img", command=["x"], dry_run=True)
+    assert result.dry_run
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -557,3 +671,19 @@ def test_cli_setup_k8s_kubectl_list_empty(tmp_path, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(main, ["setup", "k8s", "kubectl", "--list"])
     assert result.exit_code == 0, result.output
+
+
+def test_cli_setup_k8s_run_job_dry_run(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from sparkrun.cli import main
+
+    monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["setup", "k8s", "run-job", "--name", "cl-1", "--image", "img", "--command", "sparkrun run qwen", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "kind: Job" in result.output
+    assert "dry-run" in result.output

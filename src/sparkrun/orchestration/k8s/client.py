@@ -145,5 +145,51 @@ class KubectlClient:
         args += ["--", "bash", "-c", b64_wrap_bash(script)]
         return self.run(args, timeout=timeout)
 
+    # ------------------------------------------------------------------
+    # Job transport — run an orchestration payload in-cluster
+    # ------------------------------------------------------------------
+
+    def run_launcher_job(self, spec, *, timeout: int | None = _DEFAULT_TIMEOUT) -> RemoteResult:
+        """Apply a launcher Job (+ ConfigMap) from a :class:`LauncherJobSpec`.
+
+        The in-cluster analog of ``run_remote_script``: instead of piping
+        the payload to ``ssh <host> bash -s``, it lands as a Job that the
+        cluster runs under the sparkrun service account.  Returns the
+        ``kubectl apply`` result.
+        """
+        from .job import render_launcher_manifests
+
+        return self.apply(render_launcher_manifests(spec), timeout=timeout)
+
+    def wait_for_job(
+        self,
+        name: str,
+        *,
+        condition: str = "complete",
+        timeout: int = 600,
+    ) -> RemoteResult:
+        """Block until ``job/<name>`` reaches *condition* (``complete``/``failed``)."""
+        return self.run(
+            ["wait", "--for=condition=%s" % condition, "job/%s" % name, "--timeout=%ds" % timeout],
+            timeout=timeout + 30,
+        )
+
+    def follow_job_logs(self, name: str) -> int:
+        """Stream ``kubectl logs -f job/<name>`` to the terminal (blocking).
+
+        Inherits stdio so output streams live; a ``KeyboardInterrupt``
+        (Ctrl-C) at the CLI simply stops streaming and leaves the Job
+        running — the detach-on-disconnect affordance.  Returns the exit
+        code (0 on dry-run).
+        """
+        if self.dry_run:
+            logger.debug("[dry-run] logs -f job/%s", name)
+            return 0
+        cmd = self.base_args() + ["logs", "-f", "job/%s" % name]
+        try:
+            return subprocess.call(cmd)  # noqa: S603 — argv list, inherits stdio
+        except KeyboardInterrupt:
+            return 0
+
 
 __all__ = ["KubectlClient"]

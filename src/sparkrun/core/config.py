@@ -170,6 +170,17 @@ class SparkrunConfig:
         cfg = self._data.get("k8s")
         return dict(cfg) if isinstance(cfg, dict) else {}
 
+    @property
+    def k8s_launcher_image(self) -> str | None:
+        """Container image for the in-cluster launcher Job (``k8s.launcher_image``).
+
+        The job-driven launch path runs sparkrun's orchestration inside
+        this image (typically a published sparkrun container).  ``None``
+        when unset — callers must then supply an explicit image.
+        """
+        val = self.k8s_defaults.get("launcher_image")
+        return str(val) if val else None
+
     def _kubectl_settings(self) -> dict[str, Any]:
         kubectl = self.k8s_defaults.get("kubectl")
         return kubectl if isinstance(kubectl, dict) else {}

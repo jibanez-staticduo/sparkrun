@@ -21,18 +21,27 @@ from sparkrun.orchestration.k8s import (
     ClusterInfo,
     KubectlBinary,
     KubeTarget,
+    LauncherJobResult,
+    LauncherJobSpec,
     ServiceAccountResult,
     ServiceAccountSpec,
 )
 
-from ._errors import ClusterUnreachable, KubectlUnavailable, ServiceAccountError
-from ._ops import cluster_info, configure_service_account, ensure_kubectl, make_client
+from ._errors import ClusterUnreachable, KubectlUnavailable, LauncherJobError, ServiceAccountError
+from ._ops import (
+    cluster_info,
+    configure_service_account,
+    ensure_kubectl,
+    make_client,
+    run_launcher_job,
+)
 
 __all__ = [
     # Functions
     "ensure_kubectl",
     "cluster_info",
     "configure_service_account",
+    "run_launcher_job",
     "make_client",
     # Data models
     "KubectlBinary",
@@ -40,8 +49,11 @@ __all__ = [
     "KubeTarget",
     "ServiceAccountSpec",
     "ServiceAccountResult",
+    "LauncherJobSpec",
+    "LauncherJobResult",
     # Errors
     "KubectlUnavailable",
     "ClusterUnreachable",
     "ServiceAccountError",
+    "LauncherJobError",
 ]

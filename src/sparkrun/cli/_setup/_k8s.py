@@ -13,6 +13,7 @@ api, and render results to the TTY.
 from __future__ import annotations
 
 import functools
+import shlex
 
 import click
 
@@ -173,3 +174,49 @@ def setup_k8s_sa(ctx, name, kubeconfig, kube_context, namespace, no_create_names
         click.echo("Point the k8s executor at it via config.yaml:")
         click.echo("  executor_config:")
         click.echo("    kubeconfig: %s" % result.kubeconfig_path)
+
+
+# ---------------------------------------------------------------------------
+# run-job (hidden — smoke-tests the launcher-Job transport)
+# ---------------------------------------------------------------------------
+
+
+@setup_k8s.command("run-job", hidden=True)
+@click.option("--name", required=True, help="Job name.")
+@click.option("--image", default=None, help="Launcher image (defaults to k8s.launcher_image).")
+@click.option("--command", "command", default=None, help="argv (shell-split) to run in the image.")
+@click.option("--script", "script", default=None, help="Bash script to run via a mounted ConfigMap.")
+@kube_options
+@click.option("--follow", is_flag=True, help="Stream launcher logs until interrupted (Job keeps running).")
+@click.option("--dry-run", is_flag=True, help="Print the manifests without applying.")
+@click.pass_context
+def setup_k8s_run_job(ctx, name, image, command, script, kubeconfig, kube_context, namespace, follow, dry_run):
+    """Apply an in-cluster launcher Job (foundation for job-driven launch)."""
+    from sparkrun import api
+
+    sctx = _get_context(ctx)
+    argv = shlex.split(command) if command else None
+    try:
+        result = api.k8s.run_launcher_job(
+            sctx,
+            name=name,
+            image=image,
+            command=argv,
+            script=script,
+            namespace=namespace,
+            kubeconfig=kubeconfig,
+            context=kube_context,
+            follow=follow,
+            dry_run=dry_run,
+        )
+    except api.k8s.LauncherJobError as exc:
+        raise click.ClickException(str(exc))
+
+    if dry_run:
+        click.echo(result.manifests_yaml)
+        click.secho("(dry-run — nothing applied)", fg="yellow")
+        return
+    click.secho("Launcher Job applied.", fg="green")
+    click.echo("  job:   %s/%s" % (result.namespace, result.job_name))
+    click.echo("  image: %s" % result.image)
+    click.echo("Reattach with: kubectl -n %s logs -f job/%s" % (result.namespace, result.job_name))

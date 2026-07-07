@@ -26,6 +26,12 @@ from .errors import (
     KubectlNotFoundError,
     ServiceAccountSetupError,
 )
+from .job import (
+    LauncherJobResult,
+    LauncherJobSpec,
+    build_launcher_manifests,
+    render_launcher_manifests,
+)
 from .kubectl import KubectlBinary, ensure_kubectl, list_cached
 from .serviceaccount import (
     ServiceAccountResult,
@@ -46,6 +52,10 @@ __all__ = [
     "ServiceAccountSpec",
     "ServiceAccountResult",
     "configure_service_account",
+    "LauncherJobSpec",
+    "LauncherJobResult",
+    "build_launcher_manifests",
+    "render_launcher_manifests",
     "K8sError",
     "KubectlNotFoundError",
     "KubectlDownloadError",
