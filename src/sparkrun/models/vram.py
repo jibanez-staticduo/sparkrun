@@ -26,6 +26,7 @@ _DTYPE_BYTES: dict[str, float] = {
     "nvfp4": 0.5,
     "awq4": 0.5,
     "w4a16_awq": 0.5,
+    "w4a16_nvfp4": 0.5,
     "awq8": 1.0,
     "gptq": 0.5,
     "mxfp4": 0.5,
