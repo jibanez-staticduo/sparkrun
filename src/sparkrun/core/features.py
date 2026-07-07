@@ -199,13 +199,14 @@ def feature_source(
 # Built-in flags.
 # --------------------------------------------------------------------------
 
-# The experimental executors are on by default only on the ``alpha`` train;
-# ``stable``/``beta`` users must opt in explicitly. See docs/executors.
+# The experimental executors are off by default on every channel; users opt
+# in explicitly via ``features.executor.*`` in config.yaml (or the
+# ``SPARKRUN_FEATURE_*`` env override). The per-channel default mechanism
+# (``channel_defaults``) remains available for future flags that want it.
 FEATURE_EXECUTOR_LOCAL = register_feature(
     FeatureFlag(
         name="executor.local",
         description="Experimental native (no-container) executor",
-        channel_defaults={"stable": False, "beta": False, "alpha": True},
         default=False,
     )
 )
@@ -214,7 +215,6 @@ FEATURE_EXECUTOR_K8S = register_feature(
     FeatureFlag(
         name="executor.k8s",
         description="Experimental Kubernetes (kubectl) executor draft",
-        channel_defaults={"stable": False, "beta": False, "alpha": True},
         default=False,
     )
 )

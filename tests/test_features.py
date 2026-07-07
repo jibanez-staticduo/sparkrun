@@ -105,12 +105,12 @@ class TestResolutionPrecedence:
     def test_unknown_flag_fails_closed(self):
         assert is_feature_enabled("does.not.exist", env={}) is False
 
-    def test_channel_default_alpha_on(self):
-        assert is_feature_enabled("executor.k8s", channel="alpha", env={}) is True
-
-    def test_channel_default_stable_off(self):
-        assert is_feature_enabled("executor.k8s", channel="stable", env={}) is False
-        assert is_feature_enabled("executor.k8s", channel="beta", env={}) is False
+    def test_builtin_executor_flags_off_on_all_channels(self):
+        # The experimental executors ship off by default everywhere; only an
+        # explicit config/env opt-in enables them.
+        for channel in ("stable", "beta", "alpha"):
+            assert is_feature_enabled("executor.k8s", channel=channel, env={}) is False
+            assert is_feature_enabled("executor.local", channel=channel, env={}) is False
 
     def test_env_overrides_channel(self):
         assert is_feature_enabled("executor.k8s", channel="stable", env={"SPARKRUN_FEATURE_EXECUTOR_K8S": "1"}) is True
@@ -204,8 +204,14 @@ class TestBootstrapGatingEndToEnd:
         assert "local" not in names
         assert "k8s" not in names
 
-    def test_alpha_includes_experimental_executors(self, tmp_path):
+    def test_alpha_still_excludes_experimental_executors(self, tmp_path):
+        # The experimental executors are off on every channel, including alpha.
         names = _executor_names(tmp_path, {"features": {"channel": "alpha"}})
+        assert "local" not in names
+        assert "k8s" not in names
+
+    def test_config_override_includes_experimental_executors(self, tmp_path):
+        names = _executor_names(tmp_path, {"features": {"executor.local": True, "executor.k8s": True}})
         assert {"docker", "local", "k8s"} <= set(names)
 
     def test_explicit_override_on_stable(self, tmp_path):

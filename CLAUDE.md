@@ -291,9 +291,11 @@ Channel-aware gating for experimental plugins and behavior. Each `FeatureFlag`
 
 The active channel reuses the release channel from `core/channels.py`
 (`stable`/`beta`/`alpha`): `SparkrunConfig.feature_channel` reads
-`features.channel`, falling back to `self_update.channel`. So a flag can be
-on-by-default for `alpha` while off for `stable`/`beta` — e.g. the experimental
-`executor.local` and `executor.k8s` flags gate the corresponding executors.
+`features.channel`, falling back to `self_update.channel`. Via `channel_defaults`
+a flag can be on-by-default for `alpha` while off for `stable`/`beta`. The two
+built-in flags — `executor.local` and `executor.k8s`, gating the corresponding
+experimental executors — are off by default on **every** channel; enable them
+explicitly per-flag.
 
 **Plugin gating**: a plugin opts in by setting `required_feature_flag = "<flag>"`
 (e.g. on `LocalExecutor`/`K8sExecutor`) and self-gates via `is_multi_extension` —
@@ -315,6 +317,7 @@ Manage via `sparkrun setup features {list,enable,disable,reset}` (advanced, unde
 features:
   channel: alpha          # optional; defaults to self_update.channel
   executor.k8s: true      # explicit per-flag override (beats channel default)
+  executor.local: true
 ```
 
 Tests: the `isolate_stateful` conftest fixture force-enables the two executor

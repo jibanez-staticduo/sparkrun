@@ -311,7 +311,7 @@ def _executor_unavailable_error(name: str, known: set[str], config: "SparkrunCon
     if gate is not None:
         return ExecutorUnavailableError(
             "Executor %r is disabled by feature flag %r. Enable it with "
-            "`sparkrun setup features enable %s`. Be careful that you only do that"
+            "`sparkrun setup features enable %s`. Be careful that you only do that "
             "if you know what you're doing..." % (name, gate, gate)
         )
     return ExecutorUnavailableError("Unknown executor %r. Available: %s" % (name, sorted(known)))
