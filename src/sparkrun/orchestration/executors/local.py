@@ -68,6 +68,7 @@ class LocalExecutor(Executor):
     """
 
     executor_name = "local"
+    required_feature_flag = "executor.local"
 
     # No Docker-style defaults; the dataclass field defaults are
     # appropriate.  No rootless/auto_user concerns either.

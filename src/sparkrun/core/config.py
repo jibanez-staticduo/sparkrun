@@ -232,6 +232,50 @@ class SparkrunConfig:
             yaml.safe_dump(self._data, f, default_flow_style=False, sort_keys=False)
 
     @property
+    def feature_channel(self) -> str:
+        """Active release channel for feature-flag defaults (normalized).
+
+        Reads ``features.channel`` when set, otherwise falls back to the
+        persisted self-update channel. Lets a ``stable`` install preview an
+        entire channel's feature set (``features.channel: alpha``) without
+        changing which code it actually runs.
+        """
+        from sparkrun.core.channels import normalize_channel
+
+        features = self._data.get("features", {})
+        raw = features.get("channel") if isinstance(features, dict) else None
+        if raw:
+            return normalize_channel(raw)
+        return self.self_update_channel
+
+    def feature_override(self, name: str) -> bool | None:
+        """Return the explicit ``features.<name>`` override, or ``None`` when unset.
+
+        The ``features.channel`` key is reserved for :attr:`feature_channel`
+        and is never treated as a flag override.
+        """
+        if name == "channel":
+            return None
+        features = self._data.get("features", {})
+        if not isinstance(features, dict):
+            return None
+        if name not in features:
+            return None
+        from scitrera_app_framework import ext_parse_bool
+
+        return bool(ext_parse_bool(features[name]))
+
+    def is_feature_enabled(self, name: str) -> bool:
+        """Resolve whether feature *name* is enabled for this config.
+
+        Thin wrapper over :func:`sparkrun.core.features.is_feature_enabled`
+        that binds this config (and thus its channel + overrides).
+        """
+        from sparkrun.core.features import is_feature_enabled
+
+        return is_feature_enabled(name, config=self)
+
+    @property
     def self_update_channel(self) -> str:
         """Return the persisted update channel, normalized (default ``stable``)."""
         from sparkrun.core.channels import normalize_channel

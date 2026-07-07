@@ -64,6 +64,7 @@ __all__ = [
     "DOCKER_DEFAULTS",
     "Executor",
     "ExecutorConfig",
+    "ExecutorUnavailableError",
     "accelerator_vendor_for",
     "get_executor",
     "list_executors",
@@ -260,9 +261,14 @@ def _resolve_executor_name(
     config: "SparkrunConfig | None",
     v: Variables | None = None,
 ) -> str:
-    """Pick the executor name from the chain (CLI → recipe → cluster → runtime → config → docker).
+    """Pick the executor name from the chain (CLI → recipe → cluster → runtime → config).
 
-    Unknown names log a warning and fall back to ``"docker"``.
+    When no layer names an executor, defaults to ``"docker"``. When a layer
+    *does* name one that isn't available — either an unknown selector or a
+    real executor gated off by a feature flag — this raises
+    :class:`ExecutorUnavailableError` rather than silently downgrading to
+    docker. Running an explicitly-requested workload on the wrong executor
+    is worse than failing loudly.
     """
     known: set[str] | None = None
     for layer in (
@@ -283,9 +289,49 @@ def _resolve_executor_name(
             known = _known_executor_names(v)
         if name in known:
             return name
-        logger.warning("Unknown executor name %r; falling back to 'docker'", name)
-        return "docker"
+        raise _executor_unavailable_error(name, known, config)
     return "docker"
+
+
+class ExecutorUnavailableError(ValueError):
+    """Raised when an explicitly-requested executor isn't available.
+
+    Subclasses :class:`ValueError` so existing ``except ValueError`` handlers
+    around executor resolution keep working.
+    """
+
+
+def _executor_unavailable_error(name: str, known: set[str], config: "SparkrunConfig | None") -> ExecutorUnavailableError:
+    """Build a helpful :class:`ExecutorUnavailableError` for selector *name*.
+
+    Distinguishes a real-but-gated executor (actionable: enable the flag)
+    from an unknown selector (typo / not installed).
+    """
+    gate = _gated_off_feature(name, config)
+    if gate is not None:
+        return ExecutorUnavailableError(
+            "Executor %r is disabled by feature flag %r. Enable it with "
+            "`sparkrun setup features enable %s`. Be careful that you only do that"
+            "if you know what you're doing..." % (name, gate, gate)
+        )
+    return ExecutorUnavailableError("Unknown executor %r. Available: %s" % (name, sorted(known)))
+
+
+def _gated_off_feature(name: str, config: "SparkrunConfig | None") -> str | None:
+    """Return the feature flag gating executor *name* off, or ``None``.
+
+    Used to turn the generic "unknown executor" warning into an actionable
+    "disabled by feature flag" message when a user pins a known-but-gated
+    executor (e.g. ``executor: k8s`` on the stable channel).
+    """
+    from sparkrun.core.features import get_feature, is_feature_enabled
+
+    feature = "executor.%s" % name
+    if get_feature(feature) is None:
+        return None
+    if is_feature_enabled(feature, config=config):
+        return None  # enabled — absence must be a different problem
+    return feature
 
 
 def resolve_executor(

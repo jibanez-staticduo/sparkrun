@@ -280,6 +280,50 @@ Shared helpers used across multiple modules to avoid circular imports:
 | `~/.cache/sparkrun/pending/`         | PID lock files for in-progress operations         |
 | `~/.cache/huggingface/`              | HuggingFace model cache (mounted into containers) |
 
+### Feature Flags (`core/features.py`)
+
+Channel-aware gating for experimental plugins and behavior. Each `FeatureFlag`
+(registered in the module-level `FEATURE_FLAGS` registry) carries a
+`description`, per-channel `channel_defaults`, and a baseline `default`.
+`is_feature_enabled(name, config=…)` resolves with precedence: env override
+(`SPARKRUN_FEATURE_<NAME>`, dots→underscores) → `features.<name>` in
+`config.yaml` → per-channel default → baseline → fail-closed for unknown flags.
+
+The active channel reuses the release channel from `core/channels.py`
+(`stable`/`beta`/`alpha`): `SparkrunConfig.feature_channel` reads
+`features.channel`, falling back to `self_update.channel`. So a flag can be
+on-by-default for `alpha` while off for `stable`/`beta` — e.g. the experimental
+`executor.local` and `executor.k8s` flags gate the corresponding executors.
+
+**Plugin gating**: a plugin opts in by setting `required_feature_flag = "<flag>"`
+(e.g. on `LocalExecutor`/`K8sExecutor`) and self-gates via `is_multi_extension` —
+SAF only exposes a multi-extension plugin through `get_extensions` when that hook
+returns True, so a gated plugin stays in the plugin registry but is absent from
+`list_executors()`, tab-completion, and resolution. `core.bootstrap` stays a pure
+discovery loop (no config reads); the gate resolves config itself via
+`features.feature_gate_enabled` at registration time (env overrides
+short-circuit before any file read). The decision is frozen per-process, which
+is fine for the one-shot CLI. An explicitly-requested but gated/unknown executor
+raises `ExecutorUnavailableError` (never a silent docker fallback); teardown of a
+job whose executor was later disabled will also fail — the accepted cost of
+relying on an experimental, opt-in feature.
+
+Manage via `sparkrun setup features {list,enable,disable,reset}` (advanced, under
+`setup`). Example `config.yaml`:
+
+```yaml
+features:
+  channel: alpha          # optional; defaults to self_update.channel
+  executor.k8s: true      # explicit per-flag override (beats channel default)
+```
+
+Tests: the `isolate_stateful` conftest fixture force-enables the two executor
+flags via env so the legacy executor suite (which predates gating) keeps
+passing. `tests/test_features.py` unit-tests the gate directly
+(`K8sExecutor().is_multi_extension(...)`) and exercises exclusion end-to-end in a
+clean subprocess (SAF exposes `is_multi_extension` once at registration and the
+registry is process-global, so a plugin can't be re-hidden mid-process).
+
 ### Testing Patterns
 
 Tests use pytest with `pytest-asyncio`. The `conftest.py` provides an `isolate_stateful` autouse fixture that redirects

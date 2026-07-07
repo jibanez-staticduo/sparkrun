@@ -57,6 +57,7 @@ class K8sExecutor(Executor):
     """
 
     executor_name = "k8s"
+    required_feature_flag = "executor.k8s"
 
     # No Docker-flavoured defaults; ``--privileged`` / ``--shm-size``
     # etc. don't apply.  No rootless/auto_user handling either.

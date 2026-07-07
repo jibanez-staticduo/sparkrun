@@ -1,0 +1,220 @@
+"""Feature flags — channel-aware gating for experimental plugins and behavior.
+
+A feature flag is a named boolean whose *default* value can vary per release
+channel (``stable`` / ``beta`` / ``alpha``, see :mod:`sparkrun.core.channels`).
+This lets an experimental capability ship on by default for the ``alpha`` train
+while staying off for ``stable`` users, without a code change per release.
+
+Resolution precedence (highest first):
+
+1. Environment override — ``SPARKRUN_FEATURE_<NAME>`` (dots/dashes → underscores,
+   upper-cased). Handy for CI and one-off debugging.
+2. Explicit config override — ``features.<name>: true|false`` in ``config.yaml``.
+3. Per-channel default declared on the flag (``channel_defaults``).
+4. The flag's baseline ``default`` (used when the active channel isn't listed).
+5. Unknown flag → ``False`` (fail closed).
+
+The active channel defaults to the persisted self-update channel and can be
+overridden per-config via ``features.channel`` (see
+:attr:`sparkrun.core.config.SparkrunConfig.feature_channel`).
+
+Plugins opt into gating by declaring ``required_feature_flag = "<flag-name>"``; the
+bootstrap discovery loop skips registering a plugin whose flag resolves off (see
+:func:`sparkrun.core.bootstrap.init_sparkrun`).
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Mapping, TYPE_CHECKING
+
+from scitrera_app_framework import ext_parse_bool
+
+from sparkrun.core.channels import CHANNEL_STABLE, normalize_channel
+
+if TYPE_CHECKING:
+    from sparkrun.core.config import SparkrunConfig
+
+_ENV_PREFIX = "SPARKRUN_FEATURE_"
+
+
+def _env_key(name: str) -> str:
+    """Return the environment-variable key that overrides feature *name*."""
+    return _ENV_PREFIX + name.upper().replace(".", "_").replace("-", "_")
+
+
+@dataclass(frozen=True)
+class FeatureFlag:
+    """Definition of a single feature flag.
+
+    Args:
+        name: Dotted flag identifier (e.g. ``"executor.k8s"``).
+        description: Human-facing one-liner shown by ``setup features list``.
+        channel_defaults: Per-channel default overrides, keyed by canonical
+            channel name. Channels omitted here fall back to ``default``.
+        default: Baseline default used when the active channel is not present
+            in ``channel_defaults``.
+    """
+
+    name: str
+    description: str
+    channel_defaults: Mapping[str, bool] = field(default_factory=dict)
+    default: bool = False
+
+    def default_for_channel(self, channel: str | None) -> bool:
+        """Return the default value of this flag for *channel*."""
+        return bool(self.channel_defaults.get(normalize_channel(channel), self.default))
+
+
+# --------------------------------------------------------------------------
+# Registry — the single source of truth for known flags and their defaults.
+# --------------------------------------------------------------------------
+
+FEATURE_FLAGS: dict[str, FeatureFlag] = {}
+
+
+def register_feature(flag: FeatureFlag) -> FeatureFlag:
+    """Register *flag* in the global registry and return it.
+
+    Raises:
+        ValueError: if a different flag is already registered under the name.
+    """
+    existing = FEATURE_FLAGS.get(flag.name)
+    if existing is not None and existing != flag:
+        raise ValueError("Feature flag %r already registered with a different definition" % flag.name)
+    FEATURE_FLAGS[flag.name] = flag
+    return flag
+
+
+def get_feature(name: str) -> FeatureFlag | None:
+    """Return the :class:`FeatureFlag` registered under *name*, or ``None``."""
+    return FEATURE_FLAGS.get(name)
+
+
+def all_features() -> list[FeatureFlag]:
+    """Return all registered flags, sorted by name."""
+    return [FEATURE_FLAGS[n] for n in sorted(FEATURE_FLAGS)]
+
+
+# --------------------------------------------------------------------------
+# Resolution.
+# --------------------------------------------------------------------------
+
+
+def _env_override(name: str, env: Mapping[str, str]) -> bool | None:
+    """Return the env-var override for *name*, or ``None`` when unset."""
+    raw = env.get(_env_key(name))
+    if raw is None:
+        return None
+    try:
+        return bool(ext_parse_bool(raw))
+    except Exception:  # pragma: no cover - ext_parse_bool is permissive
+        return None
+
+
+def is_feature_enabled(
+    name: str,
+    *,
+    config: "SparkrunConfig | None" = None,
+    channel: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Resolve whether feature *name* is enabled.
+
+    See the module docstring for the full precedence order. Unknown flags
+    (no registered definition and no explicit override) resolve to ``False``.
+    """
+    env = os.environ if env is None else env
+
+    override = _env_override(name, env)
+    if override is not None:
+        return override
+
+    if config is not None:
+        cfg_override = config.feature_override(name)
+        if cfg_override is not None:
+            return bool(cfg_override)
+
+    if channel is None:
+        channel = config.feature_channel if config is not None else CHANNEL_STABLE
+
+    flag = get_feature(name)
+    if flag is not None:
+        return flag.default_for_channel(channel)
+
+    # Unknown flag, no override anywhere — fail closed.
+    return False
+
+
+def feature_gate_enabled(feature: str, v=None) -> bool:
+    """Resolve *feature* for a plugin self-gate at registration time.
+
+    Called from ``Plugin.is_multi_extension`` (which SAF evaluates when a
+    plugin registers, before any ``SparkrunContext`` exists), so the config
+    is loaded from the standard path rather than an ``sctx``. Environment
+    overrides (``SPARKRUN_FEATURE_*``) short-circuit before the file is read.
+    """
+    config = _gate_config(v)
+    return is_feature_enabled(feature, config=config)
+
+
+def _gate_config(v=None):
+    """Load a :class:`SparkrunConfig` for gate resolution (best-effort).
+
+    Read-only — this must never write. Returns ``None`` when a config can't
+    be built, in which case resolution falls back to env + channel defaults.
+    """
+    try:
+        from sparkrun.core.config import SparkrunConfig, get_config_root
+
+        return SparkrunConfig(get_config_root(v) / "config.yaml")
+    except Exception:  # pragma: no cover - defensive; gate degrades to defaults
+        return None
+
+
+def feature_source(
+    name: str,
+    *,
+    config: "SparkrunConfig | None" = None,
+    channel: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Return where the effective value of *name* comes from.
+
+    One of ``"env"``, ``"config"``, ``"channel"``, or ``"unset"``. Used by the
+    ``setup features list`` command to explain why a flag is on or off.
+    """
+    env = os.environ if env is None else env
+    if _env_override(name, env) is not None:
+        return "env"
+    if config is not None and config.feature_override(name) is not None:
+        return "config"
+    if get_feature(name) is not None:
+        return "channel"
+    return "unset"
+
+
+# --------------------------------------------------------------------------
+# Built-in flags.
+# --------------------------------------------------------------------------
+
+# The experimental executors are on by default only on the ``alpha`` train;
+# ``stable``/``beta`` users must opt in explicitly. See docs/executors.
+FEATURE_EXECUTOR_LOCAL = register_feature(
+    FeatureFlag(
+        name="executor.local",
+        description="Experimental native (no-container) executor",
+        channel_defaults={"stable": False, "beta": False, "alpha": True},
+        default=False,
+    )
+)
+
+FEATURE_EXECUTOR_K8S = register_feature(
+    FeatureFlag(
+        name="executor.k8s",
+        description="Experimental Kubernetes (kubectl) executor draft",
+        channel_defaults={"stable": False, "beta": False, "alpha": True},
+        default=False,
+    )
+)

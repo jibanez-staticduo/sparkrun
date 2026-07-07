@@ -58,7 +58,10 @@ def init_sparkrun(v: Variables | None = None, log_level: str = "WARNING") -> Var
     # Import here to avoid circular imports
     from sparkrun.runtimes.base import RuntimePlugin
 
-    # Auto-discover all RuntimePlugin subclasses in sparkrun.runtimes
+    # Auto-discover all RuntimePlugin subclasses in sparkrun.runtimes.
+    # Plugins gated off by a feature flag still register here; they hide
+    # themselves as extensions via ``is_multi_extension`` (see
+    # ``Plugin.is_multi_extension`` overrides / ``core.features``).
     discovered = list(find_types_in_modules("sparkrun.runtimes", RuntimePlugin))
     for runtime_cls in discovered:
         try:

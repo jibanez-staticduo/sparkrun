@@ -25,6 +25,7 @@ from sparkrun.orchestration.executor import (
     DockerExecutor,
     Executor,
     ExecutorConfig,
+    ExecutorUnavailableError,
     get_executor,
     list_executors,
     resolve_executor,
@@ -289,9 +290,11 @@ class TestResolutionChain:
         )
         assert isinstance(ex, DockerExecutor)
 
-    def test_unknown_falls_back_to_docker(self):
-        ex = resolve_executor(cli_overrides={"executor": "wasm"})
-        assert isinstance(ex, DockerExecutor)
+    def test_unknown_explicit_request_raises(self):
+        # An explicitly-requested but unknown executor must fail loudly
+        # rather than silently downgrade to docker.
+        with pytest.raises(ExecutorUnavailableError, match="Unknown executor"):
+            resolve_executor(cli_overrides={"executor": "wasm"})
 
 
 class TestDockerAdjustmentsApplyOnlyToDocker:
@@ -493,9 +496,9 @@ class TestClusterLayer:
         )
         assert isinstance(ex, LocalExecutor)
 
-    def test_cluster_unknown_executor_falls_back_to_docker(self):
-        ex = resolve_executor(cluster=self._cluster(executor="some-future-thing"))
-        assert isinstance(ex, DockerExecutor)
+    def test_cluster_unknown_executor_raises(self):
+        with pytest.raises(ExecutorUnavailableError, match="Unknown executor"):
+            resolve_executor(cluster=self._cluster(executor="some-future-thing"))
 
     # ---- config chain ----
 

@@ -276,6 +276,13 @@ class Executor(Plugin):
     # --- Subclass must define ---
     executor_name: ClassVar[str] = ""
 
+    # --- Optional channel-aware gating ---
+    # When set to a registered feature-flag name (e.g. ``"executor.k8s"``),
+    # this executor hides itself from the SAF extension registry (via
+    # :meth:`is_multi_extension`) whenever that flag resolves off for the
+    # active channel/config. ``None`` means always available.
+    required_feature_flag: ClassVar[str | None] = None
+
     # --- SAF Plugin interface ---
 
     def name(self) -> str:
@@ -291,6 +298,16 @@ class Executor(Plugin):
         return False
 
     def is_multi_extension(self, v: Variables) -> bool:
+        # SAF only exposes a multi-extension plugin (via get_extensions) when
+        # this returns True at registration. An executor gated behind a
+        # feature flag hides itself here — it stays in the plugin registry but
+        # is absent from get_extensions / list_executors / resolution, so a
+        # gated selector fails closed (ExecutorUnavailableError). See
+        # core.features and docs (Feature Flags).
+        if self.required_feature_flag:
+            from sparkrun.core.features import feature_gate_enabled
+
+            return feature_gate_enabled(self.required_feature_flag, v)
         return True
 
     def initialize(self, v: Variables, logger=None) -> "Executor":

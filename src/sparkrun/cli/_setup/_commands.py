@@ -342,6 +342,113 @@ def setup_telemetry(ctx, enable, disable):
         click.echo("Env:       set %s=1 to opt out for one process" % NO_TELEMETRY_ENV)
 
 
+@setup.group("features")
+def setup_features():
+    """View and toggle advanced feature flags.
+
+    Feature flags gate experimental capabilities (e.g. the ``local`` and
+    ``k8s`` executors). Each flag has a per-channel default; explicit
+    overrides written here take precedence. See ``setup features list``.
+    """
+
+
+def _feature_state(config, flag):
+    """Return ``(enabled, source, override)`` for *flag* under *config*."""
+    from sparkrun.core.features import feature_source
+
+    enabled = config.is_feature_enabled(flag.name)
+    source = feature_source(flag.name, config=config)
+    override = config.feature_override(flag.name)
+    return enabled, source, override
+
+
+@setup_features.command("list")
+@click.pass_context
+def setup_features_list(ctx):
+    """List all feature flags and their effective state."""
+    from sparkrun.core.features import all_features
+
+    config = _get_context(ctx).config
+    channel = config.feature_channel
+    flags = all_features()
+    if not flags:
+        click.echo("No feature flags registered.")
+        return
+
+    click.echo("Feature channel: %s" % channel)
+    click.echo("")
+    width = max(len(f.name) for f in flags)
+    for flag in flags:
+        enabled, source, _override = _feature_state(config, flag)
+        state = "on " if enabled else "off"
+        click.echo("%-*s  %s  (%-7s)  %s" % (width, flag.name, state, source, flag.description))
+
+
+def _require_known_flag(name):
+    """Return the :class:`FeatureFlag` for *name* or raise a ClickException."""
+    from sparkrun.core.features import all_features, get_feature
+
+    flag = get_feature(name)
+    if flag is None:
+        known = ", ".join(f.name for f in all_features()) or "(none)"
+        raise click.ClickException("Unknown feature flag %r. Known flags: %s" % (name, known))
+    return flag
+
+
+def _set_feature_override(config, name, value):
+    """Persist ``features.<name> = value`` to config and save.
+
+    Writes the literal flag name (e.g. ``executor.k8s``) as a single key
+    under ``features`` — ``config.set`` splits on dots, so the nested
+    ``features`` dict is edited directly instead.
+    """
+    features = config.get("features")
+    if not isinstance(features, dict):
+        features = {}
+    features[name] = value
+    config.set("features", features)
+    config.save()
+
+
+@setup_features.command("enable")
+@click.argument("name")
+@click.pass_context
+def setup_features_enable(ctx, name):
+    """Force feature NAME on (writes features.<name>: true)."""
+    _require_known_flag(name)
+    config = _get_context(ctx).config
+    _set_feature_override(config, name, True)
+    click.echo("Feature %r enabled. Restart in-progress commands to pick up the change." % name)
+
+
+@setup_features.command("disable")
+@click.argument("name")
+@click.pass_context
+def setup_features_disable(ctx, name):
+    """Force feature NAME off (writes features.<name>: false)."""
+    _require_known_flag(name)
+    config = _get_context(ctx).config
+    _set_feature_override(config, name, False)
+    click.echo("Feature %r disabled." % name)
+
+
+@setup_features.command("reset")
+@click.argument("name")
+@click.pass_context
+def setup_features_reset(ctx, name):
+    """Clear the explicit override for NAME (revert to channel default)."""
+    _require_known_flag(name)
+    config = _get_context(ctx).config
+    features = config.get("features")
+    if isinstance(features, dict) and name in features:
+        del features[name]
+        config.save()
+        click.echo("Feature %r override cleared; now follows the channel default." % name)
+    else:
+        click.echo("Feature %r had no explicit override." % name)
+    click.echo("Effective (channel %s): %s" % (config.feature_channel, "on" if config.is_feature_enabled(name) else "off"))
+
+
 def _run_ssh_diagnose(host_list, user, local_user):
     """Run comprehensive SSH diagnostics on each host.
 

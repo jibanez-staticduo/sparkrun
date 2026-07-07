@@ -386,5 +386,8 @@ class TestResolveExecutorFullMatrix:
             K8sExecutor,
         )
 
-    def test_unknown_falls_back_to_docker(self):
-        assert isinstance(resolve_executor(cli_overrides={"executor": "wasm"}), DockerExecutor)
+    def test_unknown_explicit_request_raises(self):
+        from sparkrun.orchestration.executor import ExecutorUnavailableError
+
+        with pytest.raises(ExecutorUnavailableError, match="Unknown executor"):
+            resolve_executor(cli_overrides={"executor": "wasm"})

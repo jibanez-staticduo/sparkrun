@@ -20,6 +20,13 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
     """
     monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
     monkeypatch.setenv("SPARKRUN_NO_TELEMETRY", "1")
+    # The experimental local/k8s executors gate themselves off by default on
+    # the stable channel (via is_multi_extension). Most of the suite exercises
+    # their behavior directly and predates the feature-flag gating, so enable
+    # them here to preserve that contract. tests/test_features.py exercises the
+    # gating itself in clean subprocesses that strip these env overrides.
+    monkeypatch.setenv("SPARKRUN_FEATURE_EXECUTOR_LOCAL", "1")
+    monkeypatch.setenv("SPARKRUN_FEATURE_EXECUTOR_K8S", "1")
     import sparkrun.core.bootstrap
 
     sparkrun.core.bootstrap._variables = None
