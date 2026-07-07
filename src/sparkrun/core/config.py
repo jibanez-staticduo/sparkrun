@@ -158,6 +158,61 @@ class SparkrunConfig:
         return dict(cfg) if isinstance(cfg, dict) else {}
 
     @property
+    def k8s_defaults(self) -> dict[str, Any]:
+        """CLI / setup-time Kubernetes defaults (the ``k8s:`` block).
+
+        Distinct from :attr:`executor_config` (which feeds executor-time
+        ``kubeconfig`` / ``k8s_*`` overrides): this block holds the target
+        a plain ``sparkrun setup k8s ...`` invocation defaults to, plus
+        the ``kubectl`` binary settings (``path`` / ``version`` / per-
+        context ``pinned`` versions).  Empty dict when unset.
+        """
+        cfg = self._data.get("k8s")
+        return dict(cfg) if isinstance(cfg, dict) else {}
+
+    def _kubectl_settings(self) -> dict[str, Any]:
+        kubectl = self.k8s_defaults.get("kubectl")
+        return kubectl if isinstance(kubectl, dict) else {}
+
+    @property
+    def kubectl_path(self) -> str | None:
+        """Explicit ``kubectl`` binary path override (``k8s.kubectl.path``)."""
+        val = self._kubectl_settings().get("path")
+        return str(val) if val else None
+
+    @property
+    def kubectl_version(self) -> str | None:
+        """Pinned ``kubectl`` version (``k8s.kubectl.version``)."""
+        val = self._kubectl_settings().get("version")
+        return str(val) if val else None
+
+    def kubectl_pinned_version(self, context: str | None) -> str | None:
+        """Server-matched ``kubectl`` version pinned for *context*, if any."""
+        if not context:
+            return None
+        pinned = self._kubectl_settings().get("pinned")
+        if isinstance(pinned, dict):
+            val = pinned.get(context)
+            return str(val) if val else None
+        return None
+
+    def pin_kubectl_version(self, context: str, version: str) -> None:
+        """Persist a per-context ``kubectl`` version pin under ``k8s.kubectl.pinned``."""
+        k8s = self.get("k8s")
+        if not isinstance(k8s, dict):
+            k8s = {}
+        kubectl = k8s.get("kubectl")
+        if not isinstance(kubectl, dict):
+            kubectl = {}
+        pinned = kubectl.get("pinned")
+        if not isinstance(pinned, dict):
+            pinned = {}
+        pinned[context] = version
+        kubectl["pinned"] = pinned
+        k8s["kubectl"] = kubectl
+        self.set("k8s", k8s)
+
+    @property
     def ssh_user(self) -> str | None:
         if hasattr(self, "_ssh_user_override"):
             return self._ssh_user_override

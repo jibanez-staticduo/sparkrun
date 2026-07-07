@@ -28,6 +28,7 @@ def setup(ctx):
 # ---------------------------------------------------------------------------
 
 from . import _commands as _commands  # noqa: E402, F401  — registers @setup.command() decorators
+from . import _k8s as _k8s  # noqa: E402, F401  — registers @setup.group("k8s")
 from ._wizard import setup_wizard  # noqa: E402
 from ._uninstall import setup_uninstall  # noqa: E402
 
