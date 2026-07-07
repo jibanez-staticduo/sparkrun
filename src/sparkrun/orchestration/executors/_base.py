@@ -152,6 +152,11 @@ class ExecutorConfig:
     k8s_node_selector: str | None = None
     k8s_image_pull_policy: str | None = None
     kubeconfig: str | None = None
+    # Absolute path to the kubectl binary the executor should invoke.
+    # Usually resolved from sparkrun's managed cache by
+    # :meth:`K8sExecutor.finalize_config`; falls back to bare ``kubectl``
+    # (PATH lookup at script-run time) when unset.
+    kubectl_path: str | None = None
 
     @classmethod
     def from_chain(cls, chain) -> ExecutorConfig:
@@ -195,6 +200,7 @@ class ExecutorConfig:
             "k8s_node_selector",
             "k8s_image_pull_policy",
             "kubeconfig",
+            "kubectl_path",
         ):
             v = chain.get(key)
             if v:
@@ -316,6 +322,20 @@ class Executor(Plugin):
     def __init__(self, config: ExecutorConfig | None = None):
         super().__init__()
         self.config = config or ExecutorConfig()
+
+    def finalize_config(self, *, config=None, v: Variables | None = None) -> None:
+        """Post-construction hook to enrich ``self.config``.
+
+        Called once by :func:`sparkrun.orchestration.executor.resolve_executor`
+        after the executor is built, with the resolving
+        :class:`~sparkrun.core.config.SparkrunConfig` (or ``None``).
+        Executors that need session-level state the executor-agnostic
+        chain can't provide (e.g. the kubectl binary path from sparkrun's
+        managed cache) override this.  Default is a no-op — directly
+        constructed executors (tests, ad-hoc callers) keep working
+        unchanged.
+        """
+        return None
 
     # --- Per-executor layering hooks ---
 

@@ -41,6 +41,7 @@ import logging
 import re
 
 from sparkrun.orchestration.executors._base import Executor
+from sparkrun.orchestration.k8s.client import KubectlClient
 from sparkrun.utils.shell import b64_wrap_bash, quote
 
 logger = logging.getLogger(__name__)
@@ -63,20 +64,57 @@ class K8sExecutor(Executor):
     # etc. don't apply.  No rootless/auto_user handling either.
 
     # ------------------------------------------------------------------
-    # Common kubectl prefix
+    # Binary resolution + common kubectl prefix
     # ------------------------------------------------------------------
+
+    def finalize_config(self, *, config=None, v=None) -> None:
+        """Resolve sparkrun's managed kubectl binary into ``config.kubectl_path``.
+
+        Only an *already-available* binary is used (an explicit config
+        path, a cached download, or ``kubectl`` on PATH) — launch-time
+        never triggers an implicit network download.  Acquiring / updating
+        the binary is the job of ``sparkrun setup k8s kubectl``.  When
+        nothing resolves, ``kubectl_path`` stays ``None`` and the emitted
+        commands fall back to a bare ``kubectl`` (PATH lookup on the
+        execution host).
+        """
+        if self.config.kubectl_path or config is None:
+            return
+        from sparkrun.core.config import SparkrunConfig
+
+        # Binary resolution needs the real config surface (cache dir, pins).
+        # Partial stand-ins (tests exercising chain ordering) are skipped.
+        if not isinstance(config, SparkrunConfig):
+            return
+        from sparkrun.orchestration.k8s import ensure_kubectl
+        from sparkrun.orchestration.k8s.errors import K8sError
+
+        version = config.kubectl_version or config.kubectl_pinned_version(self.config.k8s_context)
+        try:
+            binary = ensure_kubectl(
+                config.cache_dir,
+                version=version,
+                explicit_path=config.kubectl_path,
+                allow_download=False,
+            )
+        except K8sError:
+            logger.debug("No managed kubectl available; K8sExecutor will use bare 'kubectl'.")
+            return
+        self.config.kubectl_path = str(binary.path)
+
+    def _client(self) -> KubectlClient:
+        """Build a :class:`KubectlClient` from this executor's config."""
+        cfg = self.config
+        return KubectlClient(
+            cfg.kubectl_path or "kubectl",
+            kubeconfig=cfg.kubeconfig,
+            context=cfg.k8s_context,
+            namespace=cfg.k8s_namespace,
+        )
 
     def _kubectl_prefix(self) -> str:
         """Build ``kubectl [--kubeconfig K] [--context C] [-n NS]`` prefix."""
-        cfg = self.config
-        parts: list[str] = ["kubectl"]
-        if cfg.kubeconfig:
-            parts.extend(["--kubeconfig", quote(cfg.kubeconfig)])
-        if cfg.k8s_context:
-            parts.extend(["--context", quote(cfg.k8s_context)])
-        if cfg.k8s_namespace:
-            parts.extend(["-n", quote(cfg.k8s_namespace)])
-        return " ".join(parts)
+        return self._client().prefix_string()
 
     def _gpu_limit(self) -> str | None:
         """Translate ``gpus`` into a ``nvidia.com/gpu`` resource limit.

@@ -393,4 +393,9 @@ def resolve_executor(
         env_placement=EnvPlacement.IGNORED,
     )
     exec_cfg = ExecutorConfig.from_chain(chain)
-    return cls(exec_cfg)
+    executor = cls(exec_cfg)
+    # Post-construction enrichment that needs the SparkrunConfig / Variables
+    # the executor-agnostic chain can't carry (e.g. the k8s executor
+    # resolving its kubectl binary from sparkrun's managed cache).
+    executor.finalize_config(config=config, v=v)
+    return executor

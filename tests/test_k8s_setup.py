@@ -455,6 +455,81 @@ def test_api_cluster_info_pins_server_version(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# K8sExecutor transition onto KubectlClient
+# ---------------------------------------------------------------------------
+
+
+def test_k8s_executor_prefix_uses_resolved_path():
+    from sparkrun.orchestration.executors._base import ExecutorConfig
+    from sparkrun.orchestration.executors.k8s import K8sExecutor
+
+    ex = K8sExecutor(ExecutorConfig(kubectl_path="/opt/kubectl", k8s_context="ctx", k8s_namespace="ns"))
+    cmd = ex.run_cmd(image="img:tag", command="echo hi", container_name="pod1")
+    assert cmd.startswith("/opt/kubectl ")
+    assert "--context ctx" in cmd
+    assert "-n ns" in cmd
+
+
+def test_k8s_executor_prefix_falls_back_to_bare_kubectl():
+    from sparkrun.orchestration.executors._base import ExecutorConfig
+    from sparkrun.orchestration.executors.k8s import K8sExecutor
+
+    ex = K8sExecutor(ExecutorConfig(executor_type="k8s"))
+    cmd = ex.run_cmd(image="img:tag", command="echo hi", container_name="pod1")
+    assert cmd.startswith("kubectl ")
+
+
+def test_k8s_executor_finalize_config_resolves_cached_binary(tmp_path):
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.orchestration.executors._base import ExecutorConfig
+    from sparkrun.orchestration.executors.k8s import K8sExecutor
+
+    os_name, arch = kubectl.detect_os(), kubectl.detect_arch()
+    binary = kubectl.cached_binary_path(tmp_path, "v1.31.0", os_name, arch)
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+
+    cfg = SparkrunConfig(tmp_path / "config.yaml")
+    cfg.set("cache_dir", str(tmp_path))
+
+    ex = K8sExecutor(ExecutorConfig(executor_type="k8s"))
+    ex.finalize_config(config=cfg)
+    assert ex.config.kubectl_path == str(binary)
+
+
+def test_k8s_executor_finalize_config_skips_partial_config(tmp_path):
+    from sparkrun.orchestration.executors._base import ExecutorConfig
+    from sparkrun.orchestration.executors.k8s import K8sExecutor
+
+    class _PartialConfig:
+        default_executor = "k8s"
+        executor_config: dict = {}
+
+    ex = K8sExecutor(ExecutorConfig(executor_type="k8s"))
+    ex.finalize_config(config=_PartialConfig())  # must not raise
+    assert ex.config.kubectl_path is None
+
+
+def test_resolve_executor_wires_kubectl_path(tmp_path):
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.orchestration.executor import resolve_executor
+    from sparkrun.orchestration.executors.k8s import K8sExecutor
+
+    os_name, arch = kubectl.detect_os(), kubectl.detect_arch()
+    binary = kubectl.cached_binary_path(tmp_path, "v1.31.0", os_name, arch)
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+
+    cfg = SparkrunConfig(tmp_path / "config.yaml")
+    cfg.set("cache_dir", str(tmp_path))
+    # executor.k8s is force-enabled by the isolate_stateful conftest fixture.
+
+    ex = resolve_executor(cli_overrides={"executor": "k8s"}, config=cfg, rootless=False, auto_user=False)
+    assert isinstance(ex, K8sExecutor)
+    assert ex.config.kubectl_path == str(binary)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
