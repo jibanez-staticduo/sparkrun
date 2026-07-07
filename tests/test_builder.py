@@ -415,35 +415,111 @@ class TestEugrPrepareImage:
 
         assert mock_build.call_args.kwargs["save_logs"] is True
 
-    def test_eugr_prepare_sentinel_default_is_on(self, eugr_builder_with_repo, tmp_path):
-        """With config returning empty builder defaults, sentinel behavior stays ON."""
+    @pytest.mark.parametrize(
+        "sentinel_image",
+        [
+            "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest",
+            "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5:latest",
+            "eugr/spark-vllm:latest",
+            "docker.io/eugr/spark-vllm:latest",
+        ],
+    )
+    def test_eugr_prepare_sentinel_default_pulls_our_nightly(self, eugr_builder_with_repo, tmp_path, sentinel_image):
+        """Pull-first default: every sentinel resolves to OUR GHCR nightly and is pulled, not built.
+
+        Following eugr's pull-first switch, a bare nightly sentinel (no --use-wheels)
+        is remapped to ``ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest`` and flows
+        through the pullable path — no repo clone, no build, no smoke test.
+        """
         builder, repo_dir = eugr_builder_with_repo
         recipe = Recipe.from_dict(
             {
                 "name": "test",
                 "model": "some/model",
                 "runtime": "eugr-vllm",
-                "container": "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest",
+                "container": sentinel_image,
             }
         )
         config = mock.Mock()
         config.cache_dir = tmp_path  # real path so Path(config.cache_dir) works
         config.get_defaults_builder = mock.Mock(return_value={})
 
-        with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
-            with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
-                with mock.patch.object(builder, "_verify_image_imports"):
-                    with mock.patch.object(builder, "_save_build_metadata"):
-                        result = builder.prepare_image(
-                            "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest",
-                            recipe,
-                            ["10.0.0.1"],
-                            config=config,
-                        )
+        with mock.patch.object(builder, "ensure_repo") as mock_ensure:
+            with mock.patch("sparkrun.builders.eugr._run_build_capturing") as mock_build:
+                with mock.patch.object(builder, "_verify_image_imports") as mock_verify:
+                    result = builder.prepare_image(sentinel_image, recipe, ["10.0.0.1"], config=config)
 
-        # Sentinel remap fired: image renamed to local tag, build happened.
+        # Remapped to our authoritative nightly and pulled (no build path taken).
+        assert result == "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest"
+        mock_ensure.assert_not_called()
+        mock_build.assert_not_called()
+        mock_verify.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "sentinel_image",
+        [
+            "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest",
+            "eugr/spark-vllm:latest",
+            "docker.io/eugr/spark-vllm:latest",
+            # The tf5 GHCR nightly now unifies onto the same non-tf5 local build.
+            "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5:latest",
+        ],
+    )
+    def test_eugr_prepare_use_wheels_maps_to_local_build(self, eugr_builder_with_repo, tmp_path, sentinel_image):
+        """With --use-wheels, every sentinel builds the standard nightly locally from wheels."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": sentinel_image,
+                "runtime_config": {"build_args": ["--use-wheels"]},
+            }
+        )
+        config = mock.Mock()
+        config.cache_dir = tmp_path
+        config.get_defaults_builder = mock.Mock(return_value={})
+
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
+            with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
+                with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                    with mock.patch.object(builder, "_can_skip_build", return_value=False):
+                        with mock.patch.object(builder, "_verify_image_imports"):
+                            with mock.patch.object(builder, "_save_build_metadata"):
+                                result = builder.prepare_image(sentinel_image, recipe, ["10.0.0.1"], config=config)
+
+        # Sentinel remap fired: image renamed to the standard (non-tf5) local tag.
         assert result == "sparkrun-eugr-vllm"
+        cmd = mock_build.call_args[0][0]
+        assert "sparkrun-eugr-vllm" in cmd
+        # Control args (--tf5 / --use-wheels) are dropped from the build invocation.
+        assert "--tf5" not in cmd
+        assert "--use-wheels" not in cmd
         mock_build.assert_called_once()
+
+    def test_eugr_prepare_dockerhub_sentinel_respects_use_sentinel_image_false(self, eugr_builder_with_repo, tmp_path):
+        """With use_sentinel_image=false, eugr/spark-vllm:latest is treated as a normal image."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "eugr/spark-vllm:latest",
+            }
+        )
+        config = mock.Mock()
+        config.cache_dir = tmp_path
+        config.get_defaults_builder = mock.Mock(return_value={"use_sentinel_image": False})
+
+        # Not a known registry prefix and present locally → no build, returned unchanged.
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=True):
+            with mock.patch.object(builder, "ensure_repo") as mock_ensure:
+                result = builder.prepare_image("eugr/spark-vllm:latest", recipe, ["10.0.0.1"], config=config)
+                mock_ensure.assert_not_called()
+
+        assert result == "eugr/spark-vllm:latest"
 
 
 class TestEugrRebuild:
@@ -628,6 +704,62 @@ class TestEugrRebuild:
 
         assert result == "my-image"
         mock_build.assert_not_called()
+
+    def test_rebuild_sentinel_default_force_pulls_our_nightly(self, eugr_builder_with_repo):
+        """rebuild on a bare sentinel (no --use-wheels) force-pulls our GHCR nightly.
+
+        Under pull-first, --rebuild keeps its uniform meaning for pullable images:
+        a fresh `docker pull`, not a wheels build.
+        """
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "eugr/spark-vllm:latest",
+                "builder_config": {"rebuild": True},
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.ensure_image", return_value=0) as mock_ensure:
+            with mock.patch("sparkrun.builders.eugr._run_build_capturing") as mock_build:
+                result = builder.prepare_image("eugr/spark-vllm:latest", recipe, ["10.0.0.1"])
+
+        # Remapped to our authoritative nightly and force-pulled; no wheels build.
+        assert result == "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest"
+        mock_build.assert_not_called()
+        mock_ensure.assert_called_once()
+        assert mock_ensure.call_args.kwargs.get("force_pull") is True
+
+    def test_rebuild_with_use_wheels_forces_wheels_rebuild(self, eugr_builder_with_repo):
+        """--use-wheels + rebuild builds from wheels and bypasses the build cache."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest",
+                "runtime_config": {"build_args": ["--use-wheels"]},
+                "builder_config": {"rebuild": True},
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=True):
+            with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
+                # A cache hit must be ignored because rebuild is forced.
+                with mock.patch.object(builder, "_can_skip_build", return_value=True) as mock_skip:
+                    with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                        with mock.patch.object(builder, "_verify_image_imports"):
+                            with mock.patch.object(builder, "_save_build_metadata"):
+                                result = builder.prepare_image(
+                                    "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest",
+                                    recipe,
+                                    ["10.0.0.1"],
+                                )
+
+        assert result == "sparkrun-eugr-vllm"
+        mock_skip.assert_not_called()
+        mock_build.assert_called_once()
 
     def test_docker_pull_rebuild_is_noop(self):
         """docker-pull ignores rebuild — prepare_image stays a pure no-op."""

@@ -33,6 +33,9 @@ EUGR_BUILD_INDEX_CACHE_NAME = "eugr-vllm-build-index.json"
 GHCR_EUGR_NIGHTLY = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly"
 GHCR_EUGR_NIGHTLY_TF5 = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5"
 
+DOCKER_EUGR_NIGHTLY_SHORT = "eugr/spark-vllm:latest"
+DOCKER_EUGR_NIGHTLY = f"docker.io/{DOCKER_EUGR_NIGHTLY_SHORT}"
+
 # GHCR package paths (without registry prefix) for API calls
 GHCR_EUGR_PKG = "spark-arena/dgx-vllm-eugr-nightly"
 GHCR_EUGR_PKG_TF5 = "spark-arena/dgx-vllm-eugr-nightly-tf5"
@@ -40,6 +43,32 @@ GHCR_EUGR_PKG_TF5 = "spark-arena/dgx-vllm-eugr-nightly-tf5"
 # Local image names produced by prepare_image() for nightly builds
 LOCAL_EUGR_NIGHTLY = "sparkrun-eugr-vllm"
 LOCAL_EUGR_NIGHTLY_TF5 = "sparkrun-eugr-vllm-tf5"
+
+# Fully-qualified ":latest" refs for the GHCR nightly variants.
+GHCR_EUGR_NIGHTLY_LATEST = GHCR_EUGR_NIGHTLY + ":latest"
+GHCR_EUGR_NIGHTLY_TF5_LATEST = GHCR_EUGR_NIGHTLY_TF5 + ":latest"
+
+# ":latest" image refs recognized as eugr nightly sentinels. Following eugr's
+# pull-first switch, sparkrun PULLS our authoritative GHCR nightly
+# (``GHCR_EUGR_NIGHTLY_LATEST``) for these by default and only builds locally from
+# upstream wheels when the recipe opts in with ``--use-wheels`` (see
+# ``prepare_image``). All four forms — GHCR nightly, GHCR nightly-tf5, and the
+# Docker Hub ``eugr/spark-vllm`` image in short and fully-qualified form — resolve
+# to the single non-tf5 build (tf5 and non-tf5 now build identically). The
+# official Docker Hub images are sentinels too, so we always substitute our own
+# nightly as the authoritative ":latest".
+EUGR_NIGHTLY_LATEST_SENTINELS = (
+    GHCR_EUGR_NIGHTLY_LATEST,
+    GHCR_EUGR_NIGHTLY_TF5_LATEST,
+    DOCKER_EUGR_NIGHTLY_SHORT,
+    DOCKER_EUGR_NIGHTLY,
+)
+
+# build_args tokens recognized as control flags on a nightly sentinel — they don't
+# select a distinct build. ``--use-wheels`` opts into the local wheels build
+# instead of the pull-first default; ``--tf5`` is a legacy no-op.
+USE_WHEELS_BUILD_ARG = "--use-wheels"
+_SENTINEL_CONTROL_ARGS = frozenset({"--tf5", USE_WHEELS_BUILD_ARG})
 
 # Build cache file name (stored under cache_dir)
 EUGR_BUILD_CACHE_NAME = "eugr-build-cache.json"
@@ -320,29 +349,48 @@ class EugrBuilder(BuilderPlugin):
         use_sentinel_image = bool(builder_defaults.get("use_sentinel_image", True))
         save_build_logs = bool(builder_defaults.get("save_build_logs", False))
 
-        # ~~ SPECIAL CASES: map pullable eugr nightly images to use direct build ~~~
+        # ~~ SPECIAL CASES: eugr nightly ":latest" sentinels ~~~
+        # eugr publishes prebuilt nightly images and (as of the pull-first switch)
+        # treats a direct `docker pull` as the primary path, with a local wheels
+        # build as the `--use-wheels` fallback. sparkrun mirrors that. Every
+        # recognized sentinel resolves to OUR authoritative GHCR nightly:
+        #   * default        -> pull our nightly (`--rebuild` force-pulls a fresh copy
+        #                       via the pullable branch below)
+        #   * `--use-wheels` -> build our nightly locally from upstream wheels; the
+        #                       build cache is honored so an existing local image is
+        #                       reused, and `--rebuild` on top forces a from-scratch
+        #                       wheels rebuild (it bypasses the cache check below).
         if not use_sentinel_image:
             logger.debug(
                 "eugr sentinel image handling disabled (defaults.builders.eugr.use_sentinel_image=false); "
                 "':latest' will be treated as a regular pullable image"
             )
-        elif image.strip() == GHCR_EUGR_NIGHTLY_TF5 + ":latest" and (build_args == ["--tf5"] or not build_args):
-            # use sparkrun prefixed names to avoid collisions with other user images
-            image = LOCAL_EUGR_NIGHTLY_TF5
-            build_args = ["--tf5"]
-            needs_build = True
-            logger.info("Mapped eugr nightly tf5 image to use direct build via container name '%s' (build_args managed)", image)
-        elif image.strip() == GHCR_EUGR_NIGHTLY + ":latest" and not build_args:
-            # use sparkrun prefixed names to avoid collisions with other user images
-            image = LOCAL_EUGR_NIGHTLY
-            needs_build = True
-            logger.info("Mapped eugr nightly image to container name '%s'", image)
-        # NOTE: if not :latest, then we do want to use the given container image
-
-        # TODO: review semantics here for build/no-build when image names are standarized
-        # # if we have "unusual build_args then we need to pursue the build path
-        # elif build_args:
-        #     needs_build = True
+        elif image.strip() in EUGR_NIGHTLY_LATEST_SENTINELS and all(a in _SENTINEL_CONTROL_ARGS for a in build_args):
+            # tf5 and non-tf5 nightlies build identically now, so control-only args
+            # (`--tf5`, `--use-wheels`) never select a distinct build and are dropped.
+            if USE_WHEELS_BUILD_ARG in build_args:
+                # Wheels fallback: build our nightly locally. Use the sparkrun-prefixed
+                # name to avoid collisions with user images.
+                logger.info(
+                    "Mapped eugr nightly image '%s' to local wheels build '%s' (--use-wheels)",
+                    image.strip(),
+                    LOCAL_EUGR_NIGHTLY,
+                )
+                image = LOCAL_EUGR_NIGHTLY
+                build_args = []
+                needs_build = True
+            else:
+                # Pull-first default: always pull OUR authoritative GHCR nightly,
+                # whichever sentinel form the recipe wrote (GHCR tf5 / Docker Hub
+                # included). Falls through to the pullable branch below.
+                logger.info(
+                    "Mapped eugr nightly image '%s' to pullable '%s' (pass --use-wheels in build_args to build from wheels)",
+                    image.strip(),
+                    GHCR_EUGR_NIGHTLY_LATEST,
+                )
+                image = GHCR_EUGR_NIGHTLY_LATEST
+                build_args = []
+        # NOTE: if not a sentinel, then we do want to use the given container image
 
         # Determine if we need to build the image.
         # If the image references a known public registry, it's pullable — never build it.

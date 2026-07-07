@@ -481,10 +481,13 @@ class TestSaveBuildMetadataDelegated:
 
 class TestPrepareImageCacheIntegration:
     def test_skip_build_when_cache_hit(self, tmp_path):
-        """When _can_skip_build returns True, _build_image should NOT be called."""
+        """When _can_skip_build returns True, _build_image should NOT be called.
+
+        The wheels build path is reached via --use-wheels (pull is the default now).
+        """
         builder = EugrBuilder()
         recipe = mock.MagicMock()
-        recipe.runtime_config = {"build_args": [], "mods": []}
+        recipe.runtime_config = {"build_args": ["--use-wheels"], "mods": []}
         recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
@@ -510,7 +513,7 @@ class TestPrepareImageCacheIntegration:
         """When _can_skip_build returns False, _build_image should be called."""
         builder = EugrBuilder()
         recipe = mock.MagicMock()
-        recipe.runtime_config = {"build_args": [], "mods": []}
+        recipe.runtime_config = {"build_args": ["--use-wheels"], "mods": []}
         recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
@@ -536,10 +539,10 @@ class TestPrepareImageCacheIntegration:
         assert result == "sparkrun-eugr-vllm"
 
     def test_dry_run_skips_cache_check(self, tmp_path):
-        """In dry_run mode, cache check is not performed."""
+        """In dry_run mode, cache check is not performed (wheels path via --use-wheels)."""
         builder = EugrBuilder()
         recipe = mock.MagicMock()
-        recipe.runtime_config = {"build_args": [], "mods": []}
+        recipe.runtime_config = {"build_args": ["--use-wheels"], "mods": []}
         recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
@@ -561,10 +564,15 @@ class TestPrepareImageCacheIntegration:
         mock_skip.assert_not_called()
 
     def test_delegated_mode_checks_cache(self, tmp_path):
-        """In delegated mode, cache check IS performed with host param."""
+        """In delegated mode, cache check IS performed with host param.
+
+        With --use-wheels the tf5 nightly sentinel takes the local wheels build path
+        and unifies with the non-tf5 build: it maps to ``sparkrun-eugr-vllm`` and the
+        control args (``--tf5``/``--use-wheels``) are dropped.
+        """
         builder = EugrBuilder()
         recipe = mock.MagicMock()
-        recipe.runtime_config = {"build_args": ["--tf5"], "mods": []}
+        recipe.runtime_config = {"build_args": ["--tf5", "--use-wheels"], "mods": []}
         recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
@@ -585,8 +593,8 @@ class TestPrepareImageCacheIntegration:
             )
 
         mock_skip.assert_called_once_with(
-            "sparkrun-eugr-vllm-tf5",
-            ["--tf5"],
+            "sparkrun-eugr-vllm",
+            [],
             config,
             host="host1",
             ssh_kwargs={},
