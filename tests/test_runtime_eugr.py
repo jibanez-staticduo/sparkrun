@@ -168,7 +168,11 @@ class TestEugrPrepare:
                 mock_ensure.assert_not_called()
 
     def test_prepare_builds_when_image_missing(self, eugr_builder):
-        """prepare_image() triggers a build when image is missing locally."""
+        """prepare_image() triggers a build when --use-wheels is set and image is missing.
+
+        eugr is pull-first now; a missing image only builds when build_args request it
+        (here via --use-wheels). Without it the image would be pulled instead.
+        """
         builder, repo_dir = eugr_builder
         recipe = Recipe.from_dict(
             {
@@ -176,19 +180,22 @@ class TestEugrPrepare:
                 "model": "some-model",
                 "runtime": "eugr-vllm",
                 "container": "my-image",
+                "runtime_config": {"build_args": ["--use-wheels"]},
             }
         )
         with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
             with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
-                with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
-                    with mock.patch.object(builder, "_verify_image_imports"):
-                        with mock.patch.object(builder, "_save_build_metadata"):
-                            builder.prepare_image("my-image", recipe, ["10.0.0.1"])
+                with mock.patch.object(builder, "_can_skip_build", return_value=False):
+                    with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                        with mock.patch.object(builder, "_verify_image_imports"):
+                            with mock.patch.object(builder, "_save_build_metadata"):
+                                builder.prepare_image("my-image", recipe, ["10.0.0.1"])
                     mock_build.assert_called_once()
                     cmd = mock_build.call_args[0][0]
                     assert str(repo_dir / "build-and-copy.sh") in cmd[0]
                     assert "-t" in cmd
                     assert "my-image" in cmd
+                    assert "--use-wheels" in cmd
 
     def test_prepare_dry_run(self, eugr_builder):
         """prepare_image() in dry-run does not execute the build."""

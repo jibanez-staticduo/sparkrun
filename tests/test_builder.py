@@ -126,7 +126,7 @@ class TestEugrPrepareImage:
     """Test EugrBuilder.prepare_image() — build and mod injection."""
 
     def test_eugr_prepare_with_build_args(self, eugr_builder_with_repo):
-        """prepare_image() calls build-and-copy.sh when build_args are present and image missing."""
+        """prepare_image() calls build-and-copy.sh when --use-wheels is present and image missing."""
         builder, repo_dir = eugr_builder_with_repo
         recipe = Recipe.from_dict(
             {
@@ -134,7 +134,7 @@ class TestEugrPrepareImage:
                 "model": "some/model",
                 "runtime": "eugr-vllm",
                 "container": "my-image",
-                "runtime_config": {"build_args": ["--some-flag"]},
+                "runtime_config": {"build_args": ["--use-wheels", "--some-flag"]},
             }
         )
         with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
@@ -171,8 +171,34 @@ class TestEugrPrepareImage:
 
         assert result == "vllm-node"
 
-    def test_eugr_prepare_builds_when_image_missing(self, eugr_builder_with_repo):
-        """prepare_image() triggers a build when image is not found locally."""
+    def test_eugr_prepare_missing_image_without_use_wheels_substitutes_nightly(self, eugr_builder_with_repo):
+        """Pull-first: a missing non-pullable eugr image without --use-wheels pulls our nightly.
+
+        Regression for the reported case: a v1 recipe container name (e.g. vllm-node)
+        that isn't present locally used to fall through to build-and-copy.sh. eugr is
+        pull-first now, so without --use-wheels it resolves to our canonical GHCR
+        nightly and is pulled instead of built.
+        """
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "vllm-node",
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
+            with mock.patch.object(builder, "ensure_repo") as mock_ensure:
+                with mock.patch("sparkrun.builders.eugr._run_build_capturing") as mock_build:
+                    result = builder.prepare_image("vllm-node", recipe, ["10.0.0.1"])
+
+        assert result == "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest"
+        mock_build.assert_not_called()
+        mock_ensure.assert_not_called()
+
+    def test_eugr_prepare_builds_when_use_wheels_and_image_missing(self, eugr_builder_with_repo):
+        """prepare_image() triggers a wheels build for a custom image name with --use-wheels."""
         builder, repo_dir = eugr_builder_with_repo
         recipe = Recipe.from_dict(
             {
@@ -180,21 +206,70 @@ class TestEugrPrepareImage:
                 "model": "some/model",
                 "runtime": "eugr-vllm",
                 "container": "my-image",
+                "runtime_config": {"build_args": ["--use-wheels"]},
             }
         )
         with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
             with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
-                with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
-                    with mock.patch.object(builder, "_verify_image_imports"):
-                        with mock.patch.object(builder, "_save_build_metadata"):
-                            result = builder.prepare_image("my-image", recipe, ["10.0.0.1"])
+                with mock.patch.object(builder, "_can_skip_build", return_value=False):
+                    with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                        with mock.patch.object(builder, "_verify_image_imports"):
+                            with mock.patch.object(builder, "_save_build_metadata"):
+                                result = builder.prepare_image("my-image", recipe, ["10.0.0.1"])
 
         mock_build.assert_called_once()
         cmd = mock_build.call_args[0][0]
         assert str(repo_dir / "build-and-copy.sh") in cmd[0]
         assert "-t" in cmd
         assert "my-image" in cmd
+        # --use-wheels must reach the script so it builds from wheels rather than pulling.
+        assert "--use-wheels" in cmd
         assert result == "my-image"
+
+    @pytest.mark.parametrize(
+        "build_args",
+        [
+            ["--rebuild-vllm"],
+            ["--rebuild-flashinfer"],
+            ["--vllm-ref", "main"],
+            ["--exp-mxfp4"],
+            ["--force-download"],
+            ["--tf5", "--rebuild-vllm"],
+        ],
+    )
+    def test_eugr_prepare_custom_build_flags_force_build(self, eugr_builder_with_repo, build_args):
+        """Custom build-and-copy.sh flags (not just --use-wheels) route to a build, not a pull.
+
+        Mirrors the script's CUSTOM_BUILD_REQUESTED gate: --rebuild-vllm, --vllm-ref,
+        --exp-mxfp4, --force-download, etc. all mean "build", so a missing image with
+        any of them is built (and the flags forwarded) rather than substituted+pulled.
+        """
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "vllm-node",
+                "runtime_config": {"build_args": build_args},
+            }
+        )
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
+            with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
+                with mock.patch.object(builder, "_can_skip_build", return_value=False):
+                    with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                        with mock.patch.object(builder, "_verify_image_imports"):
+                            with mock.patch.object(builder, "_save_build_metadata"):
+                                result = builder.prepare_image("vllm-node", recipe, ["10.0.0.1"])
+
+        # Built as the recipe's own image name (not substituted with our nightly).
+        assert result == "vllm-node"
+        mock_build.assert_called_once()
+        cmd = mock_build.call_args[0][0]
+        assert "vllm-node" in cmd
+        # Every custom flag is forwarded verbatim to build-and-copy.sh.
+        for tok in build_args:
+            assert tok in cmd
 
     def test_eugr_prepare_dry_run(self, eugr_builder_with_repo):
         """prepare_image() in dry-run does not execute subprocess (build script)."""
@@ -204,7 +279,7 @@ class TestEugrPrepareImage:
                 "name": "test",
                 "model": "some/model",
                 "runtime": "eugr-vllm",
-                "runtime_config": {"build_args": ["--flag"]},
+                "runtime_config": {"build_args": ["--use-wheels", "--flag"]},
             }
         )
         with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
@@ -279,6 +354,7 @@ class TestEugrPrepareImage:
 
         This keeps the build cache identity tied to the recipe's canonical args so
         subsequent cache lookups still hit when nothing else changed (commit 110aca7).
+        The cache identity also drops the deprecated ``--tf5`` no-op.
         """
         builder, repo_dir = eugr_builder_with_repo
         recipe = Recipe.from_dict(
@@ -287,7 +363,7 @@ class TestEugrPrepareImage:
                 "model": "some/model",
                 "runtime": "eugr-vllm",
                 "container": "my-image",
-                "runtime_config": {"build_args": ["--tf5"]},
+                "runtime_config": {"build_args": ["--tf5", "--use-wheels"]},
             }
         )
         with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
@@ -297,11 +373,12 @@ class TestEugrPrepareImage:
                         with mock.patch.object(builder, "_save_build_metadata") as mock_save:
                             builder.prepare_image("my-image", recipe, ["10.0.0.1"])
 
-        # _save_build_metadata is called with the recipe's original build_args (no --cleanup).
+        # _save_build_metadata is called with the normalized cache args (no --cleanup,
+        # no deprecated --tf5) — just the meaningful --use-wheels.
         args, kwargs = mock_save.call_args
         # Signature: _save_build_metadata(image, build_args, config, host=..., ssh_kwargs=...)
         saved_build_args = args[1]
-        assert saved_build_args == ["--tf5"]
+        assert saved_build_args == ["--use-wheels"]
 
     def test_eugr_prepare_smoke_failure_removes_tag_and_skips_cache(self, eugr_builder_with_repo):
         """If the post-build flashinfer smoke test fails, the tag is removed and cache is not updated."""
@@ -493,9 +570,10 @@ class TestEugrPrepareImage:
         assert result == "sparkrun-eugr-vllm"
         cmd = mock_build.call_args[0][0]
         assert "sparkrun-eugr-vllm" in cmd
-        # Control args (--tf5 / --use-wheels) are dropped from the build invocation.
+        # --use-wheels must be forwarded so build-and-copy.sh builds from wheels
+        # rather than pulling the prebuilt runner. --tf5 was not in build_args.
+        assert "--use-wheels" in cmd
         assert "--tf5" not in cmd
-        assert "--use-wheels" not in cmd
         mock_build.assert_called_once()
 
     def test_eugr_prepare_dockerhub_sentinel_respects_use_sentinel_image_false(self, eugr_builder_with_repo, tmp_path):
@@ -526,7 +604,7 @@ class TestEugrRebuild:
     """`builder_config.rebuild` — force a fresh image (rebuild or fresh pull)."""
 
     def test_rebuild_forces_build_when_image_exists(self, eugr_builder_with_repo):
-        """rebuild=True builds a locally-built image even when it already exists."""
+        """rebuild=True builds a wheels image even when it already exists."""
         builder, repo_dir = eugr_builder_with_repo
         recipe = Recipe.from_dict(
             {
@@ -534,6 +612,7 @@ class TestEugrRebuild:
                 "model": "some/model",
                 "runtime": "eugr-vllm",
                 "container": "my-image",
+                "runtime_config": {"build_args": ["--use-wheels"]},
                 "builder_config": {"rebuild": True},
             }
         )
@@ -556,6 +635,7 @@ class TestEugrRebuild:
                 "model": "some/model",
                 "runtime": "eugr-vllm",
                 "container": "my-image",
+                "runtime_config": {"build_args": ["--use-wheels"]},
                 "builder_config": {"rebuild": True},
             }
         )

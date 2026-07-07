@@ -501,21 +501,33 @@ builder-specific, with one standard cross-builder key:
 The `rebuild` key can also be set per-invocation with `sparkrun run --rebuild <recipe>`
 (or `--no-rebuild` to force it off); the CLI flag overrides the recipe's `builder_config.rebuild`.
 
-#### eugr nightly sentinels (pull-first)
+#### eugr is pull-first
 
-The eugr nightly `:latest` images — `ghcr.io/spark-arena/dgx-vllm-eugr-nightly(-tf5):latest` and the
-Docker Hub `eugr/spark-vllm:latest` (short or `docker.io/`-qualified) — are recognized as **sentinels**.
-Mirroring upstream's pull-first switch, all of them resolve to sparkrun's authoritative
-`ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest`:
+Mirroring upstream `build-and-copy.sh`, the eugr builder **pulls a prebuilt image by default and only
+builds from wheels when `build_args` request it**. A build is requested when `build_args` contains
+`--use-wheels` **or any custom build flag** (`--rebuild-vllm`, `--rebuild-flashinfer`, `--vllm-ref`,
+`--exp-mxfp4`, `--force-download`, `--apply-vllm-pr`, …) — exactly the flags that set the script's
+`CUSTOM_BUILD_REQUESTED`. `build_args` that are empty or contain only the deprecated `--tf5` no-op do
+**not** trigger a build.
 
-- **default** → the nightly is **pulled** (via the distribution phase). `--rebuild` force-pulls a fresh copy.
-- **`--use-wheels` in `build_args`** → the nightly is **built locally from upstream wheels** via
-  `build-and-copy.sh` (the historical path). The build cache is honored, so an existing local
-  `sparkrun-eugr-vllm` image is reused; `--rebuild` on top forces a from-scratch wheels rebuild.
+**Pull path (default):**
 
-The legacy `--tf5` flag is a no-op (tf5 and non-tf5 now build identically). Set
-`defaults.builders.eugr.use_sentinel_image: false` in `~/.config/sparkrun/config.yaml` to disable
-sentinel recognition entirely and treat these refs as ordinary pullable images.
+- The eugr nightly `:latest` sentinels — `ghcr.io/spark-arena/dgx-vllm-eugr-nightly(-tf5):latest` and the
+  Docker Hub `eugr/spark-vllm:latest` (short or `docker.io/`-qualified) — resolve to sparkrun's
+  authoritative `ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest` and are pulled.
+- Any other non-pullable eugr image (e.g. a v1 `container: vllm-node`) is reused if already present,
+  otherwise substituted with our nightly and pulled — eugr no longer builds it implicitly.
+- `--rebuild` force-pulls a fresh copy.
+
+**Build path (`--use-wheels` or a custom build flag):**
+
+- The nightly sentinels build locally as `sparkrun-eugr-vllm`; other images build under their own name.
+- `build_args` are forwarded verbatim to `build-and-copy.sh` (so `--use-wheels`, `--vllm-ref`, etc. take
+  effect). The build cache is honored for the standard `--use-wheels` build; `--rebuild` forces a
+  from-scratch rebuild.
+
+Set `defaults.builders.eugr.use_sentinel_image: false` in `~/.config/sparkrun/config.yaml` to opt out of
+pull-first entirely: images are used verbatim and a missing one is built via `build-and-copy.sh`.
 
 ### eugr Builder (v1 Compatibility, Legacy)
 

@@ -567,8 +567,8 @@ class TestPrepareImageCacheIntegration:
         """In delegated mode, cache check IS performed with host param.
 
         With --use-wheels the tf5 nightly sentinel takes the local wheels build path
-        and unifies with the non-tf5 build: it maps to ``sparkrun-eugr-vllm`` and the
-        control args (``--tf5``/``--use-wheels``) are dropped.
+        and unifies with the non-tf5 build: it maps to ``sparkrun-eugr-vllm``. The
+        cache identity keeps the meaningful ``--use-wheels`` but drops ``--tf5``.
         """
         builder = EugrBuilder()
         recipe = mock.MagicMock()
@@ -579,6 +579,7 @@ class TestPrepareImageCacheIntegration:
 
         with (
             mock.patch.object(builder, "_ensure_repo_remote", return_value="/remote/path"),
+            mock.patch.object(builder, "_image_exists_on_host", return_value=False),
             mock.patch.object(builder, "_can_skip_build", return_value=True) as mock_skip,
             mock.patch.object(builder, "_build_image_remote") as mock_build,
         ):
@@ -594,7 +595,7 @@ class TestPrepareImageCacheIntegration:
 
         mock_skip.assert_called_once_with(
             "sparkrun-eugr-vllm",
-            [],
+            ["--use-wheels"],
             config,
             host="host1",
             ssh_kwargs={},
@@ -604,12 +605,13 @@ class TestPrepareImageCacheIntegration:
     def test_delegated_build_saves_metadata(self, tmp_path):
         """After a delegated build, metadata is saved with host param.
 
-        The cache stores the recipe's canonical build_args (without the implicit
-        ``--cleanup`` hygiene flag) so subsequent cache checks can match.
+        The build invocation forwards the recipe's build_args verbatim (plus the
+        implicit ``--cleanup`` hygiene flag) while the cache stores the normalized
+        args so subsequent cache checks can match.
         """
         builder = EugrBuilder()
         recipe = mock.MagicMock()
-        recipe.runtime_config = {"build_args": [], "mods": []}
+        recipe.runtime_config = {"build_args": ["--use-wheels"], "mods": []}
         recipe.builder_config = {}
         recipe.pre_exec = []
         config = _mock_config(tmp_path)
@@ -632,28 +634,28 @@ class TestPrepareImageCacheIntegration:
                 ssh_kwargs={"user": "u"},
             )
 
-        # _build_image_remote receives the augmented args (with --cleanup) so the
-        # actual build still gets the hygiene flag.
+        # _build_image_remote receives the forwarded build_args plus --cleanup so the
+        # script actually builds from wheels (--use-wheels) with the hygiene flag.
         mock_build.assert_called_once_with(
             "my-image",
-            ["--cleanup"],
+            ["--use-wheels", "--cleanup"],
             "head1",
             {"user": "u"},
             False,
             config=config,
             save_logs=False,
         )
-        # _save_build_metadata receives the canonical args (without --cleanup) so the
+        # _save_build_metadata receives the normalized cache args (no --cleanup) so the
         # cache entry remains comparable to future recipe-driven cache checks.
         mock_save.assert_called_once_with(
             "my-image",
-            [],
+            ["--use-wheels"],
             config,
             host="head1",
             ssh_kwargs={"user": "u"},
         )
         # The recipe's build_args list must not be mutated by the implicit append.
-        assert recipe.runtime_config["build_args"] == []
+        assert recipe.runtime_config["build_args"] == ["--use-wheels"]
 
     def test_cache_round_trip_survives_implicit_cleanup(self, tmp_path):
         """Regression: a build → save → check cycle must produce a cache hit.
