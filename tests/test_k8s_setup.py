@@ -644,6 +644,166 @@ def test_api_run_launcher_job_dry_run_does_not_build_client(tmp_path, monkeypatc
 
 
 # ---------------------------------------------------------------------------
+# Node inventory (k8s-native introspection spine)
+# ---------------------------------------------------------------------------
+
+
+def _node(name, labels, *, capacity_gpu=None, allocatable_gpu=None, unschedulable=False):
+    capacity = {"nvidia.com/gpu": str(capacity_gpu)} if capacity_gpu is not None else {}
+    allocatable = {"nvidia.com/gpu": str(allocatable_gpu)} if allocatable_gpu is not None else {}
+    return {
+        "metadata": {"name": name, "labels": labels},
+        "status": {"capacity": capacity, "allocatable": allocatable},
+        "spec": {"unschedulable": unschedulable} if unschedulable else {},
+    }
+
+
+_SPARK_LABELS = {
+    "nvidia.com/gpu.present": "true",
+    "nvidia.com/gpu.product": "NVIDIA-GB10",
+    "nvidia.com/gpu.machine": "NVIDIA-DGX-Spark",
+    "nvidia.com/gpu.count": "1",
+    "nvidia.com/gpu.memory": "131072",
+    "feature.node.kubernetes.io/pci-15b3.present": "true",
+}
+_RTX_LABELS = {
+    "nvidia.com/gpu.present": "true",
+    "nvidia.com/gpu.product": "NVIDIA-RTX-PRO-6000-Blackwell",
+    "nvidia.com/gpu.count": "1",
+    "nvidia.com/gpu.memory": "98304",
+}
+
+
+def test_inventory_dgx_spark_node_maps_to_gb10():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+    from sparkrun.platforms import resolve_platform
+
+    info = build_node_info(_node("spark-0", _SPARK_LABELS, capacity_gpu=1, allocatable_gpu=1))
+    accel = info.hardware.accelerators[0]
+    assert accel.vendor == "nvidia"
+    assert accel.model == "gb10"  # same token as the SSH fingerprint path
+    assert accel.count == 1
+    assert accel.memory_gb == 128.0  # 131072 MiB / 1024
+    assert "rdma:roce-v2" in accel.capabilities  # Mellanox PCI present
+    assert resolve_platform(info.hardware).platform_name == "dgx-spark"
+
+
+def test_inventory_rtx_pro_6000_maps_to_generic_nvidia():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+    from sparkrun.platforms import resolve_platform
+
+    info = build_node_info(_node("rtx-0", _RTX_LABELS, capacity_gpu=1, allocatable_gpu=1))
+    accel = info.hardware.accelerators[0]
+    assert accel.model == "rtx-pro-6000-blackwell"
+    assert accel.memory_gb == 96.0
+    # Not gb10 → generic NVIDIA platform, not DGX Spark
+    assert resolve_platform(info.hardware).platform_name == "nvidia-generic"
+
+
+def test_inventory_hybrid_cluster_distinguishes_node_classes():
+    from sparkrun.orchestration.k8s.inventory import parse_nodes
+    from sparkrun.platforms import resolve_platform
+
+    nodes = parse_nodes({"items": [_node("spark-0", _SPARK_LABELS, capacity_gpu=1), _node("rtx-0", _RTX_LABELS, capacity_gpu=1)]})
+    by_name = {n.name: n for n in nodes}
+    assert resolve_platform(by_name["spark-0"].hardware).platform_name == "dgx-spark"
+    assert resolve_platform(by_name["rtx-0"].hardware).platform_name == "nvidia-generic"
+    # distinct models → the scheduler can allocate the right node class
+    assert by_name["spark-0"].hardware.accelerators[0].model != by_name["rtx-0"].hardware.accelerators[0].model
+
+
+def test_inventory_cordoned_and_allocatable():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+
+    info = build_node_info(_node("rtx-0", _RTX_LABELS, capacity_gpu=1, allocatable_gpu=0, unschedulable=True))
+    assert info.schedulable is False
+    assert info.capacity_gpus == 1
+    assert info.allocatable_gpus == 0
+
+
+def test_inventory_count_falls_back_to_capacity_when_label_absent():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+
+    labels = {"nvidia.com/gpu.present": "true", "nvidia.com/gpu.product": "NVIDIA-H200"}
+    info = build_node_info(_node("h200-0", labels, capacity_gpu=8, allocatable_gpu=8))
+    assert info.hardware.accelerators[0].count == 8
+    assert info.hardware.accelerators[0].model == "h200"
+
+
+def test_inventory_cpu_node_has_no_accelerators():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+
+    info = build_node_info(_node("cpu-0", {"kubernetes.io/arch": "amd64"}))
+    assert info.hardware.accelerators == []
+    assert info.has_accelerators is False
+
+
+def test_probe_nodes_passes_selector_and_filters_gpu_only(monkeypatch):
+    from sparkrun.orchestration.k8s.client import KubectlClient
+    from sparkrun.orchestration.k8s.inventory import probe_nodes
+
+    client = KubectlClient("/usr/bin/kubectl")
+    captured = {}
+
+    def _run_json(args, **k):
+        captured["args"] = args
+        return {"items": [_node("spark-0", _SPARK_LABELS, capacity_gpu=1), _node("cpu-0", {})]}
+
+    monkeypatch.setattr(client, "run_json", _run_json)
+    nodes = probe_nodes(client, selector="nvidia.com/gpu.present=true", gpu_only=True)
+    assert "-l" in captured["args"] and "nvidia.com/gpu.present=true" in captured["args"]
+    assert [n.name for n in nodes] == ["spark-0"]  # cpu-0 filtered out
+
+
+def test_probe_node_hardware_returns_hosthardware_map(monkeypatch):
+    from sparkrun.core.hardware import HostHardware
+    from sparkrun.orchestration.k8s.client import KubectlClient
+    from sparkrun.orchestration.k8s.inventory import probe_node_hardware
+
+    client = KubectlClient("/usr/bin/kubectl")
+    monkeypatch.setattr(client, "run_json", lambda args, **k: {"items": [_node("spark-0", _SPARK_LABELS, capacity_gpu=1)]})
+    hw_map = probe_node_hardware(client)
+    assert set(hw_map) == {"spark-0"}
+    assert isinstance(hw_map["spark-0"], HostHardware)
+
+
+def test_api_list_nodes_translates_error(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+    from sparkrun.orchestration.k8s.errors import K8sError
+
+    sctx = _sctx(tmp_path)
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+
+    def _boom(*a, **k):
+        raise K8sError("connection refused")
+
+    # list_nodes imports probe_nodes from the inventory module at call time.
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", _boom)
+    with pytest.raises(api.k8s.ClusterUnreachable, match="connection refused"):
+        api.k8s.list_nodes(sctx)
+
+
+def test_cli_setup_k8s_nodes_renders(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from sparkrun.cli import main
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+
+    monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
+    fake = [
+        build_node_info(_node("spark-0", _SPARK_LABELS, capacity_gpu=1, allocatable_gpu=1)),
+        build_node_info(_node("rtx-0", _RTX_LABELS, capacity_gpu=1, allocatable_gpu=1)),
+    ]
+    monkeypatch.setattr("sparkrun.api.k8s.list_nodes", lambda *a, **k: fake)
+    result = CliRunner().invoke(main, ["setup", "k8s", "nodes"])
+    assert result.exit_code == 0, result.output
+    assert "spark-0" in result.output and "gb10" in result.output
+    assert "rtx-0" in result.output and "rtx-pro-6000" in result.output
+    assert "DGX Spark" in result.output
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

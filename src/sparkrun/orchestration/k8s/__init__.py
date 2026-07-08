@@ -26,6 +26,13 @@ from .errors import (
     KubectlNotFoundError,
     ServiceAccountSetupError,
 )
+from .inventory import (
+    NodeInfo,
+    build_node_info,
+    parse_nodes,
+    probe_node_hardware,
+    probe_nodes,
+)
 from .job import (
     LauncherJobResult,
     LauncherJobSpec,
@@ -56,6 +63,11 @@ __all__ = [
     "LauncherJobResult",
     "build_launcher_manifests",
     "render_launcher_manifests",
+    "NodeInfo",
+    "probe_nodes",
+    "probe_node_hardware",
+    "parse_nodes",
+    "build_node_info",
     "K8sError",
     "KubectlNotFoundError",
     "KubectlDownloadError",

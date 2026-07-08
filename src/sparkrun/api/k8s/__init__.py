@@ -23,6 +23,7 @@ from sparkrun.orchestration.k8s import (
     KubeTarget,
     LauncherJobResult,
     LauncherJobSpec,
+    NodeInfo,
     ServiceAccountResult,
     ServiceAccountSpec,
 )
@@ -32,6 +33,7 @@ from ._ops import (
     cluster_info,
     configure_service_account,
     ensure_kubectl,
+    list_nodes,
     make_client,
     run_launcher_job,
 )
@@ -41,12 +43,14 @@ __all__ = [
     "ensure_kubectl",
     "cluster_info",
     "configure_service_account",
+    "list_nodes",
     "run_launcher_job",
     "make_client",
     # Data models
     "KubectlBinary",
     "ClusterInfo",
     "KubeTarget",
+    "NodeInfo",
     "ServiceAccountSpec",
     "ServiceAccountResult",
     "LauncherJobSpec",

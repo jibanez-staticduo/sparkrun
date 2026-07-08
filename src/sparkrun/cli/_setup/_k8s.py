@@ -120,6 +120,52 @@ def setup_k8s_info(ctx, kubeconfig, kube_context, namespace, no_pin):
 
 
 # ---------------------------------------------------------------------------
+# nodes
+# ---------------------------------------------------------------------------
+
+
+@setup_k8s.command("nodes")
+@kube_options
+@click.option("--selector", "-l", default=None, help="kubectl label selector to filter nodes.")
+@click.option("--gpu-only", is_flag=True, help="Show only nodes with detected accelerators.")
+@click.pass_context
+def setup_k8s_nodes(ctx, kubeconfig, kube_context, namespace, selector, gpu_only):
+    """Show cluster nodes with GPU hardware detected from labels.
+
+    Synthesizes sparkrun hardware metadata from GPU Feature Discovery /
+    Node Feature Discovery labels — the k8s-native analog of an SSH probe,
+    and the basis for hybrid-cluster scheduling.
+    """
+    from sparkrun import api
+    from sparkrun.platforms import resolve_platform
+
+    sctx = _get_context(ctx)
+    try:
+        nodes = api.k8s.list_nodes(sctx, kubeconfig=kubeconfig, context=kube_context, selector=selector, gpu_only=gpu_only)
+    except (api.k8s.ClusterUnreachable, api.k8s.KubectlUnavailable) as exc:
+        raise click.ClickException(str(exc))
+
+    if not nodes:
+        click.echo("No nodes found.")
+        return
+
+    for node in nodes:
+        hw = node.hardware
+        platform = resolve_platform(hw)
+        cordon = "" if node.schedulable else "  [cordoned]"
+        click.secho("%s%s" % (node.name, cordon), bold=True)
+        if hw.accelerators:
+            for accel in hw.accelerators:
+                mem = " %.0fGB" % accel.memory_gb if accel.memory_gb else ""
+                caps = ", ".join(sorted(accel.capabilities))
+                click.echo("  %d× %s%s  (%s)" % (accel.count, accel.model, mem, caps))
+        else:
+            click.echo("  (no accelerators detected)")
+        click.echo("  allocatable: %d/%d nvidia.com/gpu" % (node.allocatable_gpus, node.capacity_gpus))
+        click.echo("  platform:    %s" % (platform.display_name if platform else "unknown"))
+
+
+# ---------------------------------------------------------------------------
 # sa
 # ---------------------------------------------------------------------------
 

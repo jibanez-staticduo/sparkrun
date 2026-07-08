@@ -23,6 +23,7 @@ from sparkrun.orchestration.k8s import (
 )
 from sparkrun.orchestration.k8s.errors import (
     ClusterUnreachableError,
+    K8sError,
     KubectlDownloadError,
     KubectlNotFoundError,
     ServiceAccountSetupError,
@@ -35,7 +36,7 @@ from ._errors import ClusterUnreachable, KubectlUnavailable, LauncherJobError, S
 
 if TYPE_CHECKING:
     from sparkrun.core.context import SparkrunContext
-    from sparkrun.orchestration.k8s import ClusterInfo, KubectlBinary, ServiceAccountResult
+    from sparkrun.orchestration.k8s import ClusterInfo, KubectlBinary, NodeInfo, ServiceAccountResult
 
 
 def ensure_kubectl(
@@ -163,6 +164,30 @@ def configure_service_account(
         raise ServiceAccountError(str(exc)) from exc
 
 
+def list_nodes(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    kubeconfig: str | None = None,
+    context: str | None = None,
+    selector: str | None = None,
+    gpu_only: bool = False,
+) -> "list[NodeInfo]":
+    """Return the cluster's nodes as :class:`NodeInfo` (hardware + capacity).
+
+    Synthesizes :class:`~sparkrun.core.hardware.HostHardware` from GPU
+    Feature Discovery / Node Feature Discovery labels — the k8s-native
+    analog of an SSH hardware probe, needing only ``nodes`` read RBAC.
+    """
+    from sparkrun.orchestration.k8s.inventory import probe_nodes as _probe_nodes
+
+    sctx = resolve_sctx(sctx)
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context)
+    try:
+        return _probe_nodes(client, selector=selector, gpu_only=gpu_only)
+    except K8sError as exc:
+        raise ClusterUnreachable(str(exc)) from exc
+
+
 def run_launcher_job(
     sctx: "SparkrunContext | None" = None,
     *,
@@ -241,5 +266,6 @@ __all__ = [
     "make_client",
     "cluster_info",
     "configure_service_account",
+    "list_nodes",
     "run_launcher_job",
 ]

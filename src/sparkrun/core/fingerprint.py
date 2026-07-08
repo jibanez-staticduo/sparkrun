@@ -182,6 +182,15 @@ def _normalize_apple_model(raw: str) -> str:
     return name.lower().replace(" ", "-")
 
 
+# Public aliases: the k8s node-inventory path
+# (``sparkrun.orchestration.k8s.inventory``) reuses these so labels-derived
+# AcceleratorSpec models / memory values match the SSH fingerprint path
+# byte-for-byte on hybrid clusters (a DGX Spark is model ``"gb10"`` whether
+# detected via nvidia-smi or via ``nvidia.com/gpu.product``).
+normalize_nvidia_model = _normalize_nvidia_model
+mib_to_gb = _mib_to_gb
+
+
 def _group_accelerators(
     entries: list[tuple[str, str, float | None]],
     vendor: str,
