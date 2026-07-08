@@ -48,6 +48,14 @@ from .kueue import (
     build_provision_manifests,
     derive_flavors,
 )
+from .jobset import (
+    JobSetPlan,
+    PodSetPlan,
+    build_jobset,
+    node_selectors_from_nodes,
+    plan_from_rank_models,
+    render_jobset,
+)
 from .scheduling import (
     ClassFeasibility,
     FeasibilityReport,
@@ -96,6 +104,12 @@ __all__ = [
     "FeasibilityReport",
     "aggregate_gpu_classes",
     "check_feasibility",
+    "PodSetPlan",
+    "JobSetPlan",
+    "build_jobset",
+    "render_jobset",
+    "node_selectors_from_nodes",
+    "plan_from_rank_models",
     "K8sError",
     "KubectlNotFoundError",
     "KubectlDownloadError",

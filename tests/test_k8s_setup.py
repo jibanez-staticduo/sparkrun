@@ -1007,6 +1007,107 @@ def test_api_check_feasibility_reads_inventory(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Placement -> JobSet translation
+# ---------------------------------------------------------------------------
+
+
+def test_node_selectors_from_inventory():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+    from sparkrun.orchestration.k8s.jobset import node_selectors_from_nodes
+
+    nodes = [build_node_info(_node("s0", _SPARK_LABELS, capacity_gpu=1)), build_node_info(_node("r0", _RTX_LABELS, capacity_gpu=1))]
+    selectors = node_selectors_from_nodes(nodes)
+    assert selectors["gb10"] == {"nvidia.com/gpu.product": "NVIDIA-GB10"}
+    assert selectors["rtx-pro-6000-blackwell"] == {"nvidia.com/gpu.product": "NVIDIA-RTX-PRO-6000-Blackwell"}
+
+
+def test_plan_from_rank_models_groups_by_class():
+    from sparkrun.orchestration.k8s.jobset import plan_from_rank_models
+
+    plan = plan_from_rank_models(
+        "job-1",
+        ["gb10", "gb10", "rtx-pro-6000-blackwell"],
+        image="img",
+        node_selectors={
+            "gb10": {"nvidia.com/gpu.product": "NVIDIA-GB10"},
+            "rtx-pro-6000-blackwell": {"nvidia.com/gpu.product": "NVIDIA-RTX-PRO-6000-Blackwell"},
+        },
+    )
+    by_name = {ps.name: ps for ps in plan.pod_sets}
+    assert by_name["gb10"].replicas == 2
+    assert by_name["rtx-pro-6000-blackwell"].replicas == 1
+    assert plan.total_pods == 3
+    assert {(r.model, r.gpus) for r in plan.gpu_requests} == {("gb10", 2), ("rtx-pro-6000-blackwell", 1)}
+
+
+def test_build_jobset_hybrid_shape():
+    from sparkrun.orchestration.k8s.jobset import QUEUE_LABEL, build_jobset, plan_from_rank_models
+
+    plan = plan_from_rank_models(
+        "job-1",
+        ["gb10", "gb10", "rtx-pro-6000-blackwell"],
+        image="ghcr.io/x/sparkrun:latest",
+        node_selectors={
+            "gb10": {"nvidia.com/gpu.product": "NVIDIA-GB10"},
+            "rtx-pro-6000-blackwell": {"nvidia.com/gpu.product": "NVIDIA-RTX-PRO-6000-Blackwell"},
+        },
+    )
+    js = build_jobset(plan)
+    assert js["kind"] == "JobSet" and js["apiVersion"].startswith("jobset.x-k8s.io/")
+    assert js["metadata"]["labels"][QUEUE_LABEL] == "sparkrun"
+    rjs = {rj["name"]: rj for rj in js["spec"]["replicatedJobs"]}
+    assert rjs["gb10"]["replicas"] == 2
+    gb10_pod = rjs["gb10"]["template"]["spec"]["template"]["spec"]
+    assert gb10_pod["nodeSelector"] == {"nvidia.com/gpu.product": "NVIDIA-GB10"}
+    assert gb10_pod["serviceAccountName"] == "sparkrun"
+    assert gb10_pod["restartPolicy"] == "Never"
+    assert gb10_pod["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == "1"
+    # gang: JobSet job template does not retry a failed launch
+    assert rjs["gb10"]["template"]["spec"]["backoffLimit"] == 0
+
+
+def test_plan_multi_gpu_per_pod():
+    from sparkrun.orchestration.k8s.jobset import build_jobset, plan_from_rank_models
+
+    # single-node tp=4 on one RTX box → 1 pod requesting 4 GPUs
+    plan = plan_from_rank_models("job-2", ["rtx-pro-6000-blackwell"], image="img", gpus_per_pod={"rtx-pro-6000-blackwell": 4})
+    js = build_jobset(plan)
+    rj = js["spec"]["replicatedJobs"][0]
+    assert rj["replicas"] == 1
+    pod = rj["template"]["spec"]["template"]["spec"]
+    assert pod["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == "4"
+
+
+def test_plan_command_and_env_threaded_into_pod():
+    from sparkrun.orchestration.k8s.jobset import PodSetPlan, JobSetPlan, build_jobset
+
+    plan = JobSetPlan(
+        name="job-3",
+        pod_sets=[
+            PodSetPlan(
+                name="gb10", replicas=1, gpus_per_pod=1, image="img", model="gb10", command=["sparkrun", "run"], env={"HF_TOKEN": "x"}
+            )
+        ],
+    )
+    pod = build_jobset(plan)["spec"]["replicatedJobs"][0]["template"]["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    assert container["command"] == ["sparkrun", "run"]
+    assert {"name": "HF_TOKEN", "value": "x"} in container["env"]
+
+
+def test_jobset_gpu_requests_feed_feasibility():
+    from sparkrun.orchestration.k8s.jobset import plan_from_rank_models
+    from sparkrun.orchestration.k8s.scheduling import check_feasibility
+
+    # the plan's own gpu_requests drive the precheck against inventory
+    plan = plan_from_rank_models("job-4", ["gb10", "gb10"], image="img")
+    nodes = _nodes_for([("s0", _SPARK_LABELS, 1, 1, False)])  # only 1 gb10 GPU available
+    report = check_feasibility(nodes, plan.gpu_requests)
+    assert report.feasible is False
+    assert report.classes[0].shortfall == 1
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
