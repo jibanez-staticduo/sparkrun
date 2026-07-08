@@ -40,6 +40,14 @@ from .job import (
     render_launcher_manifests,
 )
 from .kubectl import KubectlBinary, ensure_kubectl, list_cached
+from .kueue import (
+    FlavorSpec,
+    KueueError,
+    KueueSetupResult,
+    KueueStatus,
+    build_provision_manifests,
+    derive_flavors,
+)
 from .serviceaccount import (
     ServiceAccountResult,
     ServiceAccountSpec,
@@ -68,6 +76,12 @@ __all__ = [
     "probe_node_hardware",
     "parse_nodes",
     "build_node_info",
+    "FlavorSpec",
+    "KueueStatus",
+    "KueueSetupResult",
+    "KueueError",
+    "derive_flavors",
+    "build_provision_manifests",
     "K8sError",
     "KubectlNotFoundError",
     "KubectlDownloadError",

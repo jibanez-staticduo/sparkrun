@@ -27,15 +27,24 @@ from sparkrun.orchestration.k8s import (
     ServiceAccountResult,
     ServiceAccountSpec,
 )
+from sparkrun.orchestration.k8s.kueue import KueueSetupResult, KueueStatus
 
-from ._errors import ClusterUnreachable, KubectlUnavailable, LauncherJobError, ServiceAccountError
+from ._errors import (
+    ClusterUnreachable,
+    KubectlUnavailable,
+    KueueSetupError,
+    LauncherJobError,
+    ServiceAccountError,
+)
 from ._ops import (
     cluster_info,
     configure_service_account,
     ensure_kubectl,
+    kueue_status,
     list_nodes,
     make_client,
     run_launcher_job,
+    setup_kueue,
 )
 
 __all__ = [
@@ -44,6 +53,8 @@ __all__ = [
     "cluster_info",
     "configure_service_account",
     "list_nodes",
+    "kueue_status",
+    "setup_kueue",
     "run_launcher_job",
     "make_client",
     # Data models
@@ -55,9 +66,12 @@ __all__ = [
     "ServiceAccountResult",
     "LauncherJobSpec",
     "LauncherJobResult",
+    "KueueStatus",
+    "KueueSetupResult",
     # Errors
     "KubectlUnavailable",
     "ClusterUnreachable",
     "ServiceAccountError",
     "LauncherJobError",
+    "KueueSetupError",
 ]

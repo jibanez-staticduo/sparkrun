@@ -185,6 +185,22 @@ class SparkrunConfig:
         kubectl = self.k8s_defaults.get("kubectl")
         return kubectl if isinstance(kubectl, dict) else {}
 
+    def _k8s_subsection(self, key: str) -> dict[str, Any]:
+        sub = self.k8s_defaults.get(key)
+        return sub if isinstance(sub, dict) else {}
+
+    @property
+    def kueue_version(self) -> str | None:
+        """Pinned Kueue release to install (``k8s.kueue.version``)."""
+        val = self._k8s_subsection("kueue").get("version")
+        return str(val) if val else None
+
+    @property
+    def jobset_version(self) -> str | None:
+        """Pinned JobSet release to install (``k8s.jobset.version``)."""
+        val = self._k8s_subsection("jobset").get("version")
+        return str(val) if val else None
+
     @property
     def kubectl_path(self) -> str | None:
         """Explicit ``kubectl`` binary path override (``k8s.kubectl.path``)."""

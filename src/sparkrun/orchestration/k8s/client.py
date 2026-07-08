@@ -121,9 +121,25 @@ class KubectlClient:
         except json.JSONDecodeError as exc:
             raise K8sError("kubectl %s produced non-JSON output" % " ".join(args)) from exc
 
-    def apply(self, manifest_yaml: str, *, timeout: int | None = _DEFAULT_TIMEOUT) -> RemoteResult:
-        """``kubectl apply -f -`` with *manifest_yaml* piped over stdin."""
-        return self.run(["apply", "-f", "-"], input_data=manifest_yaml, timeout=timeout)
+    def apply(
+        self,
+        manifest_yaml: str,
+        *,
+        server_side: bool = False,
+        timeout: int | None = _DEFAULT_TIMEOUT,
+    ) -> RemoteResult:
+        """``kubectl apply -f -`` with *manifest_yaml* piped over stdin.
+
+        *server_side* uses ``--server-side --force-conflicts`` — required for
+        large CRD bundles (e.g. the Kueue release manifest) that can exceed
+        the client-side apply annotation size limit.
+        """
+        args = ["apply", "--server-side", "--force-conflicts", "-f", "-"] if server_side else ["apply", "-f", "-"]
+        return self.run(args, input_data=manifest_yaml, timeout=timeout)
+
+    def resource_exists(self, kind: str, name: str) -> bool:
+        """True iff ``kubectl get <kind> <name>`` succeeds (e.g. a CRD)."""
+        return self.run(["get", kind, name, "-o", "name"]).success
 
     def exec(
         self,

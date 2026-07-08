@@ -223,6 +223,70 @@ def setup_k8s_sa(ctx, name, kubeconfig, kube_context, namespace, no_create_names
 
 
 # ---------------------------------------------------------------------------
+# kueue
+# ---------------------------------------------------------------------------
+
+
+@setup_k8s.command("kueue")
+@kube_options
+@click.option("--install", is_flag=True, help="Install Kueue + JobSet if missing (applies pinned release manifests).")
+@click.option("--kueue-version", default=None, help="Kueue release to install (overrides k8s.kueue.version).")
+@click.option("--jobset-version", default=None, help="JobSet release to install (overrides k8s.jobset.version).")
+@click.option("--yes", "-y", is_flag=True, help="Skip the install confirmation prompt.")
+@click.option("--dry-run", is_flag=True, help="Render the provisioning manifests without installing/applying.")
+@click.pass_context
+def setup_k8s_kueue(ctx, kubeconfig, kube_context, namespace, install, kueue_version, jobset_version, yes, dry_run):
+    """Install Kueue + JobSet (gang scheduling) and provision sparkrun queues.
+
+    Derives one ResourceFlavor per detected GPU node-class, a ClusterQueue
+    with per-flavor quota, and a LocalQueue. Runs under the admin context.
+    Kueue is required for all k8s-mode launches.
+    """
+    from sparkrun import api
+
+    sctx = _get_context(ctx)
+
+    if install and not yes and not dry_run:
+        status = api.k8s.kueue_status(sctx, kubeconfig=kubeconfig, context=kube_context)
+        missing = [n for n, ok in (("JobSet", status.jobset_installed), ("Kueue", status.kueue_installed)) if not ok]
+        if missing:
+            click.confirm(
+                "Install %s into this cluster (applies upstream release manifests)?" % " + ".join(missing),
+                abort=True,
+            )
+
+    try:
+        result = api.k8s.setup_kueue(
+            sctx,
+            install=install,
+            kueue_version=kueue_version,
+            jobset_version=jobset_version,
+            namespace=namespace,
+            kubeconfig=kubeconfig,
+            context=kube_context,
+            dry_run=dry_run,
+        )
+    except (api.k8s.KueueSetupError, api.k8s.ClusterUnreachable, api.k8s.KubectlUnavailable) as exc:
+        raise click.ClickException(str(exc))
+
+    if dry_run:
+        click.echo(result.manifests_yaml)
+        click.secho("(dry-run — nothing installed or applied)", fg="yellow")
+        return
+
+    if result.installed_jobset:
+        click.secho("Installed JobSet %s." % result.jobset_version, fg="green")
+    if result.installed_kueue:
+        click.secho("Installed Kueue %s." % result.kueue_version, fg="green")
+    click.secho("Kueue queues provisioned.", fg="green")
+    click.echo("  namespace:     %s" % result.namespace)
+    click.echo("  cluster queue: %s" % result.cluster_queue)
+    click.echo("  local queue:   %s" % result.local_queue)
+    for flavor in result.flavors:
+        click.echo("  flavor:        %s  (%s, %d GPU quota)" % (flavor.name, flavor.model, flavor.gpu_quota))
+
+
+# ---------------------------------------------------------------------------
 # run-job (hidden — smoke-tests the launcher-Job transport)
 # ---------------------------------------------------------------------------
 

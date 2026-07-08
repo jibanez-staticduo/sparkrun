@@ -804,6 +804,122 @@ def test_cli_setup_k8s_nodes_renders(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Kueue setup (gang scheduling)
+# ---------------------------------------------------------------------------
+
+
+def test_kueue_derive_flavors_groups_by_product():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+    from sparkrun.orchestration.k8s.kueue import derive_flavors
+
+    nodes = [
+        build_node_info(_node("spark-0", _SPARK_LABELS, capacity_gpu=1)),
+        build_node_info(_node("spark-1", _SPARK_LABELS, capacity_gpu=1)),
+        build_node_info(_node("rtx-0", _RTX_LABELS, capacity_gpu=1)),
+    ]
+    flavors = {f.name: f for f in derive_flavors(nodes)}
+    assert set(flavors) == {"sparkrun-gb10", "sparkrun-rtx-pro-6000-blackwell"}
+    assert flavors["sparkrun-gb10"].gpu_quota == 2  # two spark nodes summed
+    assert flavors["sparkrun-gb10"].node_labels == {"nvidia.com/gpu.product": "NVIDIA-GB10"}
+    assert flavors["sparkrun-rtx-pro-6000-blackwell"].gpu_quota == 1
+
+
+def test_kueue_provision_manifests_shape():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+    from sparkrun.orchestration.k8s.kueue import build_provision_manifests
+
+    nodes = [build_node_info(_node("spark-0", _SPARK_LABELS, capacity_gpu=1)), build_node_info(_node("rtx-0", _RTX_LABELS, capacity_gpu=1))]
+    docs, flavors = build_provision_manifests(nodes, namespace="sparkrun")
+    kinds = [d["kind"] for d in docs]
+    assert kinds.count("ResourceFlavor") == 2
+    assert kinds.count("ClusterQueue") == 1 and kinds.count("LocalQueue") == 1
+    cq = next(d for d in docs if d["kind"] == "ClusterQueue")
+    quotas = {f["name"]: f["resources"][0]["nominalQuota"] for f in cq["spec"]["resourceGroups"][0]["flavors"]}
+    assert quotas == {"sparkrun-gb10": "1", "sparkrun-rtx-pro-6000-blackwell": "1"}
+    lq = next(d for d in docs if d["kind"] == "LocalQueue")
+    assert lq["metadata"]["namespace"] == "sparkrun" and lq["spec"]["clusterQueue"] == "sparkrun"
+
+
+def test_kueue_provision_raises_without_gpu_product_labels():
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+    from sparkrun.orchestration.k8s.kueue import KueueError, build_provision_manifests
+
+    nodes = [build_node_info(_node("cpu-0", {"kubernetes.io/arch": "amd64"}))]
+    with pytest.raises(KueueError, match="GPU Feature Discovery"):
+        build_provision_manifests(nodes)
+
+
+def test_kueue_detect_reads_crds(monkeypatch):
+    from sparkrun.orchestration.k8s.client import KubectlClient
+    from sparkrun.orchestration.k8s.kueue import CRD_CLUSTERQUEUE, CRD_JOBSET, detect
+
+    client = KubectlClient("/usr/bin/kubectl")
+    present = {CRD_CLUSTERQUEUE: True, CRD_JOBSET: False}
+    monkeypatch.setattr(client, "resource_exists", lambda kind, name: present.get(name, False))
+    status = detect(client)
+    assert status.kueue_installed is True and status.jobset_installed is False
+    assert status.ready is False
+
+
+def test_kueue_fetch_manifest_rejects_non_https():
+    from sparkrun.orchestration.k8s.kueue import KueueError, fetch_manifest
+
+    with pytest.raises(KueueError, match="non-https"):
+        fetch_manifest("http://example.com/manifests.yaml")
+
+
+def test_api_setup_kueue_dry_run_renders_without_install(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+
+    from sparkrun.orchestration.k8s import kueue as kmod
+
+    sctx = _sctx(tmp_path)
+    nodes = [build_node_info(_node("spark-0", _SPARK_LABELS, capacity_gpu=1))]
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+    monkeypatch.setattr(kmod, "detect", lambda client: kmod.KueueStatus(False, False))
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", lambda client, **k: nodes)
+
+    result = api.k8s.setup_kueue(sctx, dry_run=True)
+    assert result.dry_run and not result.provisioned
+    assert not result.installed_kueue and not result.installed_jobset
+    assert {f.name for f in result.flavors} == {"sparkrun-gb10"}
+    assert "kind: ClusterQueue" in result.manifests_yaml
+
+
+def test_api_setup_kueue_missing_without_install_raises(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+    from sparkrun.orchestration.k8s import kueue as kmod
+
+    sctx = _sctx(tmp_path)
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+    monkeypatch.setattr(kmod, "detect", lambda client: kmod.KueueStatus(False, False))
+    with pytest.raises(api.k8s.KueueSetupError, match="not installed"):
+        api.k8s.setup_kueue(sctx, install=False, dry_run=False)
+
+
+def test_cli_setup_k8s_kueue_dry_run(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from sparkrun.cli import main
+    from sparkrun.orchestration.k8s import kueue as kmod
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+
+    monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
+    nodes = [build_node_info(_node("spark-0", _SPARK_LABELS, capacity_gpu=1)), build_node_info(_node("rtx-0", _RTX_LABELS, capacity_gpu=1))]
+    monkeypatch.setattr("sparkrun.api.k8s._ops.make_client", lambda *a, **k: object())
+    monkeypatch.setattr(kmod, "detect", lambda client: kmod.KueueStatus(True, True))
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", lambda client, **k: nodes)
+
+    result = CliRunner().invoke(main, ["setup", "k8s", "kueue", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "kind: ResourceFlavor" in result.output and "kind: ClusterQueue" in result.output
+    assert "dry-run" in result.output
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

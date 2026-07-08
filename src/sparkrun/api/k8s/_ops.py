@@ -32,11 +32,18 @@ from sparkrun.orchestration.k8s.job import LauncherJobResult, LauncherJobSpec
 from sparkrun.orchestration.k8s.kubectl import normalize_release_version
 from sparkrun.orchestration.k8s.serviceaccount import ServiceAccountSpec, DEFAULT_SA_NAME
 
-from ._errors import ClusterUnreachable, KubectlUnavailable, LauncherJobError, ServiceAccountError
+from ._errors import (
+    ClusterUnreachable,
+    KubectlUnavailable,
+    KueueSetupError,
+    LauncherJobError,
+    ServiceAccountError,
+)
 
 if TYPE_CHECKING:
     from sparkrun.core.context import SparkrunContext
     from sparkrun.orchestration.k8s import ClusterInfo, KubectlBinary, NodeInfo, ServiceAccountResult
+    from sparkrun.orchestration.k8s.kueue import KueueSetupResult, KueueStatus
 
 
 def ensure_kubectl(
@@ -188,6 +195,105 @@ def list_nodes(
         raise ClusterUnreachable(str(exc)) from exc
 
 
+def kueue_status(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    kubeconfig: str | None = None,
+    context: str | None = None,
+) -> "KueueStatus":
+    """Report whether Kueue + JobSet CRDs are present on the cluster."""
+    from sparkrun.orchestration.k8s import kueue as _kueue
+
+    sctx = resolve_sctx(sctx)
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context)
+    try:
+        return _kueue.detect(client)
+    except K8sError as exc:
+        raise ClusterUnreachable(str(exc)) from exc
+
+
+def setup_kueue(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    install: bool = False,
+    kueue_version: str | None = None,
+    jobset_version: str | None = None,
+    namespace: str | None = None,
+    kubeconfig: str | None = None,
+    context: str | None = None,
+    dry_run: bool = False,
+) -> "KueueSetupResult":
+    """Ensure Kueue + JobSet are present, then provision sparkrun's queues.
+
+    Runs under the admin context.  When *install* and a component is
+    missing, its pinned release manifest is applied and the controller
+    awaited; without *install*, a missing component raises
+    :class:`KueueSetupError` pointing the user to re-run with install.
+    ResourceFlavors / ClusterQueue / LocalQueue are derived from the node
+    inventory (one flavor per GPU node-class).  *dry_run* renders the
+    provisioning manifests without installing or applying anything.
+    """
+    from sparkrun.orchestration.k8s import kueue as _kueue
+    from sparkrun.orchestration.k8s.inventory import probe_nodes as _probe_nodes
+    from sparkrun.orchestration.k8s.kueue import KueueSetupResult
+
+    sctx = resolve_sctx(sctx)
+    ns = namespace or DEFAULT_SA_NAME
+    kv = kueue_version or sctx.config.kueue_version or _kueue.DEFAULT_KUEUE_VERSION
+    jv = jobset_version or sctx.config.jobset_version or _kueue.DEFAULT_JOBSET_VERSION
+
+    # A real (non-dry-run) client: reads (detect, node inventory) are safe and
+    # required even for a dry run; only install / apply are gated on dry_run.
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context, namespace=ns)
+
+    try:
+        status = _kueue.detect(client)
+
+        installed_kueue = installed_jobset = False
+        if not dry_run:
+            if not status.jobset_installed:
+                if not install:
+                    raise KueueSetupError("JobSet is not installed. Re-run with install=True (CLI: --install).")
+                _kueue.install_component(
+                    client, url=_kueue.JOBSET_MANIFEST_URL % jv, namespace=_kueue.JOBSET_NAMESPACE, deployment=_kueue.JOBSET_DEPLOYMENT
+                )
+                installed_jobset = True
+            if not status.kueue_installed:
+                if not install:
+                    raise KueueSetupError("Kueue is not installed. Re-run with install=True (CLI: --install).")
+                _kueue.install_component(
+                    client, url=_kueue.KUEUE_MANIFEST_URL % kv, namespace=_kueue.KUEUE_NAMESPACE, deployment=_kueue.KUEUE_DEPLOYMENT
+                )
+                installed_kueue = True
+
+        nodes = _probe_nodes(client, gpu_only=True)
+        docs, flavors = _kueue.build_provision_manifests(nodes, namespace=ns)
+        manifests_yaml = _kueue.render_manifests(docs)
+
+        result = KueueSetupResult(
+            namespace=ns,
+            cluster_queue=_kueue.DEFAULT_CLUSTER_QUEUE_NAME,
+            local_queue=_kueue.DEFAULT_QUEUE_NAME,
+            flavors=flavors,
+            manifests_yaml=manifests_yaml,
+            dry_run=dry_run,
+            kueue_version=kv,
+            jobset_version=jv,
+            installed_kueue=installed_kueue,
+            installed_jobset=installed_jobset,
+        )
+        if dry_run:
+            return result
+
+        apply_res = client.apply(manifests_yaml)
+        if not apply_res.success:
+            raise KueueSetupError("Failed to apply Kueue provisioning manifests: %s" % apply_res.stderr.strip()[:400])
+        result.provisioned = True
+        return result
+    except _kueue.KueueError as exc:
+        raise KueueSetupError(str(exc)) from exc
+
+
 def run_launcher_job(
     sctx: "SparkrunContext | None" = None,
     *,
@@ -267,5 +373,7 @@ __all__ = [
     "cluster_info",
     "configure_service_account",
     "list_nodes",
+    "kueue_status",
+    "setup_kueue",
     "run_launcher_job",
 ]

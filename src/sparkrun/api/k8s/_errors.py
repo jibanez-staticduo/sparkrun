@@ -27,4 +27,14 @@ class LauncherJobError(SparkrunError):
     """Building or applying an in-cluster launcher Job failed."""
 
 
-__all__ = ["KubectlUnavailable", "ClusterUnreachable", "ServiceAccountError", "LauncherJobError"]
+class KueueSetupError(SparkrunError):
+    """Detecting, installing, or provisioning Kueue / JobSet failed."""
+
+
+__all__ = [
+    "KubectlUnavailable",
+    "ClusterUnreachable",
+    "ServiceAccountError",
+    "LauncherJobError",
+    "KueueSetupError",
+]
