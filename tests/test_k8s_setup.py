@@ -920,6 +920,93 @@ def test_cli_setup_k8s_kueue_dry_run(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Scheduling / feasibility precheck
+# ---------------------------------------------------------------------------
+
+
+def _nodes_for(spec):
+    """spec: list of (name, labels, capacity_gpu, allocatable_gpu, unschedulable)."""
+    from sparkrun.orchestration.k8s.inventory import build_node_info
+
+    return [
+        build_node_info(_node(n, labels, capacity_gpu=cap, allocatable_gpu=alloc, unschedulable=unsched))
+        for (n, labels, cap, alloc, unsched) in spec
+    ]
+
+
+def test_aggregate_gpu_classes_sums_allocatable_from_schedulable_only():
+    from sparkrun.orchestration.k8s.scheduling import aggregate_gpu_classes
+
+    nodes = _nodes_for(
+        [
+            ("spark-0", _SPARK_LABELS, 1, 1, False),
+            ("spark-1", _SPARK_LABELS, 1, 1, True),  # cordoned → excluded from allocatable
+            ("rtx-0", _RTX_LABELS, 1, 1, False),
+        ]
+    )
+    classes = aggregate_gpu_classes(nodes)
+    assert classes["gb10"].allocatable_gpus == 1  # only the schedulable spark node
+    assert classes["gb10"].capacity_gpus == 2  # both count toward capacity
+    assert classes["gb10"].schedulable_node_count == 1
+    assert classes["gb10"].product == "NVIDIA-GB10"
+    assert classes["rtx-pro-6000-blackwell"].allocatable_gpus == 1
+
+
+def test_check_feasibility_hybrid_ok():
+    from sparkrun.orchestration.k8s.scheduling import GpuRequest, check_feasibility
+
+    nodes = _nodes_for(
+        [("spark-0", _SPARK_LABELS, 1, 1, False), ("spark-1", _SPARK_LABELS, 1, 1, False), ("rtx-0", _RTX_LABELS, 1, 1, False)]
+    )
+    report = check_feasibility(nodes, [GpuRequest("gb10", 2), GpuRequest("rtx-pro-6000-blackwell", 1)])
+    assert report.feasible is True
+    assert all(c.ok for c in report.classes)
+
+
+def test_check_feasibility_shortfall():
+    from sparkrun.orchestration.k8s.scheduling import GpuRequest, check_feasibility
+
+    nodes = _nodes_for([("spark-0", _SPARK_LABELS, 1, 1, False)])
+    report = check_feasibility(nodes, [GpuRequest("gb10", 2)])
+    assert report.feasible is False
+    cf = report.classes[0]
+    assert cf.shortfall == 1 and cf.allocatable == 1 and cf.required == 2
+    assert "short by 1" in report.summary()
+
+
+def test_check_feasibility_unknown_model():
+    from sparkrun.orchestration.k8s.scheduling import GpuRequest, check_feasibility
+
+    nodes = _nodes_for([("spark-0", _SPARK_LABELS, 1, 1, False)])
+    report = check_feasibility(nodes, [GpuRequest("h200", 8)])
+    assert report.feasible is False
+    assert report.unknown_models == ["h200"]
+    assert "no such GPU class" in report.summary()
+
+
+def test_check_feasibility_aggregates_multiple_requests_same_model():
+    from sparkrun.orchestration.k8s.scheduling import GpuRequest, check_feasibility
+
+    nodes = _nodes_for([("spark-0", _SPARK_LABELS, 1, 1, False), ("spark-1", _SPARK_LABELS, 1, 1, False)])
+    # two rank-groups on gb10 summing to 2 → fits exactly
+    report = check_feasibility(nodes, [GpuRequest("gb10", 1, "rank0"), GpuRequest("gb10", 1, "rank1")])
+    assert report.feasible is True
+    assert report.classes[0].required == 2
+
+
+def test_api_check_feasibility_reads_inventory(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+
+    sctx = _sctx(tmp_path)
+    nodes = _nodes_for([("spark-0", _SPARK_LABELS, 1, 1, False)])
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", lambda client, **k: nodes)
+    report = api.k8s.check_feasibility(sctx, requests=[api.k8s.GpuRequest("gb10", 1)])
+    assert report.feasible is True
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

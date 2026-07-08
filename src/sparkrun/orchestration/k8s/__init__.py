@@ -48,6 +48,14 @@ from .kueue import (
     build_provision_manifests,
     derive_flavors,
 )
+from .scheduling import (
+    ClassFeasibility,
+    FeasibilityReport,
+    GpuClass,
+    GpuRequest,
+    aggregate_gpu_classes,
+    check_feasibility,
+)
 from .serviceaccount import (
     ServiceAccountResult,
     ServiceAccountSpec,
@@ -82,6 +90,12 @@ __all__ = [
     "KueueError",
     "derive_flavors",
     "build_provision_manifests",
+    "GpuClass",
+    "GpuRequest",
+    "ClassFeasibility",
+    "FeasibilityReport",
+    "aggregate_gpu_classes",
+    "check_feasibility",
     "K8sError",
     "KubectlNotFoundError",
     "KubectlDownloadError",

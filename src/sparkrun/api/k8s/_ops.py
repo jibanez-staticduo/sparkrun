@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from sparkrun.core.context import SparkrunContext
     from sparkrun.orchestration.k8s import ClusterInfo, KubectlBinary, NodeInfo, ServiceAccountResult
     from sparkrun.orchestration.k8s.kueue import KueueSetupResult, KueueStatus
+    from sparkrun.orchestration.k8s.scheduling import FeasibilityReport, GpuRequest
 
 
 def ensure_kubectl(
@@ -193,6 +194,32 @@ def list_nodes(
         return _probe_nodes(client, selector=selector, gpu_only=gpu_only)
     except K8sError as exc:
         raise ClusterUnreachable(str(exc)) from exc
+
+
+def check_feasibility(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    requests: "list[GpuRequest]",
+    kubeconfig: str | None = None,
+    context: str | None = None,
+) -> "FeasibilityReport":
+    """Check whether *requests* (per-model GPU demand) fit the live cluster.
+
+    Reads the node inventory and returns a :class:`FeasibilityReport`; a
+    fast pre-submit check that turns a would-be-Pending workload into a
+    clear verdict.  Never raises for an infeasible request — inspect
+    ``report.feasible``.
+    """
+    from sparkrun.orchestration.k8s.inventory import probe_nodes as _probe_nodes
+    from sparkrun.orchestration.k8s.scheduling import check_feasibility as _check
+
+    sctx = resolve_sctx(sctx)
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context)
+    try:
+        nodes = _probe_nodes(client, gpu_only=True)
+    except K8sError as exc:
+        raise ClusterUnreachable(str(exc)) from exc
+    return _check(nodes, requests)
 
 
 def kueue_status(
@@ -373,6 +400,7 @@ __all__ = [
     "cluster_info",
     "configure_service_account",
     "list_nodes",
+    "check_feasibility",
     "kueue_status",
     "setup_kueue",
     "run_launcher_job",
