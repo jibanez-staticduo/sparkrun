@@ -81,6 +81,9 @@ def build_launch_jobset(
     env: dict[str, str] | None = None,
     master_port: int = nccl.DEFAULT_MASTER_PORT,
     socket_ifname: str = "eth0",
+    transport: str = "tcp",
+    rdma_resource: str = nccl.DEFAULT_RDMA_RESOURCE,
+    rdma_hca: str = nccl.DEFAULT_RDMA_HCA,
     namespace: str = DEFAULT_NAMESPACE,
     queue: str = DEFAULT_QUEUE_NAME,
     service_account: str = DEFAULT_SERVICE_ACCOUNT,
@@ -90,9 +93,13 @@ def build_launch_jobset(
 
     *serve_command* is the workload shell command; it runs after a per-pod
     prelude that exports ``RANK`` / ``WORLD_SIZE`` / ``MASTER_ADDR`` etc.
+    *transport* is ``"tcp"`` (portable default) or ``"rdma"`` (opt-in;
+    requests the RDMA resource + ``IPC_LOCK`` and pins ``NCCL_IB_HCA``).
     """
     if not rank_models:
         raise ValueError("rank_models must be non-empty")
+    if transport not in ("tcp", "rdma"):
+        raise ValueError("transport must be 'tcp' or 'rdma', got %r" % transport)
     node_selectors = node_selectors or {}
     base_env = dict(env or {})
     world_size = len(rank_models)
@@ -100,12 +107,19 @@ def build_launch_jobset(
     groups = group_contiguous_ranks(rank_models)
     head_model = groups[0].model  # rank 0 lives in the first podset
     master = nccl.master_addr(name, head_model)
-    tcp_env = nccl.base_tcp_nccl_env(world_size, master, master_port=master_port, socket_ifname=socket_ifname)
+    if transport == "rdma":
+        transport_env = nccl.base_rdma_nccl_env(world_size, master, master_port=master_port, socket_ifname=socket_ifname, hca=rdma_hca)
+        extra_resources = {rdma_resource: "1"}
+        capabilities = [nccl.RDMA_CAPABILITY]
+    else:
+        transport_env = nccl.base_tcp_nccl_env(world_size, master, master_port=master_port, socket_ifname=socket_ifname)
+        extra_resources = {}
+        capabilities = []
 
     pod_sets: list[PodSetPlan] = []
     for group in groups:
         per_pod = gpus_per_pod.get(group.model, 1) if isinstance(gpus_per_pod, dict) else gpus_per_pod
-        pod_env = {**base_env, **tcp_env}
+        pod_env = {**base_env, **transport_env}
         prelude = nccl.rank_prelude(group.base_rank)
         pod_sets.append(
             PodSetPlan(
@@ -118,6 +132,8 @@ def build_launch_jobset(
                 command=["bash", "-lc", prelude + "\n" + serve_command],
                 env=pod_env,
                 field_ref_env=nccl.field_ref_env(),
+                extra_resources=dict(extra_resources),
+                capabilities=list(capabilities),
             )
         )
 

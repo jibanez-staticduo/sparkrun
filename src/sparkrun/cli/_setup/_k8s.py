@@ -297,13 +297,14 @@ def setup_k8s_kueue(ctx, kubeconfig, kube_context, namespace, install, kueue_ver
 @click.option("--ranks", required=True, help="Comma-separated per-rank GPU models (e.g. gb10,gb10,rtx-pro-6000-blackwell).")
 @click.option("--serve", "serve_command", required=True, help="Serve command run in each pod.")
 @click.option("--gpus-per-pod", type=int, default=1, help="GPUs requested per pod.")
+@click.option("--transport", type=click.Choice(["tcp", "rdma"]), default="tcp", help="NCCL transport tier.")
 @kube_options
 @click.option("--no-precheck", is_flag=True, help="Submit even if the feasibility check fails.")
 @click.option("--follow", is_flag=True, help="Stream JobSet logs after submit.")
 @click.option("--dry-run", is_flag=True, help="Render the JobSet + feasibility without submitting.")
 @click.pass_context
 def setup_k8s_launch(
-    ctx, name, image, ranks, serve_command, gpus_per_pod, kubeconfig, kube_context, namespace, no_precheck, follow, dry_run
+    ctx, name, image, ranks, serve_command, gpus_per_pod, transport, kubeconfig, kube_context, namespace, no_precheck, follow, dry_run
 ):
     """Submit a Kueue-admitted JobSet launch (foundation for k8s-mode run)."""
     from sparkrun import api
@@ -318,6 +319,7 @@ def setup_k8s_launch(
             image=image,
             serve_command=serve_command,
             gpus_per_pod=gpus_per_pod,
+            transport=transport,
             namespace=namespace,
             kubeconfig=kubeconfig,
             context=kube_context,

@@ -65,6 +65,7 @@ from .launch import (
     stop_jobset,
     submit_jobset,
 )
+from .probe import parse_probe_output, probe_job_manifest, probe_nodes_fallback
 from .scheduling import (
     ClassFeasibility,
     FeasibilityReport,
@@ -126,6 +127,9 @@ __all__ = [
     "stop_jobset",
     "jobset_status",
     "jobset_logs",
+    "probe_job_manifest",
+    "parse_probe_output",
+    "probe_nodes_fallback",
     "K8sError",
     "KubectlNotFoundError",
     "KubectlDownloadError",

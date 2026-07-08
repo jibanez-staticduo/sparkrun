@@ -51,6 +51,10 @@ class PodSetPlan:
     env: dict[str, str] = field(default_factory=dict)
     field_ref_env: dict[str, str] = field(default_factory=dict)
     """Downward-API env: name -> fieldPath (e.g. the JobSet job-index annotation)."""
+    extra_resources: dict[str, str] = field(default_factory=dict)
+    """Extra resource limits beyond GPUs (e.g. ``{"rdma/rdma_shared_device_a": "1"}``)."""
+    capabilities: list[str] = field(default_factory=list)
+    """Linux capabilities to add (e.g. ``["IPC_LOCK"]`` for RDMA)."""
 
 
 @dataclass
@@ -84,11 +88,15 @@ def _env_list(env: dict[str, str]) -> list[dict]:
 
 
 def _container(pod_set: PodSetPlan) -> dict:
+    limits = {"nvidia.com/gpu": str(pod_set.gpus_per_pod)}
+    limits.update(pod_set.extra_resources)
     container: dict = {
         "name": "worker",
         "image": pod_set.image,
-        "resources": {"limits": {"nvidia.com/gpu": str(pod_set.gpus_per_pod)}},
+        "resources": {"limits": limits},
     }
+    if pod_set.capabilities:
+        container["securityContext"] = {"capabilities": {"add": list(pod_set.capabilities)}}
     if pod_set.command:
         container["command"] = list(pod_set.command)
     if pod_set.args:

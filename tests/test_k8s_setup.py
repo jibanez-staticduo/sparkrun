@@ -1247,6 +1247,135 @@ def test_cli_setup_k8s_launch_dry_run(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Step 6a: RDMA NCCL tier
+# ---------------------------------------------------------------------------
+
+
+def test_rdma_available_detection():
+    from sparkrun.orchestration.k8s import nccl
+
+    assert nccl.rdma_available({"feature.node.kubernetes.io/pci-15b3.present": "true"}, {"rdma/rdma_shared_device_a": "8"}) is True
+    assert nccl.rdma_available({"feature.node.kubernetes.io/pci-15b3.present": "true"}, {}) is False  # no rdma resource
+    assert nccl.rdma_available({}, {"rdma/rdma_shared_device_a": "8"}) is False  # no Mellanox NIC
+
+
+def test_rdma_nccl_env_enables_ib():
+    from sparkrun.orchestration.k8s import nccl
+
+    env = nccl.base_rdma_nccl_env(2, "m", hca="mlx5_2")
+    assert env["NCCL_IB_HCA"] == "mlx5_2"
+    assert "NCCL_IB_DISABLE" not in env  # IB left enabled (unlike TCP tier)
+
+
+def test_build_launch_jobset_rdma_requests_resource_and_caps():
+    from sparkrun.orchestration.k8s.jobset import build_jobset
+    from sparkrun.orchestration.k8s.launch import build_launch_jobset
+
+    plan = build_launch_jobset("j", ["gb10", "gb10"], image="img", serve_command="serve", transport="rdma")
+    pod = build_jobset(plan)["spec"]["replicatedJobs"][0]["template"]["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    assert container["resources"]["limits"]["rdma/rdma_shared_device_a"] == "1"
+    assert container["securityContext"]["capabilities"]["add"] == ["IPC_LOCK"]
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    assert env["NCCL_IB_HCA"] == "mlx5_0" and "NCCL_IB_DISABLE" not in env
+
+
+def test_build_launch_jobset_tcp_has_no_rdma_bits():
+    from sparkrun.orchestration.k8s.jobset import build_jobset
+    from sparkrun.orchestration.k8s.launch import build_launch_jobset
+
+    plan = build_launch_jobset("j", ["gb10"], image="img", serve_command="serve", transport="tcp")
+    pod = build_jobset(plan)["spec"]["replicatedJobs"][0]["template"]["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    assert "rdma/rdma_shared_device_a" not in container["resources"]["limits"]
+    assert "securityContext" not in container
+
+
+def test_build_launch_jobset_rejects_bad_transport():
+    from sparkrun.orchestration.k8s.launch import build_launch_jobset
+
+    with pytest.raises(ValueError, match="transport"):
+        build_launch_jobset("j", ["gb10"], image="img", serve_command="s", transport="magic")
+
+
+# ---------------------------------------------------------------------------
+# Step 6b: privileged fallback probe
+# ---------------------------------------------------------------------------
+
+
+def test_probe_job_manifest_is_privileged_and_pinned():
+    from sparkrun.orchestration.k8s.probe import probe_job_manifest
+
+    manifest = probe_job_manifest("gpu-node-1", namespace="sparkrun", image="cuda:12")
+    assert manifest["metadata"]["name"] == "sparkrun-probe-gpu-node-1"
+    pod = manifest["spec"]["template"]["spec"]
+    assert pod["nodeName"] == "gpu-node-1"
+    assert pod["hostPID"] is True
+    assert pod["containers"][0]["securityContext"]["privileged"] is True
+    assert any(v["hostPath"]["path"] == "/dev" for v in pod["volumes"])
+
+
+def test_probe_output_parsed_with_ssh_fingerprint_parser():
+    from sparkrun.orchestration.k8s.probe import parse_probe_output
+
+    stdout = (
+        "SPARKRUN_PROBE_ACCEL_START\n"
+        "NVIDIA_GPU_COUNT=1\n"
+        "NVIDIA_GPU_0_NAME=NVIDIA GB10\n"
+        "NVIDIA_GPU_0_MEMORY_MIB=131072\n"
+        "SPARKRUN_PROBE_ACCEL_END\n"
+        "SPARKRUN_PROBE_IB_START\n"
+        "IB_PRESENT=0\n"
+        "SPARKRUN_PROBE_IB_END\n"
+    )
+    hw = parse_probe_output(stdout)
+    # same model token the label path + SSH path produce
+    assert hw.accelerators[0].model == "gb10"
+    assert hw.accelerators[0].memory_gb == 128.0
+
+
+def test_probe_nodes_fallback_collects_per_node(monkeypatch):
+    from sparkrun.orchestration.k8s.client import KubectlClient
+    from sparkrun.orchestration.k8s import probe as probe_mod
+
+    client = KubectlClient("/usr/bin/kubectl")
+    calls = []
+
+    def _apply(manifest, **k):
+        calls.append("apply")
+        return RemoteResult(host="k8s", returncode=0, stdout="created", stderr="")
+
+    def _run(args, **k):
+        if args[:1] == ["logs"]:
+            return RemoteResult(
+                host="k8s",
+                returncode=0,
+                stdout="SPARKRUN_PROBE_ACCEL_START\nNVIDIA_GPU_COUNT=1\nNVIDIA_GPU_0_NAME=NVIDIA GB10\nNVIDIA_GPU_0_MEMORY_MIB=131072\nSPARKRUN_PROBE_ACCEL_END\n",
+                stderr="",
+            )
+        return RemoteResult(host="k8s", returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(client, "apply", _apply)
+    monkeypatch.setattr(client, "run", _run)
+    monkeypatch.setattr(client, "wait_for_job", lambda *a, **k: RemoteResult(host="k8s", returncode=0, stdout="", stderr=""))
+    result = probe_mod.probe_nodes_fallback(client, ["node-a"], image="cuda:12")
+    assert set(result) == {"node-a"}
+    assert result["node-a"].accelerators[0].model == "gb10"
+
+
+def test_api_probe_nodes_fallback(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+    from sparkrun.core.hardware import HostHardware
+
+    sctx = _sctx(tmp_path)
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+    monkeypatch.setattr("sparkrun.orchestration.k8s.probe.probe_nodes_fallback", lambda client, nodes, **k: {"n": HostHardware()})
+    out = api.k8s.probe_nodes_fallback(sctx, node_names=["n"], image="cuda:12")
+    assert set(out) == {"n"}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

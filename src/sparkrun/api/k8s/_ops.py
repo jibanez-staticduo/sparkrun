@@ -224,6 +224,33 @@ def check_feasibility(
     return _check(nodes, requests)
 
 
+def probe_nodes_fallback(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    node_names: list[str],
+    image: str,
+    namespace: str | None = None,
+    kubeconfig: str | None = None,
+    context: str | None = None,
+) -> dict:
+    """Privileged in-cluster hardware probe for nodes lacking GFD/NFD labels.
+
+    Runs sparkrun's combined nvidia-smi/ibstat probe in a privileged Job on
+    each node and parses the output into ``{node: HostHardware}`` — the
+    higher-privilege fallback to label-based detection.  Requires privileged
+    PodSecurity in *namespace*.
+    """
+    from sparkrun.orchestration.k8s.probe import probe_nodes_fallback as _probe_fallback
+
+    sctx = resolve_sctx(sctx)
+    ns = namespace or DEFAULT_SA_NAME
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context, namespace=ns)
+    try:
+        return _probe_fallback(client, node_names, image=image, namespace=ns)
+    except K8sError as exc:
+        raise ClusterUnreachable(str(exc)) from exc
+
+
 def kueue_status(
     sctx: "SparkrunContext | None" = None,
     *,
@@ -332,6 +359,7 @@ def launch_jobset(
     serve_command: str,
     env: dict[str, str] | None = None,
     gpus_per_pod: int = 1,
+    transport: str = "tcp",
     namespace: str | None = None,
     kubeconfig: str | None = None,
     context: str | None = None,
@@ -369,6 +397,7 @@ def launch_jobset(
             node_selectors=node_selectors_from_nodes(nodes),
             gpus_per_pod=gpus_per_pod,
             env=env,
+            transport=transport,
             namespace=ns,
         )
     except ValueError as exc:
@@ -517,6 +546,7 @@ __all__ = [
     "cluster_info",
     "configure_service_account",
     "list_nodes",
+    "probe_nodes_fallback",
     "check_feasibility",
     "kueue_status",
     "setup_kueue",
