@@ -31,10 +31,15 @@ class KueueSetupError(SparkrunError):
     """Detecting, installing, or provisioning Kueue / JobSet failed."""
 
 
+class JobSetLaunchError(SparkrunError):
+    """Building, prechecking, or submitting a k8s JobSet launch failed."""
+
+
 __all__ = [
     "KubectlUnavailable",
     "ClusterUnreachable",
     "ServiceAccountError",
     "LauncherJobError",
     "KueueSetupError",
+    "JobSetLaunchError",
 ]

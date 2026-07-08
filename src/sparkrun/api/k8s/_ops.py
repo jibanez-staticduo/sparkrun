@@ -34,6 +34,7 @@ from sparkrun.orchestration.k8s.serviceaccount import ServiceAccountSpec, DEFAUL
 
 from ._errors import (
     ClusterUnreachable,
+    JobSetLaunchError,
     KubectlUnavailable,
     KueueSetupError,
     LauncherJobError,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from sparkrun.core.context import SparkrunContext
     from sparkrun.orchestration.k8s import ClusterInfo, KubectlBinary, NodeInfo, ServiceAccountResult
     from sparkrun.orchestration.k8s.kueue import KueueSetupResult, KueueStatus
+    from sparkrun.orchestration.k8s.launch import LaunchJobsetResult
     from sparkrun.orchestration.k8s.scheduling import FeasibilityReport, GpuRequest
 
 
@@ -321,6 +323,121 @@ def setup_kueue(
         raise KueueSetupError(str(exc)) from exc
 
 
+def launch_jobset(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    name: str,
+    rank_models: list[str],
+    image: str,
+    serve_command: str,
+    env: dict[str, str] | None = None,
+    gpus_per_pod: int = 1,
+    namespace: str | None = None,
+    kubeconfig: str | None = None,
+    context: str | None = None,
+    precheck: bool = True,
+    follow: bool = False,
+    dry_run: bool = False,
+) -> "LaunchJobsetResult":
+    """Build, precheck, and submit a Kueue-admitted JobSet launch.
+
+    *rank_models* is the per-rank GPU model assignment (from the layout);
+    node selectors and the feasibility precheck come from the live node
+    inventory.  *dry_run* renders the manifest (and the feasibility
+    verdict) without submitting.  Raises :class:`JobSetLaunchError` when a
+    precheck fails or the apply is rejected.
+    """
+    from sparkrun.orchestration.k8s import launch as _launch
+    from sparkrun.orchestration.k8s.inventory import probe_nodes as _probe_nodes
+    from sparkrun.orchestration.k8s.jobset import node_selectors_from_nodes
+
+    sctx = resolve_sctx(sctx)
+    ns = namespace or DEFAULT_SA_NAME
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context, namespace=ns)
+
+    try:
+        nodes = _probe_nodes(client, gpu_only=True)
+    except K8sError as exc:
+        raise ClusterUnreachable(str(exc)) from exc
+
+    try:
+        plan = _launch.build_launch_jobset(
+            name,
+            rank_models,
+            image=image,
+            serve_command=serve_command,
+            node_selectors=node_selectors_from_nodes(nodes),
+            gpus_per_pod=gpus_per_pod,
+            env=env,
+            namespace=ns,
+        )
+    except ValueError as exc:
+        raise JobSetLaunchError(str(exc)) from exc
+
+    from sparkrun.orchestration.k8s.jobset import render_jobset
+    from sparkrun.orchestration.k8s.launch import LaunchJobsetResult
+
+    report = _launch.precheck(plan, nodes)
+    result = LaunchJobsetResult(
+        name=name,
+        namespace=ns,
+        manifests_yaml=render_jobset(plan),
+        feasible=report.feasible,
+        dry_run=dry_run,
+        feasibility_summary=report.summary(),
+    )
+
+    if dry_run:
+        return result
+    if precheck and not report.feasible:
+        raise JobSetLaunchError("Launch is infeasible:\n%s" % report.summary())
+
+    apply_res = _launch.submit_jobset(client, plan)
+    if not apply_res.success:
+        raise JobSetLaunchError("Failed to submit JobSet %s: %s" % (name, apply_res.stderr.strip()[:400]))
+    result.submitted = True
+    if follow:
+        _launch.jobset_logs(client, name, follow=True)
+    return result
+
+
+def stop_jobset(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    name: str,
+    namespace: str | None = None,
+    kubeconfig: str | None = None,
+    context: str | None = None,
+) -> bool:
+    """Delete a JobSet (cascades to Jobs/pods).  Returns True on success."""
+    from sparkrun.orchestration.k8s import launch as _launch
+
+    sctx = resolve_sctx(sctx)
+    ns = namespace or DEFAULT_SA_NAME
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context, namespace=ns)
+    return _launch.stop_jobset(client, name).success
+
+
+def jobset_status(
+    sctx: "SparkrunContext | None" = None,
+    *,
+    name: str,
+    namespace: str | None = None,
+    kubeconfig: str | None = None,
+    context: str | None = None,
+) -> dict:
+    """Return the JobSet object as a dict."""
+    from sparkrun.orchestration.k8s import launch as _launch
+
+    sctx = resolve_sctx(sctx)
+    ns = namespace or DEFAULT_SA_NAME
+    client = make_client(sctx, kubeconfig=kubeconfig, context=context, namespace=ns)
+    try:
+        return _launch.jobset_status(client, name)
+    except K8sError as exc:
+        raise ClusterUnreachable(str(exc)) from exc
+
+
 def run_launcher_job(
     sctx: "SparkrunContext | None" = None,
     *,
@@ -403,5 +520,8 @@ __all__ = [
     "check_feasibility",
     "kueue_status",
     "setup_kueue",
+    "launch_jobset",
+    "stop_jobset",
+    "jobset_status",
     "run_launcher_job",
 ]

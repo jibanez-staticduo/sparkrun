@@ -56,6 +56,15 @@ from .jobset import (
     plan_from_rank_models,
     render_jobset,
 )
+from .launch import (
+    build_launch_jobset,
+    group_contiguous_ranks,
+    jobset_logs,
+    jobset_status,
+    precheck,
+    stop_jobset,
+    submit_jobset,
+)
 from .scheduling import (
     ClassFeasibility,
     FeasibilityReport,
@@ -110,6 +119,13 @@ __all__ = [
     "render_jobset",
     "node_selectors_from_nodes",
     "plan_from_rank_models",
+    "build_launch_jobset",
+    "group_contiguous_ranks",
+    "precheck",
+    "submit_jobset",
+    "stop_jobset",
+    "jobset_status",
+    "jobset_logs",
     "K8sError",
     "KubectlNotFoundError",
     "KubectlDownloadError",

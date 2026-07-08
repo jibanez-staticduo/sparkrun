@@ -1108,6 +1108,145 @@ def test_jobset_gpu_requests_feed_feasibility():
 
 
 # ---------------------------------------------------------------------------
+# NCCL + full launch (step 5)
+# ---------------------------------------------------------------------------
+
+
+def test_nccl_headless_dns_and_master():
+    from sparkrun.orchestration.k8s import nccl
+
+    assert nccl.headless_pod_dns("job-x", "gb10", job_index=0, pod_index=0) == "job-x-gb10-0-0.job-x"
+    assert nccl.master_addr("job-x", "gb10") == "job-x-gb10-0-0.job-x"
+
+
+def test_nccl_base_env_forces_tcp():
+    from sparkrun.orchestration.k8s import nccl
+
+    env = nccl.base_tcp_nccl_env(4, "job-x-gb10-0-0.job-x", master_port=29500)
+    assert env["WORLD_SIZE"] == "4"
+    assert env["MASTER_ADDR"] == "job-x-gb10-0-0.job-x"
+    assert env["NCCL_IB_DISABLE"] == "1"  # TCP tier
+    assert env["NCCL_SOCKET_IFNAME"] == "eth0"
+
+
+def test_nccl_rank_prelude_offsets_base():
+    from sparkrun.orchestration.k8s import nccl
+
+    prelude = nccl.rank_prelude(2)
+    assert "RANK=$(( 2 + SPARKRUN_JOB_INDEX ))" in prelude
+    assert 'NODE_RANK="$RANK"' in prelude
+
+
+def test_group_contiguous_ranks_rejects_interleaving():
+    from sparkrun.orchestration.k8s.launch import group_contiguous_ranks
+
+    groups = group_contiguous_ranks(["gb10", "gb10", "rtx-pro-6000-blackwell"])
+    assert [(g.model, g.base_rank, g.count) for g in groups] == [("gb10", 0, 2), ("rtx-pro-6000-blackwell", 2, 1)]
+    with pytest.raises(ValueError, match="not contiguous"):
+        group_contiguous_ranks(["gb10", "rtx-pro-6000-blackwell", "gb10"])
+
+
+def test_build_launch_jobset_hybrid_wires_ranks_and_master():
+    from sparkrun.orchestration.k8s.jobset import build_jobset
+    from sparkrun.orchestration.k8s.launch import build_launch_jobset
+
+    selectors = {
+        "gb10": {"nvidia.com/gpu.product": "NVIDIA-GB10"},
+        "rtx-pro-6000-blackwell": {"nvidia.com/gpu.product": "NVIDIA-RTX-PRO-6000-Blackwell"},
+    }
+    plan = build_launch_jobset(
+        "job-x", ["gb10", "gb10", "rtx-pro-6000-blackwell"], image="img", serve_command="vllm serve M", node_selectors=selectors
+    )
+    js = build_jobset(plan)
+    rjs = {rj["name"]: rj for rj in js["spec"]["replicatedJobs"]}
+
+    rtx_pod = rjs["rtx-pro-6000-blackwell"]["template"]["spec"]["template"]["spec"]
+    env = {e["name"]: e for e in rtx_pod["containers"][0]["env"]}
+    # rank 0 lives in the gb10 podset → everyone rendezvouses there
+    assert env["MASTER_ADDR"]["value"] == "job-x-gb10-0-0.job-x"
+    assert env["WORLD_SIZE"]["value"] == "3"
+    # rtx block starts at global rank 2
+    cmd = rtx_pod["containers"][0]["command"]
+    assert cmd[0] == "bash" and "RANK=$(( 2 + SPARKRUN_JOB_INDEX ))" in cmd[2]
+    assert "vllm serve M" in cmd[2]
+    # job-index injected via downward API
+    assert env["SPARKRUN_JOB_INDEX"]["valueFrom"]["fieldRef"]["fieldPath"].endswith("job-index']")
+
+
+def test_build_launch_jobset_empty_rejected():
+    from sparkrun.orchestration.k8s.launch import build_launch_jobset
+
+    with pytest.raises(ValueError, match="non-empty"):
+        build_launch_jobset("j", [], image="img", serve_command="x")
+
+
+def test_api_launch_jobset_dry_run_reports_feasibility(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+
+    sctx = _sctx(tmp_path)
+    nodes = _nodes_for([("s0", _SPARK_LABELS, 1, 1, False), ("s1", _SPARK_LABELS, 1, 1, False)])
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", lambda client, **k: nodes)
+
+    result = api.k8s.launch_jobset(sctx, name="job-x", rank_models=["gb10", "gb10"], image="img", serve_command="serve", dry_run=True)
+    assert result.dry_run and not result.submitted
+    assert result.feasible is True
+    assert "kind: JobSet" in result.manifests_yaml
+
+
+def test_api_launch_jobset_infeasible_raises(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+
+    sctx = _sctx(tmp_path)
+    nodes = _nodes_for([("s0", _SPARK_LABELS, 1, 1, False)])  # only 1 gb10 GPU
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", lambda client, **k: nodes)
+
+    with pytest.raises(api.k8s.JobSetLaunchError, match="infeasible"):
+        api.k8s.launch_jobset(sctx, name="job-x", rank_models=["gb10", "gb10"], image="img", serve_command="serve")
+
+
+def test_api_launch_jobset_submits(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api import k8s as apik8s
+    from sparkrun.orchestration.k8s import launch as launch_mod
+
+    sctx = _sctx(tmp_path)
+    nodes = _nodes_for([("s0", _SPARK_LABELS, 1, 1, False)])
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", lambda client, **k: nodes)
+    submitted = {}
+
+    def _submit(client, plan, **k):
+        submitted["name"] = plan.name
+        return RemoteResult(host="k8s", returncode=0, stdout="created", stderr="")
+
+    monkeypatch.setattr(launch_mod, "submit_jobset", _submit)
+    result = api.k8s.launch_jobset(sctx, name="job-x", rank_models=["gb10"], image="img", serve_command="serve")
+    assert result.submitted and submitted["name"] == "job-x"
+
+
+def test_cli_setup_k8s_launch_dry_run(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from sparkrun.cli import main
+
+    monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
+    nodes = _nodes_for([("s0", _SPARK_LABELS, 1, 1, False), ("s1", _SPARK_LABELS, 1, 1, False)])
+    monkeypatch.setattr("sparkrun.api.k8s._ops.make_client", lambda *a, **k: object())
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", lambda client, **k: nodes)
+
+    result = CliRunner().invoke(
+        main,
+        ["setup", "k8s", "launch", "--name", "job-x", "--image", "img", "--ranks", "gb10,gb10", "--serve", "vllm serve M", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "kind: JobSet" in result.output and "Feasibility" in result.output
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

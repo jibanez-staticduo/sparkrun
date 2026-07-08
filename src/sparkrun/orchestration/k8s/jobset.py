@@ -49,6 +49,8 @@ class PodSetPlan:
     command: list[str] | None = None
     args: list[str] | None = None
     env: dict[str, str] = field(default_factory=dict)
+    field_ref_env: dict[str, str] = field(default_factory=dict)
+    """Downward-API env: name -> fieldPath (e.g. the JobSet job-index annotation)."""
 
 
 @dataclass
@@ -91,8 +93,11 @@ def _container(pod_set: PodSetPlan) -> dict:
         container["command"] = list(pod_set.command)
     if pod_set.args:
         container["args"] = list(pod_set.args)
-    if pod_set.env:
-        container["env"] = _env_list(pod_set.env)
+    env_entries = _env_list(pod_set.env)
+    for name, field_path in sorted(pod_set.field_ref_env.items()):
+        env_entries.append({"name": name, "valueFrom": {"fieldRef": {"fieldPath": field_path}}})
+    if env_entries:
+        container["env"] = env_entries
     return container
 
 

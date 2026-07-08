@@ -287,6 +287,60 @@ def setup_k8s_kueue(ctx, kubeconfig, kube_context, namespace, install, kueue_ver
 
 
 # ---------------------------------------------------------------------------
+# launch (hidden — smoke-tests the JobSet launch path)
+# ---------------------------------------------------------------------------
+
+
+@setup_k8s.command("launch", hidden=True)
+@click.option("--name", required=True, help="JobSet / cluster name.")
+@click.option("--image", required=True, help="Workload container image.")
+@click.option("--ranks", required=True, help="Comma-separated per-rank GPU models (e.g. gb10,gb10,rtx-pro-6000-blackwell).")
+@click.option("--serve", "serve_command", required=True, help="Serve command run in each pod.")
+@click.option("--gpus-per-pod", type=int, default=1, help="GPUs requested per pod.")
+@kube_options
+@click.option("--no-precheck", is_flag=True, help="Submit even if the feasibility check fails.")
+@click.option("--follow", is_flag=True, help="Stream JobSet logs after submit.")
+@click.option("--dry-run", is_flag=True, help="Render the JobSet + feasibility without submitting.")
+@click.pass_context
+def setup_k8s_launch(
+    ctx, name, image, ranks, serve_command, gpus_per_pod, kubeconfig, kube_context, namespace, no_precheck, follow, dry_run
+):
+    """Submit a Kueue-admitted JobSet launch (foundation for k8s-mode run)."""
+    from sparkrun import api
+
+    sctx = _get_context(ctx)
+    rank_models = [r.strip() for r in ranks.split(",") if r.strip()]
+    try:
+        result = api.k8s.launch_jobset(
+            sctx,
+            name=name,
+            rank_models=rank_models,
+            image=image,
+            serve_command=serve_command,
+            gpus_per_pod=gpus_per_pod,
+            namespace=namespace,
+            kubeconfig=kubeconfig,
+            context=kube_context,
+            precheck=not no_precheck,
+            follow=follow,
+            dry_run=dry_run,
+        )
+    except (api.k8s.JobSetLaunchError, api.k8s.ClusterUnreachable, api.k8s.KubectlUnavailable) as exc:
+        raise click.ClickException(str(exc))
+
+    if dry_run:
+        click.echo(result.manifests_yaml)
+        click.echo("")
+        click.secho("Feasibility:", bold=True)
+        click.echo(result.feasibility_summary)
+        click.secho("(dry-run — nothing submitted)", fg="yellow")
+        return
+    click.secho("JobSet submitted.", fg="green")
+    click.echo("  jobset: %s/%s" % (result.namespace, result.name))
+    click.echo("Reattach with: kubectl -n %s logs -f -l jobset.sigs.k8s.io/jobset-name=%s" % (result.namespace, result.name))
+
+
+# ---------------------------------------------------------------------------
 # run-job (hidden — smoke-tests the launcher-Job transport)
 # ---------------------------------------------------------------------------
 

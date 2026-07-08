@@ -28,10 +28,12 @@ from sparkrun.orchestration.k8s import (
     ServiceAccountSpec,
 )
 from sparkrun.orchestration.k8s.kueue import KueueSetupResult, KueueStatus
+from sparkrun.orchestration.k8s.launch import LaunchJobsetResult
 from sparkrun.orchestration.k8s.scheduling import FeasibilityReport, GpuRequest
 
 from ._errors import (
     ClusterUnreachable,
+    JobSetLaunchError,
     KubectlUnavailable,
     KueueSetupError,
     LauncherJobError,
@@ -42,11 +44,14 @@ from ._ops import (
     cluster_info,
     configure_service_account,
     ensure_kubectl,
+    jobset_status,
     kueue_status,
+    launch_jobset,
     list_nodes,
     make_client,
     run_launcher_job,
     setup_kueue,
+    stop_jobset,
 )
 
 __all__ = [
@@ -58,6 +63,9 @@ __all__ = [
     "check_feasibility",
     "kueue_status",
     "setup_kueue",
+    "launch_jobset",
+    "stop_jobset",
+    "jobset_status",
     "run_launcher_job",
     "make_client",
     # Data models
@@ -73,10 +81,12 @@ __all__ = [
     "KueueSetupResult",
     "GpuRequest",
     "FeasibilityReport",
+    "LaunchJobsetResult",
     # Errors
     "KubectlUnavailable",
     "ClusterUnreachable",
     "ServiceAccountError",
     "LauncherJobError",
     "KueueSetupError",
+    "JobSetLaunchError",
 ]
