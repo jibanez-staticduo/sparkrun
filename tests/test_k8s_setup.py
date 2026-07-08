@@ -1376,6 +1376,42 @@ def test_api_probe_nodes_fallback(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Feature-flag gate on the whole `setup k8s` group
+# ---------------------------------------------------------------------------
+
+
+def test_cli_setup_k8s_feature_flag_registered():
+    from sparkrun.core.features import get_feature
+
+    flag = get_feature("cli.setup.k8s")
+    assert flag is not None and flag.default is False
+
+
+def test_cli_setup_k8s_gated_off_when_flag_disabled(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from sparkrun.cli import main
+
+    monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
+    # env override is checked first → deterministically disabled regardless of config
+    monkeypatch.setenv("SPARKRUN_FEATURE_CLI_SETUP_K8S", "0")
+    result = CliRunner().invoke(main, ["setup", "k8s", "kubectl", "--list"])
+    assert result.exit_code != 0
+    assert "cli.setup.k8s" in result.output
+
+
+def test_cli_setup_k8s_allowed_when_flag_enabled(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from sparkrun.cli import main
+
+    monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
+    monkeypatch.setenv("SPARKRUN_FEATURE_CLI_SETUP_K8S", "1")
+    result = CliRunner().invoke(main, ["setup", "k8s", "kubectl", "--list"])
+    assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

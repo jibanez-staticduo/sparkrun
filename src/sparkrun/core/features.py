@@ -218,3 +218,11 @@ FEATURE_EXECUTOR_K8S = register_feature(
         default=False,
     )
 )
+
+FEATURE_CLI_SETUP_K8S = register_feature(
+    FeatureFlag(
+        name="cli.setup.k8s",
+        description="Experimental 'sparkrun setup k8s' command group",
+        default=False,
+    )
+)

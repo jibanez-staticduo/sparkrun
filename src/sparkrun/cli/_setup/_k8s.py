@@ -34,14 +34,34 @@ def kube_options(func):
     return wrapper
 
 
-@setup.group("k8s")
-def setup_k8s():
+SETUP_K8S_FEATURE = "cli.setup.k8s"
+
+
+def _setup_k8s_enabled_at_import() -> bool:
+    """Best-effort flag resolution for help-visibility (hidden when off/unknown)."""
+    try:
+        from sparkrun.core.config import SparkrunConfig
+
+        return SparkrunConfig().is_feature_enabled(SETUP_K8S_FEATURE)
+    except Exception:  # noqa: BLE001 — never let a config read break CLI import
+        return False
+
+
+@setup.group("k8s", hidden=not _setup_k8s_enabled_at_import())
+@click.pass_context
+def setup_k8s(ctx):
     """Kubernetes setup: kubectl acquisition, cluster info, service account.
 
     sparkrun manages its own ``kubectl`` under ``~/.cache/sparkrun/kubectl/``
     and can configure a scoped service account for driving workloads. These
     commands are the foundation for the (experimental) k8s executor.
+
+    Experimental — gated behind the ``cli.setup.k8s`` feature flag.
     """
+    if not _get_context(ctx).config.is_feature_enabled(SETUP_K8S_FEATURE):
+        raise click.ClickException(
+            "The 'setup k8s' commands are experimental and disabled. Enable them with: sparkrun setup features enable cli.setup.k8s"
+        )
 
 
 # ---------------------------------------------------------------------------

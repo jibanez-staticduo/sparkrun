@@ -27,6 +27,10 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
     # gating itself in clean subprocesses that strip these env overrides.
     monkeypatch.setenv("SPARKRUN_FEATURE_EXECUTOR_LOCAL", "1")
     monkeypatch.setenv("SPARKRUN_FEATURE_EXECUTOR_K8S", "1")
+    # The `setup k8s` command group is likewise gated off by default; enable it
+    # so the CLI tests that exercise it keep passing (the gate itself is tested
+    # explicitly in test_k8s_setup with the env override cleared).
+    monkeypatch.setenv("SPARKRUN_FEATURE_CLI_SETUP_K8S", "1")
     import sparkrun.core.bootstrap
 
     sparkrun.core.bootstrap._variables = None
