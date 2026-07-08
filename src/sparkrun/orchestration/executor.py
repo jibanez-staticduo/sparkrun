@@ -293,6 +293,26 @@ def _resolve_executor_name(
     return "docker"
 
 
+def resolve_executor_name(
+    *,
+    cli_overrides: dict | None = None,
+    recipe: "Recipe | None" = None,
+    cluster: "ClusterDefinition | None" = None,
+    runtime: "RuntimePlugin | None" = None,
+    config: "SparkrunConfig | None" = None,
+    v: Variables | None = None,
+) -> str:
+    """Public: the executor name the resolution chain selects (no construction).
+
+    Thin wrapper over :func:`_resolve_executor_name` for callers that need
+    only the *name* to branch on (e.g. ``api.run`` deciding whether to take
+    the k8s JobSet path) without building the executor.  Raises
+    :class:`ExecutorUnavailableError` for an explicitly-named-but-unavailable
+    executor, exactly like the full resolution.
+    """
+    return _resolve_executor_name(cli_overrides=cli_overrides, recipe=recipe, cluster=cluster, runtime=runtime, config=config, v=v)
+
+
 class ExecutorUnavailableError(ValueError):
     """Raised when an explicitly-requested executor isn't available.
 

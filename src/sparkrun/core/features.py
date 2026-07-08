@@ -226,3 +226,11 @@ FEATURE_CLI_SETUP_K8S = register_feature(
         default=False,
     )
 )
+
+FEATURE_API_RUN_K8S = register_feature(
+    FeatureFlag(
+        name="api.run.k8s",
+        description="Experimental: route 'sparkrun run' with executor=k8s through the JobSet launch path",
+        default=False,
+    )
+)

@@ -1376,6 +1376,173 @@ def test_api_probe_nodes_fallback(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# api.run k8s integration (gated by api.run.k8s)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRuntime:
+    runtime_name = "vllm"
+
+    def resolve_container(self, recipe, overrides):
+        return "ghcr.io/x/vllm:latest"
+
+    def generate_command(self, recipe, overrides, is_cluster, num_nodes=1, head_ip=None, skip_keys=frozenset()):
+        return "vllm serve M --port 8000"
+
+
+class _FakeRecipe:
+    env = {"HF_TOKEN": "x"}
+    model = "M"
+    name = "r"
+    qualified_name = "r"
+
+
+def _run_k8s_common(tmp_path, monkeypatch, nodes):
+    from sparkrun.api import k8s as apik8s
+    from sparkrun.orchestration.k8s.launch import LaunchJobsetResult
+
+    sctx = _sctx(tmp_path)
+    monkeypatch.setattr(apik8s._ops, "make_client", lambda *a, **k: object())
+    monkeypatch.setattr("sparkrun.orchestration.k8s.inventory.probe_nodes", lambda client, **k: nodes)
+
+    captured = {}
+
+    def _fake_launch(_sctx, **kw):
+        captured.update(kw)
+        return LaunchJobsetResult(
+            name=kw["name"], namespace="sparkrun", manifests_yaml="kind: JobSet", feasible=True, dry_run=kw.get("dry_run", False)
+        )
+
+    monkeypatch.setattr(apik8s, "launch_jobset", _fake_launch)
+    return sctx, captured
+
+
+def test_run_k8s_solo_homogeneous(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api._run_k8s import run_k8s
+
+    nodes = _nodes_for([("s0", _SPARK_LABELS, 1, 1, False)])
+    sctx, captured = _run_k8s_common(tmp_path, monkeypatch, nodes)
+
+    result = run_k8s(
+        api.RunOptions(recipe=_FakeRecipe(), overrides={"port": 8000}, dry_run=True),
+        sctx,
+        recipe=_FakeRecipe(),
+        runtime=_FakeRuntime(),
+        cluster_def=None,
+        host_list=["s0"],
+        placement=None,
+        is_solo=True,
+        cluster_id="intent-token",
+        intent_id="intent",
+        placement_token="token",
+        effective_scheduler=None,
+        started_at=0.0,
+    )
+    assert result.executor == "k8s" and result.is_solo
+    assert result.serve_command == "vllm serve M --port 8000"
+    assert result.container_image == "ghcr.io/x/vllm:latest"
+    assert result.metadata["k8s_gpu_class"] == "gb10"
+    assert result.serve_port == 8000  # from the port override
+    # launch received a single-rank gb10 plan
+    assert captured["rank_models"] == ["gb10"]
+    assert captured["name"] == "intent-token"
+
+
+def test_run_k8s_rejects_multinode(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api._run_k8s import run_k8s
+
+    nodes = _nodes_for([("s0", _SPARK_LABELS, 1, 1, False)])
+    sctx, _ = _run_k8s_common(tmp_path, monkeypatch, nodes)
+
+    class _P:
+        total_ranks = 2
+
+    with pytest.raises(api.SparkrunError, match="solo"):
+        run_k8s(
+            api.RunOptions(recipe=_FakeRecipe()),
+            sctx,
+            recipe=_FakeRecipe(),
+            runtime=_FakeRuntime(),
+            cluster_def=None,
+            host_list=["s0", "s1"],
+            placement=_P(),
+            is_solo=False,
+            cluster_id="c",
+            intent_id="i",
+            placement_token="t",
+            effective_scheduler=None,
+            started_at=0.0,
+        )
+
+
+def test_run_k8s_rejects_hybrid_cluster(tmp_path, monkeypatch):
+    from sparkrun import api
+    from sparkrun.api._run_k8s import run_k8s
+
+    nodes = _nodes_for([("s0", _SPARK_LABELS, 1, 1, False), ("r0", _RTX_LABELS, 1, 1, False)])
+    sctx, _ = _run_k8s_common(tmp_path, monkeypatch, nodes)
+
+    with pytest.raises(api.SparkrunError, match="one GPU class"):
+        run_k8s(
+            api.RunOptions(recipe=_FakeRecipe(), dry_run=True),
+            sctx,
+            recipe=_FakeRecipe(),
+            runtime=_FakeRuntime(),
+            cluster_def=None,
+            host_list=["s0"],
+            placement=None,
+            is_solo=True,
+            cluster_id="c",
+            intent_id="i",
+            placement_token="t",
+            effective_scheduler=None,
+            started_at=0.0,
+        )
+
+
+def test_api_run_k8s_flag_registered_and_off_by_default():
+    from sparkrun.core.features import get_feature
+
+    flag = get_feature("api.run.k8s")
+    assert flag is not None and flag.default is False
+
+
+def test_api_run_branches_to_k8s_when_flag_on(tmp_path, monkeypatch):
+    """api.run routes to run_k8s only when executor=k8s AND api.run.k8s is on."""
+    import sparkrun.api._run as run_mod
+    from sparkrun import api
+    from sparkrun.core.recipe import Recipe
+
+    monkeypatch.setenv("SPARKRUN_FEATURE_API_RUN_K8S", "1")
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm", "model": "M"})
+
+    # Stub the heavy resolution pipeline so we reach the branch deterministically.
+    monkeypatch.setattr(run_mod, "_build_executor_overrides", lambda options: {"executor": "k8s"})
+    monkeypatch.setattr(
+        "sparkrun.api._resolve.resolve_cluster", lambda *a, **k: type("C", (), {"hosts": ["s0"], "user": None, "scheduler": None})()
+    )
+    monkeypatch.setattr("sparkrun.api._resolve.resolve_recipe", lambda *a, **k: recipe)
+    monkeypatch.setattr("sparkrun.api._resolve.resolve_runtime", lambda *a, **k: _FakeRuntime())
+    monkeypatch.setattr("sparkrun.api._hosts.resolve_effective_hosts", lambda *a, **k: (["s0"], True, [], None))
+    monkeypatch.setattr("sparkrun.orchestration.executor.resolve_executor_name", lambda **k: "k8s")
+
+    sentinel = object()
+    called = {}
+
+    def _fake_run_k8s(options, sctx, **kw):
+        called["hit"] = True
+        return sentinel
+
+    monkeypatch.setattr("sparkrun.api._run_k8s.run_k8s", _fake_run_k8s)
+
+    sctx = _sctx(tmp_path)
+    out = api.run(api.RunOptions(recipe=_FakeRecipe(), hosts=("s0",), solo=True, dry_run=True), sctx=sctx)
+    assert out is sentinel and called.get("hit")
+
+
+# ---------------------------------------------------------------------------
 # Feature-flag gate on the whole `setup k8s` group
 # ---------------------------------------------------------------------------
 

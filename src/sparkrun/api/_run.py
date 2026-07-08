@@ -173,6 +173,43 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
             # downstream consumers don't surface a fake one.
             placement_token = ""
 
+    # 3b. Experimental k8s JobSet path (gated by the api.run.k8s feature flag).
+    # When the resolved executor is k8s AND the flag is on, route to the
+    # native Kubernetes launcher instead of the SSH-oriented launch_inference.
+    # Flag off → fall through to the legacy k8s-executor-over-SSH draft.
+    if config.is_feature_enabled("api.run.k8s"):
+        from sparkrun.orchestration.executor import ExecutorUnavailableError, resolve_executor_name
+
+        try:
+            _executor_name = resolve_executor_name(
+                cli_overrides=_build_executor_overrides(options),
+                recipe=recipe,
+                cluster=cluster_def,
+                runtime=runtime,
+                config=config,
+                v=sctx.variables,
+            )
+        except ExecutorUnavailableError:
+            _executor_name = None
+        if _executor_name == "k8s":
+            from sparkrun.api._run_k8s import run_k8s
+
+            return run_k8s(
+                options,
+                sctx,
+                recipe=recipe,
+                runtime=runtime,
+                cluster_def=cluster_def,
+                host_list=host_list,
+                placement=placement,
+                is_solo=is_solo,
+                cluster_id=cluster_id_for_launch,
+                intent_id=intent_id,
+                placement_token=placement_token,
+                effective_scheduler=effective_scheduler,
+                started_at=started_at,
+            )
+
     # 4. Translate options → launch_inference kwargs.
     launch_kwargs: dict[str, Any] = {
         "recipe": recipe,
