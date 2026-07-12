@@ -28,7 +28,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sparkrun.api._errors import HostsUnreachable, RecipeNotFound
+from sparkrun.api._errors import HostsUnreachable, RecipeNotFound, SparkrunError
 
 if TYPE_CHECKING:
     from sparkrun.core.cluster_manager import ClusterDefinition, ClusterManager
@@ -37,6 +37,24 @@ if TYPE_CHECKING:
     from sparkrun.core.recipe import Recipe
 
 logger = logging.getLogger(__name__)
+
+
+def prepare_transport(cluster_def: "ClusterDefinition | None", *, dry_run: bool = False) -> None:
+    """Run the cluster's transport ``prepare`` step, translating failures.
+
+    Thin api-layer wrapper over
+    :func:`sparkrun.transports.prepare_cluster_transport` that maps a
+    :class:`~sparkrun.transports.TransportError` (e.g. a disabled provider
+    transport, or an instance that vanished) to :class:`SparkrunError` so the
+    console-free contract holds and CLI handlers surface a clean message.
+    No-op for plain-SSH clusters.
+    """
+    from sparkrun.transports import TransportError, prepare_cluster_transport
+
+    try:
+        prepare_cluster_transport(cluster_def, dry_run=dry_run)
+    except TransportError as e:
+        raise SparkrunError(str(e)) from e
 
 
 def resolve_recipe(

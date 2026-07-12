@@ -117,6 +117,11 @@ def stop(
         # anonymous one when no explicit cluster is given.
         cluster_def = resolve_cluster(cluster, target_hosts, sctx=sctx)
 
+    # Refresh provider-backed connection details before any SSH (no-op for ssh).
+    from sparkrun.api._resolve import prepare_transport
+
+    prepare_transport(cluster_def)
+
     # Resolve the executor — prefer recipe-encoded selection from metadata
     # so we use the same executor that launched the workload.
     cli_overrides: dict | None = None

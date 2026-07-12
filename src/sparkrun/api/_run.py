@@ -75,6 +75,16 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
     # ClusterDefinition (anonymous when only --hosts was given) so
     # downstream code never has to branch on ``cluster is None``.
     cluster_def = resolve_cluster(options.cluster, options.hosts, sctx=sctx, config=config)
+
+    # Transport prepare: for provider-backed clusters (e.g. Thunder) this
+    # refreshes ephemeral connection details (fresh IP/port, SSH key, managed
+    # ssh alias) BEFORE any SSH runs — the occupancy status query inside
+    # ``resolve_effective_hosts`` below is the first SSH.  No-op for plain-SSH
+    # clusters, so existing clusters pay nothing.
+    from sparkrun.api._resolve import prepare_transport
+
+    prepare_transport(cluster_def, dry_run=bool(getattr(options, "dry_run", False)))
+
     recipe = resolve_recipe(options.recipe, sctx=sctx, overrides=options.overrides)
     hosts = list(cluster_def.hosts)
     runtime = resolve_runtime(recipe, sctx=sctx)

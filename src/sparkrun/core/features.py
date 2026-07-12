@@ -234,3 +234,11 @@ FEATURE_API_RUN_K8S = register_feature(
         default=False,
     )
 )
+
+FEATURE_TRANSPORTS_THUNDER = register_feature(
+    FeatureFlag(
+        name="transports.thunder",
+        description="Experimental Thunder Compute remote transport ('cluster import thunder')",
+        default=False,
+    )
+)

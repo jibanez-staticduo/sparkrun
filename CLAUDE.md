@@ -55,6 +55,7 @@ src/sparkrun/
 ├── core/               # Core data models, bootstrap, and business logic (see below)
 ├── runtimes/           # Runtime plugins (see below)
 ├── orchestration/      # SSH, Docker, InfiniBand, executors, collectives (see below)
+├── transports/         # Cluster connectivity seam — how hosts are reached/prepared (ssh default + thunder)
 ├── platforms/          # HardwarePlatformPlugin registry (DGX Spark + generic NVIDIA today)
 ├── models/             # HuggingFace model download, distribution, and VRAM estimation
 ├── containers/         # Container image distribution (docker save/load over SSH)
@@ -194,6 +195,28 @@ All remote operations use **SSH stdin piping** — scripts are generated as Pyth
 - **`collectives/`** — `CollectiveBackend` ABC + implementations: `nccl.py` (default; wraps `infiniband.py`), `rccl.py` (AMD scaffold), `hccl.py` (Intel Gaudi scaffold). `get_backend(vendor)` is the lookup.
 - **`hooks.py`** — `pre_exec` / `post_exec` / `post_commands` runners. Trust gating via `_confirm_hook_execution(trust=...)`.
 
+### Transport Layer (`transports/`)
+
+The **transport** is the connectivity seam: *how sparkrun reaches / prepares a
+cluster's hosts* before the generic SSH machinery runs. It is orthogonal to the
+**executor** (`orchestration/executors/`, *how the workload runs on the host*) —
+a provider-transport cluster still uses the docker executor.
+
+- **`base.py`** — `Transport` ABC with `prepare(cluster, *, dry_run=…)` (default no-op).
+- **`ssh.py`** — `SshTransport`, the default; `prepare()` is a no-op, so every existing cluster is byte-identical to before transports existed.
+- **`__init__.py`** — plain in-process registry (mirrors `platforms/`); `resolve_transport(name)`, and `prepare_cluster_transport(cluster)` — the single call-site helper. Feature-gated transports fail closed here via `_require_transport_enabled` (never a silent SSH downgrade). `EXT_TRANSPORT` reserved for future SAF discovery.
+- **`thunder/`** — Thunder Compute provider (`api.py` stdlib REST client, `ssh_alias.py` managed `~/.config/sparkrun/ssh/thunder.conf` + `~/.ssh/config` Include, `transport.py` `ThunderTransport` + import helpers). Gated behind the `transports.thunder` feature flag (off by default).
+
+`ClusterDefinition.transport: str = "ssh"` + `provider_ref` select the transport
+(serialized only when non-default). The single wiring is
+`api/_resolve.py:prepare_transport(cluster_def)` — called by `api.run` / `api.status`
+/ `api.logs` / `api.stop` right after `resolve_cluster`, before any SSH — which
+translates `TransportError` → `SparkrunError` for clean CLI errors. **Layering:
+`cli/api → transports → {core, orchestration}`; `orchestration` never imports
+`transports`.** `sparkrun cluster import thunder` attaches one single-host cluster
+per RUNNING instance (attach-only; multi-node out of scope, multi-GPU-per-node
+handled by the probe).
+
 ### Recipe System
 
 Recipes are YAML files with fields: `model`, `runtime`, `container`, `command`, `defaults`, `env`, `metadata`,
@@ -294,11 +317,15 @@ The active channel reuses the release channel from `core/channels.py`
 `features.channel`, falling back to `self_update.channel`. Via `channel_defaults`
 a flag can be on-by-default for `alpha` while off for `stable`/`beta`. The
 built-in flags — `executor.local` and `executor.k8s` (gating the corresponding
-experimental executors) and `cli.setup.k8s` (gating the entire `sparkrun setup
-k8s` command group) — are off by default on **every** channel; enable them
-explicitly per-flag. The `setup k8s` group self-gates in its Click callback
-(raises pointing at `setup features enable cli.setup.k8s`) and hides itself from
-`setup --help` unless the flag resolves on at import.
+experimental executors), `cli.setup.k8s` (gating the entire `sparkrun setup
+k8s` command group), and `transports.thunder` (gating the Thunder Compute
+transport + `cluster import thunder`) — are off by default on **every** channel;
+enable them explicitly per-flag. The `setup k8s` group self-gates in its Click
+callback (raises pointing at `setup features enable cli.setup.k8s`) and hides
+itself from `setup --help` unless the flag resolves on at import; `cluster import
+thunder` gates the same way (`transports.thunder`), and the transport also fails
+closed at use in `transports.prepare_cluster_transport` so an already-imported
+Thunder cluster can't run once the flag is off.
 
 **Plugin gating**: a plugin opts in by setting `required_feature_flag = "<flag>"`
 (e.g. on `LocalExecutor`/`K8sExecutor`) and self-gates via `is_multi_extension` —

@@ -70,6 +70,10 @@ def logs(
     # Synthesize a cluster (possibly anonymous) carrying the target hosts
     # so executor resolution always has a populated cluster row.
     cluster_def = resolve_cluster(cluster, target_hosts, sctx=sctx)
+    # Refresh provider-backed connection details before any SSH (no-op for ssh).
+    from sparkrun.api._resolve import prepare_transport
+
+    prepare_transport(cluster_def)
 
     cli_overrides: dict | None = None
     if meta:

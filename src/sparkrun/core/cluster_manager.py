@@ -243,6 +243,19 @@ class ClusterDefinition:
     (e.g. ``spark_vllm_docker:/path/to/.env``).  ``cluster import`` upserts
     by matching this, so re-import updates the same cluster even if it was
     renamed.  Generic by design so future import sources can reuse it."""
+    transport: str = "ssh"
+    """Connectivity transport selector (see :mod:`sparkrun.transports`).
+
+    ``"ssh"`` (default) means the hosts are plain SSH targets — no preparation.
+    A provider transport (e.g. ``"thunder"``) runs an out-of-band ``prepare``
+    step at run/connect init to materialize ephemeral connection details (fresh
+    IP/port, SSH key, managed ssh alias) before any SSH runs.  Orthogonal to
+    :attr:`executor` (which selects *how the workload runs* on the host)."""
+    provider_ref: str | None = None
+    """Opaque stable handle for the backing provider resource, when
+    :attr:`transport` is provider-backed (e.g. a Thunder instance uuid).  Used
+    by the transport to re-resolve the resource across sessions and as the
+    re-import identity for ``cluster import <provider>``."""
 
     def resolve_env(self) -> dict[str, str]:
         """Resolve :attr:`env`, substituting ``${VAR}`` from :attr:`env_file`.
@@ -309,6 +322,10 @@ class ClusterDefinition:
             d["env_file"] = self.env_file
         if self.sync_source:
             d["sync_source"] = self.sync_source
+        if self.transport and self.transport != "ssh":
+            d["transport"] = self.transport
+        if self.provider_ref:
+            d["provider_ref"] = self.provider_ref
         if self.hosts_hardware:
             d["hosts_hardware"] = {h: hw.to_dict() for h, hw in self.hosts_hardware.items()}
         if self.executor:
@@ -434,6 +451,8 @@ class ClusterManager:
         env: dict[str, str] | None = None,
         env_file: str | None = None,
         sync_source: str | None = None,
+        transport: str = "ssh",
+        provider_ref: str | None = None,
         hosts_hardware: dict[str, HostHardware] | None = None,
         executor: str | None = None,
         executor_config: dict[str, Any] | None = None,
@@ -491,6 +510,8 @@ class ClusterManager:
             env=dict(env) if env else {},
             env_file=env_file,
             sync_source=sync_source,
+            transport=transport,
+            provider_ref=provider_ref,
             hosts_hardware=dict(hosts_hardware) if hosts_hardware else {},
             executor=executor,
             executor_config=dict(executor_config) if executor_config else None,
@@ -760,6 +781,10 @@ class ClusterManager:
             data["env_file"] = cluster_def.env_file
         if cluster_def.sync_source:
             data["sync_source"] = cluster_def.sync_source
+        if cluster_def.transport and cluster_def.transport != "ssh":
+            data["transport"] = cluster_def.transport
+        if cluster_def.provider_ref:
+            data["provider_ref"] = cluster_def.provider_ref
         if cluster_def.hosts_hardware:
             data["hosts_hardware"] = {h: hw.to_dict() for h, hw in cluster_def.hosts_hardware.items()}
         if cluster_def.executor:
@@ -832,6 +857,8 @@ class ClusterManager:
             env=cluster_env,
             env_file=data.get("env_file"),
             sync_source=data.get("sync_source"),
+            transport=str(data.get("transport") or "ssh"),
+            provider_ref=data.get("provider_ref"),
             hosts_hardware=hosts_hardware,
             executor=data.get("executor"),
             executor_config=executor_config,
@@ -978,6 +1005,12 @@ class ResolvedClusterConfig:
     transfer_mode: str | None = None
     transfer_interface: str | None = None
     topology: str | None = None
+    transport: str = "ssh"
+    """Cluster connectivity transport selector (see :mod:`sparkrun.transports`).
+    Mirrors :attr:`ClusterDefinition.transport`; ``"ssh"`` for plain clusters."""
+    provider_ref: str | None = None
+    """Provider resource handle for a provider-backed :attr:`transport`
+    (e.g. a Thunder instance uuid).  Mirrors :attr:`ClusterDefinition.provider_ref`."""
     executor: str | None = None
     """Cluster-level default executor selector — consumed by
     :func:`sparkrun.orchestration.executor.resolve_executor` between
@@ -1084,5 +1117,11 @@ def resolve_cluster_config(
     cfg.executor = cluster_def.executor
     cfg.executor_config = dict(cluster_def.executor_config) if cluster_def.executor_config else None
     cfg.scheduler = cluster_def.scheduler
+
+    # Transport is a cluster-deployment property (like executor): it governs
+    # how the cluster's hosts are reached, so it applies whenever the cluster
+    # is named, even with explicit --hosts.
+    cfg.transport = cluster_def.transport
+    cfg.provider_ref = cluster_def.provider_ref
 
     return cfg
