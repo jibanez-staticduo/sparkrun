@@ -220,54 +220,64 @@ def _default_distribution_config(model: str = "{model}", container: str = "{cont
 
 
 def _parse_distribution_config(data: dict[str, Any]) -> DistributionConfig:
-    """Parse ``distribution_config`` from raw recipe YAML data."""
+    """Parse ``distribution_config`` from raw recipe YAML data.
+
+    An *omitted* ``models`` or ``containers`` subkey falls back to the
+    auto-default single entry (``{model}`` / ``{container}``) so a recipe can,
+    e.g., add a second model to distribute without having to re-list the
+    container it never customized.  A subkey that IS present is honored
+    literally — an explicit ``entries: []`` or ``enabled: false`` still means
+    "distribute nothing", not "use the default".
+    """
     raw = data.get("distribution_config")
     # fallback if not provided (expected to be the default case)
     if not raw or not isinstance(raw, dict):
         return _default_distribution_config()
 
-    models_raw = raw.get("models", {})
-    if not isinstance(models_raw, dict):
-        models_raw = {}
-    models_enabled = models_raw.get("enabled", True)
-    models_entries_raw = models_raw.get("entries", [])
-    if not isinstance(models_entries_raw, list):
-        models_entries_raw = []
-    model_entries = []
-    for e in models_entries_raw:
-        if isinstance(e, dict):
-            model_entries.append(
-                DistributionModelEntry(
-                    name=e.get("name", ""),
-                    target=e.get("target", [-1]),
-                    revision=e.get("revision"),
-                )
-            )
-        elif isinstance(e, str):
-            model_entries.append(DistributionModelEntry(name=e))
+    default = _default_distribution_config()
 
-    containers_raw = raw.get("containers", {})
-    if not isinstance(containers_raw, dict):
-        containers_raw = {}
-    containers_enabled = containers_raw.get("enabled", True)
-    containers_entries_raw = containers_raw.get("entries", [])
-    if not isinstance(containers_entries_raw, list):
-        containers_entries_raw = []
-    container_entries = []
-    for e in containers_entries_raw:
-        if isinstance(e, dict):
-            container_entries.append(
-                DistributionContainerEntry(
-                    name=e.get("name", ""),
-                    target=e.get("target", [-1]),
+    def _parse_models(models_raw: Any) -> DistributionResourceConfig:
+        if not isinstance(models_raw, dict):
+            models_raw = {}
+        entries_raw = models_raw.get("entries", [])
+        if not isinstance(entries_raw, list):
+            entries_raw = []
+        entries: list[DistributionModelEntry | DistributionContainerEntry] = []
+        for e in entries_raw:
+            if isinstance(e, dict):
+                entries.append(
+                    DistributionModelEntry(
+                        name=e.get("name", ""),
+                        target=e.get("target", [-1]),
+                        revision=e.get("revision"),
+                    )
                 )
-            )
-        elif isinstance(e, str):
-            container_entries.append(DistributionContainerEntry(name=e))
+            elif isinstance(e, str):
+                entries.append(DistributionModelEntry(name=e))
+        return DistributionResourceConfig(enabled=models_raw.get("enabled", True), entries=entries)
+
+    def _parse_containers(containers_raw: Any) -> DistributionResourceConfig:
+        if not isinstance(containers_raw, dict):
+            containers_raw = {}
+        entries_raw = containers_raw.get("entries", [])
+        if not isinstance(entries_raw, list):
+            entries_raw = []
+        entries: list[DistributionModelEntry | DistributionContainerEntry] = []
+        for e in entries_raw:
+            if isinstance(e, dict):
+                entries.append(
+                    DistributionContainerEntry(
+                        name=e.get("name", ""),
+                        target=e.get("target", [-1]),
+                    )
+                )
+            elif isinstance(e, str):
+                entries.append(DistributionContainerEntry(name=e))
+        return DistributionResourceConfig(enabled=containers_raw.get("enabled", True), entries=entries)
 
     return DistributionConfig(
-        models=DistributionResourceConfig(enabled=models_enabled, entries=model_entries),
-        containers=DistributionResourceConfig(enabled=containers_enabled, entries=container_entries),
+        models=_parse_models(raw["models"]) if "models" in raw else default.models,
+        containers=_parse_containers(raw["containers"]) if "containers" in raw else default.containers,
     )
 
 
