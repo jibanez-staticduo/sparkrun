@@ -46,12 +46,18 @@ _TOKENARY_FLAG_MAP = {
     "disable_prefix_cache": "--disable-prefix-cache",
     "disable_reasoning": "--disable-reasoning",
     "disable_cuda_graph": "--disable-cuda-graph",
+    # Single-node (TP1) disaggregated serving lanes. tokenary rejects both when
+    # world_size > 1, so recipes using them should pin max_nodes: 1.
+    "encode_only": "--encode-only",
+    "ner": "--ner",
 }
 
 _TOKENARY_BOOL_FLAGS = {
     "disable_prefix_cache",
     "disable_reasoning",
     "disable_cuda_graph",
+    "encode_only",
+    "ner",
 }
 
 
