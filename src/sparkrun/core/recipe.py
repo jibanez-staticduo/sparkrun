@@ -1087,6 +1087,7 @@ class Recipe:
         cli_overrides: dict[str, Any] | None = None,
         auto_detect: bool = True,
         cache_dir: str | None = None,
+        total_gpu_memory_gb: float | None = None,
     ) -> VRAMEstimate:
         """Estimate VRAM usage for this recipe.
 
@@ -1264,6 +1265,7 @@ class Recipe:
             model_vram=float(model_vram) if model_vram is not None else None,
             kv_vram_per_token=float(kv_vram_per_token) if kv_vram_per_token is not None else None,
             gpu_memory_utilization=gpu_memory_utilization,
+            total_gpu_memory_gb=total_gpu_memory_gb,
         )
 
         # Write back auto-detected values so downstream consumers

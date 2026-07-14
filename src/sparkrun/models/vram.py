@@ -116,6 +116,7 @@ class VRAMEstimate:
 
     # GPU memory budget fields
     gpu_memory_utilization: float | None = None
+    total_gpu_memory_gb: float | None = None
     usable_gpu_memory_gb: float | None = None
     available_kv_gb: float | None = None
     max_context_tokens: int | None = None
@@ -540,6 +541,7 @@ def estimate_vram(
     model_vram: float | None = None,
     kv_vram_per_token: float | None = None,
     gpu_memory_utilization: float | None = None,
+    total_gpu_memory_gb: float | None = None,
 ) -> VRAMEstimate:
     """Estimate VRAM usage for an inference workload.
 
@@ -556,6 +558,9 @@ def estimate_vram(
         model_vram: Direct override for model weight VRAM in GB (not scaled by TP/PP).
         kv_vram_per_token: Direct override for KV cache in GB per token (scaled by max_model_len and TP*PP).
         gpu_memory_utilization: Fraction of GPU memory the runtime is allowed to use (e.g. 0.9).
+        total_gpu_memory_gb: Per-GPU memory of the *target* accelerator (e.g. 48 for an
+            RTX A6000). Defaults to the DGX Spark figure when unset, preserving the
+            legacy single-platform estimate.
 
     Returns:
         VRAMEstimate with per-GPU totals and any warnings.
@@ -627,8 +632,12 @@ def estimate_vram(
     max_context_tokens: int | None = None
     context_multiplier: float | None = None
 
+    # Target accelerator memory: caller-supplied (e.g. 48 GB A6000) or the
+    # DGX Spark default. Keeps the budget honest on non-DGX clusters.
+    _total_gpu_gb = total_gpu_memory_gb if (total_gpu_memory_gb and total_gpu_memory_gb > 0) else DGX_SPARK_VRAM_GB
+
     if gpu_memory_utilization is not None and gpu_memory_utilization > 0:
-        usable_gpu_memory_gb = DGX_SPARK_VRAM_GB * gpu_memory_utilization
+        usable_gpu_memory_gb = _total_gpu_gb * gpu_memory_utilization
         available_kv_gb = usable_gpu_memory_gb - per_gpu_weights_gb
 
         if available_kv_gb < 0:
@@ -663,6 +672,7 @@ def estimate_vram(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         gpu_memory_utilization=gpu_memory_utilization,
+        total_gpu_memory_gb=_total_gpu_gb,
         usable_gpu_memory_gb=usable_gpu_memory_gb,
         available_kv_gb=available_kv_gb,
         max_context_tokens=max_context_tokens,

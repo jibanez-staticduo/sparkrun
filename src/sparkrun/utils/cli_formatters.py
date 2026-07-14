@@ -242,6 +242,37 @@ def display_recipe_detail(recipe, show_vram=True, registry_name=None, cli_overri
         display_vram_estimate(recipe, cli_overrides=cli_overrides, cache_dir=cache_dir)
 
 
+def _resolve_target_accelerator(cluster, placement):
+    """Return ``(memory_gb, model)`` for the representative target accelerator.
+
+    Prefers the placed / solo host(s), falling back to the cluster's first host
+    with recorded hardware. Returns ``(None, None)`` when no per-host hardware is
+    known (e.g. the DGX Spark default fallback), so callers keep the legacy
+    121 GB / "DGX Spark" behavior. A recorded DGX Spark host reports
+    ``memory_gb == 121`` here, so DGX output is byte-identical either way.
+    """
+    if cluster is None:
+        return None, None
+    hw_map = getattr(cluster, "hosts_hardware", None) or {}
+    if not hw_map:
+        return None, None
+    ordered = []
+    if placement is not None and getattr(placement, "hosts_used", None):
+        ordered.extend(placement.hosts_used)
+    ordered.extend(getattr(cluster, "hosts", None) or [])
+    ordered.extend(hw_map.keys())
+    seen = set()
+    for host in ordered:
+        if host in seen:
+            continue
+        seen.add(host)
+        hw = hw_map.get(host)
+        accels = getattr(hw, "accelerators", None) if hw else None
+        if accels and getattr(accels[0], "memory_gb", None):
+            return accels[0].memory_gb, getattr(accels[0], "model", None)
+    return None, None
+
+
 def display_vram_estimate(
     recipe,
     cli_overrides=None,
@@ -260,8 +291,14 @@ def display_vram_estimate(
     """
     from sparkrun.models.vram import DEFAULT_VRAM_GB
 
+    # Resolve the target accelerator's memory so the budget/fit reflect the real
+    # GPU (e.g. 48 GB A6000) rather than the hardcoded DGX Spark figure.
+    target_mem, target_model = _resolve_target_accelerator(cluster, placement)
+
     try:
-        est = recipe.estimate_vram(cli_overrides=cli_overrides, auto_detect=auto_detect, cache_dir=cache_dir)
+        est = recipe.estimate_vram(
+            cli_overrides=cli_overrides, auto_detect=auto_detect, cache_dir=cache_dir, total_gpu_memory_gb=target_mem
+        )
     except Exception as e:
         click.echo(f"\nVRAM estimation failed: {e}", err=True)
         return
@@ -281,16 +318,21 @@ def display_vram_estimate(
     if est.pipeline_parallel > 1:
         click.echo(f"  Pipeline parallel: {est.pipeline_parallel}")
     click.echo(f"  Per-GPU total:    {est.total_per_gpu_gb:.2f} GB")
-    fit_str = "YES" if est.fits_dgx_spark else "EXCEEDS %.0f GB" % DEFAULT_VRAM_GB
-    click.echo(f"  DGX Spark fit:    {fit_str}")
+    # Fit against the resolved target memory (DGX Spark when the target is a
+    # gb10 or unknown, preserving the legacy line).
+    total_gb = est.total_gpu_memory_gb or DEFAULT_VRAM_GB
+    fits = est.total_per_gpu_gb <= total_gb
+    fit_str = "YES" if fits else "EXCEEDS %.0f GB" % total_gb
+    if target_model and target_model != "gb10":
+        click.echo(f"  Fit ({target_model.upper()}, {total_gb:.0f} GB): {fit_str}")
+    else:
+        click.echo(f"  DGX Spark fit:    {fit_str}")
 
     # GPU memory budget analysis
     if est.gpu_memory_utilization is not None:
         click.echo("\n  GPU Memory Budget:")
         click.echo(f"    gpu_memory_utilization: {est.gpu_memory_utilization:.0%}")
-        click.echo(
-            f"    Usable GPU memory:     {est.usable_gpu_memory_gb:.1f} GB ({DEFAULT_VRAM_GB:.0f} GB x {est.gpu_memory_utilization:.0%})"
-        )
+        click.echo(f"    Usable GPU memory:     {est.usable_gpu_memory_gb:.1f} GB ({total_gb:.0f} GB x {est.gpu_memory_utilization:.0%})")
         click.echo(f"    Available for KV:      {est.available_kv_gb:.1f} GB")
         if est.max_context_tokens is not None:
             click.echo(f"    Max context tokens:    {est.max_context_tokens:,}")
