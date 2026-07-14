@@ -430,9 +430,15 @@ def cluster_import_thunder(ctx, instance_ids, name, set_default, no_probe, dry_r
 
         try:
             if existing is not None:
-                # Backfill the ssh user on re-sync so clusters imported before
-                # the user field was set pick it up.
-                mgr.update(target, hosts=[alias], hosts_hardware=host_hw, user=ssh_alias.THUNDER_SSH_USER)
+                # Backfill the ssh user + executor overrides on re-sync so clusters
+                # imported before those fields were set pick them up.
+                mgr.update(
+                    target,
+                    hosts=[alias],
+                    hosts_hardware=host_hw,
+                    user=ssh_alias.THUNDER_SSH_USER,
+                    executor_config=dict(ssh_alias.THUNDER_EXECUTOR_CONFIG),
+                )
                 click.echo("Synced thunder cluster '%s'." % target, err=True)
             else:
                 mgr.create(
@@ -443,6 +449,7 @@ def cluster_import_thunder(ctx, instance_ids, name, set_default, no_probe, dry_r
                     transport="thunder",
                     provider_ref=inst.uuid,
                     hosts_hardware=host_hw,
+                    executor_config=dict(ssh_alias.THUNDER_EXECUTOR_CONFIG),
                 )
                 click.echo("Imported thunder cluster '%s' (host %s)." % (target, alias), err=True)
             if set_default:

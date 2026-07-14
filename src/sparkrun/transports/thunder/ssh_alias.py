@@ -27,6 +27,14 @@ ALIAS_PREFIX = "tnr-"
 # so the ssh alias block and the imported cluster's ``user`` field can't drift.
 THUNDER_SSH_USER = "ubuntu"
 
+# Executor overrides for Thunder-imported clusters. Thunder's custom docker runs
+# containers with zero capabilities, so it cannot raise RLIMIT_MEMLOCK to
+# unlimited — the rootless default ``memlock=-1:-1`` fails at container start
+# ("error setting rlimit type 8: operation not permitted"). We drop it and keep
+# only the stack ulimit (replace semantics: this list overrides the rootless
+# default wholesale). The value mirrors DockerExecutor.apply_runtime_adjustments.
+THUNDER_EXECUTOR_CONFIG = {"ulimit": ["stack=67108864"]}
+
 
 def alias_for(inst: ThunderInstance) -> str:
     """Stable ssh alias for *inst* — ``tnr-<uuid>``.
