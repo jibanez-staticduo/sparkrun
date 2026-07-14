@@ -321,6 +321,38 @@ def test_cluster_transport_fields_roundtrip(tmp_path):
     assert d["transport"] == "thunder" and d["provider_ref"] == "abc"
 
 
+def test_thunder_ssh_user_constant_and_alias_block():
+    from sparkrun.transports.thunder import ssh_alias
+    from sparkrun.transports.thunder.api import ThunderInstance
+
+    assert ssh_alias.THUNDER_SSH_USER == "ubuntu"
+    inst = ThunderInstance(
+        id="0",
+        uuid="abc",
+        ip="1.2.3.4",
+        port=2222,
+        status="RUNNING",
+        gpu_type="a6000",
+        num_gpus=1,
+        memory_gb=48,
+        storage_gb=100,
+        cpu_cores="8",
+    )
+    block = ssh_alias._render_block(inst, __import__("pathlib").Path("/tmp/k"))
+    assert "    User ubuntu" in block
+
+
+def test_thunder_imported_cluster_carries_user(tmp_path):
+    # Mirrors what `cluster import thunder` persists: the ssh user is stored on
+    # the cluster so setup commands don't fall back to $USER (overriding the
+    # alias's `User ubuntu`).
+    from sparkrun.transports.thunder import ssh_alias
+
+    mgr = ClusterManager(tmp_path)
+    mgr.create("thunder-0", ["tnr-abc"], user=ssh_alias.THUNDER_SSH_USER, transport="thunder", provider_ref="abc")
+    assert mgr.get("thunder-0").user == "ubuntu"
+
+
 def test_ssh_cluster_omits_transport_key(tmp_path):
     mgr = ClusterManager(tmp_path)
     mgr.create("plain", ["h1"])

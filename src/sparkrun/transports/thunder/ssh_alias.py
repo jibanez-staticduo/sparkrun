@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 ALIAS_PREFIX = "tnr-"
 
+# Thunder instances always expose the ``ubuntu`` login user. Kept as a constant
+# so the ssh alias block and the imported cluster's ``user`` field can't drift.
+THUNDER_SSH_USER = "ubuntu"
+
 
 def alias_for(inst: ThunderInstance) -> str:
     """Stable ssh alias for *inst* — ``tnr-<uuid>``.
@@ -78,7 +82,7 @@ def _render_block(inst: ThunderInstance, key: Path) -> str:
         [
             "Host %s" % alias_for(inst),
             "    HostName %s" % (inst.ip or ""),
-            "    User ubuntu",
+            "    User %s" % THUNDER_SSH_USER,
             '    IdentityFile "%s"' % key,
             "    IdentitiesOnly yes",
             "    IdentityAgent none",

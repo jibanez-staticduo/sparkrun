@@ -430,13 +430,16 @@ def cluster_import_thunder(ctx, instance_ids, name, set_default, no_probe, dry_r
 
         try:
             if existing is not None:
-                mgr.update(target, hosts=[alias], hosts_hardware=host_hw)
+                # Backfill the ssh user on re-sync so clusters imported before
+                # the user field was set pick it up.
+                mgr.update(target, hosts=[alias], hosts_hardware=host_hw, user=ssh_alias.THUNDER_SSH_USER)
                 click.echo("Synced thunder cluster '%s'." % target, err=True)
             else:
                 mgr.create(
                     target,
                     [alias],
                     description="Thunder Compute %s (%s)" % (inst.gpu_type or "GPU", inst.uuid),
+                    user=ssh_alias.THUNDER_SSH_USER,
                     transport="thunder",
                     provider_ref=inst.uuid,
                     hosts_hardware=host_hw,

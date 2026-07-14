@@ -242,3 +242,11 @@ FEATURE_TRANSPORTS_THUNDER = register_feature(
         default=False,
     )
 )
+
+FEATURE_CLI_SETUP_TAILSCALE = register_feature(
+    FeatureFlag(
+        name="cli.setup.tailscale",
+        description="Experimental 'sparkrun setup tailscale' command group (join nodes / publish endpoint on a tailnet)",
+        default=False,
+    )
+)

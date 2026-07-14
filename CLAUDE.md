@@ -217,6 +217,22 @@ translates `TransportError` → `SparkrunError` for clean CLI errors. **Layering
 per RUNNING instance (attach-only; multi-node out of scope, multi-GPU-per-node
 handled by the probe).
 
+### Tailscale Endpoint Publishing (`setup tailscale`)
+
+`sparkrun setup tailscale` (gated behind `cli.setup.tailscale`, off by default) joins cluster
+hosts to a **tailnet** and surfaces the inference HTTP endpoint to the rest of the user's network.
+It is a **control-plane / endpoint-publishing** feature — orthogonal to the transport seam and NOT
+a data-plane path (NCCL stays on InfiniBand/CX7). Auth is via a Tailscale **OAuth client** that mints
+a short-lived, pre-authorized, **tagged** auth key per join batch (never a long-lived key in config);
+exposure is a **raw tailnet port** (`http://<ip>:<port>/v1`), not `tailscale serve`.
+
+3-layer split mirroring `setup k8s`: `cli/_setup/_tailscale.py` (thin Click group, self-gates like
+`_k8s.py`) → `api/tailscale/` (console-free `join`/`status`/`expose`/`down` + dataclasses + errors)
+→ `orchestration/tailscale/` (`api.py` stdlib OAuth + key-mint + device REST client, `scripts.py` +
+`scripts/tailscale_join*.sh` join scripts driven through `run_with_sudo_fallback`, `local.py` for
+control-machine `tailscale ip` probes used by `expose --proxy`). Layering: `cli → api.tailscale →
+orchestration.tailscale → {orchestration.ssh/sudo, core.config}`. Design spec: `.slop/tailscale-setup.md`.
+
 ### Recipe System
 
 Recipes are YAML files with fields: `model`, `runtime`, `container`, `command`, `defaults`, `env`, `metadata`,
@@ -318,14 +334,16 @@ The active channel reuses the release channel from `core/channels.py`
 a flag can be on-by-default for `alpha` while off for `stable`/`beta`. The
 built-in flags — `executor.local` and `executor.k8s` (gating the corresponding
 experimental executors), `cli.setup.k8s` (gating the entire `sparkrun setup
-k8s` command group), and `transports.thunder` (gating the Thunder Compute
+k8s` command group), `cli.setup.tailscale` (gating the `sparkrun setup
+tailscale` group), and `transports.thunder` (gating the Thunder Compute
 transport + `cluster import thunder`) — are off by default on **every** channel;
 enable them explicitly per-flag. The `setup k8s` group self-gates in its Click
 callback (raises pointing at `setup features enable cli.setup.k8s`) and hides
-itself from `setup --help` unless the flag resolves on at import; `cluster import
-thunder` gates the same way (`transports.thunder`), and the transport also fails
-closed at use in `transports.prepare_cluster_transport` so an already-imported
-Thunder cluster can't run once the flag is off.
+itself from `setup --help` unless the flag resolves on at import; `setup
+tailscale` and `cluster import thunder` gate the same way
+(`cli.setup.tailscale` / `transports.thunder`), and the Thunder transport also
+fails closed at use in `transports.prepare_cluster_transport` so an
+already-imported Thunder cluster can't run once the flag is off.
 
 **Plugin gating**: a plugin opts in by setting `required_feature_flag = "<flag>"`
 (e.g. on `LocalExecutor`/`K8sExecutor`) and self-gates via `is_multi_extension` —

@@ -30,6 +30,7 @@ field additions are non-breaking, field removals are breaking.
 from __future__ import annotations
 
 from sparkrun.api import k8s
+from sparkrun.api import tailscale
 from sparkrun.api._benchmark import benchmark, resume_benchmark
 from sparkrun.api._benchmark_models import (
     BenchmarkOptions,
@@ -71,6 +72,7 @@ from sparkrun.api._stop import stop
 __all__ = [
     # Subpackages
     "k8s",
+    "tailscale",
     # Session context
     "SparkrunContext",
     "default_sctx",
