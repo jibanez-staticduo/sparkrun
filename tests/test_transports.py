@@ -353,13 +353,14 @@ def test_thunder_imported_cluster_carries_user(tmp_path):
     assert mgr.get("thunder-0").user == "ubuntu"
 
 
-def test_thunder_imported_cluster_drops_unlimited_memlock(tmp_path):
-    # Thunder's zero-capability containers can't raise RLIMIT_MEMLOCK, so the
-    # import records an executor_config that replaces the rootless default
-    # (memlock=-1 + stack) with stack only.
+def test_thunder_imported_cluster_executor_overrides(tmp_path):
+    # Thunder's proot/fastvfs docker needs root containers (no non-root user) and
+    # cannot raise RLIMIT_MEMLOCK, so the import records an executor_config that
+    # forces user=root and replaces the rootless ulimit (memlock=-1 + stack) with
+    # stack only.
     from sparkrun.transports.thunder import ssh_alias
 
-    assert ssh_alias.THUNDER_EXECUTOR_CONFIG == {"ulimit": ["stack=67108864"]}
+    assert ssh_alias.THUNDER_EXECUTOR_CONFIG == {"user": "root", "ulimit": ["stack=67108864"]}
     mgr = ClusterManager(tmp_path)
     mgr.create(
         "thunder-0",
@@ -370,7 +371,7 @@ def test_thunder_imported_cluster_drops_unlimited_memlock(tmp_path):
         executor_config=dict(ssh_alias.THUNDER_EXECUTOR_CONFIG),
     )
     cfg = mgr.get("thunder-0").executor_config
-    assert cfg == {"ulimit": ["stack=67108864"]}
+    assert cfg == {"user": "root", "ulimit": ["stack=67108864"]}
     assert "memlock" not in str(cfg)
 
 

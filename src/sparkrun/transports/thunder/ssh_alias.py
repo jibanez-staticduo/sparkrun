@@ -27,13 +27,17 @@ ALIAS_PREFIX = "tnr-"
 # so the ssh alias block and the imported cluster's ``user`` field can't drift.
 THUNDER_SSH_USER = "ubuntu"
 
-# Executor overrides for Thunder-imported clusters. Thunder's custom docker runs
-# containers with zero capabilities, so it cannot raise RLIMIT_MEMLOCK to
-# unlimited — the rootless default ``memlock=-1:-1`` fails at container start
-# ("error setting rlimit type 8: operation not permitted"). We drop it and keep
-# only the stack ulimit (replace semantics: this list overrides the rootless
-# default wholesale). The value mirrors DockerExecutor.apply_runtime_adjustments.
-THUNDER_EXECUTOR_CONFIG = {"ulimit": ["stack=67108864"]}
+# Executor overrides for Thunder-imported clusters. Thunder runs a custom
+# proot/fastvfs docker with two constraints sparkrun's rootless defaults trip on:
+#   * ``user: root`` — proot cannot run containers as a non-root user (the
+#     ``--user $(id -u):$(id -g)`` from auto_user dies with
+#     "proot ... can't sanitize binding ... Permission denied"). Forcing root
+#     also drops the /etc/passwd + /etc/group bind mounts (gated on $SHELL_USER).
+#   * ``ulimit: [stack=...]`` — zero-capability containers can't raise
+#     RLIMIT_MEMLOCK, so the rootless ``memlock=-1:-1`` fails at container start
+#     ("error setting rlimit type 8: operation not permitted"); drop it, keep stack.
+# Both use replace semantics and outrank the rootless adjustments in the chain.
+THUNDER_EXECUTOR_CONFIG = {"user": "root", "ulimit": ["stack=67108864"]}
 
 
 def alias_for(inst: ThunderInstance) -> str:
