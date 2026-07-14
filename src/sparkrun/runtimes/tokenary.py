@@ -89,7 +89,15 @@ class TokenaryRuntime(RuntimePlugin):
         appended per-node by :meth:`generate_node_command` (or by
         :meth:`generate_command` for the solo case).
         """
-        parts = ["tokenary", "--model", str(recipe.model)]
+        # Binary prefix — normally the ``tokenary`` executable.  An image whose
+        # ENTRYPOINT already invokes tokenary (e.g. the self-dispatching
+        # sm86/sm89 build that selects the binary at runtime from the GPU's
+        # compute capability) doubles the word otherwise.  Such a recipe sets
+        # ``command_binary: ""`` so the container CMD is args-only and the image
+        # entrypoint supplies the binary.
+        binary = config.get("command_binary")
+        binary = "tokenary" if binary is None else str(binary)
+        parts = ([binary] if binary else []) + ["--model", str(recipe.model)]
         skip = {"port", "tensor_parallel"}
         skip.update(skip_keys)
         parts.extend(
