@@ -136,3 +136,31 @@ def test_run_cmd_default_nvidia_emits_cdi_flag():
     cmd = DockerExecutor(cfg).run_cmd(image="img", container_name="test")
     assert "--device nvidia.com/gpu=all" in cmd
     assert "--gpus" not in cmd
+
+
+# --------------------------------------------------------------------------
+# Optional (existence-guarded) devices — /dev/infiniband
+# --------------------------------------------------------------------------
+
+
+def test_infiniband_device_is_existence_guarded():
+    """The IB fabric device is emitted as a host-existence-guarded substitution,
+    not a hard --device, so a host without /dev/infiniband (solo / cloud GPU)
+    doesn't fail docker run."""
+    from sparkrun.orchestration.executor import ExecutorConfig
+    from sparkrun.orchestration.executors.docker import DockerExecutor
+
+    cfg = ExecutorConfig(devices=["/dev/infiniband"], privileged=False, network="host", gpus="all")
+    cmd = DockerExecutor(cfg).run_cmd(image="img", container_name="c")
+    assert "$( [ -e /dev/infiniband ] && printf -- '--device /dev/infiniband' )" in cmd
+
+
+def test_non_optional_device_is_a_hard_mount():
+    """A device not in _OPTIONAL_DEVICES is still emitted as a plain --device."""
+    from sparkrun.orchestration.executor import ExecutorConfig
+    from sparkrun.orchestration.executors.docker import DockerExecutor
+
+    cfg = ExecutorConfig(devices=["/dev/kfd"], privileged=False, network="host", gpus="all")
+    cmd = DockerExecutor(cfg).run_cmd(image="img", container_name="c")
+    assert "--device /dev/kfd" in cmd
+    assert "[ -e /dev/kfd ]" not in cmd

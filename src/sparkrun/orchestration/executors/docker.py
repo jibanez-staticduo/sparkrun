@@ -58,6 +58,29 @@ def _nvidia_gpu_args(gpus: str | None) -> list[str]:
     return args or ["--device", "nvidia.com/gpu=all"]
 
 
+# Devices that sparkrun requests but that may legitimately be absent on a host
+# (e.g. a cloud GPU with no InfiniBand).  These are emitted existence-guarded so
+# ``docker run`` doesn't fail with "no such file or directory" when the node
+# isn't present; hosts that have it (IB-equipped DGX Spark clusters) still get it.
+_OPTIONAL_DEVICES = frozenset({"/dev/infiniband"})
+
+
+def _optional_device_arg(dev: str) -> str:
+    """Emit a host-existence-guarded ``--device`` for a possibly-absent device.
+
+    Returns a raw, *unquoted* shell command substitution that is evaluated on the
+    remote host at launch — the same controlled-substitution pattern already used
+    for ``--user $(id -u):$(id -g)``.  The flag is added only when the device node
+    exists, so a host without it doesn't fail ``docker run`` while a host with it
+    (IB fabric) mounts it normally.
+
+    *dev* is always an internally-sourced literal from :data:`_OPTIONAL_DEVICES`
+    (never user/recipe input), so interpolating it into the substitution carries
+    no injection risk.
+    """
+    return "$( [ -e %s ] && printf -- '--device %s' )" % (dev, dev)
+
+
 # Matches the deterministic sparkrun container-name convention emitted by
 # :class:`Executor.container_name` / :class:`Executor.node_container_name`:
 # ``sparkrun_<intent>_<placement_token>_(solo|head|worker|node_<rank>)``
@@ -146,7 +169,10 @@ class DockerExecutor(Executor):
                 "memlock=-1:-1",
                 "stack=67108864",
             ]
-            # TODO: confirm existence and/or adjust? (for future heterogeneous support??)
+            # Request the IB fabric device for rootless (non-privileged) NCCL
+            # over InfiniBand.  Emitted existence-guarded at build time (see
+            # _OPTIONAL_DEVICES) so hosts without it — solo runs, cloud GPUs — do
+            # not fail docker run; IB-equipped hosts still get it.
             adjustments["devices"] = [
                 "/dev/infiniband",
             ]
@@ -226,7 +252,11 @@ class DockerExecutor(Executor):
                 opts.extend(["--ulimit", quote(ul)])
         if cfg.devices:
             for dev in cfg.devices:
-                opts.extend(["--device", quote(dev)])
+                if dev in _OPTIONAL_DEVICES:
+                    # Emitted only when the device exists on the host (see helper).
+                    opts.append(_optional_device_arg(dev))
+                else:
+                    opts.extend(["--device", quote(dev)])
         if cfg.volumes:
             for vol in cfg.volumes:
                 # Bare path → identity mount; src:dst / src:dst:ro pass through.
