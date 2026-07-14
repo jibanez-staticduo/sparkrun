@@ -97,6 +97,44 @@ class TestFeatureFlagDefaults:
 
 
 # ---------------------------------------------------------------------------
+# cli.setup.features — visibility-only flag (group always functional)
+# ---------------------------------------------------------------------------
+
+
+class TestCliSetupFeaturesFlag:
+    def test_channel_defaults(self):
+        # On for beta/alpha, off for stable — no env/config overrides.
+        assert is_feature_enabled("cli.setup.features", channel="stable", env={}) is False
+        assert is_feature_enabled("cli.setup.features", channel="beta", env={}) is True
+        assert is_feature_enabled("cli.setup.features", channel="alpha", env={}) is True
+
+    def test_hidden_on_stable_but_still_functional(self, tmp_path):
+        # Clean subprocess (the group's `hidden=` freezes at import from config).
+        snippet = (
+            "from click.testing import CliRunner\n"
+            "from sparkrun.cli import main\n"
+            "h = CliRunner().invoke(main, ['setup', '--help']).output\n"
+            "listed = any(l.strip().startswith('features') for l in h.splitlines())\n"
+            "r = CliRunner().invoke(main, ['setup', 'features', 'list'])\n"
+            "print('LISTED', listed)\n"
+            "print('LISTEXIT', r.exit_code)\n"
+        )
+        out = _run_gated_snippet(tmp_path, {"self_update": {"channel": "stable"}}, snippet)
+        assert "LISTED False" in out  # hidden from --help on stable
+        assert "LISTEXIT 0" in out  # ...but the command still works
+
+    def test_visible_on_beta(self, tmp_path):
+        snippet = (
+            "from click.testing import CliRunner\n"
+            "from sparkrun.cli import main\n"
+            "h = CliRunner().invoke(main, ['setup', '--help']).output\n"
+            "print('LISTED', any(l.strip().startswith('features') for l in h.splitlines()))\n"
+        )
+        out = _run_gated_snippet(tmp_path, {"self_update": {"channel": "beta"}}, snippet)
+        assert "LISTED True" in out
+
+
+# ---------------------------------------------------------------------------
 # Resolution precedence
 # ---------------------------------------------------------------------------
 

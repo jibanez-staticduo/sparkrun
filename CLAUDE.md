@@ -345,6 +345,13 @@ tailscale` and `cluster import thunder` gate the same way
 fails closed at use in `transports.prepare_cluster_transport` so an
 already-imported Thunder cluster can't run once the flag is off.
 
+**Visibility-only gate**: `cli.setup.features` (via `channel_defaults`, **on for
+`beta`/`alpha`, off for `stable`**) is different — it does NOT gate execution.
+The `setup features` group is always functional; the flag only decides whether it
+appears in `setup --help` (`@setup.group("features", hidden=not
+_setup_features_visible_at_import())`, no callback raise). So a stable user can
+still run `setup features enable <flag>` even though the group is hidden.
+
 **Plugin gating**: a plugin opts in by setting `required_feature_flag = "<flag>"`
 (e.g. on `LocalExecutor`/`K8sExecutor`) and self-gates via `is_multi_extension` —
 SAF only exposes a multi-extension plugin through `get_extensions` when that hook

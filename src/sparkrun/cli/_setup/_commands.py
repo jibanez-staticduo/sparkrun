@@ -342,13 +342,33 @@ def setup_telemetry(ctx, enable, disable):
         click.echo("Env:       set %s=1 to opt out for one process" % NO_TELEMETRY_ENV)
 
 
-@setup.group("features")
+SETUP_FEATURES_FLAG = "cli.setup.features"
+
+
+def _setup_features_visible_at_import() -> bool:
+    """Resolve --help visibility for the 'setup features' group.
+
+    Visibility-only: the group is always functional, this just decides whether
+    it appears in ``setup --help`` (on by default for beta/alpha channels).
+    """
+    try:
+        from sparkrun.core.config import SparkrunConfig
+
+        return SparkrunConfig().is_feature_enabled(SETUP_FEATURES_FLAG)
+    except Exception:  # noqa: BLE001 — never let a config read break CLI import
+        return False
+
+
+@setup.group("features", hidden=not _setup_features_visible_at_import())
 def setup_features():
     """View and toggle advanced feature flags.
 
     Feature flags gate experimental capabilities (e.g. the ``local`` and
     ``k8s`` executors). Each flag has a per-channel default; explicit
     overrides written here take precedence. See ``setup features list``.
+
+    Always functional; hidden from ``setup --help`` unless the
+    ``cli.setup.features`` flag resolves on (default: on for beta/alpha).
     """
 
 

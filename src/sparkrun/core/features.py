@@ -31,7 +31,7 @@ from typing import Mapping, TYPE_CHECKING
 
 from scitrera_app_framework import ext_parse_bool
 
-from sparkrun.core.channels import CHANNEL_STABLE, normalize_channel
+from sparkrun.core.channels import CHANNEL_ALPHA, CHANNEL_BETA, CHANNEL_STABLE, normalize_channel
 
 if TYPE_CHECKING:
     from sparkrun.core.config import SparkrunConfig
@@ -247,6 +247,18 @@ FEATURE_CLI_SETUP_TAILSCALE = register_feature(
     FeatureFlag(
         name="cli.setup.tailscale",
         description="Experimental 'sparkrun setup tailscale' command group (join nodes / publish endpoint on a tailnet)",
+        default=False,
+    )
+)
+
+# Visibility-only flag: the 'setup features' group is always functional, but is
+# hidden from `setup --help` unless this resolves on. On by default for the beta
+# and alpha channels (where poking at flags is expected), off for stable.
+FEATURE_CLI_SETUP_FEATURES = register_feature(
+    FeatureFlag(
+        name="cli.setup.features",
+        description="Show the 'sparkrun setup features' group in --help (always functional; on by default for beta/alpha)",
+        channel_defaults={CHANNEL_BETA: True, CHANNEL_ALPHA: True},
         default=False,
     )
 )
