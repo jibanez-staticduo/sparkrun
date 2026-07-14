@@ -304,6 +304,9 @@ def test_resolve_auto_cross_user_returns_delegated(mock_in_cluster):
     assert isinstance(result, TransferModeResult)
     assert result.mode == "delegated"
     assert result.ib_result is None
+    # auto-inferred delegated must arm the push fallback (e.g. private image the
+    # cross-user head can't pull but the control machine has locally).
+    assert result.auto_delegated is True
 
 
 @patch("sparkrun.orchestration.distribution.is_control_in_cluster", return_value=True)
@@ -316,10 +319,60 @@ def test_resolve_auto_same_user_returns_local(mock_in_cluster):
 
 
 def test_resolve_explicit_mode_passthrough():
-    """Explicit modes are returned unchanged."""
-    assert resolve_auto_transfer_mode("local", ["10.0.0.5"]).mode == "local"
-    assert resolve_auto_transfer_mode("delegated", ["10.0.0.5"]).mode == "delegated"
-    assert resolve_auto_transfer_mode("push", ["10.0.0.5"]).mode == "push"
+    """Explicit modes are returned unchanged and never arm the push fallback."""
+    for mode in ("local", "delegated", "push"):
+        res = resolve_auto_transfer_mode(mode, ["10.0.0.5"])
+        assert res.mode == mode
+        # Explicitly-chosen delegated must NOT silently fall back to push.
+        assert res.auto_delegated is False
+
+
+def test_single_image_delegated_falls_back_to_push_single_host():
+    """auto_delegated + single-host delegated pull failure → push from local succeeds."""
+    from sparkrun.orchestration.distribution import _distribute_single_image
+
+    with (
+        patch("sparkrun.containers.distribute.distribute_image_from_head", return_value=["h1"]),
+        patch("sparkrun.containers.distribute.distribute_image_from_local", return_value=[]) as m_local,
+    ):
+        failed = _distribute_single_image("img", ["h1"], ["h1"], "delegated", None, None, {}, dry_run=False, auto_delegated=True)
+    assert failed == []  # push to head succeeded → overall success (was the single-host bug)
+    m_local.assert_called_once()
+
+
+def test_single_image_delegated_no_fallback_when_not_auto():
+    """Explicit delegated (auto_delegated=False) does not fall back to push."""
+    from sparkrun.orchestration.distribution import _distribute_single_image
+
+    with (
+        patch("sparkrun.containers.distribute.distribute_image_from_head", return_value=["h1"]),
+        patch("sparkrun.containers.distribute.distribute_image_from_local", return_value=[]) as m_local,
+    ):
+        failed = _distribute_single_image("img", ["h1"], ["h1"], "delegated", None, None, {}, dry_run=False, auto_delegated=False)
+    assert failed == ["h1"]
+    m_local.assert_not_called()
+
+
+def test_single_image_delegated_fallback_multi_host_fans_out():
+    """auto_delegated fallback: push to head, then head→worker fan-out."""
+    from sparkrun.orchestration.distribution import _distribute_single_image
+
+    calls = {"head": 0}
+
+    def head_side(image, targets, **k):
+        calls["head"] += 1
+        return list(targets) if calls["head"] == 1 else []  # 1st call (pull) fails, 2nd (fan-out) ok
+
+    with (
+        patch("sparkrun.containers.distribute.distribute_image_from_head", side_effect=head_side),
+        patch("sparkrun.containers.distribute.distribute_image_from_local", return_value=[]) as m_local,
+    ):
+        failed = _distribute_single_image(
+            "img", ["h1", "h2"], ["h1", "h2"], "delegated", None, None, {}, dry_run=False, auto_delegated=True
+        )
+    assert failed == []
+    m_local.assert_called_once()  # pushed to head
+    assert calls["head"] == 2  # pull attempt + fan-out
 
 
 @patch("sparkrun.orchestration.distribution.is_control_in_cluster", return_value=False)
@@ -330,6 +383,7 @@ def test_resolve_auto_external_no_local_ib_returns_delegated(mock_ib, mock_in_cl
     result = resolve_auto_transfer_mode("auto", ["10.0.0.5"], ssh_kwargs={"ssh_user": "drew"})
     assert result.mode == "delegated"
     assert result.ib_result is None
+    assert result.auto_delegated is True
 
 
 @patch("sparkrun.orchestration.distribution.is_control_in_cluster", return_value=False)

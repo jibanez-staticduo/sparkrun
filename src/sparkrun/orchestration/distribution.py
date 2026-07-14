@@ -101,13 +101,16 @@ def resolve_auto_transfer_mode(
             "Auto-detected transfer mode: delegated (cluster user '%s' differs from OS user)",
             ssh_kwargs.get("ssh_user") if ssh_kwargs else None,
         )
-        return TransferModeResult(mode="delegated")
+        # auto_delegated=True: the mode was *inferred* (not user-chosen), so a
+        # delegated pull failure should fall back to push (e.g. a private image
+        # the head can't pull but the control machine has locally).
+        return TransferModeResult(mode="delegated", auto_delegated=True)
 
     # External control + same user: check if local machine has IB.
     # If no local IB, control can never reach cluster IB → delegated.
     if not _has_local_ib():
         logger.info("Auto-detected transfer mode: delegated (external control, no local IB)")
-        return TransferModeResult(mode="delegated")
+        return TransferModeResult(mode="delegated", auto_delegated=True)
 
     # Local IB exists — run IB detection + connectivity validation to
     # resolve definitively and cache results for distribute_resources().
@@ -480,7 +483,8 @@ def distribute_resources(
                 ssh_kwargs=ssh_kwargs,
                 dry_run=dry_run,
             )
-        _auto_delegated = False
+        # Honor a pre-resolved auto_delegated verdict (see distribute_from_config).
+        _auto_delegated = pre_ib.auto_delegated if pre_ib is not None else False
         if transfer_mode == "auto":
             _in_cluster = is_control_in_cluster(host_list)
             if _in_cluster and not _cross_user:
@@ -783,7 +787,11 @@ def distribute_from_config(
         _ib_validated = None
         if transfer_mode in ("auto", "local"):
             _ib_validated = validate_ib_connectivity(ib_result.ib_candidates, ssh_kwargs=ssh_kwargs, dry_run=dry_run)
-        _auto_delegated = False
+        # Honor a pre-resolved auto_delegated verdict: the cross-user / no-local-IB
+        # fast paths in resolve_auto_transfer_mode() return the concrete mode with
+        # auto_delegated=True but *without* caching ib_result, so we land here (IB
+        # is recomputed) yet must still keep the push-fallback armed.
+        _auto_delegated = pre_ib.auto_delegated if pre_ib is not None else False
         if transfer_mode == "auto":
             _cu = _is_cross_user(ssh_kwargs)
             if is_control_in_cluster(host_list) and not _cu:
@@ -951,10 +959,18 @@ def _distribute_single_image(
     elif transfer_mode == "delegated":
         result = distribute_image_from_head(image, targets, worker_transfer_hosts=w_hosts, dry_run=dry_run, **ssh_kwargs)
         if result and auto_delegated:
+            # Delegated pull failed (e.g. a private image the head can't pull).
+            # Fall back to push: the control machine has the image locally → push
+            # it to the head, then head fans out to any workers over IB.
+            logger.info("Delegated image pull failed; falling back to push from the control machine")
             head = targets[0]
             head_failed = distribute_image_from_local(image, [head], transfer_hosts=None, dry_run=dry_run, **ssh_kwargs)
-            if not head_failed and len(targets) > 1:
+            if head_failed:
+                result = list(targets)
+            elif len(targets) > 1:
                 result = distribute_image_from_head(image, targets, worker_transfer_hosts=w_hosts, dry_run=dry_run, **ssh_kwargs)
+            else:
+                result = []
         return result
     return distribute_image_from_local(image, targets, transfer_hosts=t_hosts, dry_run=dry_run, **ssh_kwargs)
 
@@ -1054,6 +1070,7 @@ def _distribute_single_model(
             **ssh_kwargs,
         )
         if result and auto_delegated:
+            logger.info("Delegated model download failed; falling back to push from the control machine")
             head = targets[0]
             head_failed = distribute_model_from_local(
                 model,
@@ -1067,7 +1084,10 @@ def _distribute_single_model(
                 preserve_perms=prefs.preserve_perms,
                 **ssh_kwargs,
             )
-            if not head_failed and len(targets) > 1:
+            if head_failed:
+                head_reason = head_failed[0].reason
+                result = [TransferFailure(host=h, reason=head_reason) for h in targets]
+            elif len(targets) > 1:
                 result = distribute_model_from_head(
                     model,
                     targets,
@@ -1080,6 +1100,8 @@ def _distribute_single_model(
                     skip_fan_out=prefs.skip_fan_out,
                     **ssh_kwargs,
                 )
+            else:
+                result = []
         return result
     return distribute_model_from_local(
         model,
