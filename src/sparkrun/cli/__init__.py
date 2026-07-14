@@ -122,10 +122,18 @@ def search_cmd(ctx, registry, runtime, query):
 @main.command("status")
 @host_options
 @dry_run_option
+@json_option()
 @click.pass_context
-def status(ctx, hosts, hosts_file, cluster_name, dry_run):
+def status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json):
     """Show sparkrun containers running on cluster hosts (alias for 'cluster status')."""
-    ctx.invoke(cluster_status, hosts=hosts, hosts_file=hosts_file, cluster_name=cluster_name, dry_run=dry_run)
+    ctx.invoke(
+        cluster_status,
+        hosts=hosts,
+        hosts_file=hosts_file,
+        cluster_name=cluster_name,
+        dry_run=dry_run,
+        output_json=output_json,
+    )
 
 
 @main.command("update")

@@ -1186,6 +1186,29 @@ class TestClusterCommands:
         assert "groups" in data
         assert data["solo_entries"][0]["cluster_id"] == "cid1"
 
+    def test_top_level_status_json(self, runner, cluster_setup):
+        """The top-level `status` alias forwards --json to cluster status."""
+        import json
+        from sparkrun.core.cluster_manager import ClusterStatusResult, ClusterSoloEntry
+
+        with mock.patch(
+            "sparkrun.core.cluster_manager.query_cluster_status",
+            return_value=ClusterStatusResult(
+                groups={},
+                solo_entries=[ClusterSoloEntry("cid1", "10.0.0.1", "name", "running", "img", {"recipe": "test"})],
+                errors={},
+                idle_hosts=[],
+                pending_ops=[],
+                total_containers=1,
+                host_count=1,
+            ),
+        ):
+            result = runner.invoke(main, ["status", "--cluster", "test-cluster", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["solo_entries"][0]["cluster_id"] == "cid1"
+
     def test_cluster_create(self, runner, tmp_path, monkeypatch):
         """Test creating a cluster."""
         config_root = tmp_path / "config"
