@@ -183,7 +183,7 @@ def test_generate_ray_worker_script_with_nccl():
 
 
 def test_generate_exec_serve_script_detached():
-    """Uses nohup for background execution."""
+    """Launches the serve detached via `docker exec -d` (survives proot/fastvfs)."""
     script = generate_exec_serve_script(
         container_name="my-container",
         serve_command="vllm serve model",
@@ -191,8 +191,12 @@ def test_generate_exec_serve_script_detached():
     )
 
     assert script.startswith("#!/bin/bash")
-    assert "docker exec my-container" in script
-    assert "nohup" in script
+    assert "docker exec my-container" in script  # foreground write of the serve script
+    # Detached launch owned by docker (not an in-shell `nohup ... &`, which
+    # proot/fastvfs kills when the exec returns), with a self-recorded PID.
+    assert "docker exec -d my-container" in script
+    assert "echo $$ > /tmp/sparkrun_serve.pid" in script
+    assert "nohup bash" not in script  # the old in-shell background command is gone
     assert "/tmp/sparkrun_serve.log" in script
     assert "tail -f" in script
     assert b64_encode_cmd("vllm serve model") in script

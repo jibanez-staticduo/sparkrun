@@ -6,10 +6,18 @@ echo "--- Command ---"
 printf '%s' '{b64_cmd}' | base64 -d --
 echo -e "\n---------------"
 
-# Launch the serve command detached with stdout/stderr redirected to a file
-# inside the container. Container PID 1 is `sleep infinity`, so `docker logs`
-# is structurally blind to this output -- it must be read via `docker exec cat`.
-docker exec {container_name} bash -c "printf '%s' '{b64_cmd}' | base64 -d -- > /tmp/sparkrun_serve.sh && nohup bash --noprofile --norc /tmp/sparkrun_serve.sh > /tmp/sparkrun_serve.log 2>&1 & echo \$! > /tmp/sparkrun_serve.pid"
+# Materialize the serve script (foreground write), then launch it detached.
+# Container PID 1 is `sleep infinity`, so `docker logs` is structurally blind to
+# this output -- it must be read via `docker exec cat`.
+docker exec {container_name} bash -c "printf '%s' '{b64_cmd}' | base64 -d -- > /tmp/sparkrun_serve.sh"
+
+# Launch via `docker exec -d` (docker owns the detached process) rather than an
+# in-container `nohup ... &`: some runtimes — notably the proot/fastvfs docker on
+# Thunder Compute — kill an in-shell backgrounded child the moment the launching
+# `exec` returns (and its redirect file never materializes), so the serve would
+# die instantly. The wrapper records its own PID, which `exec` preserves as the
+# serve process's PID, so the liveness check + watchdog below are unchanged.
+docker exec -d {container_name} bash -c 'echo $$ > /tmp/sparkrun_serve.pid; exec bash --noprofile --norc /tmp/sparkrun_serve.sh > /tmp/sparkrun_serve.log 2>&1'
 
 # Wait for process to start and (hopefully) produce initial output
 sleep 3
