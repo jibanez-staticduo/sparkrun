@@ -32,6 +32,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _nvidia_gpu_args(gpus: str | None) -> list[str]:
+    """Request NVIDIA GPUs via CDI (Container Device Interface).
+
+    Emits ``--device nvidia.com/gpu=<id>``.  CDI is the modern, portable path
+    (Docker >= 25): it works on DGX Spark (``nvidia-ctk`` auto-registers the
+    devices) and is *required* on environments whose custom docker rejects
+    ``--gpus`` (e.g. Thunder Compute).  Maps the legacy ``gpus`` value —
+    ``"all"`` → ``nvidia.com/gpu=all``; ``"device=0,1"`` / ``"0,1"`` → one
+    ``--device`` per id.
+    """
+    # Falsy gpus (None / "") means "no GPU request" — preserve that (byte-identical
+    # to the legacy `if cfg.gpus:` guard) rather than forcing all GPUs.
+    if not gpus:
+        return []
+    spec = gpus.strip().strip('"')
+    if not spec or spec == "all":
+        return ["--device", "nvidia.com/gpu=all"]
+    spec = spec.removeprefix("device=")
+    args: list[str] = []
+    for dev in spec.split(","):
+        dev = dev.strip()
+        if dev:
+            args += ["--device", quote("nvidia.com/gpu=%s" % dev)]
+    return args or ["--device", "nvidia.com/gpu=all"]
+
+
 # Matches the deterministic sparkrun container-name convention emitted by
 # :class:`Executor.container_name` / :class:`Executor.node_container_name`:
 # ``sparkrun_<intent>_<placement_token>_(solo|head|worker|node_<rank>)``
@@ -133,7 +159,7 @@ class DockerExecutor(Executor):
     def _accelerator_opts(self) -> list[str]:
         """Emit accelerator device flags based on ``config.accelerator_vendor``.
 
-        - ``None`` (default) or ``"nvidia"`` → ``--gpus <cfg.gpus>``.
+        - ``None`` (default) or ``"nvidia"`` → CDI (``--device nvidia.com/gpu=…``).
         - ``"amd"`` → ROCm device + render-group flags.
         - ``"intel"`` → Intel Gaudi device flag.
         - ``"apple"`` / ``"cpu"`` → no device flag.  Apple MLX cannot
@@ -144,9 +170,7 @@ class DockerExecutor(Executor):
         vendor = (cfg.accelerator_vendor or "").lower()
 
         if not vendor or vendor == "nvidia":
-            if cfg.gpus:
-                return ["--gpus", quote(cfg.gpus)]
-            return []
+            return _nvidia_gpu_args(cfg.gpus)
         if vendor == "amd":
             return [
                 "--device",

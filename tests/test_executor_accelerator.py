@@ -19,21 +19,27 @@ def _build_opts(vendor: str | None = None, gpus: str = "all") -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def test_default_vendor_emits_gpus_all():
-    """No vendor declared -> legacy --gpus all (byte-identical to pre-Phase-4)."""
-    assert _build_opts(vendor=None, gpus="all") == ["--gpus", "all"]
+def test_default_vendor_emits_cdi_all():
+    """No vendor declared -> NVIDIA via CDI (--device nvidia.com/gpu=all)."""
+    assert _build_opts(vendor=None, gpus="all") == ["--device", "nvidia.com/gpu=all"]
 
 
-def test_explicit_nvidia_emits_gpus_all():
-    assert _build_opts(vendor="nvidia", gpus="all") == ["--gpus", "all"]
+def test_explicit_nvidia_emits_cdi_all():
+    assert _build_opts(vendor="nvidia", gpus="all") == ["--device", "nvidia.com/gpu=all"]
 
 
-def test_nvidia_with_custom_gpu_spec():
-    assert _build_opts(vendor="nvidia", gpus="device=0,1") == ["--gpus", "device=0,1"]
+def test_nvidia_with_custom_gpu_spec_maps_to_cdi():
+    # `device=0,1` -> one --device per id.
+    assert _build_opts(vendor="nvidia", gpus="device=0,1") == [
+        "--device",
+        "nvidia.com/gpu=0",
+        "--device",
+        "nvidia.com/gpu=1",
+    ]
 
 
 def test_default_with_empty_gpus_emits_nothing():
-    """Empty gpus + no vendor -> no flag (matches legacy behavior)."""
+    """Empty gpus -> no device flag (preserved from the legacy behavior)."""
     assert _build_opts(vendor=None, gpus="") == []
 
 
@@ -124,8 +130,9 @@ def test_run_cmd_amd_contains_rocm_flags():
     assert "--gpus" not in cmd
 
 
-def test_run_cmd_default_byte_for_byte_with_legacy_gpus_flag():
-    """Default (no accelerator_vendor) keeps the legacy --gpus all flag in run_cmd output."""
+def test_run_cmd_default_nvidia_emits_cdi_flag():
+    """Default (no accelerator_vendor) requests NVIDIA GPUs via CDI in run_cmd output."""
     cfg = ExecutorConfig(privileged=False, gpus="all", network="")
     cmd = DockerExecutor(cfg).run_cmd(image="img", container_name="test")
-    assert "--gpus all" in cmd
+    assert "--device nvidia.com/gpu=all" in cmd
+    assert "--gpus" not in cmd
