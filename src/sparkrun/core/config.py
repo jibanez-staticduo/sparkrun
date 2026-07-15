@@ -440,6 +440,29 @@ class SparkrunConfig:
                 return str(ref)
         return DEFAULT_VLLM_TUNE_REF
 
+    @property
+    def external_plugin_paths(self) -> list[Path]:
+        """Directories to load out-of-tree plugins from (``plugins.paths``).
+
+        Each entry is a directory prepended to ``sys.path`` at startup; every
+        importable top-level module/package inside it is imported, scanned for
+        sparkrun plugin base classes (runtimes, executors, transports, …), and
+        given the chance to self-register via a module-level ``register(v)``
+        hook.  Empty list (the default) disables external plugin loading, so a
+        stock install pays zero cost and exposes zero extra surface.  Because
+        the config file and these directories are user-owned, loading them is
+        trusted by definition — the same model as a pip-installed package.
+        """
+        plugins = self._data.get("plugins", {})
+        if not isinstance(plugins, dict):
+            return []
+        raw = plugins.get("paths", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [Path(os.path.expanduser(str(entry))) for entry in raw if entry]
+
     def get_recipe_search_paths(self) -> list[Path]:
         """Return ordered list of paths to search for recipes."""
         paths = []

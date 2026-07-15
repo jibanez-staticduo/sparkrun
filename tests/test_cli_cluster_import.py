@@ -90,3 +90,31 @@ def test_import_dry_run_writes_nothing(tmp_path):
     assert r.stdout.strip() == "cluster"  # still emits resolved name
     names = {c.name for c in _get_cluster_manager().list_clusters()}
     assert "cluster" not in names
+
+
+# ---------------------------------------------------------------------------
+# svd / eugr subcommands (the modern form of the legacy --from-... flag)
+# ---------------------------------------------------------------------------
+
+
+def test_import_group_help_lists_svd():
+    r = CliRunner().invoke(main, ["cluster", "import", "--help"])
+    assert r.exit_code == 0
+    assert "svd" in r.output
+
+
+def test_import_svd_subcommand(tmp_path):
+    envf = tmp_path / "cluster.env"
+    envf.write_text("CLUSTER_NODES=10.0.0.1,10.0.0.2\nETH_IF=enp1s0f1np1\n")
+    r = CliRunner().invoke(main, ["cluster", "import", "svd", str(envf)])
+    assert r.exit_code == 0, r.stderr
+    assert r.stdout.strip() == "cluster"
+    assert _get_cluster_manager().get("cluster").hosts == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_import_eugr_alias(tmp_path):
+    envf = tmp_path / "prod.env"
+    envf.write_text("CLUSTER_NODES=10.0.0.5\n")
+    r = CliRunner().invoke(main, ["cluster", "import", "eugr", str(envf)])
+    assert r.exit_code == 0, r.stderr
+    assert _get_cluster_manager().get("prod").hosts == ["10.0.0.5"]

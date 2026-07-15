@@ -20,6 +20,12 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
     """
     monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
     monkeypatch.setenv("SPARKRUN_NO_TELEMETRY", "1")
+    # Hard-disable external-plugin auto-loading during tests. The feature flag
+    # alone is not enough: pytest reads the developer's REAL ~/.config/sparkrun
+    # (the SAF stateful root isn't "ready"), so a developer who enabled
+    # core.external_plugins would otherwise load their real plugins mid-suite.
+    # Loader tests pass explicit paths (which bypass this) or delenv it.
+    monkeypatch.setenv("SPARKRUN_NO_EXTERNAL_PLUGINS", "1")
     # The experimental local/k8s executors gate themselves off by default on
     # the stable channel (via is_multi_extension). Most of the suite exercises
     # their behavior directly and predates the feature-flag gating, so enable

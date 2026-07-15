@@ -4,10 +4,13 @@ A transport owns how sparkrun *reaches / prepares* a cluster's hosts before the
 generic SSH machinery runs.  ``ssh`` (the default) is a no-op; provider-backed
 transports (``thunder``) refresh ephemeral connection details out-of-band.
 
-Resolution uses a plain in-process registry keyed by
-:attr:`ClusterDefinition.transport` — mirroring :mod:`sparkrun.platforms`.  The
-set is tiny and closed, so SAF discovery would add indirection without benefit;
-``EXT_TRANSPORT`` is reserved for a future entry-point wiring if that changes.
+Transports are SAF plugins discovered by
+``find_types_in_modules("sparkrun.transports", Transport)`` in
+:func:`sparkrun.core.bootstrap.init_sparkrun` and selected by
+:attr:`Transport.transport_name` — the same mechanism as
+:mod:`sparkrun.orchestration.executors`.  (Selection is by exact name, so unlike
+the order-sensitive :mod:`sparkrun.platforms` registry there is no ordering to
+preserve — which is why transports, but not platforms, moved onto SAF.)
 
 Layering: ``cli/api → transports → {core, orchestration}``; ``orchestration``
 never imports this package.
@@ -18,42 +21,34 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sparkrun.transports.base import Transport, TransportError
+from scitrera_app_framework import Variables, get_extensions
+
+from sparkrun.transports.base import EXT_TRANSPORT, Transport, TransportError
 from sparkrun.transports.ssh import SshTransport
-from sparkrun.transports.thunder.transport import ThunderTransport
 
 if TYPE_CHECKING:
     from sparkrun.core.cluster_manager import ClusterDefinition
 
 logger = logging.getLogger(__name__)
 
-# Reserved for future SAF entry-point discovery (see module docstring).
-EXT_TRANSPORT = "sparkrun.transport"
-
 DEFAULT_TRANSPORT = "ssh"
 
-_REGISTRY: dict[str, type[Transport]] = {
-    "ssh": SshTransport,
-    "thunder": ThunderTransport,
-}
 
-# Provider transports gated behind a feature flag (off by default).  A cluster
-# declaring a gated transport fails closed unless the flag is enabled — the
-# transport is never silently downgraded to plain SSH.
-_TRANSPORT_FEATURE: dict[str, str] = {
-    "thunder": "transports.thunder",
-}
+def _require_transport_enabled(name: str, transport: Transport) -> None:
+    """Raise :class:`TransportError` if *transport* is feature-gated and disabled.
 
-
-def _require_transport_enabled(name: str) -> None:
-    """Raise :class:`TransportError` if *name* is feature-gated and disabled.
-
-    Resolves the flag context-free (env → config.yaml → channel default) via
+    The gate is declared by the transport itself via
+    :attr:`Transport.required_feature_flag` (so external transports self-gate
+    without any core registry). Resolves the flag context-free (env →
+    config.yaml → channel default) via
     :func:`sparkrun.core.features.feature_gate_enabled`, so it works from the
-    run/status/logs/stop hook where no ``SparkrunContext`` is threaded.
+    run/status/logs/stop hook where no ``SparkrunContext`` is threaded. Enforced
+    here at the ``prepare`` call site — not via SAF ``is_multi_extension``
+    hiding — so a gated selector yields a clear "enable it with ..." error
+    rather than an "unknown transport".
     """
-    flag = _TRANSPORT_FEATURE.get(name)
-    if flag is None:
+    flag = getattr(transport, "required_feature_flag", None)
+    if not flag:
         return
     from sparkrun.core.features import feature_gate_enabled
 
@@ -63,29 +58,36 @@ def _require_transport_enabled(name: str) -> None:
         )
 
 
-def register_transport(name: str, cls: type[Transport]) -> None:
-    """Register a transport class under *name* (external providers)."""
-    _REGISTRY[name] = cls
-    logger.debug("Registered transport %r -> %s", name, cls.__name__)
+def _transport_extensions(v: Variables | None = None) -> dict:
+    """Return SAF transport plugins, initializing the framework if needed."""
+    if v is None:
+        from sparkrun.core.bootstrap import get_variables
+
+        v = get_variables()
+    return get_extensions(EXT_TRANSPORT, v=v)
 
 
-def list_transports() -> list[str]:
+def list_transports(v: Variables | None = None) -> list[str]:
     """Return the registered transport selector names."""
-    return sorted(_REGISTRY)
+    return sorted(t.transport_name for t in _transport_extensions(v).values() if getattr(t, "transport_name", ""))
 
 
-def resolve_transport(name: str | None) -> Transport:
+def resolve_transport(name: str | None, v: Variables | None = None) -> Transport:
     """Return a :class:`Transport` instance for selector *name*.
 
     ``None`` / empty resolves to the default ``ssh`` transport.  An unknown
     selector raises :class:`TransportError` (never a silent fallback — a cluster
     that declares ``transport: foo`` must not silently run over plain SSH).
+
+    Transports are stateless, so the registered SAF singleton is returned
+    directly (mirroring the platform registry; unlike executors, which carry
+    per-launch config and are instantiated fresh).
     """
     key = name or DEFAULT_TRANSPORT
-    cls = _REGISTRY.get(key)
-    if cls is None:
-        raise TransportError("Unknown transport %r (known: %s)" % (key, ", ".join(list_transports())))
-    return cls()
+    for transport in _transport_extensions(v).values():
+        if getattr(transport, "transport_name", "") == key:
+            return transport
+    raise TransportError("Unknown transport %r (known: %s)" % (key, ", ".join(list_transports(v))))
 
 
 def prepare_cluster_transport(cluster: "ClusterDefinition | None", *, dry_run: bool = False) -> None:
@@ -102,8 +104,31 @@ def prepare_cluster_transport(cluster: "ClusterDefinition | None", *, dry_run: b
     name = getattr(cluster, "transport", None) or DEFAULT_TRANSPORT
     if name == DEFAULT_TRANSPORT:
         return
-    _require_transport_enabled(name)
-    resolve_transport(name).prepare(cluster, dry_run=dry_run)
+    transport = resolve_transport(name)
+    _require_transport_enabled(name, transport)
+    transport.prepare(cluster, dry_run=dry_run)
+
+
+def cleanup_cluster_transport(cluster: "ClusterDefinition | None", *, dry_run: bool = False) -> None:
+    """Run the transport ``cleanup_cluster`` step for *cluster* on deletion.
+
+    Mirrors :func:`prepare_cluster_transport`.  Deliberately **not** feature-
+    gated — teardown of provider-owned state (ssh aliases, keys) must succeed
+    even if the transport was later disabled.  Defensive: an unknown/absent
+    transport (e.g. its plugin isn't loaded) is a no-op rather than a delete
+    failure.
+    """
+    if cluster is None:
+        return
+    name = getattr(cluster, "transport", None) or DEFAULT_TRANSPORT
+    if name == DEFAULT_TRANSPORT:
+        return
+    try:
+        transport = resolve_transport(name)
+    except TransportError:
+        logger.debug("No transport %r available to clean up cluster %r; skipping", name, getattr(cluster, "name", "?"))
+        return
+    transport.cleanup_cluster(cluster, dry_run=dry_run)
 
 
 __all__ = [
@@ -112,9 +137,8 @@ __all__ = [
     "Transport",
     "TransportError",
     "SshTransport",
-    "ThunderTransport",
-    "register_transport",
     "list_transports",
     "resolve_transport",
     "prepare_cluster_transport",
+    "cleanup_cluster_transport",
 ]

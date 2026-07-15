@@ -308,6 +308,15 @@ class TestRequiredFeatureGuard:
             if feature:
                 assert get_feature(feature) is not None, "%s gates on unregistered flag %r" % (cls.__name__, feature)
 
+    def test_transport_required_features_are_registered(self):
+        from scitrera_app_framework.util import find_types_in_modules
+        from sparkrun.transports.base import Transport
+
+        for cls in find_types_in_modules("sparkrun.transports", Transport):
+            feature = getattr(cls, "required_feature_flag", None)
+            if feature:
+                assert get_feature(feature) is not None, "%s gates on unregistered flag %r" % (cls.__name__, feature)
+
     def test_builtin_executor_flags_present(self):
         names = {f.name for f in all_features()}
         assert {"executor.local", "executor.k8s"} <= names

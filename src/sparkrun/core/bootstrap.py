@@ -119,6 +119,33 @@ def init_sparkrun(v: Variables | None = None, log_level: str = "WARNING") -> Var
         except (ValueError, TypeError) as e:
             logger.debug("Skipping scheduler %s: %s", scheduler_cls.__name__, e)
 
+    # Auto-discover all Transport subclasses in sparkrun.transports. Imported
+    # here (function-local) so ``core`` only touches ``transports`` at
+    # discovery time — no module-level cycle (transports imports core).
+    from sparkrun.transports.base import Transport as _TransportPlugin
+
+    discovered_transports = list(find_types_in_modules("sparkrun.transports", _TransportPlugin))
+    for transport_cls in discovered_transports:
+        # Skip the abstract-ish base (blank transport_name) shared by concrete
+        # transports; only named selectors are registered.
+        if not getattr(transport_cls, "transport_name", ""):
+            logger.debug("Skipping unnamed transport: %s", transport_cls.__name__)
+            continue
+        try:
+            register_plugin(transport_cls, v=v)
+            logger.debug("Registered transport: %s", transport_cls.__name__)
+        except (ValueError, TypeError) as e:
+            logger.debug("Skipping transport %s: %s", transport_cls.__name__, e)
+
+    # External (out-of-tree) plugins from user-configured ``plugins.paths``.
+    # No-op unless configured; never allowed to break startup.
+    from sparkrun.core.external_plugins import load_external_plugins
+
+    try:
+        load_external_plugins(v)
+    except Exception:  # noqa: BLE001 - a broken plugin dir must not kill the CLI
+        logger.exception("External plugin loading failed")
+
     return v
 
 

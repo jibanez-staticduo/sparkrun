@@ -190,7 +190,9 @@ def cluster_import(ctx, svd_env, name, set_default, dry_run):
 
     \b
       svd | eugr PATH   import a spark-vllm-docker .env file
-      thunder [IDS...]  attach Thunder Compute instances as clusters
+
+    Additional providers may be contributed by plugins (e.g. ``cluster import
+    thunder`` from the sparkrun_thunder plugin).
 
     The legacy ``--from-spark-vllm-docker-env PATH`` flag is still accepted
     (deprecated) and forwards to ``import svd``.
@@ -324,142 +326,6 @@ def cluster_import_svd(ctx, path, name, set_default, dry_run):
 
 # ``eugr`` is an alias for ``svd`` (same spark-vllm-docker .env format).
 cluster_import.add_command(cluster_import_svd, "eugr")
-
-
-THUNDER_TRANSPORT_FEATURE = "transports.thunder"
-
-
-def _thunder_transport_enabled_at_import() -> bool:
-    """Best-effort flag resolution for help-visibility (hidden when off/unknown)."""
-    try:
-        from sparkrun.core.config import SparkrunConfig
-
-        return SparkrunConfig().is_feature_enabled(THUNDER_TRANSPORT_FEATURE)
-    except Exception:  # noqa: BLE001 — never let a config read break CLI import
-        return False
-
-
-@cluster_import.command("thunder", hidden=not _thunder_transport_enabled_at_import())
-@click.argument("instance_ids", nargs=-1, metavar="[ID...]")
-@click.option("--name", "name", type=CLUSTER_NAME, default=None, help="Cluster name (single instance only; default: thunder-<id>)")
-@click.option("--default", "set_default", is_flag=True, default=False, help="Set as the default cluster (single instance only)")
-@click.option("--no-probe", "no_probe", is_flag=True, default=False, help="Skip the SSH hardware probe; seed hardware from the Thunder API")
-@dry_run_option
-@click.pass_context
-def cluster_import_thunder(ctx, instance_ids, name, set_default, no_probe, dry_run):
-    """Attach Thunder Compute instances as sparkrun clusters (one per instance).
-
-    With no IDs, imports every RUNNING instance; otherwise only the given
-    instance ids/uuids.  Each becomes its own single-host cluster reachable over
-    SSH (provisions a key + managed ssh alias via the Thunder API).  Re-running
-    syncs in place, matched by the instance uuid.  Prints each cluster name.
-
-    Experimental — gated behind the ``transports.thunder`` feature flag.
-    """
-    from sparkrun.core.cluster_manager import ClusterError
-    from sparkrun.transports.thunder import api as thunder_api
-    from sparkrun.transports.thunder import ssh_alias
-    from sparkrun.transports.thunder import transport as thunder_transport
-
-    if not _get_context(ctx).config.is_feature_enabled(THUNDER_TRANSPORT_FEATURE):
-        raise click.ClickException(
-            "The 'cluster import thunder' command is experimental and disabled. "
-            "Enable it with: sparkrun setup features enable transports.thunder"
-        )
-
-    try:
-        token, base, running = thunder_transport.list_running_instances()
-    except thunder_api.ThunderError as e:
-        click.echo("Error: %s" % e, err=True)
-        sys.exit(1)
-
-    if instance_ids:
-        wanted = set(instance_ids)
-        selected = [i for i in running if i.id in wanted or i.uuid in wanted]
-        matched = {i.id for i in selected} | {i.uuid for i in selected}
-        missing = wanted - matched
-        if missing:
-            click.echo("Error: no RUNNING Thunder instance matches: %s" % ", ".join(sorted(missing)), err=True)
-            sys.exit(1)
-    else:
-        selected = list(running)
-
-    if not selected:
-        click.echo("No RUNNING Thunder instances found. Start one with `tnr` first.", err=True)
-        sys.exit(1)
-    if name is not None and len(selected) != 1:
-        click.echo("Error: --name requires selecting exactly one instance.", err=True)
-        sys.exit(1)
-    if set_default and len(selected) != 1:
-        click.echo("Error: --default requires selecting exactly one instance.", err=True)
-        sys.exit(1)
-
-    sctx = _get_context(ctx)
-    mgr = _get_cluster_manager(sctx=sctx)
-
-    for inst in selected:
-        alias = ssh_alias.alias_for(inst)
-        # Re-import identity is the stable instance uuid (provider_ref).
-        existing = next((c for c in mgr.list_clusters() if c.provider_ref == inst.uuid), None)
-        target = existing.name if existing is not None else (name or ("thunder-%s" % inst.id))
-
-        click.echo(
-            "  instance %s (uuid %s): %s x%d @ %s:%d" % (inst.id, inst.uuid, inst.gpu_type or "?", inst.num_gpus, inst.ip, inst.port),
-            err=True,
-        )
-
-        if dry_run:
-            click.echo("[dry-run] would %s thunder cluster '%s' (host %s)." % ("sync" if existing else "create", target, alias), err=True)
-            click.echo(target)
-            continue
-
-        try:
-            key = ssh_alias.ensure_key(token, base, inst)
-            ssh_alias.write_aliases([(inst, key)])
-        except thunder_api.ThunderError as e:
-            click.echo("Error: %s" % e, err=True)
-            sys.exit(1)
-
-        if no_probe:
-            host_hw = {alias: thunder_transport.seed_hardware(inst)}
-        else:
-            from sparkrun.core.hardware_probe import probe_host
-
-            click.echo("  probing %s ..." % alias, err=True)
-            host_hw = {alias: probe_host(alias, ssh_kwargs={})}
-
-        try:
-            if existing is not None:
-                # Backfill the ssh user + executor overrides on re-sync so clusters
-                # imported before those fields were set pick them up.
-                mgr.update(
-                    target,
-                    hosts=[alias],
-                    hosts_hardware=host_hw,
-                    user=ssh_alias.THUNDER_SSH_USER,
-                    executor_config=dict(ssh_alias.THUNDER_EXECUTOR_CONFIG),
-                )
-                click.echo("Synced thunder cluster '%s'." % target, err=True)
-            else:
-                mgr.create(
-                    target,
-                    [alias],
-                    description="Thunder Compute %s (%s)" % (inst.gpu_type or "GPU", inst.uuid),
-                    user=ssh_alias.THUNDER_SSH_USER,
-                    transport="thunder",
-                    provider_ref=inst.uuid,
-                    hosts_hardware=host_hw,
-                    executor_config=dict(ssh_alias.THUNDER_EXECUTOR_CONFIG),
-                )
-                click.echo("Imported thunder cluster '%s' (host %s)." % (target, alias), err=True)
-            if set_default:
-                mgr.set_default(target)
-                click.echo("Default cluster set to '%s'." % target, err=True)
-        except ClusterError as e:
-            click.echo("Error: %s" % e, err=True)
-            sys.exit(1)
-
-        click.echo(target)
 
 
 @cluster.command("update")
@@ -836,13 +702,11 @@ def cluster_delete(ctx, name, force):
     if not force:
         click.confirm(f"Delete cluster '{name}'?", abort=True)
 
-    # Capture provider details before deletion so we can clean up the managed
-    # ssh alias for provider-backed (e.g. Thunder) clusters.
-    provider_ref = None
+    # Capture the definition before deletion so a provider transport can tear
+    # down out-of-band state (e.g. the managed ssh alias) after it's gone.
+    _cd = None
     try:
         _cd = mgr.get(name)
-        if getattr(_cd, "transport", "ssh") == "thunder":
-            provider_ref = _cd.provider_ref
     except ClusterError:
         pass
 
@@ -853,10 +717,10 @@ def cluster_delete(ctx, name, force):
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    if provider_ref:
-        from sparkrun.transports.thunder import ssh_alias
+    if _cd is not None:
+        from sparkrun.transports import cleanup_cluster_transport
 
-        ssh_alias.remove_alias(provider_ref)
+        cleanup_cluster_transport(_cd)
 
 
 @cluster.command("set-default")

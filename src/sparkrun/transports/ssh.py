@@ -14,4 +14,4 @@ from sparkrun.transports.base import Transport
 class SshTransport(Transport):
     """No-op transport for plain-SSH clusters (the default)."""
 
-    name = "ssh"
+    transport_name = "ssh"

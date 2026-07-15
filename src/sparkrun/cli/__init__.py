@@ -5,6 +5,7 @@ from __future__ import annotations
 import click
 
 from sparkrun import __version__
+from .ext import PluggableGroup
 from ._common import (
     RECIPE_NAME,
     REGISTRY_NAME,
@@ -44,7 +45,7 @@ def _print_version(ctx, param, value):
     ctx.exit()
 
 
-@click.group()
+@click.group(cls=PluggableGroup)
 @click.option("-v", "--verbose", count=True, help="Increase verbosity (-v detail, -vv timestamps, -vvv debug)")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress all output except errors (for scripting)")
 @click.option(

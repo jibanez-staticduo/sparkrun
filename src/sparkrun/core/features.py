@@ -235,18 +235,22 @@ FEATURE_API_RUN_K8S = register_feature(
     )
 )
 
-FEATURE_TRANSPORTS_THUNDER = register_feature(
-    FeatureFlag(
-        name="transports.thunder",
-        description="Experimental Thunder Compute remote transport ('cluster import thunder')",
-        default=False,
-    )
-)
-
 FEATURE_CLI_SETUP_TAILSCALE = register_feature(
     FeatureFlag(
         name="cli.setup.tailscale",
         description="Experimental 'sparkrun setup tailscale' command group (join nodes / publish endpoint on a tailnet)",
+        default=False,
+    )
+)
+
+# Loading out-of-tree plugins from ``plugins.paths`` executes user-supplied
+# Python at startup; keep it off by default on every channel so a stock install
+# never reads (let alone imports) external plugin directories unless the user
+# opts in explicitly. See ``sparkrun.core.external_plugins``.
+FEATURE_CORE_EXTERNAL_PLUGINS = register_feature(
+    FeatureFlag(
+        name="core.external_plugins",
+        description="Load out-of-tree plugins from 'plugins.paths' in config.yaml at startup",
         default=False,
     )
 )

@@ -111,11 +111,23 @@ The CLI was split from a single `cli.py` into a package for maintainability. The
 | `_wizard.py`      | `setup wizard` command — guided cluster setup                                                                                                                                                                                                                     |
 | `_proxy.py`       | `proxy` command group — LiteLLM inference proxy management                                                                                                                                                                                                        |
 | `_monitor_tui.py` | Textual TUI for `cluster monitor`                                                                                                                                                                                                                                 |
+| `ext.py`          | Plugin CLI-command extension point — `register_cli_command(cmd, parent=…)` + `PluggableGroup` (see below)                                                                                                                                                          |
+
+**Plugin CLI commands** (`cli/ext.py`): external plugins add Click commands via
+`register_cli_command(command, parent=(...))` (`parent=()` → top-level;
+`parent=("cluster","import")` → nested). The top-level `main` is a
+`PluggableGroup`: on first command resolution it runs `ensure_cli_extensions`
+(→ `init_sparkrun`, which imports plugins so they register, → attach), so plugin
+commands appear in `--help` and dispatch like built-ins even though the command
+tree is built at import time (before plugins load). Attachment is idempotent and
+never clobbers a built-in; command↔plugin mapping is intentionally free-form
+(not tied to the transport/executor abstractions). Per-command gating is the
+command's own concern.
 
 ### Plugin System (SAF)
 
 sparkrun uses [scitrera-app-framework](https://github.com/scitrera/python-app-framework) (SAF) for plugin discovery and
-lifecycle. Four extension points are registered:
+lifecycle. Six extension points are registered:
 
 | Extension point        | Constant       | Module scanned                       | Base class              |
 |------------------------|----------------|--------------------------------------|-------------------------|
@@ -123,16 +135,49 @@ lifecycle. Four extension points are registered:
 | `sparkrun.builder`     | `EXT_BUILDER`  | `sparkrun.builders`                  | `BuilderPlugin`         |
 | `sparkrun.benchmarking`| `EXT_BENCHMARKING` | `sparkrun.benchmarking`          | `BenchmarkingPlugin`    |
 | `sparkrun.executor`    | `EXT_EXECUTOR` | `sparkrun.orchestration.executors`   | `Executor`              |
+| `sparkrun.scheduler`   | (scheduler)    | `sparkrun.schedulers`                | `Scheduler`             |
+| `sparkrun.transport`   | `EXT_TRANSPORT`| `sparkrun.transports`                | `Transport`             |
 
 Key bootstrap flow: `cli/__init__.py` → `core.bootstrap.init_sparkrun()` → SAF `init_framework_desktop()` →
-`find_types_in_modules("sparkrun.runtimes", RuntimePlugin)` +
-`find_types_in_modules("sparkrun.benchmarking", BenchmarkingPlugin)` +
-`find_types_in_modules("sparkrun.builders", BuilderPlugin)` +
-`find_types_in_modules("sparkrun.orchestration.executors", Executor)` → `register_plugin()` for each discovered plugin.
+`find_types_in_modules(...)` over each scanned module above → `register_plugin()` for each discovered plugin (schedulers
+and transports skip base classes with a blank `scheduler_name` / `transport_name`). Finally
+`load_external_plugins(v)` loads any out-of-tree plugins (see External Plugins below).
 
 The `EXT_PLATFORM` constant is defined in `platforms/base.py` for future SAF
 entry-point discovery; today `platforms/__init__.py` keeps an ordered
-in-process registry that callers iterate via `resolve_platform()`.
+in-process registry that callers iterate via `resolve_platform()`. Platforms
+stay in-process (not SAF-scanned) because their resolution is **order-sensitive**
+(most-specific `matches()` first) — transports, which select by exact name, moved
+onto SAF; platforms did not.
+
+### External Plugins (`core/external_plugins.py`)
+
+Out-of-tree plugins (private executors, transports, runtimes, …) load from
+directories listed under `plugins.paths` in `config.yaml`
+(`SparkrunConfig.external_plugin_paths`). `load_external_plugins(v)`, called at
+the end of `init_sparkrun`, prepends each dir to `sys.path`, imports every
+top-level module/package in it, scans each for the six SAF plugin base types and
+`register_plugin`s them, then calls an optional module-level `register(v)` hook —
+the escape hatch for the still-in-process registries (`platforms`,
+`collectives`), which register via `register_platform()` rather than SAF subclass
+discovery. Loading is trusted by definition (the config + dirs are user-owned);
+a broken plugin logs and is skipped, never breaking startup.
+
+**Gated off by default** behind the `core.external_plugins` feature flag (off on
+every channel). When the flag resolves off, the config-driven path returns
+immediately **without reading `plugins.paths`** (let alone importing anything) —
+the gate uses the same context-free `feature_gate_enabled` resolution as the
+executor/transport gates, so no init cycle. Enable via `sparkrun setup features
+enable core.external_plugins`. The flag gates only the auto-load (`paths=None`)
+path; an explicit `paths=` argument (programmatic / a plugin's own tests)
+bypasses it.
+
+Test isolation uses a separate hard kill-switch, `SPARKRUN_NO_EXTERNAL_PLUGINS`
+(set by `conftest.isolate_stateful`): the feature flag alone is insufficient
+because pytest reads the developer's **real** `~/.config/sparkrun` (the SAF
+stateful root isn't "ready" under pytest), so a developer who enabled the flag
+would otherwise load their real plugins mid-suite. The kill-switch short-circuits
+the auto-load path before the flag is even consulted.
 
 ### Runtime Architecture
 
@@ -202,10 +247,10 @@ cluster's hosts* before the generic SSH machinery runs. It is orthogonal to the
 **executor** (`orchestration/executors/`, *how the workload runs on the host*) —
 a provider-transport cluster still uses the docker executor.
 
-- **`base.py`** — `Transport` ABC with `prepare(cluster, *, dry_run=…)` (default no-op).
-- **`ssh.py`** — `SshTransport`, the default; `prepare()` is a no-op, so every existing cluster is byte-identical to before transports existed.
-- **`__init__.py`** — plain in-process registry (mirrors `platforms/`); `resolve_transport(name)`, and `prepare_cluster_transport(cluster)` — the single call-site helper. Feature-gated transports fail closed here via `_require_transport_enabled` (never a silent SSH downgrade). `EXT_TRANSPORT` reserved for future SAF discovery.
-- **`thunder/`** — Thunder Compute provider (`api.py` stdlib REST client, `ssh_alias.py` managed `~/.config/sparkrun/ssh/thunder.conf` + `~/.ssh/config` Include, `transport.py` `ThunderTransport` + import helpers). Gated behind the `transports.thunder` feature flag (off by default).
+- **`base.py`** — `Transport` SAF `Plugin` (selector `transport_name`, extension point `EXT_TRANSPORT`) with `prepare(cluster, *, dry_run=…)` (default no-op) and its delete-time counterpart `cleanup_cluster(cluster, *, dry_run=…)` (release out-of-band state — ssh alias/key — on cluster delete). A transport self-gates via `required_feature_flag` (like `Executor`). Discovered via `find_types_in_modules("sparkrun.transports", Transport)` in `core.bootstrap` — mirrors `Executor`.
+- **`ssh.py`** — `SshTransport` (`transport_name = "ssh"`), the default; `prepare()` is a no-op, so every existing cluster is byte-identical to before transports existed.
+- **`__init__.py`** — SAF-backed resolution: `resolve_transport(name)` / `list_transports()` query `get_extensions(EXT_TRANSPORT)` by `transport_name` (returning the stateless SAF singleton). `prepare_cluster_transport(cluster)` (run/status/logs/stop) and `cleanup_cluster_transport(cluster)` (delete) are the single call-site helpers. `_require_transport_enabled` reads the resolved transport's `required_feature_flag` and fails closed at the `prepare` call site (never a silent SSH downgrade, never SAF `is_multi_extension` hiding) — a gated selector yields a clear "enable it with …" error rather than "unknown transport". `cleanup_cluster_transport` is deliberately **ungated** (teardown must succeed even if the flag was later disabled) and tolerant of an absent transport plugin.
+- **Thunder Compute** (`transport: thunder`) is **no longer in core** — it was externalized to the out-of-tree `sparkrun_thunder` plugin (the reference example for the plugin system). It registers `ThunderTransport` (SAF), its own `transports.thunder` feature flag, and the `sparkrun cluster import thunder` command (via `register_cli_command`). Core keeps only the generic seam; a `transport: thunder` cluster fails closed unless the plugin is loaded (`core.external_plugins` + `transports.thunder`).
 
 `ClusterDefinition.transport: str = "ssh"` + `provider_ref` select the transport
 (serialized only when non-default). The single wiring is
