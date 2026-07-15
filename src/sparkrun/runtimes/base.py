@@ -498,12 +498,16 @@ class RuntimePlugin(Plugin):
 
         The base implementation sets ``HF_HOME`` so HuggingFace
         libraries find the cache at the rootless-compatible mount
-        point (``/cache/huggingface``).
+        point (``/cache/huggingface``).  It also sets ``HF_HUB_CACHE``
+        (``$HF_HOME/hub``) explicitly: some clients (e.g. the Rust
+        ``hf-hub``-based tokenary runtime) honor ``HF_HUB_CACHE`` but
+        not ``HF_HOME``, so without this they'd fall back to
+        ``~/.cache/huggingface`` and miss the mounted cache.
 
         Returns:
             Dict of env var name -> value.
         """
-        return {"HF_HOME": "/cache/huggingface"}
+        return {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub"}
 
     def get_extra_docker_opts(self) -> list[str]:
         """Return additional ``docker run`` options for this runtime.

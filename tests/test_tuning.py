@@ -372,7 +372,7 @@ class TestSglangRuntimeAutoMount:
             lambda: None,
         )
         runtime = get_runtime("sglang", v)
-        assert runtime.get_extra_env() == {"HF_HOME": "/cache/huggingface"}
+        assert runtime.get_extra_env() == {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub"}
 
     def test_get_extra_volumes_returns_mapping(self, v, monkeypatch):
         """SglangRuntime.get_extra_volumes returns mapping when configs exist."""
@@ -390,7 +390,7 @@ class TestSglangRuntimeAutoMount:
         """SglangRuntime.get_extra_env returns env when configs exist."""
         from sparkrun.core.bootstrap import get_runtime
 
-        expected = {"HF_HOME": "/cache/huggingface", "SGLANG_MOE_CONFIG_DIR": TUNING_ENV_PATH}
+        expected = {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub", "SGLANG_MOE_CONFIG_DIR": TUNING_ENV_PATH}
         monkeypatch.setattr(
             "sparkrun.tuning.sglang.get_sglang_tuning_env",
             lambda: {"SGLANG_MOE_CONFIG_DIR": TUNING_ENV_PATH},
@@ -418,7 +418,7 @@ class TestBaseRuntimeHooks:
         from sparkrun.core.bootstrap import get_runtime
 
         runtime = get_runtime("llama-cpp", v)
-        assert runtime.get_extra_env() == {"HF_HOME": "/cache/huggingface"}
+        assert runtime.get_extra_env() == {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub"}
 
 
 # ===========================================================================
@@ -901,7 +901,7 @@ class TestVllmRayRuntimeAutoMount:
             lambda: None,
         )
         runtime = get_runtime("vllm-ray", v)
-        assert runtime.get_extra_env() == {"HF_HOME": "/cache/huggingface"}
+        assert runtime.get_extra_env() == {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub"}
 
     def test_get_extra_volumes_returns_mapping(self, v, monkeypatch):
         """VllmRayRuntime.get_extra_volumes returns mapping when configs exist."""
@@ -919,7 +919,11 @@ class TestVllmRayRuntimeAutoMount:
         """VllmRayRuntime.get_extra_env returns env when configs exist."""
         from sparkrun.core.bootstrap import get_runtime
 
-        expected = {"HF_HOME": "/cache/huggingface", "VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH}
+        expected = {
+            "HF_HOME": "/cache/huggingface",
+            "HF_HUB_CACHE": "/cache/huggingface/hub",
+            "VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH,
+        }
         monkeypatch.setattr(
             "sparkrun.tuning.vllm.get_vllm_tuning_env",
             lambda: {"VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH},
@@ -949,7 +953,7 @@ class TestVllmDistributedAutoMount:
             lambda: None,
         )
         runtime = get_runtime("vllm-distributed", v)
-        assert runtime.get_extra_env() == {"HF_HOME": "/cache/huggingface"}
+        assert runtime.get_extra_env() == {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub"}
 
     def test_get_extra_volumes_returns_mapping(self, v, monkeypatch):
         """VllmDistributedRuntime.get_extra_volumes returns mapping when configs exist."""
@@ -967,7 +971,11 @@ class TestVllmDistributedAutoMount:
         """VllmDistributedRuntime.get_extra_env returns env when configs exist."""
         from sparkrun.core.bootstrap import get_runtime
 
-        expected = {"HF_HOME": "/cache/huggingface", "VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH}
+        expected = {
+            "HF_HOME": "/cache/huggingface",
+            "HF_HUB_CACHE": "/cache/huggingface/hub",
+            "VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH,
+        }
         monkeypatch.setattr(
             "sparkrun.tuning.vllm.get_vllm_tuning_env",
             lambda: {"VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH},
@@ -993,7 +1001,11 @@ class TestEugrVllmAutoMount:
         """EugrVllmRayRuntime inherits get_extra_env from VllmRayRuntime."""
         from sparkrun.core.bootstrap import get_runtime
 
-        expected = {"HF_HOME": "/cache/huggingface", "VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH}
+        expected = {
+            "HF_HOME": "/cache/huggingface",
+            "HF_HUB_CACHE": "/cache/huggingface/hub",
+            "VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH,
+        }
         monkeypatch.setattr(
             "sparkrun.tuning.vllm.get_vllm_tuning_env",
             lambda: {"VLLM_TUNED_CONFIG_FOLDER": VLLM_TUNING_CONTAINER_PATH},
