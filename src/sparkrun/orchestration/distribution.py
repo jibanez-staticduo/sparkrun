@@ -735,7 +735,7 @@ def distribute_from_config(
         pre_ib: Pre-computed IB detection results.
 
     Returns:
-        Tuple of (comm_env, ib_ip_map, mgmt_ip_map).
+        Tuple of (comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map).
     """
     from sparkrun.core.recipe import DistributionModelEntry, DistributionContainerEntry
     from sparkrun.orchestration.primitives import build_ssh_kwargs
@@ -775,7 +775,7 @@ def distribute_from_config(
                         != 0
                     ):
                         raise DistributionError(f"Failed to download model: {mn}")
-        return None, {}, {}
+        return None, {}, {}, {}
 
     # IB detection (reuse from pre_ib or compute)
     if pre_ib is not None and pre_ib.ib_result is not None:
@@ -898,7 +898,19 @@ def distribute_from_config(
                 )
 
     logger.info("Distribution complete.")
-    return comm_env, ib_ip_map, mgmt_ip_map
+
+    # IB interface backing each host's chosen IB IP, for the fabric-init pin
+    # (see runtimes._cluster_ops.run_native_cluster).  Only asserted where the
+    # final ib_ip_map still matches the first detected IB IP (whose interface
+    # we know); a validated non-first IP is omitted so the pin never produces a
+    # mismatched NODE_IP/socket-interface binding.
+    ib_iface_map = {
+        host: ib_result.ib_iface_map[host]
+        for host in ib_ip_map
+        if host in ib_result.ib_iface_map and ib_ip_map.get(host) == ib_result.ib_ip_map.get(host)
+    }
+
+    return comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map
 
 
 def _subset_transfer_hosts(

@@ -34,6 +34,21 @@ class VllmMixin:
         env.update(get_vllm_tuning_env() or {})
         return env
 
+    def finalize_host_comm_env(self, host_env: dict[str, str]) -> dict[str, str]:
+        """Advertise vLLM on the host's resolved ``NODE_IP``.
+
+        vLLM infers its message-queue / distributed host address from the
+        default route unless ``VLLM_HOST_IP`` is set.  Mirror the finalized
+        per-host ``NODE_IP`` (which the init-network selection may have pinned
+        to the IB/CX7 fabric) so vLLM binds the same network as the rendezvous
+        address instead of the default-route interface.
+        """
+        host_env = super().finalize_host_comm_env(host_env)
+        node_ip = host_env.get("NODE_IP")
+        if node_ip:
+            host_env = {**host_env, "VLLM_HOST_IP": node_ip}
+        return host_env
+
     def version_commands(self) -> dict[str, str]:
         cmds = super().version_commands()
         cmds["vllm"] = "python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo unknown"

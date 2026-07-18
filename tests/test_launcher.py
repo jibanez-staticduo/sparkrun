@@ -207,7 +207,7 @@ def test_launch_inference_threads_backends_to_runtime_run(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(
         "sparkrun.orchestration.distribution.distribute_from_config",
-        lambda *a, **kw: (None, {}, {}),
+        lambda *a, **kw: (None, {}, {}, {}),
     )
     # save_job_metadata is imported lazily inside launch_inference.
     monkeypatch.setattr(
@@ -322,7 +322,7 @@ def test_launch_inference_logs_platform_warnings_without_raising(monkeypatch, tm
     )
     monkeypatch.setattr(
         "sparkrun.orchestration.distribution.distribute_from_config",
-        lambda *a, **kw: (None, {}, {}),
+        lambda *a, **kw: (None, {}, {}, {}),
     )
     monkeypatch.setattr(
         "sparkrun.orchestration.job_metadata.save_job_metadata",
@@ -641,7 +641,7 @@ def test_launch_inference_save_job_metadata_failure_is_best_effort(monkeypatch, 
     )
     monkeypatch.setattr(
         "sparkrun.orchestration.distribution.distribute_from_config",
-        lambda *a, **kw: (None, {}, {}),
+        lambda *a, **kw: (None, {}, {}, {}),
     )
 
     save_calls: list = []

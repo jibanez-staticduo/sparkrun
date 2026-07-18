@@ -272,7 +272,7 @@ def _patch_launch(monkeypatch, tmp_path, captured):
     def _dist(*a, **kw):
         captured["dist_args"] = a
         captured["dist_kwargs"] = kw
-        return (None, {}, {})
+        return (None, {}, {}, {})
 
     monkeypatch.setattr("sparkrun.orchestration.distribution.distribute_from_config", _dist)
     monkeypatch.setattr("sparkrun.orchestration.job_metadata.save_job_metadata", lambda *a, **kw: None)

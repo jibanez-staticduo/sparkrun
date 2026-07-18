@@ -219,7 +219,7 @@ def _make_launch_monkeypatches(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         "sparkrun.orchestration.distribution.distribute_from_config",
-        lambda *a, **kw: (None, {}, {}),
+        lambda *a, **kw: (None, {}, {}, {}),
     )
     monkeypatch.setattr(
         "sparkrun.orchestration.job_metadata.save_job_metadata",

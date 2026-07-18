@@ -279,7 +279,7 @@ def test_native_cluster_step6_head_serve_failure_triggers_cleanup(monkeypatch):
     """When the head serve exec returns non-zero, cleanup_after_failure runs."""
     from sparkrun.orchestration.comm_env import ClusterCommEnv
 
-    monkeypatch.setattr(_cluster_ops, "detect_ib_with_ips", lambda *a, **k: (ClusterCommEnv.empty(), {}))
+    monkeypatch.setattr(_cluster_ops, "detect_ib_with_ips", lambda *a, **k: (ClusterCommEnv.empty(), {}, {}))
     monkeypatch.setattr(_cluster_ops, "detect_head_ip", lambda ctx: "10.0.0.1")
     monkeypatch.setattr(_cluster_ops, "resolve_hosts_for_init", lambda ctx, head_ip: ctx.hosts)
     monkeypatch.setattr(_cluster_ops, "find_port", lambda ctx, host, port: port)

@@ -215,11 +215,11 @@ def test_native_cluster_threads_backends_to_detect_ib_with_ips(monkeypatch):
 
     captured = {}
 
-    def _fake_detect(ctx, comm_env, ib_ip_map, backends=None):
+    def _fake_detect(ctx, comm_env, ib_ip_map, backends=None, ib_iface_map=None):
         captured["backends"] = backends
         from sparkrun.orchestration.comm_env import ClusterCommEnv
 
-        return ClusterCommEnv.empty(), {}
+        return ClusterCommEnv.empty(), {}, {}
 
     monkeypatch.setattr(_cluster_ops, "detect_ib_with_ips", _fake_detect)
     monkeypatch.setattr(_cluster_ops, "cleanup_ranked_containers", lambda *a, **k: None)

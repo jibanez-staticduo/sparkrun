@@ -92,6 +92,7 @@ def test_native_cluster_threads_reachable_ib_selection_into_node_commands(monkey
         lambda *_args, **_kwargs: (
             ClusterCommEnv.empty(),
             {"node-1": "192.168.100.10", "node-2": "192.168.100.11"},
+            {"node-1": "enp1s0f1np1", "node-2": "enp1s0f1np1"},
         ),
     )
     monkeypatch.setattr(_cluster_ops, "detect_head_ip", lambda _ctx: "192.168.128.10")
@@ -120,3 +121,140 @@ def test_native_cluster_threads_reachable_ib_selection_into_node_commands(monkey
     call = runtime.generate_node_command.call_args
     assert call.kwargs["head_ip"] == "192.168.100.10"
     assert call.kwargs["hosts"] == ["192.168.100.10", "192.168.100.11"]
+
+
+def test_native_cluster_pins_comm_env_to_fabric_on_ib_fallback(monkeypatch):
+    """Given mgmt failure, the per-host comm env handed to containers is fabric-pinned."""
+    ctx = _make_ctx(["node-1", "node-2"])
+
+    def _mgmt_first(mgmt_ip):
+        return {
+            "NCCL_NET": "IB",
+            "GLOO_SOCKET_IFNAME": "wlan0",
+            "TP_SOCKET_IFNAME": "wlan0",
+            "MN_IF_NAME": "wlan0",
+            "OMPI_MCA_btl_tcp_if_include": "wlan0",
+            "NCCL_SOCKET_IFNAME": "wlan0,cx0",
+            "NODE_IP": mgmt_ip,
+        }
+
+    comm_env = ClusterCommEnv.from_per_host({"node-1": _mgmt_first("192.168.1.10"), "node-2": _mgmt_first("192.168.1.11")})
+
+    monkeypatch.setattr(_cluster_ops, "cleanup_ranked_containers", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        _cluster_ops,
+        "detect_ib_with_ips",
+        lambda *_a, **_k: (
+            comm_env,
+            {"node-1": "192.168.100.10", "node-2": "192.168.100.11"},
+            {"node-1": "cx0", "node-2": "cx0"},
+        ),
+    )
+    monkeypatch.setattr(_cluster_ops, "detect_head_ip", lambda _ctx: "192.168.128.10")
+    monkeypatch.setattr(_cluster_ops, "resolve_hosts_for_init", lambda _ctx, _head_ip: ["192.168.128.10", "192.168.96.114"])
+    monkeypatch.setattr(_cluster_ops, "find_port", lambda _ctx, _host, port: port)
+    # Reachable only over the IB head → forces the fabric verdict.
+    monkeypatch.setattr(_init_network, "workers_can_reach", lambda _ctx, target_ip: target_ip == "192.168.100.10")
+
+    captured = {}
+
+    def _capture_launch(ctx_, containers, executor, ce, **_k):
+        captured["comm_env"] = ce
+        return 1
+
+    monkeypatch.setattr(_cluster_ops, "launch_containers_parallel", _capture_launch)
+
+    runtime = mock.MagicMock()
+    runtime._resolve_executor.return_value.node_container_name = lambda cid, rank: "%s_node_%d" % (cid, rank)
+    runtime.generate_node_command = mock.MagicMock(return_value="serve")
+    runtime.get_extra_docker_opts = lambda: []
+    runtime._print_cluster_banner = mock.MagicMock()
+
+    rc = _cluster_ops.run_native_cluster(runtime=runtime, ctx=ctx)
+
+    assert rc == 1
+    pinned = captured["comm_env"]
+    for host, ib_ip in (("node-1", "192.168.100.10"), ("node-2", "192.168.100.11")):
+        env = pinned.get_env(host)
+        assert env["NODE_IP"] == ib_ip
+        assert env["GLOO_SOCKET_IFNAME"] == "cx0"
+        assert env["TP_SOCKET_IFNAME"] == "cx0"
+        assert env["NCCL_SOCKET_IFNAME"] == "cx0"
+        # VLLM_HOST_IP is mirrored from NODE_IP by the vLLM runtime hook at
+        # container-launch time, not by the generic fabric pin.
+        assert "VLLM_HOST_IP" not in env
+
+
+def test_native_cluster_leaves_comm_env_untouched_when_mgmt_reachable(monkeypatch):
+    """Given reachable mgmt, the per-host comm env is not re-pinned to the fabric."""
+    ctx = _make_ctx(["node-1", "node-2"])
+    comm_env = ClusterCommEnv.from_per_host(
+        {
+            "node-1": {"GLOO_SOCKET_IFNAME": "wlan0", "NODE_IP": "192.168.1.10"},
+            "node-2": {"GLOO_SOCKET_IFNAME": "wlan0", "NODE_IP": "192.168.1.11"},
+        }
+    )
+
+    monkeypatch.setattr(_cluster_ops, "cleanup_ranked_containers", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        _cluster_ops,
+        "detect_ib_with_ips",
+        lambda *_a, **_k: (
+            comm_env,
+            {"node-1": "192.168.100.10", "node-2": "192.168.100.11"},
+            {"node-1": "cx0", "node-2": "cx0"},
+        ),
+    )
+    monkeypatch.setattr(_cluster_ops, "detect_head_ip", lambda _ctx: "192.168.128.10")
+    monkeypatch.setattr(_cluster_ops, "resolve_hosts_for_init", lambda _ctx, _head_ip: ["192.168.128.10", "192.168.96.114"])
+    monkeypatch.setattr(_cluster_ops, "find_port", lambda _ctx, _host, port: port)
+    # Management head is reachable → keep management, no re-pin.
+    monkeypatch.setattr(_init_network, "workers_can_reach", lambda _ctx, _target_ip: True)
+
+    captured = {}
+
+    def _capture_launch(ctx_, containers, executor, ce, **_k):
+        captured["comm_env"] = ce
+        return 1
+
+    monkeypatch.setattr(_cluster_ops, "launch_containers_parallel", _capture_launch)
+
+    runtime = mock.MagicMock()
+    runtime._resolve_executor.return_value.node_container_name = lambda cid, rank: "%s_node_%d" % (cid, rank)
+    runtime.generate_node_command = mock.MagicMock(return_value="serve")
+    runtime.get_extra_docker_opts = lambda: []
+    runtime._print_cluster_banner = mock.MagicMock()
+
+    _cluster_ops.run_native_cluster(runtime=runtime, ctx=ctx)
+
+    env = captured["comm_env"].get_env("node-1")
+    assert env["GLOO_SOCKET_IFNAME"] == "wlan0"
+    assert env["NODE_IP"] == "192.168.1.10"
+    assert "VLLM_HOST_IP" not in env
+
+
+def test_launch_containers_parallel_applies_runtime_finalize_hook():
+    """launch_containers_parallel routes each host env through finalize_host_comm_env."""
+    ctx = _make_ctx(["node-1"], dry_run=True)
+    comm_env = ClusterCommEnv.from_per_host({"node-1": {"NODE_IP": "192.168.0.155"}})
+
+    runtime = mock.MagicMock()
+    runtime.finalize_host_comm_env.side_effect = lambda env: {**env, "VLLM_HOST_IP": env["NODE_IP"]}
+
+    executor = mock.MagicMock()
+    executor.workload_labels_for_cluster.return_value = {}
+
+    captured = {}
+
+    def _gen(**kwargs):
+        captured["nccl_env"] = kwargs.get("nccl_env")
+        return "script"
+
+    executor.generate_launch_script.side_effect = _gen
+
+    rc = _cluster_ops.launch_containers_parallel(ctx, [("node-1", "c0")], executor, comm_env, runtime=runtime)
+
+    assert rc == 0
+    runtime.finalize_host_comm_env.assert_called_once()
+    assert captured["nccl_env"]["NODE_IP"] == "192.168.0.155"
+    assert captured["nccl_env"]["VLLM_HOST_IP"] == "192.168.0.155"

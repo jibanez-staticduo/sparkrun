@@ -490,7 +490,8 @@ def detect_ib_with_ips(
     comm_env: ClusterCommEnv | None,
     ib_ip_map: dict[str, str] | None,
     backends: "dict[str, BackendBundle] | None" = None,
-) -> tuple[ClusterCommEnv, dict[str, str]]:
+    ib_iface_map: dict[str, str] | None = None,
+) -> tuple[ClusterCommEnv, dict[str, str], dict[str, str]]:
     """Detect comm env and IP map (for runtimes needing IB addresses).
 
     Args:
@@ -501,8 +502,12 @@ def detect_ib_with_ips(
             provided, IB env vars are emitted through the host's
             collective backend (NCCL/RCCL/HCCL); otherwise the legacy
             NCCL generator is used (byte-identical for NVIDIA hosts).
+        ib_iface_map: Pre-detected host → IB interface map (preserved if
+            non-None, alongside a pre-detected *comm_env*).
 
-    Returns ``(comm_env, ib_ip_map)``.
+    Returns ``(comm_env, ib_ip_map, ib_iface_map)``.  ``ib_iface_map`` maps
+    each host to the network interface backing its ``ib_ip_map`` entry, used
+    to re-pin socket-interface env when init falls back to the fabric.
     """
     from sparkrun.orchestration.infiniband import detect_ib_for_hosts
 
@@ -510,11 +515,13 @@ def detect_ib_with_ips(
 
     if ib_ip_map is None:
         ib_ip_map = {}
+    if ib_iface_map is None:
+        ib_iface_map = {}
     if comm_env is not None:
         logger.info("Using pre-detected comm env (%d vars)", len(comm_env))
         if ib_ip_map:
             logger.info("  Pre-detected IB IPs for %d host(s)", len(ib_ip_map))
-        return comm_env, ib_ip_map
+        return comm_env, ib_ip_map, ib_iface_map
 
     logger.info("Detecting InfiniBand on all hosts...")
     ib_result = detect_ib_for_hosts(
@@ -524,7 +531,7 @@ def detect_ib_with_ips(
         topology=ctx.topology,
         backends=backends,
     )
-    return ib_result.comm_env, ib_result.ib_ip_map
+    return ib_result.comm_env, ib_result.ib_ip_map, ib_result.ib_iface_map
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +619,11 @@ def launch_containers_parallel(
         futures = {}
         for host, cname in containers:
             host_nccl_env = comm_env.get_env(host) if comm_env else None
+            # Runtime-specific per-host env finalization (e.g. vLLM mirrors
+            # NODE_IP into VLLM_HOST_IP so the message-queue advertise address
+            # follows the pinned init network, not the default route).
+            if runtime is not None and host_nccl_env is not None:
+                host_nccl_env = runtime.finalize_host_comm_env(host_nccl_env)
             rank = (container_ranks or {}).get(cname)
             sparkrun_labels = executor.workload_labels_for_cluster(
                 cluster_id=ctx.cluster_id,
@@ -760,6 +772,7 @@ def run_native_cluster(
     *,
     comm_env: ClusterCommEnv | None = None,
     ib_ip_map: dict[str, str] | None = None,
+    ib_iface_map: dict[str, str] | None = None,
     init_port: int = 25000,
     skip_keys: set[str] | frozenset[str] = frozenset(),
     banner_title: str = "Native Cluster Launcher",
@@ -816,7 +829,7 @@ def run_native_cluster(
         progress.step("Detecting InfiniBand")
     else:
         logger.info("Step 2/7: InfiniBand detection...")
-    comm_env, ib_ip_map = detect_ib_with_ips(ctx, comm_env, ib_ip_map, backends=backends)
+    comm_env, ib_ip_map, ib_iface_map = detect_ib_with_ips(ctx, comm_env, ib_ip_map, backends=backends, ib_iface_map=ib_iface_map)
     logger.info("Step 2/7: IB step done (%.1fs)", time.monotonic() - t0)
 
     # Step 3: Detect head node IP
@@ -845,6 +858,17 @@ def run_native_cluster(
     )
     head_ip = init_selection.head_ip
     resolved_hosts = list(init_selection.hosts)
+
+    # When init falls back to the fabric, the management/default-route
+    # interface is the one that is unreachable — re-pin the per-host comm env
+    # (NODE_IP + socket-interface names) onto the fabric so control traffic
+    # follows the same network as the rendezvous address.  Runtime-specific
+    # advertise vars (e.g. vLLM's VLLM_HOST_IP) mirror NODE_IP downstream via
+    # RuntimePlugin.finalize_host_comm_env at container-launch time.
+    if init_selection.network == "ib":
+        from sparkrun.orchestration.infiniband import pin_comm_env_to_ib
+
+        comm_env = pin_comm_env_to_ib(comm_env, ctx.hosts, ib_ip_map, ib_iface_map)
 
     # log after revised head_ip and resolved_hosts are finalized
     logger.info("  Head IP: %s", head_ip)

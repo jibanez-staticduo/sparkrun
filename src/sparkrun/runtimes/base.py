@@ -509,6 +509,27 @@ class RuntimePlugin(Plugin):
         """
         return {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub"}
 
+    def finalize_host_comm_env(self, host_env: dict[str, str]) -> dict[str, str]:
+        """Final per-host adjustment of the resolved comm env before launch.
+
+        Called once per host in the native-cluster launch path with that
+        host's merged comm env (shared + per-host overrides, including
+        ``NODE_IP`` after any fabric-init re-pin).  The base implementation
+        is a no-op; runtimes override to derive runtime-specific per-host
+        vars from the finalized network selection — e.g. vLLM mirrors
+        ``NODE_IP`` into ``VLLM_HOST_IP`` so vLLM advertises the same address
+        the init network resolved to, rather than inferring it from the
+        default route.
+
+        Args:
+            host_env: The host's resolved comm env.  Do not mutate; return a
+                new dict when adding keys.
+
+        Returns:
+            The (possibly augmented) per-host env dict.
+        """
+        return host_env
+
     def get_extra_docker_opts(self) -> list[str]:
         """Return additional ``docker run`` options for this runtime.
 
@@ -881,6 +902,7 @@ class RuntimePlugin(Plugin):
         detached: bool = True,
         comm_env: ClusterCommEnv | None = None,
         ib_ip_map: dict[str, str] | None = None,
+        ib_iface_map: dict[str, str] | None = None,
         skip_keys: set[str] | frozenset[str] = frozenset(),
         executor: Executor | None = None,
         extra_docker_opts: list[str] | None = None,
@@ -978,6 +1000,7 @@ class RuntimePlugin(Plugin):
             detached=detached,
             comm_env=comm_env,
             ib_ip_map=ib_ip_map,
+            ib_iface_map=ib_iface_map,
             skip_keys=skip_keys,
             progress=progress,
             extra_docker_opts=extra_docker_opts,
@@ -1401,6 +1424,7 @@ class RuntimePlugin(Plugin):
         detached: bool = True,
         comm_env: ClusterCommEnv | None = None,
         ib_ip_map: dict[str, str] | None = None,
+        ib_iface_map: dict[str, str] | None = None,
         init_port: int = 25000,
         skip_keys: set[str] | frozenset[str] = frozenset(),
         banner_title: str = "Native Cluster Launcher",
@@ -1474,6 +1498,7 @@ class RuntimePlugin(Plugin):
             overrides=overrides,
             comm_env=comm_env,
             ib_ip_map=ib_ip_map,
+            ib_iface_map=ib_iface_map,
             init_port=init_port,
             skip_keys=skip_keys,
             banner_title=banner_title,

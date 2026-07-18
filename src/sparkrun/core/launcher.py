@@ -46,6 +46,7 @@ class LaunchResult:
     recipe_ref: str | None = None
     comm_env: "ClusterCommEnv | None" = None
     ib_ip_map: dict[str, str] = field(default_factory=dict)
+    ib_iface_map: dict[str, str] = field(default_factory=dict)
     serve_command: str = ""
     runtime_info: dict[str, str] = field(default_factory=dict)
     builder: BuilderPlugin | None = None
@@ -686,6 +687,7 @@ def launch_inference(
     # -- Phase 3: Distribution --
     comm_env = None
     ib_ip_map: dict[str, str] = {}
+    ib_iface_map: dict[str, str] = {}
     if not runtime.is_delegating_runtime():
         if p:
             p.phase(3)
@@ -710,7 +712,7 @@ def launch_inference(
         _model_dist_enabled = getattr(_dist_model, "enabled", True)
         _skip_model = _skip_model_distribution or not _model_dist_enabled
 
-        comm_env, ib_ip_map, mgmt_ip_map = distribute_from_config(
+        comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map = distribute_from_config(
             recipe,
             container_image,
             host_list,
@@ -909,6 +911,7 @@ def launch_inference(
         detached=detached,
         comm_env=comm_env,
         ib_ip_map=ib_ip_map,
+        ib_iface_map=ib_iface_map,
         skip_keys=skip_keys,
         executor=executor,
         progress=progress,
@@ -994,6 +997,7 @@ def launch_inference(
         recipe_ref=recipe_ref,
         comm_env=comm_env,
         ib_ip_map=ib_ip_map,
+        ib_iface_map=ib_iface_map,
         serve_command=serve_command,
         runtime_info=runtime_info,
         builder=builder,

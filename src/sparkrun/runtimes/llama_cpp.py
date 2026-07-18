@@ -552,7 +552,7 @@ class LlamaCppRuntime(RuntimePlugin):
             progress.step("Detecting InfiniBand")
         else:
             logger.info("Step 2/6: InfiniBand detection...")
-        comm_env, ib_ip_map = detect_ib_with_ips(ctx, comm_env, ib_ip_map, backends=backends)
+        comm_env, ib_ip_map, _ib_iface_map = detect_ib_with_ips(ctx, comm_env, ib_ip_map, backends=backends)
         logger.info("Step 2/6: IB step done (%.1fs)", time.monotonic() - t0)
 
         # Resolve worker RPC addresses: prefer IB IPs for high-speed fabric
