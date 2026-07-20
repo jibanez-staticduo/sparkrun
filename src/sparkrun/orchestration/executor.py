@@ -188,6 +188,38 @@ def _cluster_exec_dict(cluster: "ClusterDefinition | None") -> dict:
     return cfg
 
 
+def _builder_exec_dict(recipe: "Recipe | None", v: Variables | None) -> dict:
+    """Contribute ``{"env_file": ...}`` from the recipe's builder, or ``{}``.
+
+    When a recipe names a builder whose :meth:`BuilderPlugin.default_env_file`
+    returns a non-empty path (e.g. an environment builder that produced a venv
+    activation script), that path becomes the default executor ``env_file``.
+    An explicit ``executor_config.env_file`` in the recipe/CLI wins (this layer
+    sits below the recipe layer); the builder default beats the cluster,
+    runtime, and config layers.  The builder outranks the cluster because an
+    environment builder's ``env_file`` (e.g. venv activation) is *essential* to
+    running the workload — a cluster's generic ``env_file`` must not silently
+    suppress it and leave the serve command under the wrong interpreter.  Any
+    error (unknown builder, resolution failure) contributes nothing and never
+    breaks resolution.
+    """
+    if recipe is None:
+        return {}
+    builder_name = _coerce_str(getattr(recipe, "builder", None))
+    if not builder_name:
+        return {}
+    try:
+        from sparkrun.core.bootstrap import get_builder
+
+        builder = get_builder(builder_name, v)
+        env_file = _coerce_str(builder.default_env_file(recipe))
+        if env_file:
+            return {"env_file": env_file}
+    except Exception:
+        logger.debug("Builder env_file resolution failed for %r", builder_name, exc_info=True)
+    return {}
+
+
 def _runtime_exec_dict(runtime: "RuntimePlugin | None") -> dict:
     """Flatten ``runtime.default_executor()`` into a chain layer."""
     if runtime is None:
@@ -371,18 +403,24 @@ def resolve_executor(
 
         1. ``cli_overrides``
         2. ``recipe.executor`` + ``recipe.executor_config``
-        3. ``cluster.executor`` + ``cluster.executor_config``
-        4. ``runtime.default_executor()``  *(name selection only)*
-        5. ``cls.apply_runtime_adjustments(rootless=, auto_user=)``
-        6. ``runtime.default_executor_config()``
-        7. ``config.default_executor`` + ``config.executor_config``
-        8. ``cls.default_config()``
-        9. :class:`ExecutorConfig` dataclass field defaults
+        3. ``builder.default_env_file()``  *(``env_file`` default only)*
+        4. ``cluster.executor`` + ``cluster.executor_config``
+        5. ``runtime.default_executor()``  *(name selection only)*
+        6. ``cls.apply_runtime_adjustments(rootless=, auto_user=)``
+        7. ``runtime.default_executor_config()``
+        8. ``config.default_executor`` + ``config.executor_config``
+        9. ``cls.default_config()``
+        10. :class:`ExecutorConfig` dataclass field defaults
 
     The cluster layer sits between the recipe (workload-specific) and
     the runtime/config (generic) so a cluster's standing preferences
     (e.g. ``executor: k8s``, ``executor_config.shm_size: 16g``) govern
-    unless a sharper layer overrides.
+    unless a sharper layer overrides.  The builder's ``env_file`` default
+    sits just above the cluster: an environment builder's activation
+    script is essential to running the workload, so a cluster's generic
+    ``env_file`` must not suppress it (recipe/CLI still win).  Note the
+    builder layer contributes only ``env_file`` — never the executor name,
+    which is resolved separately by :func:`_resolve_executor_name`.
 
     The selected executor class comes from :func:`get_executor` (SAF
     plugin registry); the resulting :class:`ExecutorConfig` is built
@@ -403,6 +441,7 @@ def resolve_executor(
         sources=(
             cli_overrides or {},
             _recipe_exec_dict(recipe),
+            _builder_exec_dict(recipe, v),
             _cluster_exec_dict(cluster),
             _runtime_exec_dict(runtime),
             cls.apply_runtime_adjustments(rootless=rootless, auto_user=auto_user),

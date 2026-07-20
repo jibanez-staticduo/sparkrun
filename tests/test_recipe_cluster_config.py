@@ -145,12 +145,18 @@ def test_resolved_model_path_in_config_chain():
 # ---------------------------------------------------------------------------
 
 
-def _patch_distribution(monkeypatch, download_calls):
+def _patch_distribution(monkeypatch, download_calls, image_calls=None):
     monkeypatch.setattr("sparkrun.orchestration.distribution.is_local_host", lambda h: True)
     monkeypatch.setattr("sparkrun.orchestration.distribution._is_cross_user", lambda kw: False)
     monkeypatch.setattr("sparkrun.orchestration.distribution._get_hf_token", lambda: "")
     monkeypatch.setattr("sparkrun.orchestration.primitives.build_ssh_kwargs", lambda *a, **kw: {})
-    monkeypatch.setattr("sparkrun.containers.registry.ensure_image", lambda *a, **kw: 0)
+
+    def _ensure(image, **kw):
+        if image_calls is not None:
+            image_calls.append(image)
+        return 0
+
+    monkeypatch.setattr("sparkrun.containers.registry.ensure_image", _ensure)
 
     def _dl(model, **kw):
         download_calls.append(model)
@@ -185,6 +191,32 @@ def test_distribute_without_skip_downloads_model(monkeypatch):
     recipe = Recipe.from_dict(_recipe_dict())
     distribute_from_config(recipe, "img:latest", ["localhost"], "/tmp/cache", _Cfg(), dry_run=False, skip_model=False)
     assert calls == ["Qwen/Qwen3-1.7B"]  # model ensured locally
+
+
+def test_distribute_skip_container_skips_image_but_keeps_model(monkeypatch):
+    """skip_container=True must skip the image ensure yet still distribute the model."""
+    model_calls: list = []
+    image_calls: list = []
+    _patch_distribution(monkeypatch, model_calls, image_calls)
+    from sparkrun.orchestration.distribution import distribute_from_config
+
+    recipe = Recipe.from_dict(_recipe_dict())
+    distribute_from_config(recipe, "img:latest", ["localhost"], "/tmp/cache", _Cfg(), dry_run=False, skip_container=True)
+    assert image_calls == []  # container image ensure skipped entirely
+    assert model_calls == ["Qwen/Qwen3-1.7B"]  # model still ensured locally
+
+
+def test_distribute_without_skip_container_ensures_image(monkeypatch):
+    """Default (skip_container=False) still ensures the container image."""
+    model_calls: list = []
+    image_calls: list = []
+    _patch_distribution(monkeypatch, model_calls, image_calls)
+    from sparkrun.orchestration.distribution import distribute_from_config
+
+    recipe = Recipe.from_dict(_recipe_dict())
+    distribute_from_config(recipe, "img:latest", ["localhost"], "/tmp/cache", _Cfg(), dry_run=False, skip_container=False)
+    assert image_calls == ["img:latest"]  # image ensured locally
+    assert model_calls == ["Qwen/Qwen3-1.7B"]
 
 
 # ---------------------------------------------------------------------------

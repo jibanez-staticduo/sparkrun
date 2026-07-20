@@ -712,6 +712,7 @@ def distribute_from_config(
     topology: str | None = None,
     prefs: ModelDistributionPrefs | None = None,
     skip_model: bool = False,
+    skip_container: bool = False,
 ) -> tuple["ClusterCommEnv | None", dict[str, str], dict[str, str]]:
     """Distribute resources based on recipe ``distribution_config``.
 
@@ -752,7 +753,7 @@ def distribute_from_config(
     ssh_kwargs = build_ssh_kwargs(config)
     hf_token = _get_hf_token()
     if len(host_list) <= 1 and is_local_host(host_list[0]) and not _is_cross_user(ssh_kwargs):
-        _do_local_ensure = dist_cfg.containers.enabled
+        _do_local_ensure = dist_cfg.containers.enabled and not skip_container
         _model_names = [e.name for e in dist_cfg.models.entries] if (dist_cfg.models.enabled and not skip_model) else []
         lock_parts = [image] + _model_names
         _lock_key = hashlib.sha256("|".join(lock_parts).encode()).hexdigest()[:12]
@@ -829,8 +830,9 @@ def distribute_from_config(
     _lock_id = f"sparkrun_{_lock_key}"
     _pop_kw = dict(recipe=recipe_name, model=image, image=image, hosts=host_list, cache_dir=str(config.cache_dir))
 
-    # Distribute container images
-    if dist_cfg.containers.enabled:
+    # Distribute container images (skipped entirely when skip_container — e.g.
+    # a container-less executor like `local` that has no image to distribute).
+    if dist_cfg.containers.enabled and not skip_container:
         for entry in dist_cfg.containers.entries:
             if not isinstance(entry, DistributionContainerEntry):
                 continue

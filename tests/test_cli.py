@@ -5057,7 +5057,7 @@ class TestClusterUserInCLICommands:
         """cluster status with --cluster should use the cluster's SSH user."""
         captured_kwargs = {}
 
-        def mock_query_status(host_list, ssh_kwargs=None, cache_dir=None):
+        def mock_query_status(host_list, ssh_kwargs=None, cache_dir=None, local_pid_dir=None):
             captured_kwargs.update(ssh_kwargs or {})
             # Return a minimal result object
             from types import SimpleNamespace
@@ -5093,7 +5093,7 @@ class TestClusterUserInCLICommands:
         """stop --all with --cluster should use the cluster's SSH user."""
         captured_kwargs = {}
 
-        def mock_query_status(host_list, ssh_kwargs=None, cache_dir=None):
+        def mock_query_status(host_list, ssh_kwargs=None, cache_dir=None, local_pid_dir=None):
             captured_kwargs.update(ssh_kwargs or {})
             from types import SimpleNamespace
 

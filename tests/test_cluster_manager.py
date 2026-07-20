@@ -1047,7 +1047,7 @@ class TestQueryClusterStatusParsing:
 
     @staticmethod
     def _mock_docker_ps(per_host_lines):
-        """Return a fake ``run_command_on_host`` that emits canned docker-ps output."""
+        """Return a fake ``run_script_on_host`` that emits canned docker-ps output."""
         from sparkrun.orchestration.ssh import RemoteResult
 
         def _impl(host, command, ssh_kwargs=None, timeout=None):
@@ -1071,7 +1071,7 @@ class TestQueryClusterStatusParsing:
             "h4": ["sparkrun_%s_%s_node_1\tUp 30 seconds\timg" % (intent, place_b)],
         }
         monkeypatch.setattr(
-            "sparkrun.orchestration.primitives.run_command_on_host",
+            "sparkrun.orchestration.primitives.run_script_on_host",
             self._mock_docker_ps(per_host),
         )
 
@@ -1100,7 +1100,7 @@ class TestQueryClusterStatusParsing:
             "h2": ["sparkrun_%s_%s_node_1\tUp 5 minutes\timg" % (intent, place)],
         }
         monkeypatch.setattr(
-            "sparkrun.orchestration.primitives.run_command_on_host",
+            "sparkrun.orchestration.primitives.run_script_on_host",
             self._mock_docker_ps(per_host),
         )
 
@@ -1120,7 +1120,7 @@ class TestQueryClusterStatusParsing:
             "h1": ["sparkrun_%s_%s_solo\tUp 10 seconds\timg" % (intent, place)],
         }
         monkeypatch.setattr(
-            "sparkrun.orchestration.primitives.run_command_on_host",
+            "sparkrun.orchestration.primitives.run_script_on_host",
             self._mock_docker_ps(per_host),
         )
 
@@ -1129,6 +1129,75 @@ class TestQueryClusterStatusParsing:
         assert result.groups == {}
         assert len(result.solo_entries) == 1
         assert result.solo_entries[0].cluster_id == "sparkrun_%s_%s" % (intent, place)
+
+    def test_local_executor_pidfile_workload_is_surfaced(self, tmp_path, monkeypatch):
+        """Native local-executor jobs (the per-host script emits an ``(local process)``
+        line for each live pidfile) surface as solo entries alongside docker containers."""
+        from sparkrun.core.cluster_manager import query_cluster_status
+
+        intent, place = "0123456789abcdef", "fedcba987654"
+        per_host = {
+            # a docker container + a local pidfile-tracked process, same tab-separated shape
+            "h1": [
+                "sparkrun_aaaaaaaaaaaaaaaa_111111111111_solo\tUp 5 seconds\tsome/img",
+                "sparkrun_%s_%s_solo\tUp (pid 4242)\t(local process)" % (intent, place),
+            ],
+        }
+        monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", self._mock_docker_ps(per_host))
+
+        result = query_cluster_status(["h1"], ssh_kwargs={}, cache_dir=str(tmp_path))
+
+        cids = {e.cluster_id for e in result.solo_entries}
+        assert "sparkrun_%s_%s" % (intent, place) in cids  # local job visible
+        local = next(e for e in result.solo_entries if e.cluster_id == "sparkrun_%s_%s" % (intent, place))
+        assert "pid 4242" in local.status and local.image == "(local process)"
+
+    def test_docker_failure_sentinel_marks_host_errored_not_idle(self, tmp_path, monkeypatch):
+        """A ``docker ps`` failure emits the sentinel line → the host is flagged
+        as errored (not silently reported as idle)."""
+        from sparkrun.core.cluster_manager import query_cluster_status, _DOCKER_ERR_SENTINEL
+
+        per_host = {"h1": [_DOCKER_ERR_SENTINEL]}  # docker probe failed, no containers/pidfiles
+        monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", self._mock_docker_ps(per_host))
+
+        result = query_cluster_status(["h1"], ssh_kwargs={}, cache_dir=str(tmp_path))
+
+        assert "h1" in result.errors  # surfaced as an error
+        assert "h1" not in result.idle_hosts  # NOT misreported as idle
+        assert result.total_containers == 0
+
+    def test_docker_failure_still_surfaces_local_workloads(self, tmp_path, monkeypatch):
+        """Even when docker is down, local pidfile workloads emitted after the
+        sentinel are still surfaced — the host is errored AND shows the local job."""
+        from sparkrun.core.cluster_manager import query_cluster_status, _DOCKER_ERR_SENTINEL
+
+        intent, place = "0123456789abcdef", "fedcba987654"
+        per_host = {"h1": [_DOCKER_ERR_SENTINEL, "sparkrun_%s_%s_solo\tUp (pid 99)\t(local process)" % (intent, place)]}
+        monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", self._mock_docker_ps(per_host))
+
+        result = query_cluster_status(["h1"], ssh_kwargs={}, cache_dir=str(tmp_path))
+
+        assert "h1" in result.errors
+        cids = {e.cluster_id for e in result.solo_entries}
+        assert "sparkrun_%s_%s" % (intent, place) in cids
+
+    def test_custom_pid_dir_is_scanned(self, tmp_path, monkeypatch):
+        """A resolved ``local_pid_dir`` is interpolated into the per-host status
+        script instead of the hardcoded default."""
+        from sparkrun.core.cluster_manager import query_cluster_status
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        captured = {}
+
+        def _capture(host, command, ssh_kwargs=None, timeout=None):
+            captured[host] = command
+            return RemoteResult(host=host, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", _capture)
+        query_cluster_status(["h1"], ssh_kwargs={}, cache_dir=str(tmp_path), local_pid_dir="/var/run/sparkrun/pids")
+
+        assert '"/var/run/sparkrun/pids"/*.pid' in captured["h1"]
+        assert "/.cache/sparkrun/local/pids" not in captured["h1"]  # default not used
 
 
 class TestClusterDistributionPrefs:

@@ -1232,6 +1232,7 @@ class RuntimePlugin(Plugin):
             serve_command=serve_command,
             env=all_env,
             detached=detached,
+            volumes=volumes,
             sparkrun_labels=sparkrun_labels or None,
         )
         result = run_script_on_host(

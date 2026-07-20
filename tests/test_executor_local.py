@@ -23,7 +23,7 @@ from sparkrun.orchestration.executor import (
     resolve_executor,
 )
 from sparkrun.orchestration.executors.docker import DockerExecutor
-from sparkrun.orchestration.executors.local import LocalExecutor
+from sparkrun.orchestration.executors.local import LocalExecutor, _hostify_env
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +178,7 @@ class TestLocalExecutorBasics:
 
     def test_run_cmd_includes_working_dir(self):
         script = _local(working_dir="/srv/inference").run_cmd(image="", command="echo hi", container_name="foo_solo")
+        # A plain path is shlex-quoted (safe chars stay bare) — NOT bare double-quoted.
         assert "cd /srv/inference" in script
 
     def test_run_cmd_sources_env_file(self):
@@ -186,6 +187,22 @@ class TestLocalExecutorBasics:
         assert "set -a" in script
         assert ". /etc/sparkrun.env" in script
         assert "set +a" in script
+
+    def test_run_cmd_env_file_home_relative_expands(self):
+        # Only a leading $HOME/ ~/ prefix expands; the remainder is shlex-quoted literal.
+        script = _local(env_file="$HOME/.cache/sparkrun/uv-venv/x/env.sh").run_cmd(image="", command="echo hi", container_name="foo_solo")
+        assert '. "$HOME"/.cache/sparkrun/uv-venv/x/env.sh' in script
+        # A leading ~/ is rewritten to $HOME/ (tilde doesn't expand inside quotes).
+        script2 = _local(env_file="~/venv/env.sh").run_cmd(image="", command="echo hi", container_name="foo_solo")
+        assert '. "$HOME"/venv/env.sh' in script2
+
+    def test_run_cmd_working_dir_does_not_expand_or_inject(self):
+        # A path with shell metacharacters must be a shlex-quoted literal — the
+        # single quotes neutralize command substitution / variable expansion
+        # (unlike a bare double-quote wrapper, which the shell would interpret).
+        script = _local(working_dir="/srv/$(touch pwned)/$data").run_cmd(image="", command="echo hi", container_name="foo_solo")
+        assert "cd '/srv/$(touch pwned)/$data'" in script  # single-quoted → inert
+        assert 'cd "/srv' not in script  # NOT double-quoted (which would expand $())
 
     def test_run_cmd_prepends_command_prefix(self):
         script = _local(command_prefix="taskset -c 0-7").run_cmd(image="", command="vllm serve foo", container_name="foo_solo")
@@ -384,6 +401,132 @@ class TestLocalExecutorRoundTrip:
 
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
+
+
+# ---------------------------------------------------------------------------
+# _hostify_env: reverse-map container-path env values to host source paths
+# ---------------------------------------------------------------------------
+
+
+class TestHostifyEnv:
+    """The container-path → host-path env reverse-mapper."""
+
+    _VOLUMES = {"/home/ubuntu/.cache/huggingface": "/cache/huggingface"}
+
+    def test_exact_target_maps_to_host_source(self):
+        out = _hostify_env({"HF_HOME": "/cache/huggingface"}, self._VOLUMES)
+        assert out == {"HF_HOME": "/home/ubuntu/.cache/huggingface"}
+
+    def test_prefix_under_target_is_rewritten(self):
+        out = _hostify_env({"HF_HUB_CACHE": "/cache/huggingface/hub"}, self._VOLUMES)
+        assert out == {"HF_HUB_CACHE": "/home/ubuntu/.cache/huggingface/hub"}
+
+    def test_non_path_value_passes_through(self):
+        out = _hostify_env({"FOO": "bar", "HF_HUB_OFFLINE": "1"}, self._VOLUMES)
+        assert out == {"FOO": "bar", "HF_HUB_OFFLINE": "1"}
+
+    def test_mixed_env_maps_only_matching_values(self):
+        env = {
+            "HF_HOME": "/cache/huggingface",
+            "HF_HUB_CACHE": "/cache/huggingface/hub",
+            "FOO": "bar",
+        }
+        out = _hostify_env(env, self._VOLUMES)
+        assert out == {
+            "HF_HOME": "/home/ubuntu/.cache/huggingface",
+            "HF_HUB_CACHE": "/home/ubuntu/.cache/huggingface/hub",
+            "FOO": "bar",
+        }
+
+    def test_longest_target_wins(self):
+        # Two overlapping mounts: the more specific (longer) target must win.
+        volumes = {
+            "/host/hf": "/cache/huggingface",
+            "/host/hf/hub": "/cache/huggingface/hub",
+        }
+        out = _hostify_env({"X": "/cache/huggingface/hub/models"}, volumes)
+        assert out == {"X": "/host/hf/hub/models"}
+
+    def test_no_volumes_passes_through_unchanged(self):
+        env = {"HF_HOME": "/cache/huggingface"}
+        assert _hostify_env(env, None) == env
+        assert _hostify_env(env, {}) == env
+
+    def test_none_env_passes_through(self):
+        assert _hostify_env(None, self._VOLUMES) is None
+
+    def test_target_prefix_without_slash_is_not_matched(self):
+        # ``/cache/huggingface-old`` must NOT be treated as under ``/cache/huggingface``.
+        out = _hostify_env({"X": "/cache/huggingface-old"}, self._VOLUMES)
+        assert out == {"X": "/cache/huggingface-old"}
+
+
+class TestLocalExecutorHostifiesEnv:
+    """LocalExecutor emits host-path exports for container-path env values."""
+
+    _VOLUMES = {"/home/ubuntu/.cache/huggingface": "/cache/huggingface"}
+    _ENV = {
+        "HF_HOME": "/cache/huggingface",
+        "HF_HUB_CACHE": "/cache/huggingface/hub",
+        "FOO": "bar",
+    }
+
+    def test_exec_serve_script_exports_host_paths(self):
+        script = _local().generate_exec_serve_script(
+            container_name="foo_solo",
+            serve_command="vllm serve x",
+            env=self._ENV,
+            volumes=self._VOLUMES,
+        )
+        # Exports are shlex-quoted; these plain paths need no quoting.
+        assert "export HF_HOME=/home/ubuntu/.cache/huggingface" in script
+        assert "export HF_HUB_CACHE=/home/ubuntu/.cache/huggingface/hub" in script
+        assert "export FOO=bar" in script
+        # The raw container path must NOT leak into the exports.
+        assert "export HF_HOME=/cache/huggingface\n" not in script
+
+    def test_exec_serve_script_without_volumes_keeps_container_paths(self):
+        script = _local().generate_exec_serve_script(
+            container_name="foo_solo",
+            serve_command="vllm serve x",
+            env=self._ENV,
+        )
+        assert "export HF_HOME=/cache/huggingface" in script
+
+    def test_node_script_hostifies_env(self):
+        script = _local().generate_node_script(
+            image="",
+            container_name="sparkrun_abc_node_0",
+            serve_command="cmd rank 0",
+            env=self._ENV,
+            volumes=self._VOLUMES,
+        )
+        assert "export HF_HOME=/home/ubuntu/.cache/huggingface" in script
+        assert "export HF_HUB_CACHE=/home/ubuntu/.cache/huggingface/hub" in script
+
+
+class TestDockerExecServeUnchangedByVolumes:
+    """DockerExecutor's exec-serve output ignores volumes (no regression)."""
+
+    def test_volumes_do_not_change_docker_exec_serve(self):
+        ex = DockerExecutor(ExecutorConfig())
+        env = {
+            "HF_HOME": "/cache/huggingface",
+            "HF_HUB_CACHE": "/cache/huggingface/hub",
+            "FOO": "bar",
+        }
+        without = ex.generate_exec_serve_script(
+            container_name="foo_solo",
+            serve_command="vllm serve x",
+            env=env,
+        )
+        with_vols = ex.generate_exec_serve_script(
+            container_name="foo_solo",
+            serve_command="vllm serve x",
+            env=env,
+            volumes={"/home/ubuntu/.cache/huggingface": "/cache/huggingface"},
+        )
+        assert without == with_vols
 
 
 # ---------------------------------------------------------------------------

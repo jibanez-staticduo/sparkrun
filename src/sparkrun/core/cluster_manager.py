@@ -873,11 +873,38 @@ class ClusterManager:
 # Cluster status query — business logic extracted from CLI
 # ---------------------------------------------------------------------------
 
+#: Marker line the per-host status script emits when ``docker ps`` fails, so a
+#: broken/unreachable docker daemon surfaces as an *error* rather than a silent
+#: "idle" host.  Chosen to never collide with a real container name (which is
+#: always ``sparkrun_...``).
+_DOCKER_ERR_SENTINEL = "__SPARKRUN_DOCKER_ERR__"
+
+
+def resolve_local_pid_dir(cluster_manager: "ClusterManager | None", cluster_name: str | None) -> str | None:
+    """Resolve a named cluster's ``executor_config.pid_dir`` (or ``None``).
+
+    Lets the CLI ``status`` / ``stop`` display path scan the same pidfile
+    directory the LocalExecutor would use for that cluster, instead of the
+    hardcoded default.  Returns ``None`` for ad-hoc host lists (no named
+    cluster) or any resolution failure — the caller then falls back to the
+    LocalExecutor default.
+    """
+    if not cluster_name or cluster_manager is None:
+        return None
+    try:
+        cdef = cluster_manager.get(cluster_name)
+    except Exception:
+        return None
+    cfg = getattr(cdef, "executor_config", None) or {}
+    pid_dir = cfg.get("pid_dir")
+    return pid_dir or None
+
 
 def query_cluster_status(
     host_list: list[str],
     ssh_kwargs: dict[str, Any],
     cache_dir: str,
+    local_pid_dir: str | None = None,
 ) -> ClusterStatusResult:
     """Query sparkrun containers on hosts and classify them.
 
@@ -894,20 +921,51 @@ def query_cluster_status(
         A :class:`ClusterStatusResult` with all collected data.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from sparkrun.orchestration.primitives import run_command_on_host
+    from sparkrun.orchestration.primitives import run_script_on_host
     from sparkrun.orchestration.ssh import resolve_parallel_cap
     from sparkrun.orchestration.job_metadata import load_job_metadata
     from sparkrun.core.pending_ops import list_pending_ops
+    from sparkrun.orchestration.executors.local import _DEFAULT_PID_DIR
 
-    docker_cmd = "docker ps --filter 'name=sparkrun_' --format '{{.Names}}\\t{{.Status}}\\t{{.Image}}'"
+    # One script per host: docker containers PLUS native `local`-executor workloads
+    # (pidfile-tracked processes, invisible to `docker ps`). Both emit the same
+    # ``<name>\t<status>\t<image>`` shape so the parser/grouping below treats them
+    # uniformly — a live local job surfaces as a ``_solo`` entry with an ``Up (pid N)``
+    # status and a ``(local process)`` "image".
+    #
+    # A ``docker ps`` failure (daemon down/unreachable) must NOT be swallowed into
+    # a false "idle" — it emits a ``_DOCKER_ERR_SENTINEL`` line so the parser flags
+    # the host as errored (matching the pre-merge behavior where a non-zero
+    # ``docker ps`` rc surfaced as an error). ``|| true`` on the *outer* group
+    # would hide it, so the docker probe is guarded by an ``if`` instead.
+    #
+    # The pidfile dir defaults to the LocalExecutor default but honors a
+    # cluster/recipe ``executor_config.pid_dir`` when the caller resolves one
+    # (mirrors ``LocalExecutor.query_status``, which reads ``config.pid_dir``).
+    # Built with plain concatenation (not %-formatting) so the embedded
+    # ``printf "%s"`` specifiers stay literal.
+    pid_dir = local_pid_dir or _DEFAULT_PID_DIR
+    status_script = (
+        "if docker_out=$(docker ps --filter 'name=sparkrun_' --format '{{.Names}}\\t{{.Status}}\\t{{.Image}}' 2>/dev/null); then\n"
+        '  [ -n "$docker_out" ] && printf "%s\\n" "$docker_out"\n'
+        "else\n"
+        '  printf "%s\\n" "' + _DOCKER_ERR_SENTINEL + '"\n'
+        "fi\n"
+        "shopt -s nullglob 2>/dev/null || true\n"
+        'for f in "' + pid_dir + '"/*.pid; do\n'
+        '  [ -f "$f" ] || continue\n'
+        '  n=$(basename "$f" .pid); p=$(cat "$f" 2>/dev/null || true)\n'
+        '  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && printf "%s\\tUp (pid %s)\\t(local process)\\n" "$n" "$p"\n'
+        "done\n"
+    )
 
     # Query all hosts in parallel (dispatches local vs SSH automatically)
     with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(host_list))) as executor:
         futures = {
             executor.submit(
-                run_command_on_host,
+                run_script_on_host,
                 host,
-                docker_cmd,
+                status_script,
                 ssh_kwargs=ssh_kwargs,
                 timeout=15,
             ): host
@@ -927,14 +985,23 @@ def query_cluster_status(
             errors[host] = result.stderr.strip()
             continue
         entries = []
+        docker_failed = False
         for line in result.stdout.strip().splitlines():
             if not line.strip():
+                continue
+            if line.startswith(_DOCKER_ERR_SENTINEL):
+                # The docker probe failed on this host; flag it as errored so it
+                # is not misreported as idle.  Any local pidfile lines emitted
+                # after the sentinel are still parsed below and surfaced.
+                docker_failed = True
                 continue
             parts = line.split("\t")
             if len(parts) == 3:
                 entries.append((parts[0], parts[1], parts[2]))
             else:
                 entries.append((line.strip(), "", ""))
+        if docker_failed:
+            errors[host] = "docker ps failed"
         host_containers[host] = entries
 
     # Build cluster groups: cluster_id -> [(host, role, status, image), ...]

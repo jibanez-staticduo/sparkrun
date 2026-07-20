@@ -58,6 +58,25 @@ _DEFAULT_LOG_DIR = "$HOME/.cache/sparkrun/local/logs"
 _GPUS_DEVICE_RE = re.compile(r"device=([0-9,]+)")
 
 
+def _shell_path(path: str) -> str:
+    """Render a config path (``working_dir`` / ``env_file``) for bash, expanding
+    only a leading ``$HOME`` / ``~/`` prefix and shlex-quoting everything else.
+
+    The goal is narrow: let a builder self-determine a ``$HOME``-relative path
+    (e.g. a venv activation ``env_file``). Only a leading ``~/``, ``$HOME/`` or
+    ``${HOME}/`` is honored — rewritten to an expanding unquoted ``"$HOME"`` —
+    and the *remainder* is shlex-quoted so nothing else in the path is
+    interpreted by the shell. This keeps a path containing ``$var`` / ``$(...)``
+    / backticks / spaces a literal (no command substitution, no accidental
+    variable expansion, no injection), unlike a bare double-quote wrapper.
+    """
+    for prefix in ("~/", "$HOME/", "${HOME}/"):
+        if path.startswith(prefix):
+            rest = path[len(prefix) :]
+            return '"$HOME"/' + quote(rest) if rest else '"$HOME"'
+    return quote(path)
+
+
 class LocalExecutor(Executor):
     """Native-subprocess executor (experimental, no container).
 
@@ -69,6 +88,7 @@ class LocalExecutor(Executor):
 
     executor_name = "local"
     required_feature_flag = "executor.local"
+    needs_image = False
 
     # No Docker-style defaults; the dataclass field defaults are
     # appropriate.  No rootless/auto_user concerns either.
@@ -106,12 +126,12 @@ class LocalExecutor(Executor):
         cfg = self.config
         lines: list[str] = []
         if cfg.working_dir:
-            lines.append("cd %s" % quote(cfg.working_dir))
+            lines.append("cd %s" % _shell_path(cfg.working_dir))
         if cfg.env_file:
             # 'set -a' so sourced KEY=VAL lines become exports — matches
             # docker --env-file semantics.
             lines.append("set -a")
-            lines.append(". %s" % quote(cfg.env_file))
+            lines.append(". %s" % _shell_path(cfg.env_file))
             lines.append("set +a")
 
         gpus_export = self._cuda_visible_devices_export()
@@ -170,11 +190,16 @@ class LocalExecutor(Executor):
     ) -> str:
         """Emit a setsid-based native launcher.
 
-        *image* and *volumes* are ignored — there is no container.
-        *extra_opts* are docker-only and are silently dropped.
-        *sparkrun_labels* is accepted for API symmetry but ignored —
-        there is no container to tag.  Workload identity for the
-        LocalExecutor flows through the pidfile name + job metadata
+        *image* is ignored — there is no container.  *volumes* mounts
+        nothing (native execution), but it *is* consulted to reverse-map
+        container-path env values back to their host source paths via
+        :func:`_hostify_env` (e.g. ``HF_HOME=/cache/huggingface`` →
+        ``HF_HOME=/home/ubuntu/.cache/huggingface``), so a natively-run
+        serve command finds host-side resources the Docker path would
+        have bind-mounted.  *extra_opts* are docker-only and are silently
+        dropped.  *sparkrun_labels* is accepted for API symmetry but
+        ignored — there is no container to tag.  Workload identity for
+        the LocalExecutor flows through the pidfile name + job metadata
         cache instead (see :func:`_parse_local_pidfile_output`).
         """
         del sparkrun_labels  # accepted but unused — no container to tag
@@ -190,7 +215,7 @@ class LocalExecutor(Executor):
         # NOTE: ``setsid`` makes the child a session leader → its own
         # process group.  ``kill -TERM -<pgid>`` (in stop_cmd) reaps the
         # whole tree without needing tini.
-        prelude = self._env_prelude(env)
+        prelude = self._env_prelude(_hostify_env(env, volumes))
         body = (
             "mkdir -p %(pid_dir_dq)s %(log_dir_dq)s\n"
             "%(prelude)s"
@@ -324,6 +349,7 @@ class LocalExecutor(Executor):
         serve_command: str,
         env: dict[str, str] | None = None,
         detached: bool = True,
+        volumes: dict[str, str] | None = None,
         *,
         sparkrun_labels: dict[str, str] | None = None,
     ) -> str:
@@ -331,8 +357,10 @@ class LocalExecutor(Executor):
 
         This is where the native subprocess starts.  ``detached`` is
         honored to match the docker behavior (always true in practice
-        for sparkrun's solo flow).  ``sparkrun_labels`` is ignored
-        (no container to tag).
+        for sparkrun's solo flow).  ``volumes`` mounts nothing here, but
+        is forwarded to :meth:`run_cmd` so container-path env values get
+        reverse-mapped to their host source (see :func:`_hostify_env`).
+        ``sparkrun_labels`` is ignored (no container to tag).
         """
         del sparkrun_labels  # accepted but unused — no container to tag
         # ``run_cmd`` already writes the launcher.  Detached / foreground
@@ -344,6 +372,7 @@ class LocalExecutor(Executor):
             container_name=container_name,
             detach=detached,
             env=env,
+            volumes=volumes,
         )
 
     def generate_node_script(
@@ -363,8 +392,11 @@ class LocalExecutor(Executor):
 
         Multi-host falls out for free because each host's
         ``container_name`` is ``<cluster_id>_node_<rank>`` — that's the
-        basename for the per-rank pidfile and logfile.
-        ``sparkrun_labels`` is ignored (no container to tag).
+        basename for the per-rank pidfile and logfile.  ``volumes`` mounts
+        nothing here, but is forwarded to :meth:`run_cmd` so container-path
+        env values get reverse-mapped to their host source (see
+        :func:`_hostify_env`).  ``sparkrun_labels`` is ignored (no
+        container to tag).
         """
         del sparkrun_labels  # accepted but unused — no container to tag
         from sparkrun.utils import merge_env
@@ -377,6 +409,7 @@ class LocalExecutor(Executor):
             container_name=container_name,
             detach=True,
             env=all_env,
+            volumes=volumes,
         )
         return (
             "#!/bin/bash\n"
@@ -544,6 +577,47 @@ def _load_metadata_safely(cluster_id: str) -> dict | None:
     except Exception:  # pragma: no cover - defensive
         logger.debug("query_status: load_job_metadata failed for %s", cluster_id, exc_info=True)
         return None
+
+
+def _hostify_env(env: dict[str, str] | None, volumes: dict[str, str] | None) -> dict[str, str] | None:
+    """Reverse-map container-path env VALUES back to their host source paths.
+
+    The DockerExecutor mounts host dirs into the container (``volumes`` is
+    ``{host_source: container_target}``) and the runtime emits env pointing at
+    the *container* target (e.g. ``HF_HOME=/cache/huggingface``).  The
+    LocalExecutor runs the serve command natively — those container paths do
+    not exist on the host — so any env value that references a mount target is
+    rewritten to point at the host source instead.
+
+    A value maps when it equals a container target or starts with
+    ``target + "/"``; the matched target prefix is replaced with the host
+    source.  When several targets match, the longest (most specific) target
+    wins.  Non-string / non-path values pass through untouched.  Returns
+    *env* unchanged when *volumes* is falsy.
+    """
+    if not env or not volumes:
+        return env
+
+    # Longest container target first so the most specific mount wins.
+    targets = sorted(
+        ((container_target, host_source) for host_source, container_target in volumes.items() if container_target),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+
+    result: dict[str, str] = {}
+    for key, value in env.items():
+        new_value = value
+        if isinstance(value, str):
+            for container_target, host_source in targets:
+                if value == container_target:
+                    new_value = host_source
+                    break
+                if value.startswith(container_target + "/"):
+                    new_value = host_source + value[len(container_target) :]
+                    break
+        result[key] = new_value
+    return result
 
 
 def _bash_safe_command(command: str) -> str:

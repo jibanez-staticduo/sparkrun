@@ -46,6 +46,28 @@ class TestBuilderPluginBase:
         result = plugin.prepare_image("my-image:latest", recipe, ["10.0.0.1"])
         assert result == "my-image:latest"
 
+    def test_builder_plugin_prepare_delegates_to_prepare_image(self):
+        """Default prepare() delegates to prepare_image — a subclass overriding
+        only prepare_image is still exercised through the canonical prepare hook."""
+        recipe = Recipe.from_dict({"name": "test", "model": "some/model", "runtime": "vllm"})
+
+        from sparkrun.builders.base import BuilderPlugin
+
+        class _ImageBuilder(BuilderPlugin):
+            builder_name = "img"
+
+            def prepare_image(self, image, recipe, hosts, config=None, dry_run=False, transfer_mode="local", ssh_kwargs=None):
+                return image + ":built"
+
+        result = _ImageBuilder().prepare("my-image", recipe, ["10.0.0.1"])
+        assert result == "my-image:built"
+
+    def test_builder_plugin_default_env_file_none(self):
+        """Default default_env_file returns None."""
+        plugin = self._make_plugin()
+        recipe = Recipe.from_dict({"name": "test", "model": "some/model", "runtime": "vllm"})
+        assert plugin.default_env_file(recipe) is None
+
     def test_builder_plugin_validate_recipe_returns_empty(self):
         """Default validate_recipe returns an empty list."""
         plugin = self._make_plugin()

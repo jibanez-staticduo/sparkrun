@@ -585,7 +585,7 @@ def launch_inference(
 
         try:
             builder = get_builder(recipe.builder, v)
-            container_image = builder.prepare_image(
+            container_image = builder.prepare(
                 container_image,
                 recipe,
                 host_list,
@@ -712,6 +712,31 @@ def launch_inference(
         _model_dist_enabled = getattr(_dist_model, "enabled", True)
         _skip_model = _skip_model_distribution or not _model_dist_enabled
 
+        # Skip container-image distribution for container-less executors (the
+        # `local` executor has no image to distribute — and the image may not
+        # even exist). Resolve the executor name cheaply here (the full
+        # resolve_executor(...) below is byte-identical, just later) and map it
+        # to its class's needs_image. k8s takes its own launch path
+        # (api/_run.py run_k8s) so only `local` reaches here as container-less.
+        # Any resolution error defaults to distributing the image (never break
+        # launch on the skip decision).
+        _skip_container = False
+        try:
+            from sparkrun.orchestration.executor import get_executor, resolve_executor_name
+
+            _exec_name = resolve_executor_name(
+                cli_overrides=executor_config if isinstance(executor_config, dict) else None,
+                recipe=recipe,
+                cluster=cluster,
+                runtime=runtime,
+                config=config,
+                v=v,
+            )
+            _skip_container = not getattr(get_executor(_exec_name, v), "needs_image", True)
+        except Exception:
+            logger.debug("Could not resolve executor for image-skip decision; distributing image", exc_info=True)
+            _skip_container = False
+
         comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map = distribute_from_config(
             recipe,
             container_image,
@@ -728,6 +753,7 @@ def launch_inference(
             topology=topology,
             prefs=_model_prefs,
             skip_model=_skip_model,
+            skip_container=_skip_container,
         )
         # Re-save job metadata with IP maps from IB detection
         if not dry_run and (ib_ip_map or mgmt_ip_map):

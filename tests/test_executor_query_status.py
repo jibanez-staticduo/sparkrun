@@ -397,3 +397,86 @@ def test_running_workload_runtime_name_optional():
 
     w2 = RunningWorkload(cluster_id="x", runtime_name="vllm")
     assert w2.runtime_name == "vllm"
+
+
+# --------------------------------------------------------------------------
+# ClusterStatus.merged_with (docker + local supplemental merge)
+# --------------------------------------------------------------------------
+
+
+def _host(host, *, workloads=(), used=0, free=0):
+    from sparkrun.core.cluster_status import HostOccupancy
+
+    return HostOccupancy(host=host, workloads=tuple(workloads), used_slots=used, free_slots=free)
+
+
+def test_merged_with_combines_workloads_and_sums_slots_same_host():
+    """Two snapshots over the same host merge workloads and sum used slots."""
+    from sparkrun.core.cluster_status import ClusterStatus
+
+    docker = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="sparkrun_docker")], used=1, free=3),),
+        queried_at=100.0,
+        executor="docker",
+    )
+    local = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="sparkrun_local")], used=1, free=3),),
+        queried_at=50.0,
+        executor="local",
+    )
+    merged = docker.merged_with(local)
+
+    occ = merged.for_host("h1")
+    assert occ is not None
+    ids = {w.cluster_id for w in occ.workloads}
+    assert ids == {"sparkrun_docker", "sparkrun_local"}
+    assert occ.used_slots == 2
+    # capacity (used+free from the primary) == 4 → 4 - 2 = 2 free.
+    assert occ.free_slots == 2
+    # Primary metadata is kept.
+    assert merged.queried_at == 100.0
+    assert merged.executor == "docker"
+
+
+def test_merged_with_preserves_host_in_only_one_snapshot():
+    """A host present in only the local snapshot is appended after primary hosts."""
+    from sparkrun.core.cluster_status import ClusterStatus
+
+    docker = ClusterStatus(hosts=(_host("h1", used=0, free=4),), executor="docker")
+    local = ClusterStatus(
+        hosts=(
+            _host("h1", used=0, free=4),
+            _host("h2", workloads=[RunningWorkload(cluster_id="sparkrun_only_local")], used=1, free=3),
+        ),
+        executor="local",
+    )
+    merged = docker.merged_with(local)
+
+    assert [h.host for h in merged.hosts] == ["h1", "h2"]
+    h2 = merged.for_host("h2")
+    assert h2 is not None
+    assert h2.workloads[0].cluster_id == "sparkrun_only_local"
+
+
+def test_merged_with_dedups_shared_cluster_id():
+    """A cluster_id seen in both snapshots is kept once (primary wins)."""
+    from sparkrun.core.cluster_status import ClusterStatus
+
+    docker = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="dup", recipe_name="from-docker")], used=1, free=3),),
+        executor="docker",
+    )
+    local = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="dup", recipe_name="from-local")], used=1, free=3),),
+        executor="local",
+    )
+    merged = docker.merged_with(local)
+
+    occ = merged.for_host("h1")
+    assert occ is not None
+    assert len(occ.workloads) == 1
+    assert occ.workloads[0].recipe_name == "from-docker"
+    # A shared cluster_id must NOT double-count slots: the workload occupies
+    # one slot, not two, so capacity(4) - 1 = 3 free (not 2).
+    assert occ.used_slots == 1
+    assert occ.free_slots == 3

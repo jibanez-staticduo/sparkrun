@@ -121,6 +121,67 @@ class ClusterStatus:
                     seen.append(w.cluster_id)
         return tuple(seen)
 
+    def merged_with(self, other: "ClusterStatus") -> "ClusterStatus":
+        """Merge *other* into this snapshot, preserving this snapshot's host order.
+
+        Combines two snapshots of the (same) host set produced by different
+        executors (e.g. ``docker`` + ``local``, which inspect *disjoint*
+        backend state on the same hosts) into one honest view.  Per host
+        present in both:
+
+        - ``workloads`` are concatenated, deduped by ``cluster_id`` (this
+          snapshot's entry wins on collision);
+        - ``used_slots`` is this snapshot's used plus the peer's slots for
+          only its *non-duplicate* workloads — a ``cluster_id`` present in
+          both (e.g. the same recipe launched once via docker and once via
+          local yields the same deterministic id) is counted once, matching
+          the workload dedup above (``used_slots == sum(ranks_on_host)`` for
+          both producing executors);
+        - ``free_slots`` recomputes as ``max(capacity - used_slots, 0)`` where
+          ``capacity`` is this snapshot's ``total_slots`` (both snapshots share
+          host hardware, so capacity matches).
+
+        A host present in only one snapshot is carried over unchanged.  This
+        snapshot's ``queried_at`` and ``executor`` name are kept (the merged
+        snapshot reports as the primary executor to keep single-name consumers
+        working).
+        """
+        other_by_host = {entry.host: entry for entry in other.hosts}
+        seen_hosts: set[str] = set()
+        merged: list[HostOccupancy] = []
+        for entry in self.hosts:
+            seen_hosts.add(entry.host)
+            peer = other_by_host.get(entry.host)
+            if peer is None:
+                merged.append(entry)
+                continue
+            workloads = list(entry.workloads)
+            seen_ids = {w.cluster_id for w in workloads}
+            # Add the peer's slots only for workloads not already counted in
+            # this snapshot, so a shared cluster_id isn't double-counted.
+            peer_added_slots = 0
+            for w in peer.workloads:
+                if w.cluster_id not in seen_ids:
+                    workloads.append(w)
+                    seen_ids.add(w.cluster_id)
+                    peer_added_slots += w.ranks_on_host
+            used = entry.used_slots + peer_added_slots
+            capacity = entry.total_slots  # shared host hardware → == peer.total_slots
+            merged.append(
+                HostOccupancy(
+                    host=entry.host,
+                    workloads=tuple(workloads),
+                    used_slots=used,
+                    free_slots=max(capacity - used, 0),
+                    free_memory_gb=entry.free_memory_gb,
+                    gpus=entry.gpus,
+                )
+            )
+        for entry in other.hosts:
+            if entry.host not in seen_hosts:
+                merged.append(entry)
+        return ClusterStatus(hosts=tuple(merged), queried_at=self.queried_at, executor=self.executor)
+
 
 def empty_status(hosts: list[str], executor: str = "") -> ClusterStatus:
     """Build a zero-occupancy snapshot — every host fully free, no workloads.

@@ -214,6 +214,76 @@ def test_status_k8s_executor_returns_safe_default():
     assert all(h.workloads == () for h in snapshot.hosts)
 
 
+def test_status_merges_local_workloads_into_docker(monkeypatch):
+    """A docker primary status also queries the local executor and merges
+    its pidfile-tracked workloads (invisible to ``docker ps``)."""
+    from sparkrun.core.cluster_status import HostOccupancy, RunningWorkload
+
+    docker_snap = ClusterStatus(
+        hosts=(HostOccupancy(host="host-a", workloads=(RunningWorkload(cluster_id="sparkrun_docker"),), used_slots=1, free_slots=3),),
+        queried_at=1.0,
+        executor="docker",
+    )
+    local_snap = ClusterStatus(
+        hosts=(HostOccupancy(host="host-a", workloads=(RunningWorkload(cluster_id="sparkrun_local"),), used_slots=1, free_slots=3),),
+        queried_at=2.0,
+        executor="local",
+    )
+
+    class _Fake:
+        def __init__(self, name, snap):
+            self.executor_name = name
+            self._snap = snap
+
+        def query_status(self, hosts, *, ssh_kwargs=None, host_hardware=None):
+            return self._snap
+
+    def fake_resolve(*, cli_overrides=None, **kw):
+        if cli_overrides and cli_overrides.get("executor") == "local":
+            return _Fake("local", local_snap)
+        return _Fake("docker", docker_snap)
+
+    monkeypatch.setattr("sparkrun.orchestration.executor.resolve_executor", fake_resolve)
+    snapshot = api.status(["host-a"])
+
+    ids = {w.cluster_id for h in snapshot.hosts for w in h.workloads}
+    assert ids == {"sparkrun_docker", "sparkrun_local"}
+    assert snapshot.executor == "docker"
+    occ = snapshot.for_host("host-a")
+    assert occ is not None
+    assert occ.used_slots == 2
+
+
+def test_status_local_unavailable_returns_primary_unchanged(monkeypatch):
+    """When the local executor is gated off (ExecutorUnavailableError), status
+    returns the primary docker snapshot byte-identical."""
+    from sparkrun.core.cluster_status import HostOccupancy
+    from sparkrun.orchestration.executor import ExecutorUnavailableError
+
+    docker_snap = ClusterStatus(
+        hosts=(HostOccupancy(host="host-a", used_slots=0, free_slots=4),),
+        queried_at=1.0,
+        executor="docker",
+    )
+
+    class _Fake:
+        executor_name = "docker"
+
+        def query_status(self, hosts, *, ssh_kwargs=None, host_hardware=None):
+            return docker_snap
+
+    def fake_resolve(*, cli_overrides=None, **kw):
+        if cli_overrides and cli_overrides.get("executor") == "local":
+            raise ExecutorUnavailableError("local disabled")
+        return _Fake()
+
+    monkeypatch.setattr("sparkrun.orchestration.executor.resolve_executor", fake_resolve)
+    snapshot = api.status(["host-a"])
+
+    assert snapshot is docker_snap
+    assert snapshot.executor == "docker"
+
+
 # --------------------------------------------------------------------------
 # api.list_jobs
 # --------------------------------------------------------------------------

@@ -324,6 +324,7 @@ class K8sExecutor(Executor):
         serve_command: str,
         env: dict[str, str] | None = None,
         detached: bool = True,
+        volumes: dict[str, str] | None = None,
         *,
         sparkrun_labels: dict[str, str] | None = None,
     ) -> str:
@@ -340,7 +341,10 @@ class K8sExecutor(Executor):
 
         ``sparkrun_labels`` is forwarded to :meth:`run_cmd` so the
         Pod manifest carries the canonical sparkrun label set.
+        ``volumes`` is accepted for API symmetry but unused here (Pod
+        mounts are out of scope for the draft executor).
         """
+        del volumes  # accepted but unused — Pod mounts are out of scope
         image = (env or {}).get("SPARKRUN_K8S_IMAGE", "")
         if not image:
             # Last-ditch: fall back to a marker that fails loudly so

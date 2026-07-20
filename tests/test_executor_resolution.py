@@ -222,9 +222,10 @@ class TestResolveExecutor:
 
 
 class _FakeRecipe:
-    def __init__(self, executor: str = "", executor_config: dict | None = None):
+    def __init__(self, executor: str = "", executor_config: dict | None = None, builder: str = ""):
         self.executor = executor
         self.executor_config = dict(executor_config or {})
+        self.builder = builder
 
 
 class _FakeRuntime:
@@ -573,6 +574,94 @@ class TestClusterLayer:
         # Config: CLI > recipe for shm_size; CLI overrides cluster's privileged.
         assert ex.config.privileged is True
         assert ex.config.shm_size == "100g"
+
+
+class TestBuilderEnvFileLayer:
+    """A builder that produces a shell env_file auto-populates the executor's
+    ``env_file`` — below an explicit recipe/CLI ``executor_config.env_file``
+    but above runtime/config/dataclass defaults.
+    """
+
+    class _StubBuilder:
+        def __init__(self, env_file):
+            self._env_file = env_file
+
+        def default_env_file(self, recipe):
+            return self._env_file
+
+    def _patch_builder(self, monkeypatch, env_file):
+        stub = self._StubBuilder(env_file)
+        import sparkrun.core.bootstrap as bootstrap
+
+        monkeypatch.setattr(bootstrap, "get_builder", lambda name, v=None: stub)
+        return stub
+
+    def test_builder_env_file_populates_when_recipe_silent(self, monkeypatch):
+        self._patch_builder(monkeypatch, "/x/env.sh")
+        ex = resolve_executor(
+            recipe=_FakeRecipe(executor="local", builder="venv"),
+            rootless=False,
+            auto_user=False,
+        )
+        assert ex.config.env_file == "/x/env.sh"
+
+    def test_recipe_executor_config_env_file_wins(self, monkeypatch):
+        self._patch_builder(monkeypatch, "/x/env.sh")
+        ex = resolve_executor(
+            recipe=_FakeRecipe(
+                executor="local",
+                executor_config={"env_file": "/explicit.sh"},
+                builder="venv",
+            ),
+            rootless=False,
+            auto_user=False,
+        )
+        assert ex.config.env_file == "/explicit.sh"
+
+    def test_no_builder_contributes_nothing(self, monkeypatch):
+        # get_builder must not even be consulted when recipe.builder is empty.
+        import sparkrun.core.bootstrap as bootstrap
+
+        def _boom(name, v=None):
+            raise AssertionError("get_builder should not be called")
+
+        monkeypatch.setattr(bootstrap, "get_builder", _boom)
+        ex = resolve_executor(recipe=_FakeRecipe(executor="local"), rootless=False, auto_user=False)
+        assert ex.config.env_file is None
+
+    def test_builder_error_is_swallowed(self, monkeypatch):
+        import sparkrun.core.bootstrap as bootstrap
+
+        def _raise(name, v=None):
+            raise ValueError("unknown builder")
+
+        monkeypatch.setattr(bootstrap, "get_builder", _raise)
+        ex = resolve_executor(recipe=_FakeRecipe(executor="local", builder="nope"), rootless=False, auto_user=False)
+        assert ex.config.env_file is None
+
+    def test_empty_env_file_contributes_nothing(self, monkeypatch):
+        self._patch_builder(monkeypatch, "")
+        ex = resolve_executor(recipe=_FakeRecipe(executor="local", builder="venv"), rootless=False, auto_user=False)
+        assert ex.config.env_file is None
+
+    def test_builder_env_file_beats_cluster_env_file(self, monkeypatch):
+        """An environment builder's essential env_file (e.g. venv activation)
+        must outrank a cluster's generic executor_config.env_file — otherwise
+        the native serve command runs under the wrong interpreter."""
+        from sparkrun.core.cluster_manager import ClusterDefinition
+
+        self._patch_builder(monkeypatch, "/venv/activate.sh")
+        ex = resolve_executor(
+            recipe=_FakeRecipe(executor="local", builder="venv"),
+            cluster=ClusterDefinition(
+                name="c",
+                hosts=["h1"],
+                executor_config={"env_file": "/cluster-generic.sh"},
+            ),
+            rootless=False,
+            auto_user=False,
+        )
+        assert ex.config.env_file == "/venv/activate.sh"
 
 
 class TestRemovedShims:

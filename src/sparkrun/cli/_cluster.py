@@ -951,7 +951,7 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
 
       sparkrun cluster status --cluster mylab
     """
-    from sparkrun.core.cluster_manager import query_cluster_status
+    from sparkrun.core.cluster_manager import query_cluster_status, resolve_local_pid_dir
     from sparkrun.utils.cli_formatters import format_job_label, format_job_commands, format_host_display
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
@@ -977,6 +977,7 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
         host_list,
         ssh_kwargs=ssh_kwargs,
         cache_dir=str(config.cache_dir),
+        local_pid_dir=resolve_local_pid_dir(_cluster_mgr, cluster_name),
     )
 
     if output_json:

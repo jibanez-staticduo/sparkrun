@@ -151,7 +151,7 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run):
     equivalent — it prints a summary of running clusters before
     issuing teardown commands.
     """
-    from sparkrun.core.cluster_manager import query_cluster_status
+    from sparkrun.core.cluster_manager import query_cluster_status, resolve_local_pid_dir
     from sparkrun.orchestration.docker import docker_stop_cmd
     from sparkrun.orchestration.job_metadata import remove_job_metadata
     from sparkrun.orchestration.primitives import build_ssh_kwargs
@@ -162,7 +162,12 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run):
     ssh_kwargs = build_ssh_kwargs(config)
 
     click.echo("Discovering sparkrun containers on %d host(s)..." % len(host_list))
-    result = query_cluster_status(host_list, ssh_kwargs=ssh_kwargs, cache_dir=str(config.cache_dir))
+    result = query_cluster_status(
+        host_list,
+        ssh_kwargs=ssh_kwargs,
+        cache_dir=str(config.cache_dir),
+        local_pid_dir=resolve_local_pid_dir(_cluster_mgr, cluster_name),
+    )
 
     if result.total_containers == 0:
         click.echo("No sparkrun containers running.")

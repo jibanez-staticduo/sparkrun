@@ -282,6 +282,10 @@ class Executor(Plugin):
     # --- Subclass must define ---
     executor_name: ClassVar[str] = ""
 
+    # Whether this executor distributes/uses a container image. Container-less
+    # executors set False so the launch skips image distribution.
+    needs_image: ClassVar[bool] = True
+
     # --- Optional channel-aware gating ---
     # When set to a registered feature-flag name (e.g. ``"executor.k8s"``),
     # this executor hides itself from the SAF extension registry (via
@@ -620,6 +624,7 @@ class Executor(Plugin):
         serve_command: str,
         env: dict[str, str] | None = None,
         detached: bool = True,
+        volumes: dict[str, str] | None = None,
         *,
         sparkrun_labels: dict[str, str] | None = None,
     ) -> str:
@@ -631,8 +636,15 @@ class Executor(Plugin):
         attach labels when the container itself is created via
         ``generate_launch_script`` / ``generate_node_script`` /
         ``generate_ray_*_script``.
+
+        ``volumes`` is accepted for API symmetry; the container mounts were
+        already established at container-create time
+        (``generate_launch_script``), so the Docker exec path ignores it.
+        Only container-less executors (LocalExecutor) consult it — to
+        reverse-map container-path env values back to their host source.
         """
         del sparkrun_labels  # accepted but unused — exec inherits labels from the container
+        del volumes  # accepted but unused — mounts were set at container-create time
 
         env_exports = ""
         if env:
