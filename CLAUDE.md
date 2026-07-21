@@ -235,10 +235,54 @@ All remote operations use **SSH stdin piping** — scripts are generated as Pyth
 - **`networking.py`** — ConnectX-7 NIC detection, IP assignment planning, CX7 configuration script generation, host key distribution
 - **`primitives.py`** — Higher-level composition: `build_ssh_kwargs()`, `build_volumes()`, `merge_env()`, `detect_infiniband()`, `run_script_on_host()`, `cleanup_containers()`
 - **`job_metadata.py`** — Persistent job metadata (cluster_id → recipe mapping) stored in `~/.cache/sparkrun/jobs/`
-- **`executor.py`** — Public facade. Re-exports `Executor`, `ExecutorConfig`, `EXT_EXECUTOR`. `resolve_executor()` is the single sanctioned executor entry point.
-- **`executors/`** — Executor plugin package. `_base.py` (ABC + dataclass), `docker.py` (default), `local.py` (experimental, no container), `k8s.py` (experimental draft, `kubectl run`-driven). Discovered via SAF.
+- **`executor.py`** — Public facade. Re-exports `Executor`, `ExecutorConfig`, `EXT_EXECUTOR`. `resolve_executor()` is the single sanctioned executor entry point; `query_status_for_cluster()` is the single status source (see Status Discovery below).
+- **`executors/`** — Executor plugin package. `_base.py` (ABC + dataclass), `docker.py` (default), `local.py` (experimental, no container), `k8s.py` (experimental draft, `kubectl run`-driven). Discovered via SAF. Each declares a `status_scope` (default `"host"`).
 - **`collectives/`** — `CollectiveBackend` ABC + implementations: `nccl.py` (default; wraps `infiniband.py`), `rccl.py` (AMD scaffold), `hccl.py` (Intel Gaudi scaffold). `get_backend(vendor)` is the lookup.
 - **`hooks.py`** — `pre_exec` / `post_exec` / `post_commands` runners. Trust gating via `_confirm_hook_execution(trust=...)`.
+
+### Status Discovery ("what's running where?")
+
+All workload-status discovery flows through **one source**, `api.status`, in two
+tiers:
+
+- **`api.status(hosts, cluster=…) -> ClusterStatus`** — the lean *occupancy*
+  snapshot (per-host `used_slots`/`free_slots`/`workloads`, `errors`). Consumed
+  by the occupancy schedulers, `api/_hosts.py` placement, proxy discovery, and
+  `api/_stop.py` teardown (intent→cluster_id). Data-only shape in
+  `core/cluster_status.py`.
+- **`api.status_report(hosts, cluster=…, cache_dir=…) -> ClusterStatusResult`** —
+  the *display* tier: `classify_cluster_status(status(...))` shapes the snapshot
+  into groups/solo/idle/pending + cached job-metadata enrichment (the CLI-facing
+  aggregate in `core/cluster_manager.py`). Used by `cluster status` and `stop
+  --all`.
+
+Under the hood, `api.status` calls
+`orchestration/executor.py:query_status_for_cluster(cluster, hosts, …)`, which
+**sweeps every enabled executor on the cluster's status substrate and merges**:
+
+- **`Executor.status_scope`** (ClassVar, default `"host"`) is the substrate an
+  executor's `query_status` inspects. Executors sharing a scope inspect
+  *disjoint* state on the *same* substrate (docker containers vs `local`
+  pidfiles on the SSH hosts) and are merged (`ClusterStatus.merge` — N-way
+  fold, first snapshot authoritative). A provider executor declares its own
+  scope (`k8s`, `modal`) and is queried alone.
+- The **cluster's scope** = `status_scope` of the executor it would launch with
+  (`resolve_executor_name`, i.e. explicit override → cluster pin →
+  config/default). So an SSH/Thunder cluster → `"host"` (docker + local); a
+  Modal cluster → `"modal"`; a k8s cluster → `"k8s"`. The scope's default
+  executor is queried first (wins per-`cluster_id` collisions); a single failing
+  executor is skipped; an unresolvable executor (gated-off provider plugin)
+  degrades to an empty snapshot rather than raising.
+
+Each `Executor.query_status(hosts, …)` inspects its own backend (docker `docker
+ps`, local pidfile scan, k8s/modal control plane) and returns a `ClusterStatus`.
+There is no separate status extension point.
+
+**Not** on this path: the `cluster monitor` TUI's job column is sourced from the
+streaming host-telemetry (`scripts/host_monitor.sh` emits `sparkrun_jobs` /
+`sparkrun_job_names` via its own `docker ps`), so it is **docker-only** and does
+not see `local`/provider workloads — a deliberate separate path (live telemetry
+vs. periodic occupancy poll), not the unified status source.
 
 ### Transport Layer (`transports/`)
 
@@ -389,6 +433,15 @@ tailscale` and `cluster import thunder` gate the same way
 (`cli.setup.tailscale` / `transports.thunder`), and the Thunder transport also
 fails closed at use in `transports.prepare_cluster_transport` so an
 already-imported Thunder cluster can't run once the flag is off.
+
+**Docker gate (`executor.docker`)**: the default executor gates like every other
+one — for uniformity and a future opt-out — but ships **enabled on every channel**
+(`default=True`, no channel overrides). Disabling it (`features.executor.docker:
+false`) removes docker from `list_executors()` / explicit selection, and the
+baseline-default resolution honors that: `_resolve_executor_name` no longer
+hard-codes `"docker"` when no layer names an executor — `_default_executor_name`
+returns docker when enabled, else the sole enabled executor, else raises "name
+one / set `default_executor`" (never silently runs on a disabled backend).
 
 **Visibility-only gate**: `cli.setup.features` (via `channel_defaults`, **on for
 `beta`/`alpha`, off for `stable`**) is different — it does NOT gate execution.
