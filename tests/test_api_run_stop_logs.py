@@ -234,6 +234,40 @@ def test_stop_with_hosts_skips_metadata_lookup(tmp_path):
     assert result.hosts_targeted == ("h1",)
 
 
+def test_discover_cluster_id_sweeps_whole_host_scope(monkeypatch):
+    """``stop <recipe>`` intent-discovery sweeps the whole host scope, so a job
+    launched under the native ``local`` executor (invisible to ``docker ps``) is
+    still found — not just docker workloads."""
+    from sparkrun.api._stop import _discover_cluster_id_by_intent
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+    from sparkrun.orchestration.executors.docker import DockerExecutor
+    from sparkrun.orchestration.executors.local import LocalExecutor
+
+    intent = "aabbccddeeff0011"
+    cid = "sparkrun_%s_0123456789ab" % intent
+
+    # docker sees nothing; the workload only exists as a local-executor process.
+    monkeypatch.setattr(DockerExecutor, "query_status", lambda self, hosts, **kw: ClusterStatus(hosts=(), executor="docker"))
+    monkeypatch.setattr(
+        LocalExecutor,
+        "query_status",
+        lambda self, hosts, **kw: ClusterStatus(
+            hosts=tuple(HostOccupancy(host=h, workloads=(RunningWorkload(cluster_id=cid),)) for h in hosts),
+            executor="local",
+        ),
+    )
+
+    found = _discover_cluster_id_by_intent(
+        intent,
+        ["h1"],
+        cluster_def=ClusterDefinition(name="c", hosts=["h1"]),
+        cache_dir=None,
+        sctx=None,
+    )
+    assert found == cid  # discovered via the local sweep, not docker
+
+
 # --------------------------------------------------------------------------
 # api.logs — argument validation
 # --------------------------------------------------------------------------

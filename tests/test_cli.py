@@ -5111,6 +5111,7 @@ class TestClusterUserInCLICommands:
         """
         from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
         from sparkrun.orchestration.executors.docker import DockerExecutor
+        from sparkrun.orchestration.executors.local import LocalExecutor
 
         captured_kwargs = {}
 
@@ -5134,6 +5135,9 @@ class TestClusterUserInCLICommands:
             )
 
         monkeypatch.setattr(DockerExecutor, "query_status", fake_query_status)
+        # Discovery now sweeps the whole host scope (docker + local); keep the
+        # local branch hermetic (no real SSH) — it contributes nothing here.
+        monkeypatch.setattr(LocalExecutor, "query_status", lambda self, hosts, **kw: ClusterStatus(hosts=(), executor="local"))
 
         result = runner.invoke(
             main,

@@ -192,26 +192,27 @@ def _discover_cluster_id_by_intent(
 ) -> str:
     """Find the running cluster_id whose intent prefix matches *intent_id*.
 
-    Strategy: ask the configured executor for a :class:`ClusterStatus`
-    over *target_hosts*, then filter ``running_cluster_ids()`` for
-    those starting with ``"sparkrun_" + intent_id + "_"``.  Raises
-    :class:`JobNotFound` on zero matches and :class:`AmbiguousWorkload`
-    on more than one.
+    Strategy: query the cluster's status via the single, cross-executor source
+    (:func:`query_status_for_cluster` — sweeps every enabled executor on the
+    cluster's substrate, so a job launched under *any* backend, e.g. the native
+    ``local`` executor, is discoverable, not just docker), then filter
+    ``running_cluster_ids()`` for those starting with
+    ``"sparkrun_" + intent_id + "_"``.  Raises :class:`JobNotFound` on zero
+    matches and :class:`AmbiguousWorkload` on more than one.
     """
-    from sparkrun.orchestration.executor import resolve_executor
+    from sparkrun.orchestration.executor import query_status_for_cluster
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-    executor = resolve_executor(
-        cluster=cluster_def,
-        cli_overrides=None,
-        rootless=False,
-        auto_user=False,
-        v=sctx.variables if sctx is not None else None,
-    )
     config = sctx.config if sctx is not None else _maybe_load_config()
     ssh_kwargs = build_ssh_kwargs(config) if config else {}
 
-    status = executor.query_status(target_hosts, ssh_kwargs=ssh_kwargs)
+    status = query_status_for_cluster(
+        cluster_def,
+        list(target_hosts),
+        ssh_kwargs=ssh_kwargs,
+        config=config,
+        v=sctx.variables if sctx is not None else None,
+    )
     running_ids = status.running_cluster_ids()
 
     new_prefix = "sparkrun_%s_" % intent_id
