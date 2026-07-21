@@ -951,7 +951,6 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
 
       sparkrun cluster status --cluster mylab
     """
-    from sparkrun.core.cluster_manager import query_cluster_status, resolve_local_pid_dir
     from sparkrun.utils.cli_formatters import format_job_label, format_job_commands, format_host_display
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
@@ -966,19 +965,13 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
         click.echo("[dry-run] Would run on %d host(s): %s" % (len(host_list), docker_cmd))
         return
 
-    # Query and classify — business logic lives in cluster_manager.
-    # NOTE: ``query_cluster_status`` is the CLI-display-oriented
-    # aggregator that adds per-container (role/status/image) detail,
-    # idle-host classification, and pending operations on top of the
-    # raw container snapshot.  :func:`sparkrun.api.status` exposes the
-    # leaner ``ClusterStatus`` shape (host occupancy + aggregated
-    # workloads) for non-CLI consumers and future scheduling.
-    result = query_cluster_status(
-        host_list,
-        ssh_kwargs=ssh_kwargs,
-        cache_dir=str(config.cache_dir),
-        local_pid_dir=resolve_local_pid_dir(_cluster_mgr, cluster_name),
-    )
+    # All status flows from the single source, ``api.status_report`` — the
+    # display tier over ``api.status``.  It owns executor resolution
+    # (cluster-aware, so a cluster's ``executor_config`` incl. ``pid_dir`` is
+    # honored), the cross-executor merge, and classification into the
+    # display-oriented ``ClusterStatusResult`` (per-container role/status/image,
+    # idle hosts, pending ops).
+    result = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
 
     if output_json:
         out = result.to_dict()

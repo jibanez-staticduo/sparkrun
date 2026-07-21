@@ -489,11 +489,13 @@ class LocalExecutor(Executor):
         )
         by_host = {r.host: r for r in results}
         host_entries: list[HostOccupancy] = []
+        errors: dict[str, str] = {}
 
         for host in hosts:
             r = by_host.get(host)
             if r is None or r.returncode != 0:
                 logger.debug("query_status: skipping unreachable host %r (rc=%s)", host, getattr(r, "returncode", "n/a"))
+                errors[host] = (getattr(r, "stderr", "") or "").strip() or "unreachable"
                 continue
 
             hw = (host_hardware or {}).get(host) or default_dgx_spark_hardware()
@@ -513,6 +515,7 @@ class LocalExecutor(Executor):
             hosts=tuple(host_entries),
             queried_at=time.time(),
             executor=self.executor_name,
+            errors=errors,
         )
 
 
@@ -530,7 +533,7 @@ def _parse_local_pidfile_output(stdout: str) -> tuple[list, int]:
     contributes a single :class:`RunningWorkload` with
     ``ranks_on_host`` reflecting the count.
     """
-    from sparkrun.core.cluster_status import RunningWorkload
+    from sparkrun.core.cluster_status import ContainerDetail, RunningWorkload
 
     by_cluster: dict[str, dict] = {}
     for line in stdout.splitlines():
@@ -544,8 +547,16 @@ def _parse_local_pidfile_output(stdout: str) -> tuple[list, int]:
         cluster_id = m.group("cluster")
         rank_str = m.group("rank")
         rank = int(rank_str) if rank_str is not None else 0
-        bucket = by_cluster.setdefault(cluster_id, {"ranks": set(), "intent_id": m.group("intent")})
+        bucket = by_cluster.setdefault(cluster_id, {"ranks": set(), "intent_id": m.group("intent"), "containers": []})
         bucket["ranks"].add(rank)
+        bucket["containers"].append(
+            ContainerDetail(
+                name=name,
+                role=m.group("role") or "?",
+                status="Up (pid %s)" % _pid,
+                image="(local process)",
+            )
+        )
 
     workloads: list[RunningWorkload] = []
     total = 0
@@ -563,6 +574,7 @@ def _parse_local_pidfile_output(stdout: str) -> tuple[list, int]:
                 recipe_name=recipe_name,
                 runtime_name=runtime_name,
                 ranks_on_host=ranks_on_host,
+                containers=tuple(bucket["containers"]),
             )
         )
     return workloads, total

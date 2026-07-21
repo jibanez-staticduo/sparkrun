@@ -150,6 +150,18 @@ class TestResolutionPrecedence:
             assert is_feature_enabled("executor.k8s", channel=channel, env={}) is False
             assert is_feature_enabled("executor.local", channel=channel, env={}) is False
 
+    def test_docker_flag_on_all_channels(self):
+        # The default docker executor ships ENABLED on every channel (it carries
+        # a flag only for uniformity + a future opt-out).
+        for channel in ("stable", "beta", "alpha"):
+            assert is_feature_enabled("executor.docker", channel=channel, env={}) is True
+
+    def test_docker_flag_can_be_disabled_by_config(self, tmp_path):
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(yaml.safe_dump({"features": {"executor.docker": False}}))
+        config = SparkrunConfig(cfg_path)
+        assert is_feature_enabled("executor.docker", config=config, env={}) is False
+
     def test_env_overrides_channel(self):
         assert is_feature_enabled("executor.k8s", channel="stable", env={"SPARKRUN_FEATURE_EXECUTOR_K8S": "1"}) is True
         assert is_feature_enabled("executor.k8s", channel="alpha", env={"SPARKRUN_FEATURE_EXECUTOR_K8S": "0"}) is False
@@ -227,10 +239,22 @@ class TestGatingDecision:
         monkeypatch.setenv("SPARKRUN_FEATURE_EXECUTOR_LOCAL", "0")
         assert LocalExecutor().is_multi_extension(None) is False
 
-    def test_plugin_without_required_feature_always_exposed(self):
+    def test_docker_exposed_when_flag_enabled(self, monkeypatch):
+        # Docker carries a flag (uniformity) that defaults on; an explicit
+        # enable keeps it exposed.
         from sparkrun.orchestration.executors.docker import DockerExecutor
 
+        monkeypatch.setenv("SPARKRUN_FEATURE_EXECUTOR_DOCKER", "1")
         assert DockerExecutor().is_multi_extension(None) is True
+
+    def test_docker_hidden_when_flag_disabled(self, monkeypatch):
+        # Objective: the default executor can be turned off on hosts that don't
+        # need it — the self-gate honors an explicit disable just like the
+        # experimental executors.
+        from sparkrun.orchestration.executors.docker import DockerExecutor
+
+        monkeypatch.setenv("SPARKRUN_FEATURE_EXECUTOR_DOCKER", "0")
+        assert DockerExecutor().is_multi_extension(None) is False
 
 
 class TestBootstrapGatingEndToEnd:
@@ -247,6 +271,17 @@ class TestBootstrapGatingEndToEnd:
         names = _executor_names(tmp_path, {"features": {"channel": "alpha"}})
         assert "local" not in names
         assert "k8s" not in names
+
+    def test_docker_included_by_default(self, tmp_path):
+        # Docker's flag defaults on, so it registers without any opt-in.
+        names = _executor_names(tmp_path, {"features": {"channel": "stable"}})
+        assert "docker" in names
+
+    def test_docker_can_be_disabled(self, tmp_path):
+        # Objective: drop the docker executor where it isn't needed — an
+        # explicit disable removes it from the registered set.
+        names = _executor_names(tmp_path, {"features": {"executor.docker": False}})
+        assert "docker" not in names
 
     def test_config_override_includes_experimental_executors(self, tmp_path):
         names = _executor_names(tmp_path, {"features": {"executor.local": True, "executor.k8s": True}})

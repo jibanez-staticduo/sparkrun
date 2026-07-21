@@ -29,7 +29,7 @@ valid executor selectors is now whatever SAF has discovered under the
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import Mapping, TYPE_CHECKING
 
 from scitrera_app_framework import Variables, get_extensions
 from scitrera_app_framework.api import EnvPlacement
@@ -44,7 +44,9 @@ from sparkrun.orchestration.executors.docker import DOCKER_DEFAULTS, DockerExecu
 
 if TYPE_CHECKING:
     from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.cluster_status import ClusterStatus
     from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.hardware import HostHardware
     from sparkrun.core.recipe import Recipe
     from sparkrun.runtimes.base import RuntimePlugin
 
@@ -66,10 +68,111 @@ __all__ = [
     "ExecutorConfig",
     "ExecutorUnavailableError",
     "accelerator_vendor_for",
+    "cluster_status_scope",
     "get_executor",
     "list_executors",
+    "query_status_for_cluster",
     "resolve_executor",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Status introspection (cluster-scoped, cross-executor merge).
+# ---------------------------------------------------------------------------
+
+
+def _resolve_status_scope(
+    cluster: "ClusterDefinition | None",
+    *,
+    executor: str | None = None,
+    config: "SparkrunConfig | None" = None,
+    v: Variables | None = None,
+) -> tuple[str, str]:
+    """Return ``(scope, default_executor_name)`` for *cluster*'s status query.
+
+    The scope is the :attr:`Executor.status_scope` of the executor the cluster
+    would launch with — resolved via the canonical
+    :func:`resolve_executor_name` chain (an explicit *executor* override wins,
+    then the cluster's pin, then config/defaults).  So an SSH cluster resolves
+    to ``"host"`` (docker/local), a Modal cluster to ``"modal"``, a k8s cluster
+    to ``"k8s"``.  Raises whatever ``resolve_executor_name`` raises when the
+    chosen executor is unknown / gated off — callers degrade gracefully.
+    """
+    cli_overrides = {"executor": executor} if executor else None
+    name = _resolve_executor_name(cli_overrides=cli_overrides, recipe=None, cluster=cluster, runtime=None, config=config, v=v)
+    return getattr(get_executor(name, v), "status_scope", "host"), name
+
+
+def cluster_status_scope(
+    cluster: "ClusterDefinition | None",
+    *,
+    executor: str | None = None,
+    config: "SparkrunConfig | None" = None,
+    v: Variables | None = None,
+) -> str:
+    """Return the status-discovery scope for *cluster* (see :func:`_resolve_status_scope`)."""
+    return _resolve_status_scope(cluster, executor=executor, config=config, v=v)[0]
+
+
+def query_status_for_cluster(
+    cluster: "ClusterDefinition | None",
+    hosts: list[str],
+    *,
+    executor: str | None = None,
+    ssh_kwargs: dict | None = None,
+    host_hardware: "Mapping[str, HostHardware] | None" = None,
+    config: "SparkrunConfig | None" = None,
+    v: Variables | None = None,
+) -> "ClusterStatus":
+    """Query every enabled executor on the cluster's status substrate, merged.
+
+    The single status source behind :func:`sparkrun.api.status`.  Resolves the
+    cluster's *scope* (:func:`cluster_status_scope`), then queries **all
+    enabled executors sharing that scope** and merges their snapshots — they
+    inspect disjoint state on the same substrate, so the merge is a complete
+    view.  For an SSH cluster that's docker + local (native pidfile workloads
+    are invisible to ``docker ps`` and vice-versa); for a provider cluster
+    (``modal`` / ``k8s``) it's that provider alone.
+
+    The cluster's default executor is queried **first**, so it wins any
+    per-``cluster_id`` collision.  A single failing executor is skipped (never
+    breaks the whole status).  When the cluster's executor can't be resolved
+    (e.g. a provider executor whose plugin / feature flag is unavailable), the
+    query degrades to an empty snapshot with a logged warning rather than
+    raising.
+    """
+    from sparkrun.core.cluster_status import ClusterStatus, empty_status
+
+    try:
+        scope, default_name = _resolve_status_scope(cluster, executor=executor, config=config, v=v)
+    except Exception:
+        logger.warning(
+            "Could not resolve an executor for status on this cluster; returning an empty snapshot",
+            exc_info=True,
+        )
+        return empty_status(list(hosts))
+
+    # Enabled executors sharing the cluster's scope (list_executors already
+    # excludes feature-gated-off executors).  Default executor first
+    # (authoritative on collision), the rest in a deterministic order.
+    try:
+        enabled = list_executors(v)
+    except Exception:
+        enabled = [default_name]
+    in_scope = [n for n in enabled if getattr(get_executor(n, v), "status_scope", "host") == scope]
+    ordered = [default_name] + sorted(n for n in in_scope if n != default_name)
+
+    snapshots: list[ClusterStatus] = []
+    for name in ordered:
+        try:
+            ex = resolve_executor(cluster=cluster, cli_overrides={"executor": name}, rootless=False, auto_user=False, config=config, v=v)
+            snapshots.append(ex.query_status(list(hosts), ssh_kwargs=ssh_kwargs, host_hardware=host_hardware))
+        except Exception:  # noqa: BLE001 - one backend failing never breaks status
+            logger.debug("Status query via executor %r failed; skipping", name, exc_info=True)
+
+    if not snapshots:
+        return empty_status(list(hosts))
+    return ClusterStatus.merge(snapshots)
 
 
 # ---------------------------------------------------------------------------

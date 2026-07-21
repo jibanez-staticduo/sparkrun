@@ -72,7 +72,7 @@ def stop(ctx, target, hosts, hosts_file, cluster_name, stop_all, tp_override, po
     config = sctx.config
 
     if stop_all:
-        _stop_all(hosts, hosts_file, cluster_name, config, dry_run)
+        _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=sctx)
         return
 
     cluster_id = _is_cluster_id(target)
@@ -144,30 +144,26 @@ def _hosts_for_cluster_id_target(target, hosts, hosts_file, cluster_name, config
     )
 
 
-def _stop_all(hosts, hosts_file, cluster_name, config, dry_run):
+def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
     """Discover and stop all sparkrun containers on the target hosts.
 
     Kept inline because the discovery-heavy presentation has no API
     equivalent — it prints a summary of running clusters before
     issuing teardown commands.
     """
-    from sparkrun.core.cluster_manager import query_cluster_status, resolve_local_pid_dir
     from sparkrun.orchestration.docker import docker_stop_cmd
     from sparkrun.orchestration.job_metadata import remove_job_metadata
     from sparkrun.orchestration.primitives import build_ssh_kwargs
     from sparkrun.orchestration.ssh import run_remote_command
 
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
+    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
 
     ssh_kwargs = build_ssh_kwargs(config)
 
     click.echo("Discovering sparkrun containers on %d host(s)..." % len(host_list))
-    result = query_cluster_status(
-        host_list,
-        ssh_kwargs=ssh_kwargs,
-        cache_dir=str(config.cache_dir),
-        local_pid_dir=resolve_local_pid_dir(_cluster_mgr, cluster_name),
-    )
+    # Status flows from the single source, ``api.status_report`` (cluster-aware
+    # resolution + cross-executor merge + display classification).
+    result = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
 
     if result.total_containers == 0:
         click.echo("No sparkrun containers running.")

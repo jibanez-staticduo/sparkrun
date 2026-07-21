@@ -284,6 +284,90 @@ def test_status_local_unavailable_returns_primary_unchanged(monkeypatch):
     assert snapshot.executor == "docker"
 
 
+def test_status_k8s_cluster_scopes_to_k8s_only():
+    """A k8s-pinned cluster resolves to the k8s substrate — docker/local are NOT
+    swept in (different scope).  K8sExecutor returns its empty default here."""
+    cluster = ClusterDefinition(name="c", hosts=["host-a"], executor="k8s")
+    # No SSH mock needed: k8s scope excludes the host executors, and the k8s
+    # query_status default returns empty without SSH.
+    snapshot = api.status(["host-a"], cluster=cluster)
+    assert snapshot.executor == "k8s"
+
+
+def test_status_host_scope_respects_enabled_executors(monkeypatch):
+    """Only *enabled* executors in the host scope are swept: with local absent
+    from ``list_executors``, status is docker-only."""
+    monkeypatch.setattr("sparkrun.orchestration.executor.list_executors", lambda v=None: ["docker"])
+    with patch(
+        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+        return_value=[RemoteResult(host="host-a", returncode=0, stdout="", stderr="")],
+    ):
+        snapshot = api.status(["host-a"])
+    assert snapshot.executor == "docker"
+
+
+def test_status_unresolvable_executor_degrades_to_empty():
+    """A cluster pinning an unavailable executor (unknown / gated-off plugin)
+    degrades to an empty snapshot instead of raising."""
+    cluster = ClusterDefinition(name="c", hosts=["host-a"], executor="modal")  # not registered in-tree
+    snapshot = api.status(["host-a"], cluster=cluster)
+    # No crash; zero-occupancy snapshot (nothing could be inspected).
+    assert all(not h.workloads for h in snapshot.hosts)
+
+
+# --------------------------------------------------------------------------
+# api.status_report — the display tier (classify over the occupancy snapshot)
+# --------------------------------------------------------------------------
+
+
+def test_status_report_classifies_snapshot(monkeypatch, tmp_path):
+    """``status_report`` composes ``status`` (occupancy) + classification into
+    a ``ClusterStatusResult`` (groups/solo/idle)."""
+    from sparkrun.core.cluster_manager import ClusterStatusResult
+    from sparkrun.core.cluster_status import ClusterStatus, ContainerDetail, HostOccupancy, RunningWorkload
+
+    snap = ClusterStatus(
+        hosts=(
+            HostOccupancy(
+                host="host-a",
+                workloads=(
+                    RunningWorkload(cluster_id="sparkrun_x", containers=(ContainerDetail("sparkrun_x_solo", "solo", "Up", "img"),)),
+                ),
+            ),
+            HostOccupancy(host="host-b"),  # reachable, no workloads → idle
+        ),
+        executor="docker",
+    )
+    # Patch the ClusterStatus source status_report composes over.
+    monkeypatch.setattr("sparkrun.api._status.status", lambda *a, **k: snap)
+
+    result = api.status_report(["host-a", "host-b"], cache_dir=str(tmp_path))
+
+    assert isinstance(result, ClusterStatusResult)
+    assert [e.cluster_id for e in result.solo_entries] == ["sparkrun_x"]
+    assert result.idle_hosts == ["host-b"]
+    assert result.total_containers == 1
+
+
+def test_status_report_forwards_query_args(monkeypatch, tmp_path):
+    """``status_report`` forwards executor/cluster/ssh_kwargs to ``status``."""
+    from sparkrun.core.cluster_status import ClusterStatus
+
+    captured = {}
+
+    def _fake_status(hosts, *, executor=None, cluster=None, ssh_kwargs=None, sctx=None):
+        captured.update(hosts=hosts, executor=executor, ssh_kwargs=ssh_kwargs)
+        return ClusterStatus(hosts=(), executor="docker")
+
+    monkeypatch.setattr("sparkrun.api._status.status", _fake_status)
+
+    api.status_report(["h1"], executor="docker", ssh_kwargs={"ssh_user": "bob"}, cache_dir=str(tmp_path))
+
+    assert captured["hosts"] == ["h1"]
+    assert captured["executor"] == "docker"
+    assert captured["ssh_kwargs"] == {"ssh_user": "bob"}
+
+
 # --------------------------------------------------------------------------
 # api.list_jobs
 # --------------------------------------------------------------------------

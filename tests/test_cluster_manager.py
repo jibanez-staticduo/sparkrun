@@ -1031,12 +1031,12 @@ def test_to_dict_includes_hosts_hardware_only_when_set(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------
-# query_cluster_status — container-name parsing
+# classify_cluster_status — snapshot → ClusterStatusResult classification
 # --------------------------------------------------------------------------
 
 
 class TestQueryClusterStatusParsing:
-    """Regression coverage for cluster_id extraction in query_cluster_status.
+    """Regression coverage for cluster_id extraction in classify_cluster_status.
 
     Container names follow ``sparkrun_<intent>_<placement>[_<role>]``.  The
     cluster_id is the full ``sparkrun_<intent>_<placement>`` — workloads
@@ -1046,158 +1046,145 @@ class TestQueryClusterStatusParsing:
     """
 
     @staticmethod
-    def _mock_docker_ps(per_host_lines):
-        """Return a fake ``run_script_on_host`` that emits canned docker-ps output."""
-        from sparkrun.orchestration.ssh import RemoteResult
+    def _cd(name, role, status="Up 1 minute", image="img"):
+        from sparkrun.core.cluster_status import ContainerDetail
 
-        def _impl(host, command, ssh_kwargs=None, timeout=None):
-            return RemoteResult(host=host, returncode=0, stdout="\n".join(per_host_lines.get(host, [])), stderr="")
+        return ContainerDetail(name=name, role=role, status=status, image=image)
 
-        return _impl
+    @classmethod
+    def _wl(cls, cluster_id, containers):
+        from sparkrun.core.cluster_status import RunningWorkload
 
-    def test_two_workloads_same_intent_distinct_placements_are_separate_clusters(self, tmp_path, monkeypatch):
+        return RunningWorkload(cluster_id=cluster_id, containers=tuple(containers))
+
+    @staticmethod
+    def _status(host_workloads, errors=None):
+        """Build a canned merged :class:`ClusterStatus` snapshot.
+
+        ``host_workloads`` maps host → list of RunningWorkloads (each host
+        present is *reachable*).  ``errors`` maps unreachable host → message
+        (those hosts are absent from ``hosts``).
+        """
+        from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy
+
+        hosts = tuple(HostOccupancy(host=h, workloads=tuple(ws)) for h, ws in host_workloads.items())
+        return ClusterStatus(hosts=hosts, executor="docker", errors=dict(errors or {}))
+
+    def test_two_workloads_same_intent_distinct_placements_are_separate_clusters(self, tmp_path):
         """Same recipe launched twice → same intent_id, different placement_tokens
         → must report as two distinct cluster_ids."""
-        from sparkrun.core.cluster_manager import query_cluster_status
+        from sparkrun.core.cluster_manager import classify_cluster_status
 
         intent = "221f3a3a45d7fa4d"
         place_a = "aabbccddeeff"
         place_b = "112233445566"
-        # Workload A on h1+h2, workload B on h3+h4 — both share the same intent prefix.
-        per_host = {
-            "h1": ["sparkrun_%s_%s_head\tUp 1 minute\timg" % (intent, place_a)],
-            "h2": ["sparkrun_%s_%s_node_1\tUp 1 minute\timg" % (intent, place_a)],
-            "h3": ["sparkrun_%s_%s_head\tUp 30 seconds\timg" % (intent, place_b)],
-            "h4": ["sparkrun_%s_%s_node_1\tUp 30 seconds\timg" % (intent, place_b)],
-        }
-        monkeypatch.setattr(
-            "sparkrun.orchestration.primitives.run_script_on_host",
-            self._mock_docker_ps(per_host),
-        )
-
-        result = query_cluster_status(list(per_host.keys()), ssh_kwargs={}, cache_dir=str(tmp_path))
-
         cid_a = "sparkrun_%s_%s" % (intent, place_a)
         cid_b = "sparkrun_%s_%s" % (intent, place_b)
+        # Workload A on h1+h2, workload B on h3+h4 — both share the same intent prefix.
+        status = self._status(
+            {
+                "h1": [self._wl(cid_a, [self._cd("%s_head" % cid_a, "head")])],
+                "h2": [self._wl(cid_a, [self._cd("%s_node_1" % cid_a, "node_1")])],
+                "h3": [self._wl(cid_b, [self._cd("%s_head" % cid_b, "head", "Up 30 seconds")])],
+                "h4": [self._wl(cid_b, [self._cd("%s_node_1" % cid_b, "node_1", "Up 30 seconds")])],
+            }
+        )
+
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1", "h2", "h3", "h4"])
+
         assert set(result.groups.keys()) == {cid_a, cid_b}
         # Each cluster has exactly two members (one per host).
         assert len(result.groups[cid_a].members) == 2
         assert len(result.groups[cid_b].members) == 2
-        # Roles parse cleanly (head + node_1, not "<placement>_head").
-        roles_a = sorted(m[1] for m in result.groups[cid_a].members)
-        assert roles_a == ["head", "node_1"]
-        roles_b = sorted(m[1] for m in result.groups[cid_b].members)
-        assert roles_b == ["head", "node_1"]
+        # Roles come straight from ContainerDetail.role (head + node_1).
+        assert sorted(m[1] for m in result.groups[cid_a].members) == ["head", "node_1"]
+        assert sorted(m[1] for m in result.groups[cid_b].members) == ["head", "node_1"]
+        assert result.total_containers == 4
 
-    def test_single_workload_parses_full_cluster_id(self, tmp_path, monkeypatch):
+    def test_single_workload_parses_full_cluster_id(self, tmp_path):
         """A single 2-node workload must surface as exactly one cluster_id with full placement token."""
-        from sparkrun.core.cluster_manager import query_cluster_status
+        from sparkrun.core.cluster_manager import classify_cluster_status
 
         intent = "deadbeefcafe1234"
         place = "0123456789ab"
-        per_host = {
-            "h1": ["sparkrun_%s_%s_head\tUp 5 minutes\timg" % (intent, place)],
-            "h2": ["sparkrun_%s_%s_node_1\tUp 5 minutes\timg" % (intent, place)],
-        }
-        monkeypatch.setattr(
-            "sparkrun.orchestration.primitives.run_script_on_host",
-            self._mock_docker_ps(per_host),
+        cid = "sparkrun_%s_%s" % (intent, place)
+        status = self._status(
+            {
+                "h1": [self._wl(cid, [self._cd("%s_head" % cid, "head", "Up 5 minutes")])],
+                "h2": [self._wl(cid, [self._cd("%s_node_1" % cid, "node_1", "Up 5 minutes")])],
+            }
         )
 
-        result = query_cluster_status(list(per_host.keys()), ssh_kwargs={}, cache_dir=str(tmp_path))
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1", "h2"])
 
-        expected = "sparkrun_%s_%s" % (intent, place)
-        assert list(result.groups.keys()) == [expected]
-        assert len(result.groups[expected].members) == 2
+        assert list(result.groups.keys()) == [cid]
+        assert len(result.groups[cid].members) == 2
 
-    def test_solo_container_uses_full_cluster_id(self, tmp_path, monkeypatch):
+    def test_solo_container_uses_full_cluster_id(self, tmp_path):
         """Solo containers (`..._solo`) must yield the full cluster_id, not the intent prefix."""
-        from sparkrun.core.cluster_manager import query_cluster_status
+        from sparkrun.core.cluster_manager import classify_cluster_status
 
         intent = "feedfacef00d4242"
         place = "abcdef012345"
-        per_host = {
-            "h1": ["sparkrun_%s_%s_solo\tUp 10 seconds\timg" % (intent, place)],
-        }
-        monkeypatch.setattr(
-            "sparkrun.orchestration.primitives.run_script_on_host",
-            self._mock_docker_ps(per_host),
-        )
+        cid = "sparkrun_%s_%s" % (intent, place)
+        status = self._status({"h1": [self._wl(cid, [self._cd("%s_solo" % cid, "solo", "Up 10 seconds")])]})
 
-        result = query_cluster_status(list(per_host.keys()), ssh_kwargs={}, cache_dir=str(tmp_path))
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1"])
 
         assert result.groups == {}
         assert len(result.solo_entries) == 1
-        assert result.solo_entries[0].cluster_id == "sparkrun_%s_%s" % (intent, place)
+        assert result.solo_entries[0].cluster_id == cid
 
-    def test_local_executor_pidfile_workload_is_surfaced(self, tmp_path, monkeypatch):
-        """Native local-executor jobs (the per-host script emits an ``(local process)``
-        line for each live pidfile) surface as solo entries alongside docker containers."""
-        from sparkrun.core.cluster_manager import query_cluster_status
+    def test_local_executor_pidfile_workload_is_surfaced(self, tmp_path):
+        """A docker container + a native local process for DIFFERENT cluster_ids both
+        surface as solo entries (the local one carries the ``(local process)`` image)."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
 
         intent, place = "0123456789abcdef", "fedcba987654"
-        per_host = {
-            # a docker container + a local pidfile-tracked process, same tab-separated shape
-            "h1": [
-                "sparkrun_aaaaaaaaaaaaaaaa_111111111111_solo\tUp 5 seconds\tsome/img",
-                "sparkrun_%s_%s_solo\tUp (pid 4242)\t(local process)" % (intent, place),
-            ],
-        }
-        monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", self._mock_docker_ps(per_host))
+        cid_docker = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+        cid_local = "sparkrun_%s_%s" % (intent, place)
+        status = self._status(
+            {
+                "h1": [
+                    self._wl(cid_docker, [self._cd("%s_solo" % cid_docker, "solo", "Up 5 seconds", "some/img")]),
+                    self._wl(cid_local, [self._cd("%s_solo" % cid_local, "solo", "Up (pid 4242)", "(local process)")]),
+                ]
+            }
+        )
 
-        result = query_cluster_status(["h1"], ssh_kwargs={}, cache_dir=str(tmp_path))
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1"])
 
         cids = {e.cluster_id for e in result.solo_entries}
-        assert "sparkrun_%s_%s" % (intent, place) in cids  # local job visible
-        local = next(e for e in result.solo_entries if e.cluster_id == "sparkrun_%s_%s" % (intent, place))
+        assert cid_docker in cids and cid_local in cids  # both distinct jobs visible
+        local = next(e for e in result.solo_entries if e.cluster_id == cid_local)
         assert "pid 4242" in local.status and local.image == "(local process)"
+        assert result.total_containers == 2
 
-    def test_docker_failure_sentinel_marks_host_errored_not_idle(self, tmp_path, monkeypatch):
-        """A ``docker ps`` failure emits the sentinel line → the host is flagged
-        as errored (not silently reported as idle)."""
-        from sparkrun.core.cluster_manager import query_cluster_status, _DOCKER_ERR_SENTINEL
+    def test_unreachable_host_is_errored_not_idle(self, tmp_path):
+        """A host the executor could not reach (recorded in ``ClusterStatus.errors``,
+        absent from ``hosts``) surfaces as an error and NOT as idle."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
 
-        per_host = {"h1": [_DOCKER_ERR_SENTINEL]}  # docker probe failed, no containers/pidfiles
-        monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", self._mock_docker_ps(per_host))
+        status = self._status({}, errors={"h1": "connection refused"})
 
-        result = query_cluster_status(["h1"], ssh_kwargs={}, cache_dir=str(tmp_path))
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1"])
 
-        assert "h1" in result.errors  # surfaced as an error
+        assert result.errors.get("h1") == "connection refused"  # surfaced as an error
         assert "h1" not in result.idle_hosts  # NOT misreported as idle
         assert result.total_containers == 0
 
-    def test_docker_failure_still_surfaces_local_workloads(self, tmp_path, monkeypatch):
-        """Even when docker is down, local pidfile workloads emitted after the
-        sentinel are still surfaced — the host is errored AND shows the local job."""
-        from sparkrun.core.cluster_manager import query_cluster_status, _DOCKER_ERR_SENTINEL
+    def test_reachable_host_with_no_workloads_is_idle(self, tmp_path):
+        """A reachable host (present in the snapshot) with zero containers
+        is idle — not an error."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
 
-        intent, place = "0123456789abcdef", "fedcba987654"
-        per_host = {"h1": [_DOCKER_ERR_SENTINEL, "sparkrun_%s_%s_solo\tUp (pid 99)\t(local process)" % (intent, place)]}
-        monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", self._mock_docker_ps(per_host))
+        status = self._status({"h1": []})
 
-        result = query_cluster_status(["h1"], ssh_kwargs={}, cache_dir=str(tmp_path))
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1"])
 
-        assert "h1" in result.errors
-        cids = {e.cluster_id for e in result.solo_entries}
-        assert "sparkrun_%s_%s" % (intent, place) in cids
-
-    def test_custom_pid_dir_is_scanned(self, tmp_path, monkeypatch):
-        """A resolved ``local_pid_dir`` is interpolated into the per-host status
-        script instead of the hardcoded default."""
-        from sparkrun.core.cluster_manager import query_cluster_status
-        from sparkrun.orchestration.ssh import RemoteResult
-
-        captured = {}
-
-        def _capture(host, command, ssh_kwargs=None, timeout=None):
-            captured[host] = command
-            return RemoteResult(host=host, returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", _capture)
-        query_cluster_status(["h1"], ssh_kwargs={}, cache_dir=str(tmp_path), local_pid_dir="/var/run/sparkrun/pids")
-
-        assert '"/var/run/sparkrun/pids"/*.pid' in captured["h1"]
-        assert "/.cache/sparkrun/local/pids" not in captured["h1"]  # default not used
+        assert result.idle_hosts == ["h1"]
+        assert "h1" not in result.errors
+        assert result.total_containers == 0
 
 
 class TestClusterDistributionPrefs:

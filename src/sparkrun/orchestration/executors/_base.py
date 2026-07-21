@@ -286,6 +286,16 @@ class Executor(Plugin):
     # executors set False so the launch skips image distribution.
     needs_image: ClassVar[bool] = True
 
+    # Status-discovery substrate.  Executors sharing a scope inspect *disjoint*
+    # state on the *same* substrate (e.g. docker containers vs local pidfiles on
+    # the SSH hosts) and are merged into one snapshot by
+    # ``query_status_for_cluster``; a provider executor with its own control
+    # plane declares a distinct scope (e.g. ``"k8s"`` / ``"modal"``) and is
+    # queried alone.  A cluster's scope is the ``status_scope`` of the executor
+    # it would launch with, so status sweeps exactly the executors that could
+    # have placed workloads on that cluster.
+    status_scope: ClassVar[str] = "host"
+
     # --- Optional channel-aware gating ---
     # When set to a registered feature-flag name (e.g. ``"executor.k8s"``),
     # this executor hides itself from the SAF extension registry (via

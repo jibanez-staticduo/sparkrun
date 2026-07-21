@@ -211,8 +211,8 @@ _PLACEMENT_TOKEN_RE = re.compile(r"^[0-9a-f]{%d}$" % PLACEMENT_TOKEN_LEN)
 _NEW_CLUSTER_ID_RE = re.compile(r"^sparkrun_([0-9a-f]{%d})_([0-9a-f]{%d})$" % (INTENT_ID_LEN, PLACEMENT_TOKEN_LEN))
 # Canonical container name: ``sparkrun_<intent>_<placement>[_<role>]``.
 # Used by every consumer that splits container names into (cluster_id, role):
-# ``cluster_manager.query_cluster_status``, the Docker executor's
-# ``query_status``, the cluster monitor TUI.
+# the Docker/local executors' ``query_status`` (the status source),
+# ``cluster_manager.classify_cluster_status``, the cluster monitor TUI.
 _CONTAINER_NAME_RE = re.compile(
     r"^sparkrun_(?P<intent>[0-9a-f]{%d})_(?P<placement>[0-9a-f]{%d})(?:_(?P<role>.+))?$" % (INTENT_ID_LEN, PLACEMENT_TOKEN_LEN)
 )

@@ -6,12 +6,14 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import yaml
 
 from sparkrun.core.hardware import HostHardware, default_dgx_spark_hardware
-from sparkrun.orchestration.job_metadata import parse_container_name
+
+if TYPE_CHECKING:
+    from sparkrun.core.cluster_status import ClusterStatus
 
 logger = logging.getLogger(__name__)
 
@@ -873,159 +875,57 @@ class ClusterManager:
 # Cluster status query — business logic extracted from CLI
 # ---------------------------------------------------------------------------
 
-#: Marker line the per-host status script emits when ``docker ps`` fails, so a
-#: broken/unreachable docker daemon surfaces as an *error* rather than a silent
-#: "idle" host.  Chosen to never collide with a real container name (which is
-#: always ``sparkrun_...``).
-_DOCKER_ERR_SENTINEL = "__SPARKRUN_DOCKER_ERR__"
 
-
-def resolve_local_pid_dir(cluster_manager: "ClusterManager | None", cluster_name: str | None) -> str | None:
-    """Resolve a named cluster's ``executor_config.pid_dir`` (or ``None``).
-
-    Lets the CLI ``status`` / ``stop`` display path scan the same pidfile
-    directory the LocalExecutor would use for that cluster, instead of the
-    hardcoded default.  Returns ``None`` for ad-hoc host lists (no named
-    cluster) or any resolution failure — the caller then falls back to the
-    LocalExecutor default.
-    """
-    if not cluster_name or cluster_manager is None:
-        return None
-    try:
-        cdef = cluster_manager.get(cluster_name)
-    except Exception:
-        return None
-    cfg = getattr(cdef, "executor_config", None) or {}
-    pid_dir = cfg.get("pid_dir")
-    return pid_dir or None
-
-
-def query_cluster_status(
-    host_list: list[str],
-    ssh_kwargs: dict[str, Any],
+def classify_cluster_status(
+    snapshot: "ClusterStatus",
+    *,
     cache_dir: str,
-    local_pid_dir: str | None = None,
+    host_list: list[str],
 ) -> ClusterStatusResult:
-    """Query sparkrun containers on hosts and classify them.
+    """Shape a :class:`~sparkrun.core.cluster_status.ClusterStatus` snapshot
+    into the CLI-display :class:`ClusterStatusResult`.
 
-    Runs ``docker ps`` on each host in parallel, parses the output,
-    groups containers into clusters vs solo entries, enriches with
-    cached job metadata, and identifies idle hosts and pending ops.
+    Pure presentation — no executor resolution, no SSH.  The snapshot is
+    produced by :func:`sparkrun.api.status` (the single status source, which
+    owns executor resolution + the cross-executor merge); this classifies its
+    workloads into cluster groups vs solo entries, enriches each with cached
+    job metadata, and derives idle hosts + relevant pending ops.
 
     Args:
-        host_list: Target hostnames/IPs to query.
-        ssh_kwargs: SSH connection keyword arguments.
+        snapshot: The merged :class:`ClusterStatus` from ``api.status``.
         cache_dir: Cache directory for job metadata and pending ops.
+        host_list: The hosts that were queried (used to derive idle hosts and
+            filter pending ops); a host absent from ``snapshot.hosts`` and not
+            in ``snapshot.errors`` is neither reachable nor idle.
 
     Returns:
         A :class:`ClusterStatusResult` with all collected data.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from sparkrun.orchestration.primitives import run_script_on_host
-    from sparkrun.orchestration.ssh import resolve_parallel_cap
     from sparkrun.orchestration.job_metadata import load_job_metadata
     from sparkrun.core.pending_ops import list_pending_ops
-    from sparkrun.orchestration.executors.local import _DEFAULT_PID_DIR
 
-    # One script per host: docker containers PLUS native `local`-executor workloads
-    # (pidfile-tracked processes, invisible to `docker ps`). Both emit the same
-    # ``<name>\t<status>\t<image>`` shape so the parser/grouping below treats them
-    # uniformly — a live local job surfaces as a ``_solo`` entry with an ``Up (pid N)``
-    # status and a ``(local process)`` "image".
-    #
-    # A ``docker ps`` failure (daemon down/unreachable) must NOT be swallowed into
-    # a false "idle" — it emits a ``_DOCKER_ERR_SENTINEL`` line so the parser flags
-    # the host as errored (matching the pre-merge behavior where a non-zero
-    # ``docker ps`` rc surfaced as an error). ``|| true`` on the *outer* group
-    # would hide it, so the docker probe is guarded by an ``if`` instead.
-    #
-    # The pidfile dir defaults to the LocalExecutor default but honors a
-    # cluster/recipe ``executor_config.pid_dir`` when the caller resolves one
-    # (mirrors ``LocalExecutor.query_status``, which reads ``config.pid_dir``).
-    # Built with plain concatenation (not %-formatting) so the embedded
-    # ``printf "%s"`` specifiers stay literal.
-    pid_dir = local_pid_dir or _DEFAULT_PID_DIR
-    status_script = (
-        "if docker_out=$(docker ps --filter 'name=sparkrun_' --format '{{.Names}}\\t{{.Status}}\\t{{.Image}}' 2>/dev/null); then\n"
-        '  [ -n "$docker_out" ] && printf "%s\\n" "$docker_out"\n'
-        "else\n"
-        '  printf "%s\\n" "' + _DOCKER_ERR_SENTINEL + '"\n'
-        "fi\n"
-        "shopt -s nullglob 2>/dev/null || true\n"
-        'for f in "' + pid_dir + '"/*.pid; do\n'
-        '  [ -f "$f" ] || continue\n'
-        '  n=$(basename "$f" .pid); p=$(cat "$f" 2>/dev/null || true)\n'
-        '  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && printf "%s\\tUp (pid %s)\\t(local process)\\n" "$n" "$p"\n'
-        "done\n"
-    )
-
-    # Query all hosts in parallel (dispatches local vs SSH automatically)
-    with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(host_list))) as executor:
-        futures = {
-            executor.submit(
-                run_script_on_host,
-                host,
-                status_script,
-                ssh_kwargs=ssh_kwargs,
-                timeout=15,
-            ): host
-            for host in host_list
-        }
-        results = {}
-        for future in as_completed(futures):
-            host = futures[future]
-            results[host] = future.result()
-
-    # Collect per-host container info: list of (name, status, image)
-    host_containers: dict[str, list[tuple[str, str, str]]] = {}
-    errors: dict[str, str] = {}
-    for host in host_list:
-        result = results[host]
-        if not result.success:
-            errors[host] = result.stderr.strip()
-            continue
-        entries = []
-        docker_failed = False
-        for line in result.stdout.strip().splitlines():
-            if not line.strip():
-                continue
-            if line.startswith(_DOCKER_ERR_SENTINEL):
-                # The docker probe failed on this host; flag it as errored so it
-                # is not misreported as idle.  Any local pidfile lines emitted
-                # after the sentinel are still parsed below and surfaced.
-                docker_failed = True
-                continue
-            parts = line.split("\t")
-            if len(parts) == 3:
-                entries.append((parts[0], parts[1], parts[2]))
-            else:
-                entries.append((line.strip(), "", ""))
-        if docker_failed:
-            errors[host] = "docker ps failed"
-        host_containers[host] = entries
-
-    # Build cluster groups: cluster_id -> [(host, role, status, image), ...]
-    # Anything ending in _solo is standalone; everything else is grouped
-    # by cluster_id (name up to last underscore-delimited role suffix).
+    # Classify the snapshot into cluster groups vs solo entries.  Roles
+    # and per-container detail come from the executors' ContainerDetail now
+    # (a ``_solo`` name / ``solo`` role is standalone; everything else groups
+    # by the workload's cluster_id).
     groups: dict[str, list[tuple[str, str, str, str]]] = {}
-    raw_solo_entries: list[tuple[str, str, str, str]] = []
+    raw_solo_entries: list[tuple[str, str, Any]] = []  # (cluster_id, host, ContainerDetail)
     total_containers = 0
+    reachable_hosts: set[str] = set()
+    host_container_counts: dict[str, int] = {}
 
-    for host in host_list:
-        for name, status, image in host_containers.get(host, []):
-            total_containers += 1
-            if name.endswith("_solo"):
-                raw_solo_entries.append((host, name, status, image))
-            else:
-                # Canonical container name: sparkrun_<intent>_<placement>[_<role>].
-                # The cluster_id is the full sparkrun_<intent>_<placement>; the
-                # trailing token (head / worker / node_N) is the role.
-                parsed = parse_container_name(name)
-                if parsed is not None:
-                    cluster_id, role = parsed
+    for hostocc in snapshot.hosts:
+        reachable_hosts.add(hostocc.host)
+        count = 0
+        for w in hostocc.workloads:
+            for c in w.containers:
+                total_containers += 1
+                count += 1
+                if c.name.endswith("_solo") or c.role == "solo":
+                    raw_solo_entries.append((w.cluster_id, hostocc.host, c))
                 else:
-                    cluster_id, role = name, "?"
-                groups.setdefault(cluster_id, []).append((host, role, status, image))
+                    groups.setdefault(w.cluster_id, []).append((hostocc.host, c.role, c.status, c.image))
+        host_container_counts[hostocc.host] = count
 
     # Enrich groups with job metadata
     cluster_groups: dict[str, ClusterGroup] = {}
@@ -1034,13 +934,17 @@ def query_cluster_status(
         cluster_groups[cid] = ClusterGroup(cluster_id=cid, members=members, meta=meta)
 
     solo_entries: list[ClusterSoloEntry] = []
-    for host, name, status, image in raw_solo_entries:
-        cid = name.removesuffix("_solo")
+    for cid, host, c in raw_solo_entries:
         meta = load_job_metadata(cid, cache_dir=cache_dir) or {}
-        solo_entries.append(ClusterSoloEntry(cluster_id=cid, host=host, name=name, status=status, image=image, meta=meta))
+        solo_entries.append(ClusterSoloEntry(cluster_id=cid, host=host, name=c.name, status=c.status, image=c.image, meta=meta))
 
-    # Idle hosts: no containers and no errors
-    idle_hosts = [h for h in host_list if h not in errors and not host_containers.get(h)]
+    # Unreachable hosts (absent from the snapshot's hosts) surfaced as errors.
+    errors = dict(snapshot.errors)
+
+    # Idle hosts: reachable (present in the merged snapshot) with zero
+    # containers and no error.  A host absent from the snapshot is an error
+    # (or was never reachable), not idle — matches the pre-refactor behavior.
+    idle_hosts = [h for h in host_list if h in reachable_hosts and host_container_counts.get(h, 0) == 0 and h not in errors]
 
     # Pending operations filtered to relevant hosts
     pending = list_pending_ops(cache_dir=cache_dir)

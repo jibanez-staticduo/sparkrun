@@ -42,7 +42,7 @@ def _parse_container_jobs(container_names: list[str], cache_dir: str | None) -> 
     :func:`sparkrun.orchestration.job_metadata.parse_container_name` so
     the TUI shares the canonical
     ``sparkrun_<intent>_<placement>[_<role>]`` format with
-    :func:`sparkrun.core.cluster_manager.query_cluster_status` and the
+    :func:`sparkrun.core.cluster_manager.classify_cluster_status` and the
     Docker executor's ``query_status``.
 
     Returns a list of dicts, one per container, with keys:

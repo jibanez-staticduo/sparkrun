@@ -66,7 +66,7 @@ from sparkrun.api._models import (
 )
 from sparkrun.api._run import run
 from sparkrun.api._schedule import schedule
-from sparkrun.api._status import status
+from sparkrun.api._status import status, status_report
 from sparkrun.api._stop import stop
 
 __all__ = [
@@ -108,6 +108,7 @@ __all__ = [
     "logs",
     "schedule",
     "status",
+    "status_report",
     "list_jobs",
     "benchmark",
     "resume_benchmark",

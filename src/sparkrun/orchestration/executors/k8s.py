@@ -59,6 +59,9 @@ class K8sExecutor(Executor):
 
     executor_name = "k8s"
     required_feature_flag = "executor.k8s"
+    # Own control plane (kubectl), not the SSH-host substrate — queried alone
+    # for a k8s cluster, never merged with the docker/local host executors.
+    status_scope = "k8s"
 
     # No Docker-flavoured defaults; ``--privileged`` / ``--shm-size``
     # etc. don't apply.  No rootless/auto_user handling either.

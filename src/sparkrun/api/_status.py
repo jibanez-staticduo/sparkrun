@@ -12,7 +12,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.cluster_manager import ClusterDefinition, ClusterStatusResult
     from sparkrun.core.cluster_status import ClusterStatus
     from sparkrun.core.context import SparkrunContext
 
@@ -50,7 +50,7 @@ def status(
         this with ``status.for_host(h) is None``.
     """
     from sparkrun.api._resolve import prepare_transport, resolve_cluster
-    from sparkrun.orchestration.executor import ExecutorUnavailableError, resolve_executor
+    from sparkrun.orchestration.executor import query_status_for_cluster
 
     # Always end up with a populated ClusterDefinition; hosts are the
     # explicit list passed in.
@@ -58,50 +58,65 @@ def status(
     # Refresh provider-backed connection details before any SSH (no-op for ssh).
     prepare_transport(cluster_def)
     v = sctx.variables if sctx is not None else None
-    cli_overrides = {"executor": executor} if executor else None
-    resolved = resolve_executor(
-        cluster=cluster_def,
-        cli_overrides=cli_overrides,
-        rootless=False,
-        auto_user=False,
-        v=v,
-    )
+    config = sctx.config if sctx is not None else None
     host_hardware = cluster_def.hosts_hardware or None
-    primary_status = resolved.query_status(
+
+    # The single status source: query every enabled executor on this cluster's
+    # substrate (its ``status_scope``) and merge.  For an SSH cluster that's
+    # docker + local (disjoint state on the same hosts); for a provider cluster
+    # (modal / k8s) it's that provider alone.  See ``query_status_for_cluster``.
+    return query_status_for_cluster(
+        cluster_def,
         list(hosts),
+        executor=executor,
         ssh_kwargs=ssh_kwargs,
         host_hardware=host_hardware,
+        config=config,
+        v=v,
     )
 
-    # Native ``local``-executor workloads (pidfile-tracked processes) are
-    # invisible to the docker executor's container introspection — they inspect
-    # disjoint state on the same hosts.  When the primary is docker and the
-    # experimental ``local`` executor is available (feature flag on), also
-    # query it and merge, so a complete status reflects BOTH.  This no-ops when
-    # ``executor.local`` is off: resolve_executor raises ExecutorUnavailableError
-    # (or the query fails) and we fall back to the primary snapshot unchanged.
-    if resolved.executor_name == "docker" and hosts:
+
+def status_report(
+    hosts: list[str],
+    *,
+    executor: str | None = None,
+    cluster: "str | ClusterDefinition | None" = None,
+    ssh_kwargs: dict | None = None,
+    cache_dir: str | None = None,
+    sctx: "SparkrunContext | None" = None,
+) -> "ClusterStatusResult":
+    """Return a display-oriented :class:`ClusterStatusResult` for *hosts*.
+
+    The higher tier over :func:`status`: it takes the occupancy
+    :class:`~sparkrun.core.cluster_status.ClusterStatus` snapshot ``status``
+    produces and classifies it into cluster groups vs solo entries, enriches
+    each with cached job metadata, and derives idle hosts + relevant pending
+    ops.  Programmatic occupancy consumers (schedulers, discovery) should call
+    :func:`status` for the lean snapshot; the CLI display paths (``cluster
+    status``, ``stop --all``) call this.
+
+    Args mirror :func:`status`, plus:
+        cache_dir: Cache directory for job metadata + pending ops.  Falls back
+            to ``sctx.config.cache_dir`` then the default cache dir.
+
+    Returns:
+        A :class:`ClusterStatusResult`.
+    """
+    from sparkrun.core.cluster_manager import classify_cluster_status
+
+    snapshot = status(hosts, executor=executor, cluster=cluster, ssh_kwargs=ssh_kwargs, sctx=sctx)
+
+    if cache_dir is None and sctx is not None:
         try:
-            local_exec = resolve_executor(
-                cluster=cluster_def,
-                cli_overrides={"executor": "local"},
-                rootless=False,
-                auto_user=False,
-                v=v,
-            )
-            local_status = local_exec.query_status(
-                list(hosts),
-                ssh_kwargs=ssh_kwargs,
-                host_hardware=host_hardware,
-            )
-        except ExecutorUnavailableError:
-            return primary_status
-        except Exception:  # noqa: BLE001 - never let the supplemental query break status
-            logger.debug("Supplemental local-executor status query failed; returning primary only", exc_info=True)
-            return primary_status
-        return primary_status.merged_with(local_status)
+            cache_dir = str(sctx.config.cache_dir)
+        except Exception:
+            cache_dir = None
+    if cache_dir is None:
+        from sparkrun.core.config import DEFAULT_CACHE_DIR
 
-    return primary_status
+        cache_dir = str(DEFAULT_CACHE_DIR)
+
+    return classify_cluster_status(snapshot, cache_dir=cache_dir, host_list=list(hosts))
 
 
-__all__ = ["status"]
+__all__ = ["status", "status_report"]

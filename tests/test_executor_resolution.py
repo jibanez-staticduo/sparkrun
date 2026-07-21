@@ -488,6 +488,18 @@ class TestClusterLayer:
         )
         assert isinstance(ex, LocalExecutor)
 
+    def test_cluster_executor_config_pid_dir_reaches_local(self):
+        """A cluster's ``executor_config.pid_dir`` flows into the local
+        executor config.  This is the mechanism the unified status path relies
+        on (``api.status`` resolves the local executor cluster-aware), which
+        replaced the manual ``resolve_local_pid_dir`` threading."""
+        ex = resolve_executor(
+            cli_overrides={"executor": "local"},
+            cluster=self._cluster(executor_config={"pid_dir": "/var/run/sparkrun/pids"}),
+        )
+        assert isinstance(ex, LocalExecutor)
+        assert ex.config.pid_dir == "/var/run/sparkrun/pids"
+
     def test_cluster_none_preserves_pre_task4_behavior(self):
         """cluster=None must reproduce the pre-Task-4 chain exactly."""
         ex = resolve_executor(

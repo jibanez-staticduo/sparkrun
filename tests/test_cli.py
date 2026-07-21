@@ -1159,25 +1159,29 @@ class TestClusterCommands:
         assert "update" in result.output
         assert "status" in result.output
 
+    @staticmethod
+    def _solo_snapshot():
+        """A one-solo-workload ``ClusterStatus`` (the single-source shape the CLI
+        classifies)."""
+        from sparkrun.core.cluster_status import ClusterStatus, ContainerDetail, HostOccupancy, RunningWorkload
+
+        return ClusterStatus(
+            hosts=(
+                HostOccupancy(
+                    host="10.0.0.1",
+                    workloads=(RunningWorkload(cluster_id="cid1", containers=(ContainerDetail("cid1_solo", "solo", "running", "img"),)),),
+                ),
+            ),
+            executor="docker",
+        )
+
     def test_cluster_status_json(self, runner, cluster_setup):
         """Test cluster status --json outputs valid JSON."""
         import json
-        from sparkrun.core.cluster_manager import ClusterStatusResult, ClusterSoloEntry
 
-        with (
-            mock.patch(
-                "sparkrun.core.cluster_manager.query_cluster_status",
-                return_value=ClusterStatusResult(
-                    groups={},
-                    solo_entries=[ClusterSoloEntry("cid1", "10.0.0.1", "name", "running", "img", {"recipe": "test"})],
-                    errors={},
-                    idle_hosts=[],
-                    pending_ops=[],
-                    total_containers=1,
-                    host_count=1,
-                ),
-            ),
-        ):
+        # CLI calls api.status_report; patch the ClusterStatus source it
+        # composes over so the real status_report + classify run end-to-end.
+        with mock.patch("sparkrun.api._status.status", return_value=self._solo_snapshot()):
             result = runner.invoke(main, ["cluster", "status", "--cluster", "test-cluster", "--json"])
 
         assert result.exit_code == 0
@@ -1189,20 +1193,8 @@ class TestClusterCommands:
     def test_top_level_status_json(self, runner, cluster_setup):
         """The top-level `status` alias forwards --json to cluster status."""
         import json
-        from sparkrun.core.cluster_manager import ClusterStatusResult, ClusterSoloEntry
 
-        with mock.patch(
-            "sparkrun.core.cluster_manager.query_cluster_status",
-            return_value=ClusterStatusResult(
-                groups={},
-                solo_entries=[ClusterSoloEntry("cid1", "10.0.0.1", "name", "running", "img", {"recipe": "test"})],
-                errors={},
-                idle_hosts=[],
-                pending_ops=[],
-                total_containers=1,
-                host_count=1,
-            ),
-        ):
+        with mock.patch("sparkrun.api._status.status", return_value=self._solo_snapshot()):
             result = runner.invoke(main, ["status", "--cluster", "test-cluster", "--json"])
 
         assert result.exit_code == 0
@@ -5054,28 +5046,21 @@ class TestClusterUserInCLICommands:
         return config_root
 
     def test_cluster_status_uses_cluster_user(self, runner, cluster_with_user, monkeypatch):
-        """cluster status with --cluster should use the cluster's SSH user."""
+        """cluster status with --cluster should use the cluster's SSH user.
+
+        Status now flows through ``api.status_report`` → ``api.status``; the
+        cluster's SSH user is applied to ``config`` in host resolution and
+        reaches the query via the ssh_kwargs the CLI forwards.
+        """
         captured_kwargs = {}
 
-        def mock_query_status(host_list, ssh_kwargs=None, cache_dir=None, local_pid_dir=None):
+        def mock_status(hosts, *, executor=None, cluster=None, ssh_kwargs=None, sctx=None):
             captured_kwargs.update(ssh_kwargs or {})
-            # Return a minimal result object
-            from types import SimpleNamespace
+            from sparkrun.core.cluster_status import ClusterStatus
 
-            return SimpleNamespace(
-                groups={},
-                solo_entries=[],
-                errors={},
-                idle_hosts=host_list,
-                pending_ops=[],
-                total_containers=0,
-                host_count=len(host_list),
-            )
+            return ClusterStatus(hosts=(), executor="docker")
 
-        monkeypatch.setattr(
-            "sparkrun.core.cluster_manager.query_cluster_status",
-            mock_query_status,
-        )
+        monkeypatch.setattr("sparkrun.api._status.status", mock_status)
 
         result = runner.invoke(
             main,
@@ -5093,24 +5078,13 @@ class TestClusterUserInCLICommands:
         """stop --all with --cluster should use the cluster's SSH user."""
         captured_kwargs = {}
 
-        def mock_query_status(host_list, ssh_kwargs=None, cache_dir=None, local_pid_dir=None):
+        def mock_status(hosts, *, executor=None, cluster=None, ssh_kwargs=None, sctx=None):
             captured_kwargs.update(ssh_kwargs or {})
-            from types import SimpleNamespace
+            from sparkrun.core.cluster_status import ClusterStatus
 
-            return SimpleNamespace(
-                groups={},
-                solo_entries=[],
-                errors={},
-                idle_hosts=host_list,
-                pending_ops=[],
-                total_containers=0,
-                host_count=len(host_list),
-            )
+            return ClusterStatus(hosts=(), executor="docker")
 
-        monkeypatch.setattr(
-            "sparkrun.core.cluster_manager.query_cluster_status",
-            mock_query_status,
-        )
+        monkeypatch.setattr("sparkrun.api._status.status", mock_status)
 
         result = runner.invoke(
             main,

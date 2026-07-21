@@ -144,6 +144,11 @@ class DockerExecutor(Executor):
     """Docker-based executor for container operations."""
 
     executor_name = "docker"
+    # Gated like every other executor (uniformity) but ships enabled on every
+    # channel — ``executor.docker`` defaults on.  The flag exists so all
+    # executors self-gate the same way and to leave room to disable docker on
+    # hosts/clusters that don't need it.  See ``core.features``.
+    required_feature_flag = "executor.docker"
 
     # --- Resolution chain hooks ---
 
@@ -447,11 +452,13 @@ class DockerExecutor(Executor):
         # Map results back to input host order.
         by_host = {r.host: r for r in results}
         host_entries: list[HostOccupancy] = []
+        errors: dict[str, str] = {}
 
         for host in hosts:
             r = by_host.get(host)
             if r is None or r.returncode != 0:
                 logger.debug("query_status: skipping unreachable host %r (rc=%s)", host, getattr(r, "returncode", "n/a"))
+                errors[host] = (getattr(r, "stderr", "") or "").strip() or "unreachable"
                 continue
 
             hw = (host_hardware or {}).get(host) or default_dgx_spark_hardware()
@@ -471,6 +478,7 @@ class DockerExecutor(Executor):
             hosts=tuple(host_entries),
             queried_at=time.time(),
             executor=self.executor_name,
+            errors=errors,
         )
 
 
@@ -502,7 +510,7 @@ def _parse_docker_ps_output(stdout: str, host: str) -> tuple[list, int]:
     cluster with multiple ranks on this host contributes one
     :class:`RunningWorkload` with ``ranks_on_host`` reflecting the count.
     """
-    from sparkrun.core.cluster_status import RunningWorkload
+    from sparkrun.core.cluster_status import ContainerDetail, RunningWorkload
 
     # Group sightings by cluster_id so we can aggregate ranks_on_host.
     by_cluster: dict[str, dict] = {}
@@ -530,6 +538,7 @@ def _parse_docker_ps_output(stdout: str, host: str) -> tuple[list, int]:
         rank_str = m.group("rank")
         rank_from_name = int(rank_str) if rank_str is not None else 0
         intent_from_name = m.group("intent")
+        role = m.group("role") or "?"
 
         labels = _parse_docker_labels(entry.get("Labels") or "")
         # Labels take precedence when present (future-proof for richer
@@ -545,6 +554,7 @@ def _parse_docker_ps_output(stdout: str, host: str) -> tuple[list, int]:
             {
                 "ranks": set(),
                 "container_ids": [],
+                "containers": [],
                 "recipe_name": None,
                 "runtime_name": None,
                 "intent_id": None,
@@ -553,6 +563,14 @@ def _parse_docker_ps_output(stdout: str, host: str) -> tuple[list, int]:
         bucket["ranks"].add(rank)
         if container_id:
             bucket["container_ids"].append(container_id)
+        bucket["containers"].append(
+            ContainerDetail(
+                name=name,
+                role=role,
+                status=entry.get("Status") or "",
+                image=entry.get("Image") or "",
+            )
+        )
         if recipe_name and bucket["recipe_name"] is None:
             bucket["recipe_name"] = recipe_name
         if runtime_name and bucket["runtime_name"] is None:
@@ -582,6 +600,7 @@ def _parse_docker_ps_output(stdout: str, host: str) -> tuple[list, int]:
                 runtime_name=bucket["runtime_name"],
                 ranks_on_host=ranks_on_host,
                 container_ids=tuple(bucket["container_ids"]),
+                containers=tuple(bucket["containers"]),
             )
         )
 

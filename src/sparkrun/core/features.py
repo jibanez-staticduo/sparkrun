@@ -199,6 +199,20 @@ def feature_source(
 # Built-in flags.
 # --------------------------------------------------------------------------
 
+# The docker executor is the default backend and ships ENABLED on every
+# channel (``default=True``, no channel overrides). It carries a flag purely for
+# uniformity — so every executor self-gates the same way — and to leave the door
+# open to disabling docker on hosts/clusters that don't need it. A user can turn
+# it off explicitly via ``features.executor.docker: false`` (or the env
+# override); unlike the experimental executors below, it is never off by default.
+FEATURE_EXECUTOR_DOCKER = register_feature(
+    FeatureFlag(
+        name="executor.docker",
+        description="Default Docker executor (enabled on all channels; disable to drop docker where it isn't needed)",
+        default=True,
+    )
+)
+
 # The experimental executors are off by default on every channel; users opt
 # in explicitly via ``features.executor.*`` in config.yaml (or the
 # ``SPARKRUN_FEATURE_*`` env override). The per-channel default mechanism
