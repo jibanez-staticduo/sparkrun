@@ -239,3 +239,51 @@ def test_container_count_counts_across_workloads():
 
     assert _container_count(_activity_with_local_job()) == 1
     assert _container_count(HostActivity(host="h1")) == 0
+
+
+# --------------------------------------------------------------------------
+# Canonical serialization (shared by CLI --json and desktop SSE)
+# --------------------------------------------------------------------------
+
+
+def test_serialize_activity_shape():
+    from sparkrun.core.monitoring import serialize_activity
+
+    row = serialize_activity(_activity_with_local_job(MonitorSample(hostname="h1", gpu_util_pct="5")))
+    assert row["host"] == "h1"
+    assert row["sample"]["gpu_util_pct"] == "5"
+    assert row["used_slots"] == 1
+    wl = row["workloads"][0]
+    assert wl["cluster_id"] == "sparkrun_deadbeefdeadbeef_aabbccddeeff"
+    assert wl["recipe"] == "qwen3-1.7b-vllm"
+    assert wl["containers"][0]["image"] == "(local process)"
+
+
+def test_serialize_activity_no_telemetry():
+    from sparkrun.core.monitoring import serialize_activity
+
+    row = serialize_activity(HostActivity(host="h1", status_error="unreachable"))
+    assert row["sample"] is None
+    assert row["error"] == "unreachable"
+    assert row["workloads"] == []
+
+
+def test_serialize_frame_is_list_of_rows():
+    from sparkrun.core.monitoring import MonitorFrame, serialize_frame
+
+    frame = MonitorFrame(hosts=(_activity_with_local_job(), HostActivity(host="h2")), queried_at=1.0)
+    rows = serialize_frame(frame)
+    assert [r["host"] for r in rows] == ["h1", "h2"]
+
+
+def test_format_activity_table_jobs_from_occupancy():
+    from sparkrun.core.monitoring import MonitorFrame
+    from sparkrun.utils.cli_formatters import format_activity_table
+
+    frame = MonitorFrame(hosts=(_activity_with_local_job(MonitorSample(hostname="h1", cpu_usage_pct="9")),))
+    out = format_activity_table(frame, ["h1"])
+    assert "Jobs" in out  # header
+    # The local workload's container is counted even though telemetry is docker-agnostic.
+    assert "\nh1" in out and " 1" in out  # jobs=1 column
+    # A None frame renders a connecting placeholder without crashing.
+    assert "connecting" in format_activity_table(None, ["h1"])

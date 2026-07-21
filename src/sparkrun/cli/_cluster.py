@@ -836,39 +836,23 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
 
     # ---- JSON streaming mode ----
     if output_json:
-        import time
+        # Stream MonitorFrames (telemetry + occupancy) as newline-delimited JSON.
+        # ``hosts`` is a list of per-host rows (the canonical MonitorFrame shape,
+        # shared with the desktop SSE): {host, error, sample, workloads, ...}.
+        from sparkrun.core.monitoring import serialize_frame
 
-        def _render_json(states):
-            """Emit one JSON object per update tick with all host data."""
-            snapshot = {"timestamp": time.time(), "hosts": {}}
-            for host in host_list:
-                state = states.get(host)
-                if state is None or state.latest is None:
-                    snapshot["hosts"][host] = {"error": state.error} if (state and state.error) else {"connecting": True}
-                    continue
-                snapshot["hosts"][host] = state.latest
-            print_json(snapshot)
-
-        if backend == "nv-monitor":
-            from sparkrun.core.monitoring import NvMonitorClusterMonitor
-
-            monitor = NvMonitorClusterMonitor(host_list, ssh_kwargs, interval)
-            monitor.start()
-            try:
-                while True:
-                    time.sleep(1)
-                    _render_json(monitor.states)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                monitor.stop()
-        else:
-            stream_cluster_monitor(
+        try:
+            for frame in api.live_monitor(
                 host_list,
-                ssh_kwargs,
+                cluster=cluster_name or None,
+                ssh_kwargs=ssh_kwargs,
                 interval=interval,
-                on_update=_render_json,
-            )
+                backend=backend,
+                sctx=_get_context(ctx),
+            ):
+                print_json({"timestamp": frame.queried_at, "hosts": serialize_frame(frame)})
+        except KeyboardInterrupt:
+            pass
         return
 
     # Try the Textual TUI unless --simple was requested.
@@ -897,46 +881,28 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
             click.echo("Textual not installed — falling back to simple mode.\n", err=True)
 
     # ---- simple plain-text fallback ----
-    import time
-
-    from sparkrun.utils.cli_formatters import format_monitor_table
+    # Also flows from api.live_monitor (telemetry + occupancy), so the Jobs
+    # column reflects all executors' workloads, not the docker-only count.
+    from sparkrun.utils.cli_formatters import format_activity_table
 
     click.echo("Monitoring %d host(s) every %ds (Ctrl-C to stop)...\n" % (len(host_list), interval))
 
     # Number of lines the table occupies: header + separator + one row per host
     table_lines = len(host_list) + 2
-
-    def _render(states):
-        """Move cursor back to table start and redraw."""
-        table = format_monitor_table(states, host_list)
-        click.echo("\033[%dA\033[J" % table_lines, nl=False)
-        click.echo(table)
-
-    if backend == "nv-monitor":
-        from sparkrun.core.monitoring import NvMonitorClusterMonitor
-
-        monitor = NvMonitorClusterMonitor(host_list, ssh_kwargs, interval)
-        monitor.start()
-        click.echo(format_monitor_table({}, host_list))
-        try:
-            while True:
-                time.sleep(1)
-                table = format_monitor_table(monitor.states, host_list)
-                click.echo("\033[%dA\033[J" % table_lines, nl=False)
-                click.echo(table)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            monitor.stop()
-    else:
-        click.echo(format_monitor_table({}, host_list))
-
-        stream_cluster_monitor(
+    click.echo(format_activity_table(None, host_list))  # initial (connecting)
+    try:
+        for frame in api.live_monitor(
             host_list,
-            ssh_kwargs,
+            cluster=cluster_name or None,
+            ssh_kwargs=ssh_kwargs,
             interval=interval,
-            on_update=_render,
-        )
+            backend=backend,
+            sctx=_get_context(ctx),
+        ):
+            click.echo("\033[%dA\033[J" % table_lines, nl=False)
+            click.echo(format_activity_table(frame, host_list))
+    except KeyboardInterrupt:
+        pass
 
     click.echo("\nMonitoring stopped.")
 

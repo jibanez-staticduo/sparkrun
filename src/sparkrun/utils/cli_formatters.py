@@ -421,3 +421,47 @@ def format_monitor_table(
         lines.append(f"{host_label:<{host_w}}{jobs:>6}{cpu_pct:>8}{ram_pct:>8}{gpu_util:>8}{cpu_temp:>10}{gpu_temp:>10}{gpu_power:>11}")
 
     return "\n".join(lines)
+
+
+def format_activity_table(frame, hosts: list[str]) -> str:
+    """Format a :class:`~sparkrun.core.monitoring.MonitorFrame` as a text table.
+
+    Like :func:`format_monitor_table` but sourced from a live-monitor frame:
+    the ``Jobs`` column counts the workloads occupying the host from
+    ``api.status`` (docker + local + provider), not the telemetry stream's
+    docker-only count; telemetry columns come from ``activity.telemetry``.
+    """
+    host_w = max(16, *(len(h) for h in hosts)) + 2
+
+    header = f"{'HOST':<{host_w}}{'Jobs':>6}{'CPU%':>8}{'RAM%':>8}{'GPU%':>8}{'CPU Temp':>10}{'GPU Temp':>10}{'GPU Power':>11}"
+    separator = "-" * len(header)
+
+    lines = [header, separator]
+    for host in hosts:
+        activity = frame.for_host(host) if frame is not None else None
+        if activity is None:
+            lines.append(f"{host:<{host_w}}{'(connecting...)':>6}")
+            continue
+
+        # Jobs from occupancy (all executors), not the docker-only telemetry count.
+        n_jobs = sum(len(w.containers) or 1 for w in activity.workloads)
+        jobs = str(n_jobs) if activity.workloads else "-"
+
+        s = activity.telemetry
+        if s is None:
+            err = activity.telemetry_error or activity.status_error
+            host_label = "%s (!)" % host if err else host
+            lines.append(f"{host_label:<{host_w}}{jobs:>6}{'-':>8}{'-':>8}{'-':>8}{'-':>10}{'-':>10}{'-':>11}")
+            continue
+
+        host_label = "%s (!)" % host if (activity.telemetry_error or activity.status_error) else host
+        cpu_pct = s.cpu_usage_pct if s.cpu_usage_pct else "-"
+        ram_pct = "%s%%" % s.mem_used_pct if s.mem_used_pct else "-"
+        gpu_util = "%s" % s.gpu_util_pct if s.gpu_util_pct else "-"
+        cpu_temp = "%s C" % s.cpu_temp_c if s.cpu_temp_c else "-"
+        gpu_temp = "%s C" % s.gpu_temp_c if s.gpu_temp_c else "-"
+        gpu_power = "%s W" % s.gpu_power_w if s.gpu_power_w else "-"
+
+        lines.append(f"{host_label:<{host_w}}{jobs:>6}{cpu_pct:>8}{ram_pct:>8}{gpu_util:>8}{cpu_temp:>10}{gpu_temp:>10}{gpu_power:>11}")
+
+    return "\n".join(lines)

@@ -150,6 +150,49 @@ class MonitorFrame:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Canonical JSON serialization (shared by CLI ``monitor --json`` and the
+# desktop MonitorHub SSE, so every client sees one shape).
+# ---------------------------------------------------------------------------
+
+
+def serialize_activity(activity: HostActivity) -> dict:
+    """Serialize one :class:`HostActivity` to a JSON-safe row.
+
+    Shape: ``{host, error, sample, workloads, used_slots, free_slots}`` where
+    ``sample`` is the telemetry :class:`MonitorSample` dict (or ``None``) and
+    ``workloads`` carries the occupancy (all executors), each
+    ``{cluster_id, recipe, runtime, ranks_on_host, containers:[{name,role,status,image}]}``.
+    ``error`` folds the telemetry and status errors.
+    """
+    import dataclasses
+
+    workloads = []
+    for w in activity.workloads:
+        workloads.append(
+            {
+                "cluster_id": w.cluster_id,
+                "recipe": w.recipe_name,
+                "runtime": w.runtime_name,
+                "ranks_on_host": w.ranks_on_host,
+                "containers": [{"name": c.name, "role": c.role, "status": c.status, "image": c.image} for c in w.containers],
+            }
+        )
+    return {
+        "host": activity.host,
+        "error": activity.telemetry_error or activity.status_error,
+        "sample": dataclasses.asdict(activity.telemetry) if activity.telemetry is not None else None,
+        "workloads": workloads,
+        "used_slots": activity.used_slots,
+        "free_slots": activity.free_slots,
+    }
+
+
+def serialize_frame(frame: MonitorFrame) -> list[dict]:
+    """Serialize a :class:`MonitorFrame` to a list of per-host rows."""
+    return [serialize_activity(a) for a in frame.hosts]
+
+
 def parse_monitor_line(line: str) -> MonitorSample | None:
     """Parse a CSV line from host_monitor.sh into a MonitorSample.
 

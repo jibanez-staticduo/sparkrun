@@ -2073,8 +2073,8 @@ class TestClusterMonitor:
             assert call_kwargs.kwargs.get("interval") == 5 or call_kwargs[1].get("interval") == 5
 
     def test_cluster_monitor_simple_flag(self, runner, cluster_setup):
-        """--simple bypasses TUI and uses plain-text fallback."""
-        with mock.patch("sparkrun.core.monitoring.stream_cluster_monitor") as mock_stream:
+        """--simple bypasses TUI and uses the plain-text fallback (via api.live_monitor)."""
+        with mock.patch("sparkrun.api.live_monitor", return_value=iter([])):
             result = runner.invoke(
                 main,
                 [
@@ -2087,34 +2087,35 @@ class TestClusterMonitor:
             )
             assert result.exit_code == 0
             assert "Monitoring" in result.output
-            mock_stream.assert_called_once()
 
     def test_cluster_monitor_json_flag(self, runner, cluster_setup):
-        """--json streams newline-delimited JSON via on_update callback."""
+        """--json streams newline-delimited JSON MonitorFrames (telemetry + occupancy)."""
         import json
 
-        from sparkrun.core.monitoring import HostMonitorState, MonitorSample
+        from sparkrun.core.cluster_status import ContainerDetail, RunningWorkload
+        from sparkrun.core.monitoring import HostActivity, MonitorFrame, MonitorSample
 
-        sample = MonitorSample(
-            timestamp="2025-01-01T00:00:00",
-            hostname="host1",
-            cpu_usage_pct="12.3",
-            mem_used_pct="45.6",
-            gpu_util_pct="78.9",
-            gpu_temp_c="55",
-            gpu_power_w="120",
+        frame = MonitorFrame(
+            hosts=(
+                HostActivity(
+                    host="10.0.0.1",
+                    telemetry=MonitorSample(hostname="host1", cpu_usage_pct="12.3", gpu_util_pct="78.9"),
+                    workloads=(
+                        RunningWorkload(
+                            cluster_id="sparkrun_x",
+                            recipe_name="qwen",
+                            containers=(ContainerDetail("sparkrun_x_solo", "solo", "Up", "(local process)"),),
+                        ),
+                    ),
+                    used_slots=1,
+                    free_slots=3,
+                ),
+                HostActivity(host="10.0.0.2", telemetry_error="connection refused"),
+            ),
+            queried_at=1.0,
         )
 
-        def fake_stream(hosts, ssh_kwargs, interval=2, on_update=None, dry_run=False):
-            """Simulate one update tick with sample data."""
-            if on_update:
-                states = {
-                    "10.0.0.1": HostMonitorState(latest=sample),
-                    "10.0.0.2": HostMonitorState(error="connection refused"),
-                }
-                on_update(states)
-
-        with mock.patch("sparkrun.core.monitoring.stream_cluster_monitor", side_effect=fake_stream):
+        with mock.patch("sparkrun.api.live_monitor", return_value=iter([frame])):
             result = runner.invoke(
                 main,
                 [
@@ -2127,13 +2128,16 @@ class TestClusterMonitor:
             )
             assert result.exit_code == 0
             obj = json.loads(result.output.strip())
-            assert "timestamp" in obj
-            assert "hosts" in obj
-            # Host with sample data should have monitor fields
-            assert obj["hosts"]["10.0.0.1"]["hostname"] == "host1"
-            assert obj["hosts"]["10.0.0.1"]["cpu_usage_pct"] == "12.3"
-            # Host with error and no sample should report error
-            assert obj["hosts"]["10.0.0.2"]["error"] == "connection refused"
+            assert "timestamp" in obj and "hosts" in obj
+            rows = {r["host"]: r for r in obj["hosts"]}  # hosts is a list of per-host rows
+            assert rows["10.0.0.1"]["sample"]["hostname"] == "host1"
+            assert rows["10.0.0.1"]["sample"]["cpu_usage_pct"] == "12.3"
+            # Occupancy (all executors) now surfaces in --json.
+            assert rows["10.0.0.1"]["workloads"][0]["cluster_id"] == "sparkrun_x"
+            assert rows["10.0.0.1"]["used_slots"] == 1
+            # Host with an error and no telemetry.
+            assert rows["10.0.0.2"]["error"] == "connection refused"
+            assert rows["10.0.0.2"]["sample"] is None
 
     def test_cluster_monitor_tui_fallback_on_import_error(self, runner, cluster_setup, monkeypatch):
         """Falls back to simple mode when Textual is not importable."""
@@ -2147,7 +2151,7 @@ class TestClusterMonitor:
             return real_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", mock_import)
-        with mock.patch("sparkrun.core.monitoring.stream_cluster_monitor") as mock_stream:
+        with mock.patch("sparkrun.api.live_monitor", return_value=iter([])):
             result = runner.invoke(
                 main,
                 [
@@ -2159,7 +2163,6 @@ class TestClusterMonitor:
             )
             assert result.exit_code == 0
             assert "falling back" in result.output.lower() or "Monitoring" in result.output
-            mock_stream.assert_called_once()
 
 
 class TestRunWithCluster:
