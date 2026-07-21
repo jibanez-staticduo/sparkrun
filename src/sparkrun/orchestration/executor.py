@@ -398,9 +398,10 @@ def _resolve_executor_name(
 ) -> str:
     """Pick the executor name from the chain (CLI → recipe → cluster → runtime → config).
 
-    When no layer names an executor, defaults to ``"docker"``. When a layer
-    *does* name one that isn't available — either an unknown selector or a
-    real executor gated off by a feature flag — this raises
+    When no layer names an executor, falls back to the baseline default (see
+    :func:`_default_executor_name` — ``"docker"`` unless it's been disabled).
+    When a layer *does* name one that isn't available — either an unknown
+    selector or a real executor gated off by a feature flag — this raises
     :class:`ExecutorUnavailableError` rather than silently downgrading to
     docker. Running an explicitly-requested workload on the wrong executor
     is worse than failing loudly.
@@ -425,7 +426,38 @@ def _resolve_executor_name(
         if name in known:
             return name
         raise _executor_unavailable_error(name, known, config)
-    return "docker"
+    return _default_executor_name(known, v, config)
+
+
+#: The historical baseline executor, used when no layer names one.
+_DEFAULT_EXECUTOR = "docker"
+
+
+def _default_executor_name(known: set[str] | None, v: Variables | None, config: "SparkrunConfig | None") -> str:
+    """Baseline executor name when no chain layer names one.
+
+    Historically always ``"docker"``.  Now that docker gates like every other
+    executor (``executor.docker``, on by default), a disable is honored: return
+    docker when it's enabled, else the sole enabled executor (the natural pick
+    when a host disables docker and enables exactly one alternative), else raise
+    so the user names one explicitly — never silently run on a backend the
+    operator turned off.
+
+    Note the static ``_known_executor_names`` fallback (SAF not initialized —
+    test harnesses) always includes docker, so this is a no-op there; the
+    fallback only diverges once SAF is up *and* ``executor.docker`` is off.
+    """
+    if known is None:
+        known = _known_executor_names(v)
+    if _DEFAULT_EXECUTOR in known:
+        return _DEFAULT_EXECUTOR
+    if len(known) == 1:
+        return next(iter(known))
+    raise ExecutorUnavailableError(
+        "The default executor %r is disabled and no executor is named. Set one "
+        "explicitly via a recipe/cluster `executor:` selector or `default_executor` "
+        "in config. Available: %s" % (_DEFAULT_EXECUTOR, sorted(known))
+    )
 
 
 def resolve_executor_name(

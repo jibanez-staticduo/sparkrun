@@ -298,6 +298,41 @@ class TestResolutionChain:
             resolve_executor(cli_overrides={"executor": "wasm"})
 
 
+class TestDefaultExecutorFallback:
+    """B5: the baseline default (no layer names an executor) honors a disabled
+    docker instead of always returning it."""
+
+    def test_docker_enabled_returns_docker(self):
+        from sparkrun.orchestration.executor import _default_executor_name
+
+        assert _default_executor_name({"docker", "local"}, None, None) == "docker"
+
+    def test_docker_disabled_single_alternative_is_picked(self):
+        from sparkrun.orchestration.executor import _default_executor_name
+
+        # A host that disabled docker and enabled exactly one alternative gets it.
+        assert _default_executor_name({"local"}, None, None) == "local"
+
+    def test_docker_disabled_ambiguous_raises(self):
+        from sparkrun.orchestration.executor import _default_executor_name
+
+        with pytest.raises(ExecutorUnavailableError, match="disabled and no executor is named"):
+            _default_executor_name({"local", "k8s"}, None, None)
+
+    def test_resolve_name_falls_back_to_sole_enabled_when_docker_off(self, monkeypatch):
+        import sparkrun.orchestration.executor as ex_mod
+
+        # SAF reports only local enabled (docker gated off); no layer names one.
+        monkeypatch.setattr(ex_mod, "_known_executor_names", lambda v=None: {"local"})
+        assert ex_mod.resolve_executor_name() == "local"
+
+    def test_resolve_name_still_docker_when_enabled(self, monkeypatch):
+        import sparkrun.orchestration.executor as ex_mod
+
+        monkeypatch.setattr(ex_mod, "_known_executor_names", lambda v=None: {"docker", "local"})
+        assert ex_mod.resolve_executor_name() == "docker"
+
+
 class TestDockerAdjustmentsApplyOnlyToDocker:
     """rootless/auto_user must not affect non-Docker configs."""
 
