@@ -278,11 +278,33 @@ Each `Executor.query_status(hosts, …)` inspects its own backend (docker `docke
 ps`, local pidfile scan, k8s/modal control plane) and returns a `ClusterStatus`.
 There is no separate status extension point.
 
-**Not** on this path: the `cluster monitor` TUI's job column is sourced from the
-streaming host-telemetry (`scripts/host_monitor.sh` emits `sparkrun_jobs` /
-`sparkrun_job_names` via its own `docker ps`), so it is **docker-only** and does
-not see `local`/provider workloads — a deliberate separate path (live telemetry
-vs. periodic occupancy poll), not the unified status source.
+### Live monitoring (telemetry + occupancy)
+
+Monitoring has a second axis alongside occupancy — **telemetry** (per-host/node
+util/mem/temp) — abstracted the same way status is, by **substrate scope**:
+
+- **`TelemetryProvider`** (`orchestration/telemetry/`, SAF ext point
+  `EXT_TELEMETRY`) is the telemetry peer of `Executor.query_status`, selected by
+  `scope` (matches `status_scope`). Telemetry is a substrate property, not
+  per-executor — docker and local share one host source — so there is one
+  provider per scope. Core ships `HostTelemetryProvider` (scope `"host"`,
+  wrapping `ClusterMonitor` / `NvMonitorClusterMonitor`); k8s/modal providers
+  ship in their plugins. `get_telemetry_provider(scope)` returns the stateless
+  singleton (or `None` → occupancy-only monitoring). A live collection's state
+  lives on the `TelemetrySession` from `provider.open(...)`.
+- **`api.open_telemetry`** — raw telemetry session for a cluster's scope.
+- **`api.open_live_monitor` / `api.live_monitor`** — compose the telemetry
+  stream with a background `api.status` occupancy poll into
+  `MonitorFrame` snapshots (per-host `HostActivity` = telemetry + the workloads
+  occupying the host). Substrate-agnostic: a host cluster combines
+  `host_monitor.sh` + docker/local occupancy, a k8s cluster would combine k8s
+  metrics + k8s occupancy — clients see the same shape.
+
+The `cluster monitor` TUI drives a `LiveMonitorSession`, so its Jobs column and
+detail pane show **all** executors' workloads (docker + local + provider), not
+just the docker containers `host_monitor.sh`'s embedded `docker ps` used to
+report. The `--simple` / `--json` telemetry-only paths still use `ClusterMonitor`
+directly.
 
 ### Transport Layer (`transports/`)
 
