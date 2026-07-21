@@ -68,6 +68,7 @@ from sparkrun.api._run import run
 from sparkrun.api._schedule import schedule
 from sparkrun.api._status import status, status_report
 from sparkrun.api._stop import stop
+from sparkrun.api._telemetry import LiveMonitorSession, live_monitor, open_live_monitor, open_telemetry
 
 __all__ = [
     # Subpackages
@@ -109,6 +110,10 @@ __all__ = [
     "schedule",
     "status",
     "status_report",
+    "open_telemetry",
+    "open_live_monitor",
+    "live_monitor",
+    "LiveMonitorSession",
     "list_jobs",
     "benchmark",
     "resume_benchmark",

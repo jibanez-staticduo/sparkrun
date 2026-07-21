@@ -92,6 +92,64 @@ class HostMonitorState:
     last_updated: float | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True)
+class HostTelemetry:
+    """Clean per-host telemetry snapshot returned by a telemetry session.
+
+    The public, process-handle-free view of one host's latest resource
+    sample: ``sample`` carries the util/mem/temp fields (``None`` until the
+    first reading lands or when unavailable), ``error`` a human string when the
+    host's collection failed.  Produced by
+    :class:`~sparkrun.orchestration.telemetry.TelemetrySession` implementations
+    (host substrate wraps :class:`ClusterMonitor`; k8s/modal use their own).
+    """
+
+    host: str
+    sample: MonitorSample | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class HostActivity:
+    """Combined per-host view: resource telemetry + occupancy workloads.
+
+    The unit of a :class:`MonitorFrame` — pairs a host's live
+    :class:`MonitorSample` (util/mem/temp) with the workloads occupying it
+    (from ``api.status``, so docker + local + providers, not just docker).
+    Either side may be missing: ``telemetry=None`` before the first sample /
+    on a substrate with no telemetry provider; ``workloads=()`` when idle.
+    """
+
+    host: str
+    telemetry: MonitorSample | None = None
+    telemetry_error: str | None = None
+    workloads: tuple = field(default_factory=tuple)  # tuple[RunningWorkload, ...]
+    used_slots: int = 0
+    free_slots: int = 0
+    status_error: str | None = None
+
+
+@dataclass(frozen=True)
+class MonitorFrame:
+    """One snapshot of live cluster activity: telemetry + occupancy per host.
+
+    The substrate-agnostic frame produced by ``api.live_monitor`` /
+    ``LiveMonitorSession.frame()`` — a host cluster combines ``host_monitor.sh``
+    telemetry with docker+local occupancy; a k8s cluster would combine k8s
+    metrics with k8s occupancy — clients (the TUI, an SSE feed) see the same
+    shape.
+    """
+
+    hosts: tuple[HostActivity, ...] = field(default_factory=tuple)
+    queried_at: float = 0.0
+
+    def for_host(self, host: str) -> HostActivity | None:
+        for entry in self.hosts:
+            if entry.host == host:
+                return entry
+        return None
+
+
 def parse_monitor_line(line: str) -> MonitorSample | None:
     """Parse a CSV line from host_monitor.sh into a MonitorSample.
 

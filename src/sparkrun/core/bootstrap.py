@@ -103,6 +103,22 @@ def init_sparkrun(v: Variables | None = None, log_level: str = "WARNING") -> Var
         except (ValueError, TypeError) as e:
             logger.debug("Skipping executor %s: %s", executor_cls.__name__, e)
 
+    # Auto-discover TelemetryProvider subclasses in sparkrun.orchestration.telemetry
+    # (substrate resource sampling, keyed by scope — the telemetry peer of the
+    # executors' query_status). Skip the abstract base (blank scope).
+    from sparkrun.orchestration.telemetry._base import TelemetryProvider as _TelemetryPlugin
+
+    discovered_telemetry = list(find_types_in_modules("sparkrun.orchestration.telemetry", _TelemetryPlugin))
+    for telemetry_cls in discovered_telemetry:
+        if not getattr(telemetry_cls, "scope", ""):
+            logger.debug("Skipping unnamed telemetry provider: %s", telemetry_cls.__name__)
+            continue
+        try:
+            register_plugin(telemetry_cls, v=v)
+            logger.debug("Registered telemetry provider: %s", telemetry_cls.__name__)
+        except (ValueError, TypeError) as e:
+            logger.debug("Skipping telemetry provider %s: %s", telemetry_cls.__name__, e)
+
     # Auto-discover all Scheduler subclasses in sparkrun.schedulers
     from sparkrun.core.scheduler import Scheduler as _SchedulerPlugin
 
