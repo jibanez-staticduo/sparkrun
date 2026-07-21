@@ -813,7 +813,7 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
 
       sparkrun cluster monitor --cluster mylab --json
     """
-    from sparkrun.core.monitoring import ClusterMonitor, stream_cluster_monitor
+    from sparkrun.core.monitoring import stream_cluster_monitor
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
     config = _get_context(ctx).config
@@ -876,14 +876,22 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
         try:
             from sparkrun.cli._monitor_tui import ClusterMonitorApp
 
-            if backend == "nv-monitor":
-                from sparkrun.core.monitoring import NvMonitorClusterMonitor
-
-                monitor = NvMonitorClusterMonitor(host_list, ssh_kwargs, interval)
-            else:
-                monitor = ClusterMonitor(host_list, ssh_kwargs, interval)
-            app = ClusterMonitorApp(monitor, cache_dir=str(config.cache_dir))
-            app.run()
+            # Single source: a LiveMonitorSession combines the substrate's
+            # telemetry stream with a background api.status occupancy poll, so
+            # the TUI shows local/provider workloads (not just docker).
+            session = api.open_live_monitor(
+                host_list,
+                cluster=cluster_name or None,
+                ssh_kwargs=ssh_kwargs,
+                interval=interval,
+                backend=backend,
+                sctx=_get_context(ctx),
+            )
+            try:
+                app = ClusterMonitorApp(session, host_list, interval=interval, cache_dir=str(config.cache_dir))
+                app.run()
+            finally:
+                session.close()
             return
         except ImportError:
             click.echo("Textual not installed — falling back to simple mode.\n", err=True)

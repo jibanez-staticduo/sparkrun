@@ -191,3 +191,51 @@ def test_live_monitor_occupancy_only_when_no_telemetry(monkeypatch):
     act = frame.for_host("h1")
     assert act.telemetry is None  # no telemetry provider
     assert act.free_slots == 4  # occupancy still present
+
+
+# --------------------------------------------------------------------------
+# TUI detail rendering — workloads sourced from occupancy (all executors)
+# --------------------------------------------------------------------------
+
+
+def _activity_with_local_job(telemetry=None):
+    from sparkrun.core.cluster_status import ContainerDetail, RunningWorkload
+
+    wl = RunningWorkload(
+        cluster_id="sparkrun_deadbeefdeadbeef_aabbccddeeff",
+        recipe_name="qwen3-1.7b-vllm",
+        runtime_name="vllm",
+        containers=(
+            ContainerDetail(name="sparkrun_deadbeefdeadbeef_aabbccddeeff_solo", role="solo", status="Up (pid 42)", image="(local process)"),
+        ),
+    )
+    return HostActivity(host="h1", telemetry=telemetry, workloads=(wl,), used_slots=1, free_slots=0)
+
+
+def test_render_detail_lists_workloads_from_occupancy(tmp_path):
+    pytest.importorskip("textual")
+    from sparkrun.cli._monitor_tui import _render_detail
+
+    out = _render_detail("h1", _activity_with_local_job(MonitorSample(hostname="h1", gpu_util_pct="7")), cache_dir=str(tmp_path))
+    # The native local workload (invisible to docker ps) is shown, with metadata.
+    assert "sparkrun_deadbeefdeadbeef_aabbccddeeff" in out
+    assert "recipe=" in out and "qwen3-1.7b-vllm" in out
+    assert "(local process)" in out or "solo" in out
+
+
+def test_render_detail_shows_workloads_without_telemetry(tmp_path):
+    pytest.importorskip("textual")
+    from sparkrun.cli._monitor_tui import _render_detail
+
+    # No telemetry sample (e.g. a provider-less substrate) still renders occupancy.
+    out = _render_detail("h1", _activity_with_local_job(None), cache_dir=str(tmp_path))
+    assert "telemetry unavailable" in out
+    assert "Workloads (1)" in out
+
+
+def test_container_count_counts_across_workloads():
+    pytest.importorskip("textual")
+    from sparkrun.cli._monitor_tui import _container_count
+
+    assert _container_count(_activity_with_local_job()) == 1
+    assert _container_count(HostActivity(host="h1")) == 0
