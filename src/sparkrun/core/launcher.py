@@ -168,7 +168,7 @@ def _enforce_recipe_mount_trust(recipe: Recipe, trusted: bool) -> None:
     """
     if trusted:
         return
-    from sparkrun.core.recipe import RecipeError
+    from sparkrun.core.recipe import RecipeError, is_local_model_path
 
     # Direct attribute access (not getattr-with-default): these are always set
     # by ``Recipe.__init__`` / ``__setstate__``, so a rename should raise loudly
@@ -180,6 +180,18 @@ def _enforce_recipe_mount_trust(recipe: Recipe, trusted: bool) -> None:
             "path or cache-dir redirection), which can expose host paths to the "
             "container. They are only honoured for trusted recipes; re-run with "
             "--trust after auditing this recipe."
+        )
+
+    # An absolute path in ``model:`` is sugar for ``resolved_model_path``: it
+    # identity-mounts that host directory into the container (see
+    # ``resolved_model_volume``).  Same host-exposure risk as the cluster_config
+    # hatch above, so gate it the same way — an untrusted "run this link" recipe
+    # must not be able to mount an arbitrary host path via ``model:``.
+    if is_local_model_path(recipe.model):
+        raise RecipeError(
+            "This recipe's model is an absolute host path (%r), which identity-mounts "
+            "that host directory into the container. It is only honoured for trusted "
+            "recipes; re-run with --trust after auditing this recipe." % recipe.model
         )
     exec_cfg = recipe.executor_config
     if isinstance(exec_cfg, dict):
@@ -219,6 +231,53 @@ def _enforce_recipe_mount_trust(recipe: Recipe, trusted: bool) -> None:
             "a Docker container (no rootless / namespace isolation). It is only "
             "honoured for trusted recipes; re-run with --trust after auditing this "
             "recipe." % selected
+        )
+
+
+def _verify_pre_placed_model(recipe, hosts, ssh_kwargs, *, runtime, cluster, config, overrides) -> None:
+    """Fail fast when pre-placed model weights are missing on the target substrate.
+
+    An absolute-path ``model:`` or ``cluster_config.resolved_model_path`` tells
+    sparkrun the weights already exist at that path on every node, so download +
+    distribution are skipped and the path is identity-mounted.  This verifies
+    that promise *before* the skip via the launching executor's
+    :meth:`~sparkrun.orchestration.executors._base.Executor.verify_mount_sources`
+    (host substrate → SSH ``test -e``; provider executors probe their own
+    volumes).  Raises :class:`RecipeError` listing the host→path gaps.
+
+    Best-effort and non-fatal by design: an unresolvable executor (e.g. a
+    gated-off provider) or an unreachable/unverifiable host is *skipped* rather
+    than blocking the launch — only a *confirmed*-missing path raises.  The
+    caller guards ``dry_run`` (no SSH).
+    """
+    from sparkrun.core.recipe import RecipeError
+    from sparkrun.orchestration.executor import resolve_executor
+    from sparkrun.orchestration.primitives import resolved_model_volume
+
+    paths = list(resolved_model_volume(recipe))  # identity-mount source path(s)
+    if not paths:
+        return
+
+    try:
+        executor = resolve_executor(recipe=recipe, cluster=cluster, runtime=runtime, config=config, cli_overrides=overrides)
+    except Exception:
+        # If the executor can't be resolved here, the runtime will surface the
+        # real error at launch — don't pre-empt it with a preflight failure.
+        logger.debug("pre-placed model preflight: executor unresolvable; skipping probe", exc_info=True)
+        return
+
+    try:
+        missing = executor.verify_mount_sources(paths, hosts, ssh_kwargs=ssh_kwargs) or {}
+    except Exception:
+        logger.debug("pre-placed model preflight: probe failed; skipping", exc_info=True)
+        return
+
+    if missing:
+        detail = "; ".join("%s: %s" % (host, ", ".join(miss)) for host, miss in sorted(missing.items()))
+        raise RecipeError(
+            "Pre-placed model weights were not found on the target host(s). The model "
+            "path must already exist on every node (download + distribution are skipped "
+            "for on-disk weights). Missing — %s" % detail
         )
 
 
@@ -481,6 +540,8 @@ def launch_inference(
     # (undocumented).  Applied at this single launch choke point so both the
     # CLI and ``api.run`` honour them.  Recipe-level values take precedence
     # over cluster/global config.  See :class:`sparkrun.core.recipe.ClusterConfig`.
+    from sparkrun.core.recipe import is_local_model_path
+
     _cluster_config = recipe.cluster_config
     _resolved_model_path: str | None = None
     if _cluster_config is not None:
@@ -508,9 +569,42 @@ def launch_inference(
                 "cluster_config.resolved_model_path set; serving on-disk weights at %s (skipping model download/distribution)",
                 _resolved_model_path,
             )
+
+    # User-facing sugar for the same behaviour: an absolute path in ``model:``
+    # is pre-placed on-disk weights.  ``recipe.model`` already *is* the path
+    # (no repoint needed) and ``resolved_model_volume`` picks up the identity
+    # mount from it; here we only need to skip download/distribution and give
+    # the served model a clean name (the directory basename, not the full path).
+    if not _resolved_model_path and is_local_model_path(recipe.model):
+        _resolved_model_path = recipe.model
+        overrides = dict(overrides)
+        if "served_model_name" not in overrides and "served_model_name" not in (recipe.defaults or {}):
+            overrides["served_model_name"] = os.path.basename(recipe.model.rstrip("/")) or recipe.model
+        logger.info(
+            "model is an absolute path; serving on-disk weights at %s (skipping model download/distribution)",
+            recipe.model,
+        )
     _skip_model_distribution = bool(_resolved_model_path)
 
     ssh_kwargs = build_ssh_kwargs(config)
+
+    # Preflight: pre-placed weights (resolved_model_path / absolute-path model)
+    # skip download + distribution, so verify the path actually exists on the
+    # substrate where the workload will run before committing to that skip.
+    # Substrate-aware via the launching executor (host → SSH ``test -e``;
+    # provider executors probe their own volumes). Best-effort: skipped on
+    # dry-run, and an unresolvable executor / unreachable host never blocks.
+    if _resolved_model_path and not dry_run:
+        _verify_pre_placed_model(
+            recipe,
+            host_list,
+            ssh_kwargs,
+            runtime=runtime,
+            cluster=cluster,
+            config=config,
+            overrides=overrides,
+        )
+
     effective_local_cache = local_cache_dir or str(config.hf_cache_dir)
     effective_cache_dir = resolve_effective_cache_dir(
         cache_dir,

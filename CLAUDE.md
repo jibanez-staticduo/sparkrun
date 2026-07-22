@@ -278,6 +278,21 @@ Each `Executor.query_status(hosts, …)` inspects its own backend (docker `docke
 ps`, local pidfile scan, k8s/modal control plane) and returns a `ClusterStatus`.
 There is no separate status extension point.
 
+**Mount-source preflight** (`Executor.verify_mount_sources(paths, hosts, …)`) is
+the substrate peer of `query_status` on the *write* path: "do these identity-mount
+sources already exist where the workload will run?" It validates pre-placed model
+weights (an absolute-path `model:` or `cluster_config.resolved_model_path`, which
+skip download+distribution) *before* the launch commits to that skip. Host-substrate
+executors (docker/local) override it to SSH `test -e` the hosts via the shared
+`ssh.verify_host_paths` helper; provider executors (k8s/modal) probe their own
+volumes; the base default is a safe no-op (`{}`). Wired at the launch choke point
+by `launcher._verify_pre_placed_model` (skipped on `--dry-run`), which raises a
+`RecipeError` listing host→missing-path gaps. Best-effort like `query_status`: an
+unresolvable executor or unreachable host degrades to "couldn't verify" and never
+blocks — only a *confirmed*-missing path fails the launch. This is why an
+absolute-path model works from a **remote control machine** that isn't a cluster
+member: the check runs on the *targets*, not the control node.
+
 ### Live monitoring (telemetry + occupancy)
 
 Monitoring has a second axis alongside occupancy — **telemetry** (per-host/node

@@ -29,7 +29,7 @@ Everything else is optional. When `command` is omitted, the runtime generates it
 
 | Field             | Type   | Required    | Default         | Description                                                       |
 |-------------------|--------|-------------|-----------------|-------------------------------------------------------------------|
-| `model`           | string | **yes**     | —               | HuggingFace model ID or GGUF spec (`Qwen/Qwen3-1.7B-GGUF:Q4_K_M`) |
+| `model`           | string | **yes**     | —               | HuggingFace model ID, GGUF spec (`Qwen/Qwen3-1.7B-GGUF:Q4_K_M`), or an absolute path to pre-placed on-disk weights |
 | `model_revision`  | string | no          | `null`          | Pin to a specific HF revision (branch, tag, or commit hash)       |
 | `runtime`         | string | no          | auto-detected   | Runtime identifier. See [Runtime Resolution](#runtime-resolution) |
 | `runtime_version` | string | no          | `""`            | Informational version tag                                         |
@@ -37,6 +37,21 @@ Everything else is optional. When `command` is omitted, the runtime generates it
 
 GGUF models use colon syntax (`repo:quant`) to download only the matching quantization files. When pre-synced, sparkrun
 rewrites `-hf` to `-m` with the resolved container cache path.
+
+**Local model weights:** an *absolute path* in `model:` (e.g. `model: /nfs/models/qwen3`) is treated as pre-placed
+on-disk weights that already exist on every node (typically a shared NFS mount). sparkrun then skips model download +
+distribution entirely, identity-mounts that directory into the container at the same path, and serves the runtime
+directly from it; the served-model name defaults to the directory basename. Only absolute paths trigger this — an
+ordinary repo id (`org/name`) or GGUF spec is never mistaken for a path, and `~`/relative paths are not expanded.
+Because this bind-mounts a host directory into the container, it is honored only for **trusted** recipes (local,
+default-registry, or `--trust`); an untrusted registry/URL recipe with an absolute-path model fails closed. This is the
+ergonomic front-end for the lower-level `cluster_config.resolved_model_path` escape hatch.
+
+Since distribution is skipped, the path must genuinely already exist on **every target node** — the control machine
+need not be a cluster member and need not see the path itself. Before launch, sparkrun verifies the path on the targets
+via the executor (host substrate → SSH `test -e`; provider executors probe their own volumes) and fails fast listing any
+node where it's missing, rather than letting the container crash. This preflight is best-effort: an unreachable or
+unverifiable node never blocks the launch.
 
 `model_revision` affects download, cache checking, VRAM auto-detection, and model sync. Pin to a commit hash for
 reproducible deployments.

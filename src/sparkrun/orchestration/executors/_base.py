@@ -470,6 +470,40 @@ class Executor(Plugin):
 
         return empty_status(hosts, executor=self.executor_name)
 
+    # --- Preflight ---
+
+    def verify_mount_sources(
+        self,
+        paths: list[str],
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> dict[str, list[str]]:
+        """Report identity-mount *paths* absent on this executor's substrate.
+
+        Preflight peer of :meth:`query_status`: it answers "do these host paths
+        already exist where the workload will run and the bind-mount will
+        resolve?" for *this* executor's substrate.  Used to validate pre-placed
+        model weights (an absolute-path ``model:`` or
+        ``cluster_config.resolved_model_path``) *before* the launch skips model
+        download + distribution — so a missing/typo'd path fails fast with a
+        clear error instead of a cryptic container crash on the target.
+
+        Returns ``{host: [missing_path, ...]}`` for hosts with confirmed-missing
+        paths; an empty dict means "all present, or could not verify".  The
+        default is the safe no-op (``{}``) — a provider executor that can't
+        cheaply probe its substrate never blocks a launch.  Host-substrate
+        executors (docker / local) override to SSH-probe the hosts; provider
+        executors (k8s / modal) would probe their own volume/PVC/control plane.
+
+        Args:
+            paths: Absolute host paths that must pre-exist on every host.
+            hosts: Target hosts for the launch.
+            ssh_kwargs: Connection settings for host-substrate probes.
+        """
+        del paths, hosts, ssh_kwargs  # base is a no-op; substrate-aware executors override
+        return {}
+
     @classmethod
     def workload_labels_for_cluster(
         cls,

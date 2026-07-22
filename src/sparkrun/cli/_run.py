@@ -446,10 +446,15 @@ def run(
         except Exception:
             display_placement = None
 
+    # A local (absolute-path) model has no HuggingFace repo id to auto-detect
+    # params from, so skip the HF lookup — the estimate falls back to recipe
+    # defaults rather than erroring on a bogus repo id.
+    from sparkrun.core.recipe import is_local_model_path
+
     _display_vram_estimate(
         recipe,
         cli_overrides=overrides,
-        auto_detect=True,
+        auto_detect=not is_local_model_path(recipe.model),
         cache_dir=local_cache_dir,
         cluster=cluster_def,
         placement=display_placement,

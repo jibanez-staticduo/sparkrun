@@ -481,6 +481,19 @@ class DockerExecutor(Executor):
             errors=errors,
         )
 
+    def verify_mount_sources(
+        self,
+        paths: list[str],
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> dict[str, list[str]]:
+        """Docker binds host paths directly, so identity-mount sources must
+        exist on the host FS — SSH-probe them (shared host-substrate impl)."""
+        from sparkrun.orchestration.ssh import verify_host_paths
+
+        return verify_host_paths(hosts, list(paths), ssh_kwargs)
+
 
 # --------------------------------------------------------------------------
 # query_status helpers (module-level so they're unit-testable)

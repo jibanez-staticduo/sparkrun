@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field, asdict as dataclass_asdict
 from json import dumps as json_dumps
@@ -712,6 +713,25 @@ class LaunchOverrides:
 # Back-compat alias: this type was previously named ``ClusterConfig``, which
 # collided with the cluster-side config types.  Keep the old name importable.
 ClusterConfig = LaunchOverrides
+
+
+def is_local_model_path(model: str | None) -> bool:
+    """True when a recipe's ``model:`` value is an absolute host path.
+
+    An absolute path in ``model:`` is user-facing sugar for
+    :attr:`LaunchOverrides.resolved_model_path`: the weights are already present
+    on every node (e.g. a shared mount), so sparkrun skips model download +
+    distribution, identity-mounts the directory into the container, and serves
+    the runtime directly from it.  See :func:`sparkrun.core.launcher.launch_inference`.
+
+    Only *absolute* paths are treated this way — no ``file://`` scheme, no ``~``
+    expansion, no relative paths — so an ordinary HuggingFace repo id
+    (``org/name``) or GGUF spec (``org/name-GGUF:Q4_K_M``) is never mistaken for
+    a local path.  Because this identity-mounts a host directory, it is gated to
+    trusted recipes at the launch choke point (see
+    ``launcher._enforce_recipe_mount_trust``).
+    """
+    return isinstance(model, str) and os.path.isabs(model)
 
 
 class RecipeError(Exception):

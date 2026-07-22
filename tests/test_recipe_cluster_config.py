@@ -445,3 +445,238 @@ def test_launch_inference_cluster_disables_model_distribution(monkeypatch, tmp_p
     # left untouched (no resolved_model_path repointing).
     assert captured["dist_kwargs"]["skip_model"] is True
     assert recipe.model == "Qwen/Qwen3-1.7B"
+
+
+# ---------------------------------------------------------------------------
+# Absolute-path model sugar (is_local_model_path)
+# ---------------------------------------------------------------------------
+
+
+def test_is_local_model_path_recognizes_absolute_paths_only():
+    from sparkrun.core.recipe import is_local_model_path
+
+    assert is_local_model_path("/nfs/models/qwen3") is True
+    assert is_local_model_path("/mnt/quant/M3") is True
+    # HF repo ids, GGUF specs, relative and ~ paths, and non-strings are NOT paths.
+    assert is_local_model_path("Qwen/Qwen3-1.7B") is False
+    assert is_local_model_path("Qwen/Qwen3-1.7B-GGUF:Q4_K_M") is False
+    assert is_local_model_path("~/models/qwen3") is False
+    assert is_local_model_path("models/qwen3") is False
+    assert is_local_model_path("") is False
+    assert is_local_model_path(None) is False
+
+
+def test_resolved_model_volume_from_absolute_model_path():
+    """An absolute path in ``model:`` (no cluster_config) is identity-mounted."""
+    r = Recipe.from_dict({**_recipe_dict(), "model": "/nfs/models/qwen3"})
+    assert resolved_model_volume(r) == {"/nfs/models/qwen3": "/nfs/models/qwen3"}
+
+
+def test_resolved_model_volume_cluster_config_wins_over_model_path():
+    """cluster_config.resolved_model_path is authoritative when both are set."""
+    r = Recipe.from_dict({**_recipe_dict(resolved_model_path="/nfs/A"), "model": "/nfs/B"})
+    assert resolved_model_volume(r) == {"/nfs/A": "/nfs/A"}
+
+
+def test_resolved_model_volume_rejects_unsafe_model_path():
+    """The mount-source denylist still applies to a path arriving via ``model:``."""
+    import pytest
+
+    r = Recipe.from_dict({**_recipe_dict(), "model": "/"})
+    with pytest.raises(ValueError):
+        resolved_model_volume(r)
+
+
+# ---------------------------------------------------------------------------
+# Trust gate: an absolute-path model is a host bind-mount → trusted-only
+# ---------------------------------------------------------------------------
+
+
+def test_absolute_model_path_gated_to_trusted_recipes():
+    import pytest
+
+    from sparkrun.core.launcher import _enforce_recipe_mount_trust
+    from sparkrun.core.recipe import RecipeError
+
+    recipe = _Recipe(cluster_config=None)
+    recipe.model = "/nfs/models/qwen3"
+
+    # Untrusted (registry/URL) recipe with an absolute-path model fails closed.
+    with pytest.raises(RecipeError, match="absolute host path"):
+        _enforce_recipe_mount_trust(recipe, trusted=False)
+
+    # Trusted recipe (local / default-registry / --trust) is allowed.
+    _enforce_recipe_mount_trust(recipe, trusted=True)  # no raise
+
+
+def test_absolute_model_path_trust_gate_noop_for_repo_id():
+    from sparkrun.core.launcher import _enforce_recipe_mount_trust
+
+    recipe = _Recipe(cluster_config=None)  # model = "Qwen/Qwen3-1.7B"
+    _enforce_recipe_mount_trust(recipe, trusted=False)  # ordinary repo id → no raise
+
+
+# ---------------------------------------------------------------------------
+# launch_inference: absolute-path model == pre-placed weights
+# ---------------------------------------------------------------------------
+
+
+def test_launch_inference_absolute_model_path_skips_distribution(monkeypatch, tmp_path):
+    from sparkrun.core.launcher import launch_inference
+
+    captured: dict = {}
+    _patch_launch(monkeypatch, tmp_path, captured)
+
+    class _Cfg2:
+        hf_cache_dir = tmp_path / "hf"
+        cache_dir = tmp_path / "cache"
+
+        def get_registry_manager(self):
+            return None
+
+    recipe = _Recipe(cluster_config=None)
+    recipe.model = "/nfs/models/qwen3"
+    overrides: dict = {}
+
+    launch_inference(
+        recipe=recipe,
+        runtime=_StubRuntime(),
+        host_list=["nv-host"],
+        overrides=overrides,
+        config=_Cfg2(),
+        cluster=ClusterDefinition(name="t", hosts=["nv-host"]),
+        is_solo=True,
+        dry_run=True,
+        sync_tuning=False,
+    )
+
+    # Weights are pre-placed → download + distribution skipped.
+    assert captured["dist_kwargs"]["skip_model"] is True
+    # recipe.model already IS the path (no repoint needed); caller's overrides
+    # left untouched (served name is set on the copy handed to the runtime).
+    assert recipe.model == "/nfs/models/qwen3"
+    assert "served_model_name" not in overrides
+    run_kwargs = _StubRuntime.last_kwargs
+    assert run_kwargs["recipe"].model == "/nfs/models/qwen3"
+    # Served model gets a clean name (directory basename, not the full path).
+    assert run_kwargs["overrides"]["served_model_name"] == "qwen3"
+
+
+def test_launch_inference_absolute_model_path_keeps_explicit_served_name(monkeypatch, tmp_path):
+    from sparkrun.core.launcher import launch_inference
+
+    captured: dict = {}
+    _patch_launch(monkeypatch, tmp_path, captured)
+
+    class _Cfg2:
+        hf_cache_dir = tmp_path / "hf"
+        cache_dir = tmp_path / "cache"
+
+        def get_registry_manager(self):
+            return None
+
+    recipe = _Recipe(cluster_config=None)
+    recipe.model = "/nfs/models/qwen3"
+
+    launch_inference(
+        recipe=recipe,
+        runtime=_StubRuntime(),
+        host_list=["nv-host"],
+        overrides={"served_model_name": "my-model"},
+        config=_Cfg2(),
+        cluster=ClusterDefinition(name="t", hosts=["nv-host"]),
+        is_solo=True,
+        dry_run=True,
+        sync_tuning=False,
+    )
+
+    # An explicit served_model_name is never overwritten by the basename default.
+    assert _StubRuntime.last_kwargs["overrides"]["served_model_name"] == "my-model"
+
+
+# ---------------------------------------------------------------------------
+# Pre-placed model preflight (_verify_pre_placed_model via the executor seam)
+# ---------------------------------------------------------------------------
+
+
+class _StubExecutor:
+    """Minimal executor exposing only the verify_mount_sources seam."""
+
+    def __init__(self, missing=None, raises=False):
+        self._missing = missing or {}
+        self._raises = raises
+        self.calls = []
+
+    def verify_mount_sources(self, paths, hosts, *, ssh_kwargs=None):
+        self.calls.append((list(paths), list(hosts), ssh_kwargs))
+        if self._raises:
+            raise RuntimeError("probe boom")
+        return self._missing
+
+
+def _preflight_recipe():
+    r = _Recipe(cluster_config=None)
+    r.model = "/nfs/models/qwen3"
+    return r
+
+
+def test_preflight_passes_when_paths_present(monkeypatch):
+    from sparkrun.core import launcher
+
+    ex = _StubExecutor(missing={})
+    monkeypatch.setattr("sparkrun.orchestration.executor.resolve_executor", lambda **kw: ex)
+
+    launcher._verify_pre_placed_model(
+        _preflight_recipe(), ["nv-host"], {"ssh_user": "u"}, runtime=_StubRuntime(), cluster=None, config=None, overrides={}
+    )
+    # The identity-mount path was probed on the target host.
+    assert ex.calls == [(["/nfs/models/qwen3"], ["nv-host"], {"ssh_user": "u"})]
+
+
+def test_preflight_raises_when_path_missing(monkeypatch):
+    import pytest
+
+    from sparkrun.core import launcher
+    from sparkrun.core.recipe import RecipeError
+
+    ex = _StubExecutor(missing={"nv-host": ["/nfs/models/qwen3"]})
+    monkeypatch.setattr("sparkrun.orchestration.executor.resolve_executor", lambda **kw: ex)
+
+    with pytest.raises(RecipeError, match="not found on the target"):
+        launcher._verify_pre_placed_model(
+            _preflight_recipe(), ["nv-host"], {}, runtime=_StubRuntime(), cluster=None, config=None, overrides={}
+        )
+
+
+def test_preflight_skips_when_executor_unresolvable(monkeypatch):
+    from sparkrun.core import launcher
+
+    def _boom(**kw):
+        raise RuntimeError("gated off")
+
+    monkeypatch.setattr("sparkrun.orchestration.executor.resolve_executor", _boom)
+    # Unresolvable executor must not block — the runtime surfaces the real error.
+    launcher._verify_pre_placed_model(_preflight_recipe(), ["nv-host"], {}, runtime=_StubRuntime(), cluster=None, config=None, overrides={})
+
+
+def test_preflight_best_effort_on_probe_failure(monkeypatch):
+    from sparkrun.core import launcher
+
+    ex = _StubExecutor(raises=True)
+    monkeypatch.setattr("sparkrun.orchestration.executor.resolve_executor", lambda **kw: ex)
+    # A probe that errors (SSH broken, etc.) is best-effort — never blocks.
+    launcher._verify_pre_placed_model(_preflight_recipe(), ["nv-host"], {}, runtime=_StubRuntime(), cluster=None, config=None, overrides={})
+
+
+def test_preflight_noop_without_pre_placed_path(monkeypatch):
+    from sparkrun.core import launcher
+
+    resolved = {"n": 0}
+    monkeypatch.setattr(
+        "sparkrun.orchestration.executor.resolve_executor",
+        lambda **kw: resolved.__setitem__("n", resolved["n"] + 1) or _StubExecutor(),
+    )
+    # Ordinary repo-id model → no identity mount → executor never resolved.
+    recipe = _Recipe(cluster_config=None)  # model = "Qwen/Qwen3-1.7B"
+    launcher._verify_pre_placed_model(recipe, ["nv-host"], {}, runtime=_StubRuntime(), cluster=None, config=None, overrides={})
+    assert resolved["n"] == 0

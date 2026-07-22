@@ -518,6 +518,20 @@ class LocalExecutor(Executor):
             errors=errors,
         )
 
+    def verify_mount_sources(
+        self,
+        paths: list[str],
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> dict[str, list[str]]:
+        """Local (container-less) runs read the path straight off the host FS,
+        so pre-placed weights must exist there — SSH-probe them (shared
+        host-substrate impl, identical to the docker executor)."""
+        from sparkrun.orchestration.ssh import verify_host_paths
+
+        return verify_host_paths(hosts, list(paths), ssh_kwargs)
+
 
 # --------------------------------------------------------------------------
 # query_status helpers (module-level so they're unit-testable)

@@ -80,15 +80,23 @@ def build_volumes(
 
 
 def resolved_model_volume(recipe) -> dict[str, str]:
-    """Identity bind-mount for a recipe's ``cluster_config.resolved_model_path``.
+    """Identity bind-mount for a recipe's pre-placed on-disk model weights.
 
-    When the (undocumented) escape hatch is set, the pre-placed model-weights
-    directory — already present on every node (e.g. a shared NFS mount) — is
-    mounted into the container at the *same* path so the serving runtime can
-    read it directly (the serve argument is repointed at this path by the
-    launcher).  Returns an empty dict when not configured.
+    Two surfaces feed this: the ``cluster_config.resolved_model_path`` escape
+    hatch, and — as user-facing sugar — an absolute path in the recipe's
+    ``model:`` field (:func:`sparkrun.core.recipe.is_local_model_path`).  Either
+    way the weights directory is already present on every node (e.g. a shared
+    NFS mount) and is mounted into the container at the *same* path so the
+    serving runtime can read it directly (the serve argument points at this path
+    already).  Returns an empty dict when neither is configured.
     """
     path = getattr(getattr(recipe, "cluster_config", None), "resolved_model_path", None)
+    if not path:
+        from sparkrun.core.recipe import is_local_model_path
+
+        model = getattr(recipe, "model", None)
+        if is_local_model_path(model):
+            path = model
     if not path or not isinstance(path, str):
         return {}
     from sparkrun.utils.shell import assert_safe_mount_source

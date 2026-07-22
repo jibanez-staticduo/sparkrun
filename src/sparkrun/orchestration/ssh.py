@@ -608,6 +608,63 @@ def run_remote_scripts_parallel(
     return results
 
 
+def verify_host_paths(
+    hosts: list[str],
+    paths: list[str],
+    ssh_kwargs: dict | None = None,
+) -> dict[str, list[str]]:
+    """Report host-filesystem *paths* that are absent on each of *hosts*.
+
+    Runs a single ``test -e`` sweep per host over SSH (in parallel), echoing
+    back every path that does not exist.  Returns ``{host: [missing, ...]}``
+    containing **only** hosts with at least one confirmed-missing path.
+
+    Tolerant by design — the same "safe degradation" contract as
+    :meth:`Executor.query_status`: a host whose SSH probe is unreachable or
+    errors is *omitted* (treated as "couldn't verify", never a false block), so
+    callers should raise only on the paths this function actively reports
+    missing.  This is the host-substrate implementation shared by the docker and
+    local executors' :meth:`Executor.verify_mount_sources`.
+
+    Args:
+        hosts: Target hostnames/IPs.
+        paths: Absolute host paths that must exist on every host.
+        ssh_kwargs: Connection settings (``ssh_user`` / ``ssh_key`` /
+            ``ssh_options`` / ``timeout``), as built by ``build_ssh_kwargs``.
+    """
+    if not hosts or not paths:
+        return {}
+
+    ssh_kwargs = ssh_kwargs or {}
+    requested = list(dict.fromkeys(paths))  # de-dupe, preserve order
+    # For each path, echo it verbatim (on its own line) iff it is missing.
+    script = "".join("if [ ! -e %s ]; then printf '%%s\\n' %s; fi\n" % (quote(p), quote(p)) for p in requested)
+
+    results = run_remote_scripts_parallel(
+        hosts,
+        script,
+        ssh_user=ssh_kwargs.get("ssh_user"),
+        ssh_key=ssh_kwargs.get("ssh_key"),
+        ssh_options=ssh_kwargs.get("ssh_options"),
+        timeout=ssh_kwargs.get("timeout", 15),
+        quiet=True,
+    )
+
+    requested_set = set(requested)
+    missing_by_host: dict[str, list[str]] = {}
+    for r in results:
+        # Unreachable / non-zero probe → couldn't verify → don't block.
+        if r.returncode != 0:
+            logger.debug("verify_host_paths: skipping unverifiable host %r (rc=%s)", r.host, r.returncode)
+            continue
+        missing = [ln for ln in (line.strip() for line in r.stdout.splitlines()) if ln in requested_set]
+        if missing:
+            # Preserve the requested order for a stable, readable error.
+            order = {p: i for i, p in enumerate(requested)}
+            missing_by_host[r.host] = sorted(set(missing), key=order.get)
+    return missing_by_host
+
+
 def run_remote_sudo_script(
     host: str,
     script: str,
