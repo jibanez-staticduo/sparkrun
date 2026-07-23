@@ -32,9 +32,11 @@ from . import _k8s as _k8s  # noqa: E402, F401  — registers @setup.group("k8s"
 from . import _tailscale as _tailscale  # noqa: E402, F401  — registers @setup.group("tailscale")
 from ._wizard import setup_wizard  # noqa: E402
 from ._uninstall import setup_uninstall  # noqa: E402
+from . import _check as _check  # noqa: E402  — registers @setup.command("check")
 
 setup.add_command(setup_wizard)
 setup.add_command(setup_uninstall)
+_check.register(setup)
 
 # ---------------------------------------------------------------------------
 # Re-export symbols used by external code (tests, etc.)
