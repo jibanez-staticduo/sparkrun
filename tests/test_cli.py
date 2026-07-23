@@ -5484,6 +5484,17 @@ class TestSetupEarlyoom:
         assert "dbus-daemon" in avoid_regex
         assert "NetworkManager" in avoid_regex
 
+    def test_cdi_summary(self):
+        """_cdi_summary extracts the status line from CDI generate output."""
+        from sparkrun.cli._setup._phases import _cdi_summary
+
+        generated = "some noise\nGENERATED: /etc/cdi/nvidia.yaml (1 device(s))\n"
+        assert _cdi_summary(generated) == "GENERATED: /etc/cdi/nvidia.yaml (1 device(s))"
+        assert _cdi_summary("SKIPPED: nvidia-ctk not found") == "SKIPPED: nvidia-ctk not found"
+        assert _cdi_summary("ERROR: nvidia-ctk cdi generate failed") == "ERROR: nvidia-ctk cdi generate failed"
+        # No recognized keyword → falls back to a truncated raw dump.
+        assert _cdi_summary("weird output") == "weird output"
+
 
 class TestStopLogsClusterIdAndOverrides:
     """Test stop/logs with cluster ID targeting and --port/--served-model-name overrides."""

@@ -65,6 +65,7 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         EARLYOOM_PREFER_PATTERNS,
         EARLYOOM_AVOID_PATTERNS,
         _build_earlyoom_regex,
+        _cdi_summary,
         _DOCKER_GROUP_SCRIPT,
         _DOCKER_GROUP_FALLBACK_SCRIPT,
         _docker_group_summary,
@@ -893,6 +894,65 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                 results["docker"] = "skipped"
             click.echo()
 
+        # ── Phase 4b: NVIDIA CDI Spec ────────────────────────────────
+        # Generate /etc/cdi/nvidia.yaml so Docker can resolve the
+        # `--device nvidia.com/gpu=...` flags the docker executor emits.
+        # Some DGX Spark hosts need this generated explicitly for full CDI
+        # support; the script self-skips where nvidia-ctk is absent.
+        if host_list:
+            click.echo("Phase 4b: NVIDIA CDI (Container Device Interface)")
+            click.echo("-" * 30)
+            click.echo("Generates /etc/cdi/nvidia.yaml so Docker can access the GPU(s).")
+
+            run_cdi = yes or click.confirm(
+                "Generate the NVIDIA CDI spec on all hosts?",
+                default=True,
+            )
+
+            if run_cdi:
+                try:
+                    cdi_script = read_script("nvidia_cdi_generate.sh")
+                    cdi_fallback = read_script("nvidia_cdi_generate_fallback.sh")
+
+                    if dry_run:
+                        click.echo("  [dry-run] Would generate CDI spec on %d host(s)." % len(host_list))
+                        results["cdi"] = "dry-run"
+                    else:
+                        pw = _ensure_sudo_password()
+                        if _indirect_sudo_user:
+                            cdi_result_map = {}
+                            for h in host_list:
+                                cdi_result_map[h] = _run_sudo_on_host(h, cdi_fallback, pw, timeout=120)
+                        else:
+                            cdi_result_map, cdi_still_failed = run_with_sudo_fallback(
+                                host_list,
+                                cdi_script,
+                                cdi_fallback,
+                                sudo_ssh_kwargs,
+                                dry_run=dry_run,
+                                sudo_password=pw,
+                            )
+                            if cdi_still_failed and pw:
+                                for h in cdi_still_failed:
+                                    cdi_result_map[h] = _run_sudo_on_host(h, cdi_fallback, pw, timeout=120)
+
+                        cdi_ok = sum(1 for h in host_list if cdi_result_map.get(h) and cdi_result_map[h].success)
+                        results["cdi"] = "OK (%d/%d)" % (cdi_ok, len(host_list)) if cdi_ok else "failed"
+                        for h in host_list:
+                            r = cdi_result_map.get(h)
+                            if r and r.success:
+                                click.echo("  %s: %s" % (h, _cdi_summary(r.stdout)))
+                        if cdi_ok and cluster_name:
+                            manifest_mgr.record_phase(cluster_name, user, host_list, "nvidia_cdi")
+                except Exception as e:
+                    results["cdi"] = "failed"
+                    click.echo("CDI error: %s" % e, err=True)
+                    if not yes and not click.confirm("Continue?", default=True):
+                        return
+            else:
+                results["cdi"] = "skipped"
+            click.echo()
+
         # ── Phase 5: Sudoers Entries ─────────────────────────────────
         if host_list:
             click.echo("Phase 5: Sudoers Entries")
@@ -1072,6 +1132,8 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         click.echo("  SSH remesh: %s" % results["ssh_remesh"])
     if results.get("docker"):
         click.echo("  Docker:     %s" % results["docker"])
+    if results.get("cdi"):
+        click.echo("  CDI:        %s" % results["cdi"])
     if results.get("sudoers"):
         click.echo("  Sudoers:    %s" % results["sudoers"])
     if results.get("earlyoom"):

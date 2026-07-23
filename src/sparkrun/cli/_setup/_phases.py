@@ -38,6 +38,20 @@ echo "DOCKER_GROUP=added"
 """
 
 
+def _cdi_summary(stdout: str) -> str:
+    """Extract the status line from nvidia CDI generate output.
+
+    Returns the first recognized status line (GENERATED/SKIPPED/ERROR) so the
+    wizard can show a one-line result per host instead of the raw script dump.
+    """
+    for kw in ("GENERATED:", "SKIPPED:", "ERROR:"):
+        for line in stdout.strip().splitlines():
+            line = line.strip()
+            if line.startswith(kw):
+                return line
+    return stdout.strip()[:80]
+
+
 def _docker_group_summary(stdout: str, user: str | None = None) -> str:
     """Extract status from docker-group script output."""
     label = "'%s' " % user if user else ""
