@@ -14,10 +14,16 @@ if ! command -v nvidia-ctk >/dev/null 2>&1; then
     exit 0
 fi
 
-sudo -n mkdir -p /etc/cdi
-if ! sudo -n nvidia-ctk cdi generate --output="$OUTPUT" 2>/tmp/sparkrun-cdi.err; then
+# nvidia-ctk writes $OUTPUT itself (as root under sudo), and its own logs go to
+# stderr — deliberately no shell redirect to a temp file: a fixed /tmp path
+# collides across users/runs and, under fs.protected_regular, even root can't
+# write another user's file in /tmp.
+if ! sudo -n mkdir -p /etc/cdi; then
+    echo "ERROR: could not create /etc/cdi (sudo required)"
+    exit 1
+fi
+if ! sudo -n nvidia-ctk cdi generate --output="$OUTPUT"; then
     echo "ERROR: nvidia-ctk cdi generate failed"
-    cat /tmp/sparkrun-cdi.err >&2
     exit 1
 fi
 

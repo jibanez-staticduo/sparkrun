@@ -13,10 +13,11 @@ if ! command -v nvidia-ctk >/dev/null 2>&1; then
     exit 0
 fi
 
+# nvidia-ctk writes $OUTPUT itself and logs to stderr — no shell redirect to a
+# temp file (see the sudo -n variant for why: /tmp collisions + fs.protected_regular).
 mkdir -p /etc/cdi
-if ! nvidia-ctk cdi generate --output="$OUTPUT" 2>/tmp/sparkrun-cdi.err; then
+if ! nvidia-ctk cdi generate --output="$OUTPUT"; then
     echo "ERROR: nvidia-ctk cdi generate failed"
-    cat /tmp/sparkrun-cdi.err >&2
     exit 1
 fi
 
