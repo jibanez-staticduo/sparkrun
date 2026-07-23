@@ -827,7 +827,7 @@ class TestGoldenEquivalence:
             "user": "$SHELL_USER",
             "security_opt": ["no-new-privileges"],
             "cap_add": None,  # rootless sets cap_add=[] → coerced to None
-            "ulimit": ["memlock=-1:-1", "stack=67108864"],
+            "ulimit": ["memlock=-1:-1", "stack=67108864", "nofile=65535:65535"],
             "devices": ["/dev/infiniband"],
             "executor_type": "docker",
         }

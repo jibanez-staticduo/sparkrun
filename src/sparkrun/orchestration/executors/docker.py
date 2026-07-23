@@ -133,7 +133,7 @@ DOCKER_DEFAULTS = {
     "user": None,
     "security_opt": None,
     "cap_add": None,
-    "ulimit": None,
+    "ulimit": ["nofile=65535:65535"],
     "devices": None,
     "volumes": None,
     "entrypoint": None,
@@ -173,6 +173,7 @@ class DockerExecutor(Executor):
             adjustments["ulimit"] = [
                 "memlock=-1:-1",
                 "stack=67108864",
+                "nofile=65535:65535",
             ]
             # Request the IB fabric device for rootless (non-privileged) NCCL
             # over InfiniBand.  Emitted existence-guarded at build time (see
