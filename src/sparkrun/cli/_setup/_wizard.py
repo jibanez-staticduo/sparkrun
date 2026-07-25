@@ -31,7 +31,6 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
       sparkrun setup wizard --dry-run --hosts 10.0.0.1 --cluster test
       sparkrun setup wizard --yes --hosts 10.0.0.1,10.0.0.2
     """
-    import os
     import shutil
     import subprocess
 
@@ -70,7 +69,7 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         _DOCKER_GROUP_FALLBACK_SCRIPT,
         _docker_group_summary,
     )
-    from ._ssh import _run_ssh_mesh, _detect_and_update_mgmt_ips
+    from ._ssh import _default_ssh_user, _ensure_ssh_access, _run_ssh_mesh, _detect_and_update_mgmt_ips
 
     # Manifest tracking
     from sparkrun.core.setup_manifest import ManifestManager
@@ -90,8 +89,9 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         click.echo("=" * 48)
         click.echo()
 
-        # Default user (may be overridden by interactive prompt below)
-        default_user = os.environ.get("USER", "root")
+        # Default user (may be overridden by interactive prompt below).
+        # Never fabricate "root" — see _default_ssh_user.
+        default_user = _default_ssh_user()
         if user is None:
             user = default_user
 
@@ -125,6 +125,30 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         config = SparkrunConfig()
         cluster_mgr = _get_cluster_manager()
         manifest_mgr = ManifestManager(cluster_mgr.clusters_dir)
+
+        # Control→host SSH access is a precondition for every probe the wizard
+        # runs (CX7 detection, shared-cache detection, the mesh itself).  Gate
+        # on it once, as the *first* network action and only after the SSH
+        # username is known — otherwise a cluster that has never seen our key
+        # produces a wall of "Permission denied" from each probe in turn, with
+        # the username prompt arriving after the damage is done.
+        ssh_access_hosts: list[str] | None = None
+
+        def _gate_ssh_access(current_user):
+            """Run the access gate once; return the (possibly corrected) user."""
+            nonlocal ssh_access_hosts
+            if ssh_access_hosts is not None or not host_list:
+                return current_user
+            outcome = _ensure_ssh_access(host_list, current_user, config, dry_run=dry_run, yes=yes)
+            ssh_access_hosts = outcome.ok_hosts
+            if outcome.blocked:
+                results["ssh_access"] = "%d/%d hosts" % (len(outcome.ok_hosts), len(host_list))
+            elif outcome.bootstrapped:
+                results["ssh_access"] = "OK (key installed)"
+            else:
+                results["ssh_access"] = "OK"
+            click.echo()
+            return outcome.user
 
         # Check for existing clusters
         existing = cluster_mgr.list_clusters()
@@ -298,22 +322,9 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                 click.echo("Error: No hosts specified.", err=True)
                 return
 
-            # Detect CX7 on remote hosts if not already known
-            if not local_is_spark and not dry_run:
-                click.echo("Detecting CX7 on remote hosts...")
-                ssh_kwargs = build_ssh_kwargs(config)
-                if user:
-                    ssh_kwargs["ssh_user"] = user
-                try:
-                    remote_detections = detect_cx7_for_hosts(
-                        host_list,
-                        ssh_kwargs=ssh_kwargs,
-                    )
-                    cx7_detected_any = any(d.detected for d in remote_detections.values())
-                except Exception as e:
-                    logger.debug("Remote CX7 detection failed: %s", e)
-
-            # Step 1d: Create cluster
+            # Step 1d: Name the cluster and settle on an SSH user.  Both
+            # prompts come *before* any SSH so the first connection is made
+            # with the credentials the operator actually intends to use.
             if not cluster_name:
                 if yes:
                     cluster_name = "default"
@@ -322,13 +333,33 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
 
             # Prompt for SSH username (--user flag takes precedence)
             if not yes and user == default_user:
-                user = click.prompt("SSH username", default=default_user)
+                user = click.prompt("SSH username", default=default_user or None)
+
+            click.echo()
+
+            # Step 1e: SSH access gate — the first network action of the run.
+            user = _gate_ssh_access(user)
+
+            # Detect CX7 on remote hosts if not already known
+            if not local_is_spark and not dry_run and ssh_access_hosts:
+                click.echo("Detecting CX7 on remote hosts...")
+                ssh_kwargs = build_ssh_kwargs(config)
+                if user:
+                    ssh_kwargs["ssh_user"] = user
+                try:
+                    remote_detections = detect_cx7_for_hosts(
+                        ssh_access_hosts,
+                        ssh_kwargs=ssh_kwargs,
+                    )
+                    cx7_detected_any = any(d.detected for d in remote_detections.values())
+                except Exception as e:
+                    logger.debug("Remote CX7 detection failed: %s", e)
 
             # Detect a shared/NFS HF cache and offer to enable the matching
             # distribution preferences (skip the redundant per-host rsync,
             # drop perm preservation that fails under root_squash).
             dist_cfg = None
-            if host_list and not dry_run:
+            if ssh_access_hosts and not dry_run:
                 from sparkrun.core.cluster_manager import (
                     ClusterDistributionConfig,
                     ModelDistributionPrefs,
@@ -339,7 +370,7 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                 if user and user != default_user:
                     ssh_kwargs_cache["ssh_user"] = user
                 try:
-                    shared = detect_shared_cache(None, host_list, **ssh_kwargs_cache)
+                    shared = detect_shared_cache(None, ssh_access_hosts, **ssh_kwargs_cache)
                 except Exception as e:
                     logger.debug("Shared-cache detection failed: %s", e)
                     shared = False
@@ -422,14 +453,18 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
 
         click.echo()
 
+        # Reusing an existing cluster skips the discovery path above, so the
+        # access gate has not run yet — run it here before probing.
+        user = _gate_ssh_access(user)
+
         # Detect CX7 on cluster hosts if not already known (e.g. reusing
         # an existing cluster skips the host-discovery path above).
-        if host_list and not cx7_detected_any and len(host_list) >= 2 and not dry_run:
+        if ssh_access_hosts and not cx7_detected_any and len(ssh_access_hosts) >= 2 and not dry_run:
             ssh_kwargs_probe = build_ssh_kwargs(config)
             if user:
                 ssh_kwargs_probe["ssh_user"] = user
             try:
-                probe = detect_cx7_for_hosts(host_list, ssh_kwargs=ssh_kwargs_probe)
+                probe = detect_cx7_for_hosts(ssh_access_hosts, ssh_kwargs=ssh_kwargs_probe)
                 cx7_detected_any = any(d.detected for d in probe.values())
             except Exception as e:
                 logger.debug("CX7 probe on existing cluster failed: %s", e)
@@ -452,7 +487,7 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                     mesh_hosts = list(host_list)
                     seen = set(mesh_hosts)
                     self_ip = local_ip_for(host_list[0]) if host_list else None
-                    local_user = os.environ.get("USER", "root")
+                    local_user = _default_ssh_user()
                     cross_user = user != local_user
                     if self_ip and self_ip in seen and cross_user:
                         # Control machine was explicitly listed — keep it.
@@ -787,7 +822,7 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                 mesh_hosts = list(host_list)
                 seen_mesh = set(mesh_hosts)
                 self_ip = local_ip_for(host_list[0]) if host_list else None
-                local_user_remesh = os.environ.get("USER", "root")
+                local_user_remesh = _default_ssh_user()
                 cross_user_remesh = user != local_user_remesh
                 if self_ip and self_ip not in seen_mesh and not cross_user_remesh:
                     mesh_hosts.append(self_ip)

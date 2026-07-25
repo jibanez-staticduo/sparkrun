@@ -360,6 +360,54 @@ exposure is a **raw tailnet port** (`http://<ip>:<port>/v1`), not `tailscale ser
 control-machine `tailscale ip` probes used by `expose --proxy`). Layering: `cli → api.tailscale →
 orchestration.tailscale → {orchestration.ssh/sudo, core.config}`. Design spec: `.slop/tailscale-setup.md`.
 
+### SSH Access Bootstrap (`api/setup/`)
+
+Every setup phase — CX7 detection, shared-cache detection, the mesh itself —
+assumes passwordless control→host SSH. `api/setup/` is the console-free layer
+that *establishes* that, and it is the first piece of the wizard written to be
+GUI-drivable (the desktop app's sidecar can call it directly instead of
+shelling out to a terminal wizard).
+
+| Function                          | Purpose                                                                              |
+|-----------------------------------|--------------------------------------------------------------------------------------|
+| `probe_ssh_access`                | `BatchMode=yes` reachability sweep → `SshProbe` per host                              |
+| `ensure_local_key`                | Find an existing identity, else generate `~/.ssh/sparkrun_ed25519`                    |
+| `install_public_key_interactive`  | Install the pubkey on one host via password auth                                      |
+| `mesh_ssh_keys_native`            | host↔host key mesh with **no local shell**                                            |
+
+**Everything here runs on a bare Windows control machine.** The only external
+binaries are `ssh` and `ssh-keygen` (Windows 10+ ships both); there is no
+`bash`, no paramiko. Two design rules follow from that and should not be
+relaxed:
+
+- **Key material travels over stdin, never argv.** Scripts are generated with
+  the key embedded (single-quoted, or a quoted heredoc for the mesh) and piped
+  to `bash -s`, so nothing depends on the *local* platform's command-line
+  quoting — the difference between working and mangling a key on Windows.
+- **`probe_ssh_access` adds `StrictHostKeyChecking=accept-new`.** `build_ssh_cmd`
+  already forces `BatchMode=yes`; with the stock `ask` policy a first-contact
+  host fails host-key verification and would be misreported as *unreachable*
+  rather than merely unknown.
+
+`SshProbe` distinguishes **auth failure** (host answered, rejected us → a
+bootstrap candidate), **host-key failure** (changed key → operator must resolve;
+never auto-fixed), and **unreachable** (network/sshd). Only the first is
+offered a key install. The install's exit code is treated as a hint —
+success is confirmed by re-probing, which is the only trustworthy signal.
+
+**CLI wiring** (`cli/_setup/_ssh.py`): `_ensure_ssh_access` is the wizard's gate
+(prints, prompts, persists a generated key as `ssh.key`); `_default_ssh_user`
+replaces the old `os.environ.get("USER", "root")` — POSIX-only, so on Windows it
+made every first connection as `root`. `_run_ssh_mesh` prefers
+`scripts/mesh_ssh_keys.sh` and falls back to `mesh_ssh_keys_native` when local
+`bash` is absent. The wizard runs the gate **once**, after the cluster-name and
+SSH-username prompts and before any other probe.
+
+> Note: other `os.environ.get("USER", "root")` call sites remain outside setup
+> (`cli/_common.py`, `orchestration/primitives.py:is_local_user`,
+> `orchestration/distribution.py`, `core/launcher.py`). They affect *launch-time*
+> cross-user decisions and are still POSIX-only.
+
 ### Recipe System
 
 Recipes are YAML files with fields: `model`, `runtime`, `container`, `command`, `defaults`, `env`, `metadata`,
