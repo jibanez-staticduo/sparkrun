@@ -7,6 +7,7 @@ from remote git repositories using sparse checkouts for efficiency.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -300,6 +301,65 @@ def _profile_category(path: Path) -> str | None:
     cat = _profile_category_from_data(data)
     _PROFILE_CATEGORY_CACHE[key] = cat
     return cat
+
+
+def is_dir_link(path: Path) -> bool:
+    """True when *path* is a symlink **or** a Windows directory junction.
+
+    ``Path.is_symlink()`` reports False for junctions, so code that only checks
+    for symlinks will treat one as an ordinary directory — and then delete
+    *through* it, taking the shared clone's contents with it.
+    """
+    return path.is_symlink() or os.path.isjunction(path)
+
+
+def remove_dir_link(path: Path) -> None:
+    """Remove a link without following it. Junctions need ``rmdir``, not ``unlink``."""
+    if path.is_symlink():
+        path.unlink()
+    else:
+        os.rmdir(path)
+
+
+def link_directory(link: Path, target: Path) -> None:
+    """Point *link* at directory *target*, portably.
+
+    Windows grants the symlink privilege only to elevated processes (or with
+    Developer Mode enabled), so a plain symlink fails there with
+    ``WinError 1314: A required privilege is not held by the client``.  A
+    directory *junction* is the unprivileged equivalent for local paths, so fall
+    back to that rather than requiring every Windows user to elevate.
+
+    Raises:
+        OSError: Neither a symlink nor a junction could be created.
+    """
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as e:
+        if os.name != "nt":
+            raise
+        logger.debug("symlink %s -> %s failed (%s); falling back to a junction", link, target, e)
+
+    try:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        failed = result.returncode != 0 or not link.exists()
+        detail = (result.stderr or result.stdout or "").strip()
+    except OSError as e:
+        # Couldn't even launch mklink; report it as the link failure it is
+        # rather than letting a bare "No such file or directory: 'cmd'" escape.
+        failed, detail = True, str(e)
+
+    if failed:
+        raise OSError(
+            "Could not link %s -> %s: creating a symlink needs elevation or Developer Mode, "
+            "and the junction fallback failed: %s" % (link, target, detail)
+        )
+    logger.debug("Created junction %s -> %s", link, target)
 
 
 class RegistryManager:
@@ -698,17 +758,18 @@ class RegistryManager:
         shared_dir = self._clone_dir_for_url(entry.url)
         per_registry_dir = self._cache_dir(entry.name)
 
-        # Remove old per-registry dir if it's a real directory (not a symlink)
-        if per_registry_dir.exists() and not per_registry_dir.is_symlink():
+        # Remove old per-registry dir if it's a real directory (not a link)
+        if per_registry_dir.exists() and not is_dir_link(per_registry_dir):
             import shutil
 
             shutil.rmtree(per_registry_dir)
 
-        # Create symlink: per_registry_dir -> shared_dir
+        # Link per_registry_dir -> shared_dir (junction on Windows; see
+        # link_directory for why a plain symlink isn't enough there).
         per_registry_dir.parent.mkdir(parents=True, exist_ok=True)
-        if per_registry_dir.is_symlink():
-            per_registry_dir.unlink()
-        per_registry_dir.symlink_to(shared_dir)
+        if is_dir_link(per_registry_dir):
+            remove_dir_link(per_registry_dir)
+        link_directory(per_registry_dir, shared_dir)
 
     def _clone_or_pull_single(self, entry: RegistryEntry) -> bool:
         """Clone or update a registry repository (single-URL implementation).
@@ -1060,8 +1121,8 @@ class RegistryManager:
                 if cache_dir.exists():
                     import shutil
 
-                    if cache_dir.is_symlink():
-                        cache_dir.unlink()
+                    if is_dir_link(cache_dir):
+                        remove_dir_link(cache_dir)
                     else:
                         shutil.rmtree(cache_dir)
                 cleaned.append(entry.name)
@@ -1100,8 +1161,8 @@ class RegistryManager:
         count = 0
         if self.cache_root.exists():
             for child in self.cache_root.iterdir():
-                if child.is_symlink():
-                    child.unlink()
+                if is_dir_link(child):
+                    remove_dir_link(child)
                     count += 1
                 elif child.is_dir():
                     shutil.rmtree(child)

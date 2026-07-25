@@ -17,6 +17,9 @@ from sparkrun.core.registry import (
     RegistryManager,
     _get_git_org,
     validate_registry_name,
+    is_dir_link,
+    link_directory,
+    remove_dir_link,
 )
 
 
@@ -865,7 +868,7 @@ class TestSharedClone:
         assert "other" not in paths
 
     def test_link_registry_to_shared(self, mgr, sample_entry):
-        """Test that _link_registry_to_shared creates a symlink."""
+        """Test that _link_registry_to_shared links to the shared clone."""
         # Create the shared dir
         shared = mgr._clone_dir_for_url(sample_entry.url)
         shared.mkdir(parents=True)
@@ -874,8 +877,53 @@ class TestSharedClone:
         mgr._link_registry_to_shared(sample_entry)
 
         per_reg = mgr._cache_dir(sample_entry.name)
-        assert per_reg.is_symlink()
+        assert is_dir_link(per_reg)
         assert per_reg.resolve() == shared.resolve()
+
+    def test_link_registry_to_shared_is_idempotent(self, mgr, sample_entry):
+        """Re-linking an already-linked registry must not fail or duplicate."""
+        shared = mgr._clone_dir_for_url(sample_entry.url)
+        (shared / sample_entry.subpath).mkdir(parents=True)
+
+        mgr._link_registry_to_shared(sample_entry)
+        mgr._link_registry_to_shared(sample_entry)
+
+        per_reg = mgr._cache_dir(sample_entry.name)
+        assert is_dir_link(per_reg)
+        assert per_reg.resolve() == shared.resolve()
+
+
+class TestDirectoryLinks:
+    """Portable directory links (symlink, or a junction on Windows)."""
+
+    def test_link_directory_and_detection(self, tmp_path):
+        target = tmp_path / "shared"
+        (target / "recipes").mkdir(parents=True)
+        link = tmp_path / "per-registry"
+
+        link_directory(link, target)
+
+        assert is_dir_link(link)
+        assert (link / "recipes").is_dir()
+        assert not is_dir_link(target)
+
+    def test_remove_dir_link_keeps_the_target(self, tmp_path):
+        """Removing the link must never delete through to the shared clone.
+
+        A junction reports ``is_symlink() == False``, so code that only tests for
+        symlinks would treat one as a plain directory and recursively delete the
+        shared clone's contents.
+        """
+        target = tmp_path / "shared"
+        (target / "recipes").mkdir(parents=True)
+        (target / "recipes" / "r.yaml").write_text("model: m\n")
+        link = tmp_path / "per-registry"
+        link_directory(link, target)
+
+        remove_dir_link(link)
+
+        assert not link.exists()
+        assert (target / "recipes" / "r.yaml").read_text() == "model: m\n"
 
 
 class TestManifestParsing:
