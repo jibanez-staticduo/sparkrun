@@ -1562,21 +1562,15 @@ class RegistryManager:
             if recipe_dir is None:
                 continue
             # Flat lookup first (existing behavior)
+            found = False
             for ext in (".yaml", ".yml"):
                 candidate = recipe_dir / (name + ext)
                 if candidate.exists():
                     matches.append((entry.name, candidate))
+                    found = True
 
-        # If flat lookup found nothing, search subdirectories by stem
-        if not matches:
-            for entry in registries:
-                if not entry.enabled:
-                    continue
-                if not include_hidden and not entry.visible:
-                    continue
-                recipe_dir = self._recipe_dir(entry)
-                if recipe_dir is None:
-                    continue
+            # If flat lookup found nothing, search subdirectories by stem
+            if not found:
                 for ext in (".yaml", ".yml"):
                     for candidate in sorted(recipe_dir.rglob(f"{name}{ext}")):
                         matches.append((entry.name, candidate))
