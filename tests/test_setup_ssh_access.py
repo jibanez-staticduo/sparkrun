@@ -310,7 +310,13 @@ def test_install_public_key_disables_pubkey_auth_and_pipes_the_script():
     assert cmd[-2:] == ["bash", "-s"]
     # stdout/stderr are NOT captured: OpenSSH must reach the terminal to prompt.
     assert "capture_output" not in m.call_args.kwargs
-    assert "ssh-ed25519 AAAA me@box" in m.call_args.kwargs["input"]
+    # Piped as bytes with LF endings only: text mode would CRLF-mangle the
+    # script on a Windows control machine, and the remote bash would fail with
+    # "invalid option" / "unexpected end of file".
+    piped = m.call_args.kwargs["input"]
+    assert isinstance(piped, bytes)
+    assert b"ssh-ed25519 AAAA me@box" in piped
+    assert b"\r" not in piped
 
 
 def test_install_public_key_reports_failure_without_raising():

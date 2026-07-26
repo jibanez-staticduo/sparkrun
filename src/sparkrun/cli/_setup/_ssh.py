@@ -380,6 +380,7 @@ def _run_ssh_mesh(mesh_hosts, user, cluster_hosts=None, ssh_key=None, discover_i
     Returns:
         ``True`` if mesh completed successfully, ``False`` otherwise.
     """
+    import os
     import shutil
     import subprocess
     from sparkrun.scripts import get_script_path
@@ -391,10 +392,15 @@ def _run_ssh_mesh(mesh_hosts, user, cluster_hosts=None, ssh_key=None, discover_i
     cluster_hosts = cluster_hosts or list(mesh_hosts)
 
     # Phase 1: Mesh SSH keys.  ``mesh_ssh_keys.sh`` needs a POSIX shell on the
-    # *control* machine, which a Windows control machine does not have; fall
-    # back to the native implementation, which does all its shell work on the
-    # (always-Linux) cluster hosts.
-    if shutil.which("bash") is None:
+    # *control* machine; fall back to the native implementation, which does all
+    # its shell work on the (always-Linux) cluster hosts.
+    #
+    # On Windows this applies even when a `bash` *is* on PATH.  Git Bash and WSL
+    # both take a POSIX view of the filesystem, so the Windows path to the
+    # bundled script is either escape-mangled or simply not addressable:
+    #
+    #   /bin/bash: C:UsersdrewDesktop...mesh_ssh_keys.sh: No such file or directory
+    if os.name == "nt" or shutil.which("bash") is None:
         ok = _run_ssh_mesh_native(mesh_hosts, user, ssh_key=ssh_key, dry_run=dry_run)
         if dry_run:
             if discover_ips:

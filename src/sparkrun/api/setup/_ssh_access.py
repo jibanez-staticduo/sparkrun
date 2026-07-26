@@ -30,6 +30,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from sparkrun.utils.shell import stdin_bytes
+
 from ._errors import OpenSshUnavailable, SshKeyError
 
 logger = logging.getLogger(__name__)
@@ -388,7 +390,7 @@ def install_public_key_interactive(
     # stdout/stderr are deliberately inherited: OpenSSH writes its password
     # prompt and its failure reasons straight to the terminal.
     try:
-        proc = subprocess.run(cmd, input=script, text=True)
+        proc = subprocess.run(cmd, input=stdin_bytes(script), text=False)
     except OSError as e:
         logger.debug("Public key install on %s failed to launch: %s", host, e)
         return False

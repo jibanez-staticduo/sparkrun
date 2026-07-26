@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from sparkrun.utils.shell import stdin_bytes
+
 logger = logging.getLogger(__name__)
 
 # Column names matching host_monitor.sh CSV field order (single source of truth).
@@ -330,6 +332,25 @@ def prom2json_to_sample(metrics_list: list[dict], hostname: str) -> MonitorSampl
     return prometheus_to_sample(flat, hostname)
 
 
+def _ssh_start_error(exc: OSError, proc) -> str:
+    """Explain why a monitor's SSH died, not just how we noticed.
+
+    ssh that exits before we finish writing the script surfaces here as
+    ``[Errno 32] Broken pipe``, which says nothing useful — the actual reason
+    ("Permission denied (publickey)", "Host key verification failed", ...) went
+    to ssh's stderr. Prefer that when we can still read it.
+    """
+    if proc is not None:
+        try:
+            proc.wait(timeout=2)
+            err = (proc.stderr.read() or "").strip()
+            if err:
+                return err.splitlines()[-1]
+        except Exception:  # never let diagnosis raise over the original failure
+            logger.debug("could not read ssh stderr after %s", exc, exc_info=True)
+    return str(exc)
+
+
 class ClusterMonitor:
     """Manage parallel SSH monitor streams across cluster hosts.
 
@@ -375,6 +396,7 @@ class ClusterMonitor:
         )
         cmd.extend(["bash", "-s", "--", str(self.interval)])
 
+        proc = None
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -383,7 +405,9 @@ class ClusterMonitor:
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            proc.stdin.write(self._script)
+            # .buffer bypasses text-mode newline translation, which would
+            # CRLF-mangle the script when the control node is Windows.
+            proc.stdin.buffer.write(stdin_bytes(self._script))
             proc.stdin.close()
 
             self.states[host].process = proc
@@ -395,8 +419,9 @@ class ClusterMonitor:
             )
             thread.start()
         except OSError as e:
-            self.states[host].error = "Failed to start SSH: %s" % e
-            logger.warning("Failed to start monitor on %s: %s", host, e)
+            detail = _ssh_start_error(e, proc)
+            self.states[host].error = "SSH failed: %s" % detail
+            logger.warning("Failed to start monitor on %s: %s", host, detail)
 
     def stop(self) -> None:
         """Terminate all SSH subprocesses."""
@@ -593,6 +618,7 @@ class NvMonitorClusterMonitor:
         )
         cmd.extend(["bash", "-s", "--", str(self.port), str(self.interval)])
 
+        proc = None
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -601,7 +627,9 @@ class NvMonitorClusterMonitor:
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            proc.stdin.write(self._script)
+            # .buffer bypasses text-mode newline translation, which would
+            # CRLF-mangle the script when the control node is Windows.
+            proc.stdin.buffer.write(stdin_bytes(self._script))
             proc.stdin.close()
 
             self.states[host].process = proc
@@ -610,7 +638,7 @@ class NvMonitorClusterMonitor:
             thread = threading.Thread(target=self._reader, args=(host, proc), daemon=True)
             thread.start()
         except OSError as e:
-            self.states[host].error = "SSH failed: %s" % e
+            self.states[host].error = "SSH failed: %s" % _ssh_start_error(e, proc)
 
     def stop(self) -> None:
         """Terminate all SSH processes."""

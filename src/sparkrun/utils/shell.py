@@ -21,6 +21,27 @@ class Quoted(str):
     """
 
 
+def stdin_bytes(data: str) -> bytes:
+    """Encode *data* for a subprocess stdin pipe, with no newline translation.
+
+    Piping a script as ``str`` (``subprocess.run(..., text=True)``) wraps stdin
+    in a ``TextIOWrapper`` with ``newline=None``, which rewrites every ``\\n`` to
+    ``os.linesep``.  On a Windows control machine that appends a CR to every
+    line of a *bash* script, and the remote shell then reports::
+
+        set: -e^M: invalid option
+        bash: line 13: syntax error: unexpected end of file
+
+    (the CR is part of the argument, and a heredoc terminator with a trailing CR
+    never matches its opening delimiter).  Piping bytes bypasses the translation
+    entirely, so the remote sees exactly what was generated.
+
+    Any CRLF already present in *data* is normalized, since the remote is always
+    a POSIX shell.
+    """
+    return data.replace("\r\n", "\n").encode("utf-8")
+
+
 def quote(value: str) -> Quoted:
     """Return a shell-safe quoted version of *value*.
 

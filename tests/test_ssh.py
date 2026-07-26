@@ -138,9 +138,10 @@ def test_run_remote_script_mocks_subprocess(mock_run):
     assert "bash" in cmd
     assert "-s" in cmd
 
-    # Check script was passed as input
-    assert call_args[1]["input"] == script
-    assert call_args[1]["text"] is True
+    # The script is piped as raw bytes: text mode would rewrite "\n" to
+    # os.linesep and CRLF-mangle it on a Windows control machine.
+    assert call_args[1]["input"] == script.encode()
+    assert call_args[1]["text"] is False
     assert call_args[1]["capture_output"] is True
 
     # Verify result
@@ -273,10 +274,12 @@ def test_run_remote_sudo_script_mocks_subprocess(mock_run):
     assert "bash" in cmd
     assert "-s" in cmd
 
-    # Check password + script passed as input
+    # Password + script are piped as bytes; the separator must stay a bare LF,
+    # since a CR would become part of the password `sudo -S` reads.
     full_input = call_args[1]["input"]
-    assert full_input.startswith(password + "\n")
-    assert script in full_input
+    assert full_input.startswith((password + "\n").encode())
+    assert script.encode() in full_input
+    assert b"\r" not in full_input
 
     assert result.success
     assert result.stdout == "OK: fixed permissions"
@@ -527,3 +530,45 @@ def test_parallel_hung_host_hits_timeout(mock_run):
     timed_out = [r for r in results if r.returncode == -1]
     assert len(timed_out) == 1
     assert "timed out" in timed_out[0].stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# Script piping must not be newline-translated (Windows control machines)
+# ---------------------------------------------------------------------------
+
+
+def test_stdin_bytes_never_emits_cr():
+    """A bash script must reach the remote with LF endings only.
+
+    Piping a str with text=True wraps stdin in a TextIOWrapper that rewrites
+    "\\n" to os.linesep, so on Windows the remote sees `set -e\\r` ("invalid
+    option") and a heredoc terminator that never matches.
+    """
+    from sparkrun.utils.shell import stdin_bytes
+
+    script = "set -e\ncat <<'EOF'\nbody\nEOF\n"
+    assert stdin_bytes(script) == b"set -e\ncat <<'EOF'\nbody\nEOF\n"
+    assert b"\r" not in stdin_bytes(script)
+
+    # Already-CRLF input is normalized rather than doubled.
+    assert stdin_bytes("a\r\nb\r\n") == b"a\nb\n"
+
+
+def test_run_remote_script_pipes_bytes_without_cr():
+    """The workhorse must hand ssh raw bytes, not a newline-translated str."""
+    from unittest import mock
+
+    from sparkrun.orchestration.ssh import run_remote_script
+
+    script = "set -e\necho hi\n"
+    completed = mock.Mock(returncode=0, stdout=b"hi\n", stderr=b"")
+    with mock.patch("subprocess.run", return_value=completed) as run:
+        result = run_remote_script("host1", script)
+
+    kwargs = run.call_args.kwargs
+    assert isinstance(kwargs["input"], bytes), "script must be piped as bytes"
+    assert b"\r" not in kwargs["input"]
+    assert kwargs["text"] is False
+    # Captured output is still surfaced as text to callers.
+    assert result.stdout == "hi\n"
+    assert result.success

@@ -12,7 +12,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from sparkrun.utils.shell import quote, quote_list, args_list_to_shell_str
+from sparkrun.utils.shell import quote, quote_list, args_list_to_shell_str, stdin_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,21 @@ class RemoteResult:
         return lines[-1] if lines else ""
 
 
+def _decode(raw: bytes | str | None) -> str:
+    """Normalize subprocess output to text.
+
+    Output is captured in binary mode (see :func:`_run_subprocess`), so this is
+    a decode in practice; ``errors="replace"`` keeps an odd byte from turning a
+    command failure into a UnicodeDecodeError. ``str`` is accepted unchanged so
+    a caller (or a test double) that already has text isn't a special case.
+    """
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    return raw.decode("utf-8", errors="replace")
+
+
 def _run_subprocess(
     cmd: list[str] | str,
     host: str,
@@ -97,11 +112,14 @@ def _run_subprocess(
     """
     t0 = time.monotonic()
     try:
+        # Bytes in, bytes out: text mode would rewrite every "\n" in the script
+        # to os.linesep, which breaks the remote bash on a Windows control
+        # machine (see utils.shell.stdin_bytes).
         proc = subprocess.run(
             cmd,
-            input=input_data,
+            input=stdin_bytes(input_data) if input_data is not None else None,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=timeout,
             shell=shell,
         )
@@ -109,8 +127,8 @@ def _run_subprocess(
         result = RemoteResult(
             host=host,
             returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
+            stdout=_decode(proc.stdout),
+            stderr=_decode(proc.stderr),
         )
         if result.success:
             logger.debug("  %s <- %s OK (%.1fs)", label, host, elapsed)
@@ -122,7 +140,7 @@ def _run_subprocess(
                 host,
                 proc.returncode,
                 elapsed,
-                proc.stderr.strip()[:200],
+                result.stderr.strip()[:200],
             )
         return result
     except subprocess.TimeoutExpired:
@@ -268,16 +286,16 @@ def run_remote_script_streaming(
         if quiet:
             proc = subprocess.run(
                 cmd,
-                input=script,
-                text=True,
+                input=stdin_bytes(script),
+                text=False,
                 timeout=timeout,
                 capture_output=True,
             )
         else:
             proc = subprocess.run(
                 cmd,
-                input=script,
-                text=True,
+                input=stdin_bytes(script),
+                text=False,
                 timeout=timeout,
                 # stdout/stderr go to terminal (no capture)
                 stdout=None,
