@@ -766,7 +766,15 @@ def launch_inference(
                 backends=backends,
             )
         except Exception:
-            logger.debug("Failed to save job metadata: %s", cluster_id, exc_info=True)
+            # Not fatal to the launch, but it is not cosmetic either: without
+            # metadata, `stop` and `logs` can't recover this job's hosts from
+            # the cluster id alone.  Warn rather than whisper at debug — a
+            # silent debug line hid a total write failure on Windows.
+            logger.warning(
+                "Could not save job metadata for %s; `sparkrun logs`/`stop` may not find this job by cluster id (pass --hosts if so)",
+                cluster_id,
+                exc_info=True,
+            )
 
     # Pre-launch preparation (post-container builds)
     runtime.prepare(

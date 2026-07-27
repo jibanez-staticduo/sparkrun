@@ -39,6 +39,8 @@ from typing import Any, TYPE_CHECKING, Optional
 
 import yaml
 
+from sparkrun.utils.fs import open_private_write
+
 if TYPE_CHECKING:
     from sparkrun.core.backend_select import BackendBundle
     from sparkrun.core.context import SparkrunContext
@@ -501,7 +503,10 @@ def save_job_metadata(
     # O_NOFOLLOW refuses to write through a symlink: if another local user
     # pre-planted ``<digest>.yaml`` as a link to a file they can read, the open
     # fails (ELOOP) rather than leaking the key through the link's target.
-    fd = os.open(meta_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    # (open_private_write applies it only where it exists — naming it directly
+    # is an AttributeError on a Windows control node, which meant no job
+    # metadata was written there at all.)
+    fd = open_private_write(meta_path)
     with os.fdopen(fd, "w") as f:
         yaml.safe_dump(meta, f, default_flow_style=False)
     # If the file pre-existed as a regular file with looser perms, O_CREAT won't

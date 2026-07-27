@@ -28,6 +28,7 @@ from sparkrun.proxy import (
     DEFAULT_UI_USERNAME,
 )
 from sparkrun.proxy.discovery import DiscoveredEndpoint
+from sparkrun.utils.fs import open_private_write
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ def write_config(config_dict: dict[str, Any], config_path: Path | None = None) -
     # follow a symlink at the target path (mirrors orchestration.job_metadata);
     # _restrict_file_permissions afterwards repairs perms on a pre-existing file
     # written by an older version under the default umask.
-    fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    fd = open_private_write(config_path)
     with os.fdopen(fd, "w") as f:
         yaml.safe_dump(config_dict, f, default_flow_style=False, sort_keys=False)
     _restrict_file_permissions(config_path)
@@ -393,7 +394,7 @@ class ProxyEngine:
         _restrict_dir_permissions(self.state_dir)
         # The autodiscover config carries the master_key, so create it owner-only
         # (no default-umask window) and refuse to follow a symlink at the target.
-        fd = os.open(self._autodiscover_config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        fd = open_private_write(self._autodiscover_config_path)
         with os.fdopen(fd, "w") as f:
             yaml.safe_dump(cfg, f, default_flow_style=False)
         _restrict_file_permissions(self._autodiscover_config_path)

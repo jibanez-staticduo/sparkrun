@@ -339,6 +339,29 @@ def test_save_job_metadata_refuses_symlinked_target(tmp_path: Path, mock_recipe)
     assert victim.read_text() == "untouched"  # write was not followed through
 
 
+def test_save_job_metadata_writes_where_o_nofollow_is_unavailable(tmp_path: Path, mock_recipe, monkeypatch):
+    """A Windows control node has no ``os.O_NOFOLLOW``.
+
+    Naming it directly raised AttributeError before the launcher's broad
+    ``except`` swallowed it, so a Windows machine wrote *no* job metadata for
+    the jobs it launched — and then `logs` and `stop` could not resolve their
+    hosts from the cluster id.  The symlink hardening is POSIX-only by nature;
+    losing it must not cost us the write itself.
+    """
+    import os
+
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+
+    intent = "b" * INTENT_ID_LEN
+    token = "f" * PLACEMENT_TOKEN_LEN
+    cid = "sparkrun_%s_%s" % (intent, token)
+    save_job_metadata(cid, mock_recipe, ["h1", "h2"], cache_dir=str(tmp_path))
+
+    meta = load_job_metadata(cid, cache_dir=str(tmp_path))
+    assert meta is not None
+    assert meta["hosts"] == ["h1", "h2"]
+
+
 # ---------------------------------------------------------------------------
 # api.stop recipe path: status-driven discovery
 # ---------------------------------------------------------------------------
