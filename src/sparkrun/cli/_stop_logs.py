@@ -164,8 +164,16 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
     # resolution + cross-executor merge + display classification).
     result = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
 
+    # A host that errored during discovery may still be running containers —
+    # it must not silently read as "nothing to stop".
+    if result.errors:
+        for err_host, err in sorted(result.errors.items()):
+            click.echo("Error: could not query %s: %s" % (err_host, err), err=True)
+
     if result.total_containers == 0:
         click.echo("No sparkrun containers running.")
+        if result.errors:
+            sys.exit(1)
         return
 
     # Summarise what was found
@@ -225,6 +233,7 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
     if failed_hosts:
         for failed_host, err in sorted(failed_hosts.items()):
             click.echo("Error: failed to stop containers on %s: %s" % (failed_host, err), err=True)
+    if failed_hosts or result.errors:
         sys.exit(1)
 
 

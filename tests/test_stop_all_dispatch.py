@@ -84,3 +84,48 @@ def test_stop_all_success_cleans_metadata_and_reports(monkeypatch):
     assert result.exit_code == 0
     assert removed == ["sparkrun_aaaabbbbccccdddd_eeeeffff0000"]
     assert "Stopped 1 job(s), 1 container(s) across 1 host(s)." in result.output
+
+
+def test_query_status_dispatches_locally_for_local_host(monkeypatch):
+    """Status discovery must not SSH to a local host (no self-SSH required)."""
+    from sparkrun.orchestration.executors.docker import DockerExecutor
+
+    def mock_local_script(script, dry_run=False):
+        assert "docker ps" in script
+        return RemoteResult(host="localhost", returncode=0, stdout="", stderr="")
+
+    def fail_if_sshed(*args, **kwargs):
+        raise AssertionError("query_status attempted SSH for a local host")
+
+    monkeypatch.setattr("sparkrun.orchestration.primitives.should_run_locally", lambda host, ssh_user=None: True)
+    monkeypatch.setattr("sparkrun.orchestration.primitives.run_local_script", mock_local_script)
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", fail_if_sshed)
+
+    status = DockerExecutor().query_status(["localhost"])
+    occ = status.for_host("localhost")
+    assert occ is not None, "local host missing from status (dispatch failed)"
+    assert occ.workloads == ()
+
+
+def test_stop_all_discovery_error_exits_nonzero(monkeypatch):
+    """A host that errors during discovery must not read as 'nothing to stop'."""
+
+    def erroring_report(hosts, *, executor=None, cluster=None, ssh_kwargs=None, sctx=None):
+        return ClusterStatusResult(
+            groups={},
+            solo_entries=[],
+            errors={"localhost": "Host key verification failed."},
+            idle_hosts=[],
+            pending_ops=[],
+            total_containers=0,
+            host_count=1,
+        )
+
+    monkeypatch.setattr("sparkrun.api.status_report", erroring_report)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["stop", "--all", "--hosts", "localhost"], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "could not query localhost" in result.output
+    assert "Host key verification failed." in result.output
