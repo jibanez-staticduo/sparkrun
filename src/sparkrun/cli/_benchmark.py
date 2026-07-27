@@ -55,6 +55,30 @@ def _resolve_resume_prompt(
     return True
 
 
+def _resolve_complete_prompt(
+    state,
+    on_complete_state: "Callable[[Any], bool] | None",
+) -> bool:
+    """Decide whether to delete COMPLETE prior state and re-measure (mode AUTO).
+
+    Resolution order mirrors :func:`_resolve_resume_prompt`:
+    1. Explicit ``on_complete_state`` callback — caller drives the answer.
+    2. TTY: ``click.confirm`` with default=True (re-measure).
+    3. Non-TTY: ``False`` — reuse deterministically; the API layer warns that
+       cached results are being re-emitted.
+    """
+    if on_complete_state is not None:
+        return bool(on_complete_state(state))
+    import sys as _sys
+
+    if _sys.stdin.isatty():
+        return click.confirm(
+            "Found COMPLETE benchmark state — reusing it re-emits the previous results without running anything. Delete and re-measure?",
+            default=True,
+        )
+    return False
+
+
 class _BenchmarkGroup(click.Group):
     """Click group for ``sparkrun benchmark`` with:
 
@@ -448,6 +472,7 @@ def _run_benchmark(
     fresh: bool = False,
     resume_mode: "ResumeMode | None" = None,
     on_prompt_required: "Callable[[Any], bool] | None" = None,
+    on_complete_state: "Callable[[Any], bool] | None" = None,
     submission_id_for_extras: str | None = None,
     scheduler_name: str | None = None,
     host_list=None,
@@ -486,6 +511,12 @@ def _run_benchmark(
     # task count for the resumed run.
     if on_prompt_required is None:
         on_prompt_required = lambda state: _resolve_resume_prompt(state, len(state.schedule), None)  # noqa: E731
+
+    # Same wiring for COMPLETE prior state: reusing it re-emits recorded
+    # results without measuring, so AUTO mode asks (TTY) or reuses loudly
+    # (non-TTY) via ``_resolve_complete_prompt``.
+    if on_complete_state is None:
+        on_complete_state = lambda state: _resolve_complete_prompt(state, None)  # noqa: E731
 
     # Parse bench_options key=value strings into a dict for BenchmarkOptions.
     # Validation (insecure api_key, malformed) happens in _execute_benchmark.
@@ -565,6 +596,7 @@ def _run_benchmark(
         progress_callback=None,
         state_extras=state_extras,
         on_prompt_required=on_prompt_required,
+        on_complete_state=on_complete_state,
     )
 
     class _CliEmitter(_ProgressEmitter):

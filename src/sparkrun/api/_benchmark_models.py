@@ -154,6 +154,11 @@ class BenchmarkOptions:
     on_prompt_required: "Callable[[Any], bool] | None" = None
     """Callback invoked when the CLI would show a confirmation prompt.
     Return ``True`` to accept, ``False`` to cancel.  Step 4 wires this."""
+    on_complete_state: "Callable[[Any], bool] | None" = None
+    """Callback invoked under ``ResumeMode.AUTO`` when prior benchmark state is
+    already COMPLETE.  Return ``True`` to delete it and re-measure, ``False`` to
+    re-emit the recorded results.  When ``None``, complete state is reused —
+    with a warning, never silently."""
 
 
 # --------------------------------------------------------------------------

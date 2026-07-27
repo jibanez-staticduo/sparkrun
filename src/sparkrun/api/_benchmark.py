@@ -7,6 +7,7 @@ callers get the full flow with no Click / sys.exit coupling.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -233,6 +234,7 @@ def _execute_benchmark(
     export_results_files = options.export_files
     resume_mode = options.resume
     on_prompt_required = options.on_prompt_required
+    on_complete_state = options.on_complete_state
     submission_id_for_extras = options.state_extras.get("submission_id") if options.state_extras else None
     scheduler_name = options.scheduler
     category = options.category
@@ -509,12 +511,22 @@ def _execute_benchmark(
     if tasks is not None:
         from sparkrun.benchmarking.run_state import BenchmarkRunState, derive_benchmark_id
 
+        # Fingerprint the effective recipe configuration (canonical resolved
+        # content + user overrides) so two recipes sharing an intent — same
+        # model, port, parallelism — but differing in serve configuration
+        # (e.g. --speculative-config) derive distinct benchmark IDs.  Declared
+        # configuration only: resolved container digests and placement stay
+        # out, keeping the ID stable across relaunches of the same workload.
+        fp_raw = json.dumps(recipe.to_dict(overrides=overrides), sort_keys=True, default=str)
+        recipe_fingerprint = hashlib.sha256(fp_raw.encode()).hexdigest()[:12]
+
         benchmark_id = derive_benchmark_id(
             cluster_id,
             fw.framework_name,
             profile,
             bench_args,
             [t.schedule_entry for t in tasks],
+            recipe_fingerprint=recipe_fingerprint,
         )
 
         state_dir = (config.cache_dir / "benchmarks" / benchmark_id) if config else None
@@ -534,6 +546,27 @@ def _execute_benchmark(
                     shutil.rmtree(state_dir)
                     logger.debug("Deleted complete benchmark state at %s (--fresh)", state_dir)
                 existing_state = None
+            else:
+                # "Resuming" COMPLETE state runs zero tasks and re-emits the
+                # previous run's results into the new output — which looks
+                # exactly like a real measurement.  That must never happen
+                # silently.  AUTO consults the caller's callback (the CLI
+                # wires an interactive prompt); IF_EXISTS/REQUIRED asked for
+                # resume explicitly, so reuse — but say so.
+                remeasure = False
+                if resume_mode == ResumeMode.AUTO and on_complete_state is not None:
+                    remeasure = bool(on_complete_state(existing_state))
+                if remeasure:
+                    if state_dir and state_dir.exists():
+                        shutil.rmtree(state_dir)
+                        logger.debug("Deleted complete benchmark state at %s (user chose re-measure)", state_dir)
+                    existing_state = None
+                else:
+                    emitter.warning(
+                        "Prior benchmark state for %s is COMPLETE — re-emitting its recorded results; no requests will be sent. Use --fresh to re-measure."
+                        % benchmark_id
+                    )
+                    bench_result.resumed = True
         else:
             if resume_mode == ResumeMode.FRESH:
                 if state_dir and state_dir.exists():
