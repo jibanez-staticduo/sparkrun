@@ -67,6 +67,39 @@ def test_derive_benchmark_id_format(tmp_path: Path):
     assert re.fullmatch(r"bench_[0-9a-f]{12}", bid), f"Bad format: {bid!r}"
 
 
+def test_derive_benchmark_id_different_recipe_fingerprint(tmp_path: Path):
+    """Recipes sharing an intent but differing in content get distinct ids.
+
+    Two recipes with the same model/port/parallelism but a different serve
+    argument (different recipe fingerprint) are different workloads — resuming
+    one into the other's results would silently return wrong numbers.
+    """
+    id1 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="0" * 12)
+    id2 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="f" * 12)
+    assert id1 != id2
+
+
+def test_derive_benchmark_id_same_recipe_fingerprint_stable(tmp_path: Path):
+    """Same fingerprint (same declared workload) keeps the id stable across calls."""
+    id1 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="ab" * 6)
+    id2 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="ab" * 6)
+    assert id1 == id2
+
+
+def test_derive_benchmark_id_no_fingerprint_back_compat(tmp_path: Path):
+    """Omitting the fingerprint is identical to passing None (legacy callers)."""
+    id_omitted = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None)
+    id_none = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint=None)
+    assert id_omitted == id_none
+
+
+def test_derive_benchmark_id_fingerprint_changes_id(tmp_path: Path):
+    """A fingerprinted id differs from the legacy un-fingerprinted id."""
+    id_legacy = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None)
+    id_fp = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="0" * 12)
+    assert id_legacy != id_fp
+
+
 # ---------------------------------------------------------------------------
 # BenchmarkRunState.save / load
 # ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@ def derive_benchmark_id(
     profile: str | None,
     base_args: dict[str, Any],
     schedule: list[dict[str, Any]] | None,
+    recipe_fingerprint: str | None = None,
 ) -> str:
     """Stable ID derived from canonical-JSON of inputs. Returns ``'bench_<12hex>'``.
 
@@ -40,6 +41,16 @@ def derive_benchmark_id(
     parsed via :func:`parse_cluster_id` and only its intent half is hashed, so a
     benchmark resumes successfully across relaunches that produce a fresh
     placement token but represent the same logical workload.
+
+    ``recipe_fingerprint`` extends the identity to the recipe's *content*
+    (declared serve configuration + user overrides): two recipes that share an
+    intent — same model, port, parallelism — but differ in a serve argument
+    (e.g. ``--speculative-config``) are different workloads and must never
+    resume into each other's results.  Obtain it from
+    :func:`sparkrun.orchestration.job_metadata.derive_recipe_fingerprint`,
+    which is the single definition of *what* gets hashed: declared
+    configuration only, never resolved artifacts or placement, so it is stable
+    across relaunches of the same logical workload.
 
     Malformed (legacy) cluster_ids that do not parse fall back to hashing the
     full string verbatim — they will not match a relaunch, but they also won't
@@ -64,6 +75,8 @@ def derive_benchmark_id(
         "base_args": base_args,
         "schedule": schedule,
     }
+    if recipe_fingerprint is not None:
+        payload["recipe_fingerprint"] = recipe_fingerprint
     raw = json.dumps(payload, sort_keys=True, default=str)
     digest = hashlib.sha256(raw.encode()).hexdigest()[:12]
     return "bench_%s" % digest

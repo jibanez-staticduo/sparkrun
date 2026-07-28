@@ -144,6 +144,28 @@ def _write_consolidated(state_dir: Path, consolidated: dict[str, Any]) -> Path:
     return p
 
 
+def _should_remeasure_complete_state(
+    resume_mode: "ResumeMode",
+    on_complete_state: "Callable[[Any], bool] | None",
+    existing_state: Any,
+) -> bool:
+    """Whether COMPLETE prior state should be discarded and re-measured.
+
+    "Resuming" COMPLETE state runs zero tasks and re-emits the previous run's
+    results into the new output — indistinguishable from a real measurement, so
+    it must never happen silently (the caller warns on the reuse path).
+
+    ``ResumeMode.AUTO`` delegates the choice to *on_complete_state* (the CLI
+    wires an interactive confirm); with no callback the library default is
+    reuse, matching prior behaviour.  ``IF_EXISTS`` / ``REQUIRED`` asked for a
+    resume explicitly, so they always reuse.  (``FRESH`` never reaches here —
+    it deletes the state before this decision.)
+    """
+    if resume_mode != ResumeMode.AUTO or on_complete_state is None:
+        return False
+    return bool(on_complete_state(existing_state))
+
+
 # ---------------------------------------------------------------------------
 # Core orchestration
 # ---------------------------------------------------------------------------
@@ -233,6 +255,7 @@ def _execute_benchmark(
     export_results_files = options.export_files
     resume_mode = options.resume
     on_prompt_required = options.on_prompt_required
+    on_complete_state = options.on_complete_state
     submission_id_for_extras = options.state_extras.get("submission_id") if options.state_extras else None
     scheduler_name = options.scheduler
     category = options.category
@@ -508,6 +531,15 @@ def _execute_benchmark(
 
     if tasks is not None:
         from sparkrun.benchmarking.run_state import BenchmarkRunState, derive_benchmark_id
+        from sparkrun.orchestration.job_metadata import derive_recipe_fingerprint
+
+        # The cluster_id's intent half — previously all derive_benchmark_id
+        # hashed — covers model, port and parallelism, so two recipes differing
+        # only in a serve argument (e.g. --speculative-config) collided and
+        # resumed into each other's results.  The fingerprint digests the
+        # declared serve configuration to separate them; it excludes resolved
+        # artifacts and placement, so the ID stays stable across relaunches.
+        recipe_fingerprint = derive_recipe_fingerprint(recipe, overrides)
 
         benchmark_id = derive_benchmark_id(
             cluster_id,
@@ -515,6 +547,7 @@ def _execute_benchmark(
             profile,
             bench_args,
             [t.schedule_entry for t in tasks],
+            recipe_fingerprint=recipe_fingerprint,
         )
 
         state_dir = (config.cache_dir / "benchmarks" / benchmark_id) if config else None
@@ -534,6 +567,17 @@ def _execute_benchmark(
                     shutil.rmtree(state_dir)
                     logger.debug("Deleted complete benchmark state at %s (--fresh)", state_dir)
                 existing_state = None
+            elif _should_remeasure_complete_state(resume_mode, on_complete_state, existing_state):
+                if state_dir and state_dir.exists():
+                    shutil.rmtree(state_dir)
+                    logger.debug("Deleted complete benchmark state at %s (user chose re-measure)", state_dir)
+                existing_state = None
+            else:
+                emitter.warning(
+                    "Prior benchmark state for %s is COMPLETE — re-emitting its recorded results; no requests will be sent. Use --fresh to re-measure."
+                    % benchmark_id
+                )
+                bench_result.resumed = True
         else:
             if resume_mode == ResumeMode.FRESH:
                 if state_dir and state_dir.exists():

@@ -239,3 +239,116 @@ def test_cli_fresh_flag_sets_fresh_mode():
             assert received["resume_mode"] == ResumeMode.FRESH
         else:
             assert result.exit_code != 2 or "mutually exclusive" not in (result.output or "")
+
+
+# ---------------------------------------------------------------------------
+# on_complete_state / _resolve_complete_prompt (complete prior state must
+# never be reused silently)
+# ---------------------------------------------------------------------------
+
+
+def test_should_remeasure_auto_honours_callback():
+    """AUTO delegates the decision to the caller's callback, both ways."""
+    from sparkrun.api._benchmark import _should_remeasure_complete_state
+
+    state = MagicMock()
+    seen = []
+
+    def cb(s):
+        seen.append(s)
+        return True
+
+    assert _should_remeasure_complete_state(ResumeMode.AUTO, cb, state) is True
+    assert seen == [state]
+    assert _should_remeasure_complete_state(ResumeMode.AUTO, lambda s: False, state) is False
+
+
+def test_should_remeasure_auto_without_callback_reuses():
+    """No callback (library default) → reuse; the caller warns about it."""
+    from sparkrun.api._benchmark import _should_remeasure_complete_state
+
+    assert _should_remeasure_complete_state(ResumeMode.AUTO, None, MagicMock()) is False
+
+
+def test_should_remeasure_explicit_resume_modes_never_prompt():
+    """IF_EXISTS / REQUIRED asked for a resume, so they reuse without consulting
+    the callback — even when one is wired (the CLI always wires one)."""
+    from sparkrun.api._benchmark import _should_remeasure_complete_state
+
+    called = []
+
+    def cb(s):
+        called.append(s)
+        return True
+
+    for mode in (ResumeMode.IF_EXISTS, ResumeMode.REQUIRED):
+        assert _should_remeasure_complete_state(mode, cb, MagicMock()) is False
+    assert called == []
+
+
+def test_api_on_complete_state_threaded_through():
+    received = []
+
+    def cb(state):
+        return True
+
+    with patch("sparkrun.api._benchmark._execute_benchmark", side_effect=_stub_execute_benchmark(received)):
+        from sparkrun.api import benchmark
+        from sparkrun.api._benchmark_models import BenchmarkOptions
+
+        benchmark(BenchmarkOptions(recipe="my-recipe", on_complete_state=cb))
+    assert received[0].on_complete_state is cb
+
+
+def test_resolve_complete_prompt_uses_callback_when_provided():
+    from sparkrun.cli._benchmark import _resolve_complete_prompt
+
+    state = MagicMock()
+    called_with = {}
+
+    def cb(s):
+        called_with["state"] = s
+        return False
+
+    result = _resolve_complete_prompt(state, on_complete_state=cb)
+    assert result is False
+    assert called_with["state"] is state
+
+
+def test_resolve_complete_prompt_callback_true():
+    from sparkrun.cli._benchmark import _resolve_complete_prompt
+
+    state = MagicMock()
+    assert _resolve_complete_prompt(state, on_complete_state=lambda s: True) is True
+
+
+def test_resolve_complete_prompt_non_tty_reuses():
+    """Non-TTY: deterministic reuse (False) — the API layer warns loudly."""
+    from unittest.mock import patch as _patch
+
+    from sparkrun.cli._benchmark import _resolve_complete_prompt
+
+    state = MagicMock()
+    with _patch("sys.stdin.isatty", lambda: False):
+        assert _resolve_complete_prompt(state, on_complete_state=None) is False
+
+
+def test_resolve_complete_prompt_tty_uses_click_confirm():
+    """TTY: click.confirm with default=True (re-measure)."""
+    from unittest.mock import patch as _patch
+
+    from sparkrun.cli._benchmark import _resolve_complete_prompt
+
+    state = MagicMock()
+    called = {}
+
+    def fake_confirm(msg, default):
+        called["msg"] = msg
+        called["default"] = default
+        return True
+
+    with _patch("sys.stdin.isatty", lambda: True), _patch("click.confirm", fake_confirm):
+        result = _resolve_complete_prompt(state, on_complete_state=None)
+    assert result is True
+    assert "re-measure" in called["msg"].lower()
+    assert called["default"] is True
