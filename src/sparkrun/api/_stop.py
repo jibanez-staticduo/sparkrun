@@ -53,6 +53,7 @@ def stop(
         resolve_cluster,
         resolve_recipe,
     )
+    from sparkrun.orchestration.docker import parse_teardown_removed
     from sparkrun.orchestration.executor import resolve_executor
     from sparkrun.orchestration.job_metadata import (
         generate_intent_id,
@@ -146,10 +147,10 @@ def stop(
 
     container_names = executor.enumerate_containers(cluster_id, len(target_hosts))
 
-    # Use cleanup_containers — the established teardown path used by the
-    # CLI.  Tests mock ``sparkrun.orchestration.primitives.cleanup_containers``;
-    # this keeps the api stop dispatch on the conventional path.
-    from sparkrun.orchestration.primitives import build_ssh_kwargs, cleanup_containers
+    # ``cleanup_containers_by_host`` is the shared teardown primitive: it
+    # dispatches local-vs-SSH per host, verifies the containers are
+    # actually gone, and reports what it removed per host.
+    from sparkrun.orchestration.primitives import build_ssh_kwargs, cleanup_containers_by_host
 
     config = sctx.config if sctx is not None else _maybe_load_config()
     if config is not None and cluster_def.user:
@@ -162,23 +163,42 @@ def stop(
 
     errors: list[str] = []
     try:
-        cleanup_containers(target_hosts, container_names, ssh_kwargs=ssh_kwargs)
-        removed_count = len(target_hosts)
-    except Exception as e:
+        results = cleanup_containers_by_host(
+            {host: list(container_names) for host in target_hosts},
+            ssh_kwargs=ssh_kwargs,
+        )
+    except Exception as e:  # pragma: no cover - defensive; the primitive absorbs per-host failures
         errors.append(str(e))
-        removed_count = 0
+        results = {}
 
-    # Cleanup persistent metadata after best-effort stop (matches CLI behaviour).
-    try:
-        remove_job_metadata(cluster_id, cache_dir=cache_dir)
-    except Exception:
-        logger.debug("Failed to remove job metadata for %s", cluster_id, exc_info=True)
+    hosts_failed = tuple(host for host in target_hosts if not (results.get(host) and results[host].success))
+    removed_count = sum(parse_teardown_removed(r.stdout) for r in results.values())
+    for host in hosts_failed:
+        r = results.get(host)
+        detail = ((r.stderr or r.stdout).strip() if r else "") or "teardown did not confirm"
+        errors.append("%s: %s" % (host, detail))
+
+    # Cleanup persistent metadata only once teardown is confirmed
+    # everywhere: while a container survives, the metadata still describes
+    # a live workload and is what ``stop``/``status`` use to find it again.
+    if hosts_failed:
+        logger.warning(
+            "Keeping job metadata for %s — teardown did not confirm on: %s",
+            cluster_id,
+            ", ".join(hosts_failed),
+        )
+    else:
+        try:
+            remove_job_metadata(cluster_id, cache_dir=cache_dir)
+        except Exception:
+            logger.debug("Failed to remove job metadata for %s", cluster_id, exc_info=True)
 
     return StopResult(
         cluster_id=cluster_id,
         hosts_targeted=tuple(target_hosts),
         containers_removed=removed_count,
         errors=tuple(errors),
+        hosts_failed=hosts_failed,
     )
 
 

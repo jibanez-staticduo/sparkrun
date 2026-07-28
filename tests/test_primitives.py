@@ -657,7 +657,7 @@ def test_stop_by_cluster_id_cross_user_uses_ssh():
     with (
         patch("sparkrun.orchestration.job_metadata.load_job_metadata", return_value={"hosts": ["127.0.0.1"]}),
         patch("sparkrun.orchestration.job_metadata.remove_job_metadata"),
-        patch("sparkrun.orchestration.primitives.cleanup_containers") as mock_remote,
+        patch("sparkrun.orchestration.primitives.cleanup_containers_by_host") as mock_remote,
         patch("sparkrun.orchestration.primitives.cleanup_containers_local") as mock_local,
     ):
         api.stop(cluster_id="sparkrun_abc12345", hosts=("127.0.0.1",), cache_dir="/tmp/cache")

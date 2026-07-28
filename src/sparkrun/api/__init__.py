@@ -63,12 +63,14 @@ from sparkrun.api._models import (
     LogLine,
     RunOptions,
     RunResult,
+    StopAllResult,
     StopResult,
 )
 from sparkrun.api._run import run
 from sparkrun.api._schedule import schedule
 from sparkrun.api._status import status, status_report
 from sparkrun.api._stop import stop
+from sparkrun.api._stop_all import stop_all
 from sparkrun.api._telemetry import LiveMonitorSession, live_monitor, open_live_monitor, open_telemetry
 
 __all__ = [
@@ -83,6 +85,7 @@ __all__ = [
     "RunOptions",
     "RunResult",
     "StopResult",
+    "StopAllResult",
     "LogLine",
     "JobInfo",
     # Benchmark data models
@@ -108,6 +111,7 @@ __all__ = [
     # Functions
     "run",
     "stop",
+    "stop_all",
     "logs",
     "schedule",
     "status",

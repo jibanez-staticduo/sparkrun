@@ -5118,11 +5118,14 @@ class TestClusterUserInCLICommands:
 
         captured_kwargs = {}
 
-        def mock_cleanup(host_list, container_names, ssh_kwargs=None, dry_run=False):
+        def mock_cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None):
+            from sparkrun.orchestration.ssh import RemoteResult
+
             captured_kwargs.update(ssh_kwargs or {})
+            return {h: RemoteResult(host=h, returncode=0, stdout="sparkrun_removed=1", stderr="") for h in host_containers}
 
         monkeypatch.setattr(
-            "sparkrun.orchestration.primitives.cleanup_containers",
+            "sparkrun.orchestration.primitives.cleanup_containers_by_host",
             mock_cleanup,
         )
         monkeypatch.setattr("sparkrun.orchestration.job_metadata.generate_intent_id", lambda *a, **kw: "aabbccdd1122")
@@ -5538,7 +5541,7 @@ class TestStopLogsClusterIdAndOverrides:
             )
 
         with (
-            mock.patch("sparkrun.orchestration.primitives.cleanup_containers"),
+            mock.patch("sparkrun.orchestration.primitives.cleanup_containers_by_host"),
             mock.patch("sparkrun.orchestration.job_metadata.generate_intent_id", return_value="aabbccdd1122") as mock_gen,
             mock.patch.object(DockerExecutor, "query_status", fake_query_status),
             mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr="mocked")),
@@ -5574,7 +5577,7 @@ class TestStopLogsClusterIdAndOverrides:
             )
 
         with (
-            mock.patch("sparkrun.orchestration.primitives.cleanup_containers"),
+            mock.patch("sparkrun.orchestration.primitives.cleanup_containers_by_host"),
             mock.patch("sparkrun.orchestration.job_metadata.generate_intent_id", return_value="aabbccdd1122") as mock_gen,
             mock.patch.object(DockerExecutor, "query_status", fake_query_status),
             mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr="mocked")),
@@ -5611,7 +5614,7 @@ class TestStopLogsClusterIdAndOverrides:
         }
         (jobs_dir / "aabbccdd1122.yaml").write_text(yaml.safe_dump(meta))
 
-        with mock.patch("sparkrun.orchestration.primitives.cleanup_containers") as mock_cleanup:
+        with mock.patch("sparkrun.orchestration.primitives.cleanup_containers_by_host") as mock_cleanup:
             result = runner.invoke(main, ["stop", "aabbccdd1122"])
             assert result.exit_code == 0
             assert "stopped" in result.output.lower()

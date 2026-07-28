@@ -478,6 +478,9 @@ class LocalExecutor(Executor):
         ) % pid_dir
 
         ssh_kwargs = ssh_kwargs or {}
+        # ``allow_local=True`` for the same reason as the docker executor:
+        # both share the ``"host"`` status scope and are merged, so a host
+        # without self-SSH must not hide its native workloads either.
         results = run_remote_scripts_parallel(
             hosts,
             script,
@@ -486,6 +489,7 @@ class LocalExecutor(Executor):
             ssh_options=ssh_kwargs.get("ssh_options"),
             timeout=ssh_kwargs.get("timeout", 15),
             quiet=True,
+            allow_local=True,
         )
         by_host = {r.host: r for r in results}
         host_entries: list[HostOccupancy] = []

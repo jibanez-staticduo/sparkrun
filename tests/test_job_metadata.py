@@ -435,8 +435,14 @@ def test_api_stop_recipe_path_succeeds_on_single_match(tmp_path, intent_recipe, 
     from sparkrun.orchestration.executors.docker import DockerExecutor
 
     monkeypatch.setattr(DockerExecutor, "query_status", fake_query_status)
+
     # Stub cleanup to short-circuit the actual SSH dispatch.
-    monkeypatch.setattr("sparkrun.orchestration.primitives.cleanup_containers", lambda *a, **kw: None)
+    def fake_cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None):
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        return {h: RemoteResult(host=h, returncode=0, stdout="sparkrun_removed=1", stderr="") for h in host_containers}
+
+    monkeypatch.setattr("sparkrun.orchestration.primitives.cleanup_containers_by_host", fake_cleanup)
 
     result = api.stop(recipe=intent_recipe, hosts=("h1",), cache_dir=str(tmp_path))
     assert result.cluster_id == cid

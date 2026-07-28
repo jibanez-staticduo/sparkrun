@@ -6,10 +6,11 @@ results to the TTY.  Business logic (cluster_id derivation, executor
 selection from metadata, parallel host dispatch, log streaming)
 lives in :mod:`sparkrun.api`.
 
-The ``--all`` discovery path remains in this module because it has
-no API equivalent yet — that discovery is presentation-heavy (lists
-running clusters by recipe) and would expand the API surface for
-limited benefit.
+``--all`` is no different: discovery and teardown live in
+:func:`sparkrun.api.stop_all`, and this module only prints the
+discovered workloads between the two and maps the result onto an exit
+code.  (It used to own that logic, which meant library callers — the
+desktop sidecar included — could neither do it nor inherit its fixes.)
 """
 
 from __future__ import annotations
@@ -117,10 +118,13 @@ def stop(ctx, target, hosts, hosts_file, cluster_name, stop_all, tp_override, po
         click.echo("Error: %s" % e, err=True)
         sys.exit(1)
 
-    if result.errors:
-        for line in result.errors:
-            click.echo("Warning: %s" % line, err=True)
+    # A teardown that did not confirm is an error, not a warning: the
+    # containers may still be running.  Same contract as ``--all``.
+    for line in result.errors:
+        click.echo("Error: %s" % line, err=True)
     click.echo("Workload stopped on %d host(s)." % len(result.hosts_targeted))
+    if not result.success:
+        sys.exit(1)
 
 
 def _hosts_for_cluster_id_target(target, hosts, hosts_file, cluster_name, config) -> list[str]:
@@ -145,16 +149,14 @@ def _hosts_for_cluster_id_target(target, hosts, hosts_file, cluster_name, config
 
 
 def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
-    """Discover and stop all sparkrun containers on the target hosts.
+    """Render ``sparkrun stop --all``.
 
-    Kept inline because the discovery-heavy presentation has no API
-    equivalent — it prints a summary of running clusters before
-    issuing teardown commands.
+    Discovery and teardown live in :func:`sparkrun.api.stop_all`; this
+    prints the discovered workloads between the two (which is why the
+    snapshot is passed back in rather than re-queried) and translates the
+    result into output and an exit code.
     """
-    from sparkrun.orchestration.docker import docker_stop_cmd
-    from sparkrun.orchestration.job_metadata import remove_job_metadata
     from sparkrun.orchestration.primitives import build_ssh_kwargs
-    from sparkrun.orchestration.ssh import run_remote_command
 
     host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
 
@@ -163,48 +165,48 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
     click.echo("Discovering sparkrun containers on %d host(s)..." % len(host_list))
     # Status flows from the single source, ``api.status_report`` (cluster-aware
     # resolution + cross-executor merge + display classification).
-    result = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
+    discovered = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
 
-    if result.total_containers == 0:
+    # A host that errored during discovery may still be running containers —
+    # it must not silently read as "nothing to stop".
+    for err_host, err in sorted(discovered.errors.items()):
+        click.echo("Error: could not query %s: %s" % (err_host, err), err=True)
+
+    if discovered.total_containers == 0:
+        if discovered.errors:
+            click.echo("No sparkrun containers found on the hosts that could be queried.")
+            sys.exit(1)
         click.echo("No sparkrun containers running.")
         return
 
     # Summarise what was found
-    jobs_count = len(result.groups) + len(result.solo_entries)
-    click.echo("Found %d job(s), %d container(s):" % (jobs_count, result.total_containers))
-    for cid, group in result.groups.items():
+    jobs_count = len(discovered.groups) + len(discovered.solo_entries)
+    click.echo("Found %d job(s), %d container(s):" % (jobs_count, discovered.total_containers))
+    for cid, group in discovered.groups.items():
         recipe_label = group.meta.get("recipe", "unknown")
         click.echo("  %s (%s) — %d container(s)" % (cid, recipe_label, len(group.members)))
-    for entry in result.solo_entries:
+    for entry in discovered.solo_entries:
         click.echo("  %s on %s" % (entry.name, entry.host))
 
-    # Build per-host container name mapping
-    host_containers: dict[str, list[str]] = {}
-    for cid, group in result.groups.items():
-        for host, role, status, image in group.members:
-            container_name = "%s_%s" % (cid, role)
-            host_containers.setdefault(host, []).append(container_name)
-    for entry in result.solo_entries:
-        host_containers.setdefault(entry.host, []).append(entry.name)
-
-    # Stop containers per host
     click.echo("Stopping all containers...")
-    container_count = 0
-    for host, names in host_containers.items():
-        cmds = "; ".join(docker_stop_cmd(n) for n in names)
-        run_remote_command(host, cmds, timeout=30, dry_run=dry_run, **ssh_kwargs)
-        container_count += len(names)
+    result = api.stop_all(
+        host_list,
+        cluster=cluster_name or None,
+        cache_dir=str(config.cache_dir),
+        ssh_kwargs=ssh_kwargs,
+        dry_run=dry_run,
+        discovered=discovered,
+        sctx=sctx,
+    )
 
-    # Clean up job metadata for discovered clusters (skip in dry-run mode)
-    if not dry_run:
-        for cid in result.groups:
-            remove_job_metadata(cid, cache_dir=str(config.cache_dir))
-        for entry in result.solo_entries:
-            solo_cid = entry.name.removesuffix("_solo") if entry.name.endswith("_solo") else entry.name
-            remove_job_metadata(solo_cid, cache_dir=str(config.cache_dir))
-
-    hosts_touched = len(host_containers)
-    click.echo("Stopped %d job(s), %d container(s) across %d host(s)." % (jobs_count, container_count, hosts_touched))
+    click.echo(
+        "Stopped %d job(s), %d container(s) across %d host(s)."
+        % (result.jobs_stopped, result.containers_removed, len(result.hosts_stopped))
+    )
+    for failed_host, err in sorted(result.hosts_failed.items()):
+        click.echo("Error: failed to stop containers on %s: %s" % (failed_host, err), err=True)
+    if not result.success:
+        sys.exit(1)
 
 
 @click.command("logs")

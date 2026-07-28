@@ -440,6 +440,11 @@ class DockerExecutor(Executor):
 
         ssh_kwargs = ssh_kwargs or {}
         script = "docker ps --no-trunc --format '{{json .}}' 2>/dev/null || true\n"
+        # ``allow_local=True``: a bare SSH to localhost fails on a host
+        # without self-SSH configured, which would make every local
+        # workload invisible to status discovery — and to everything
+        # downstream of it (stop --all, cluster status, scheduler
+        # occupancy, the monitor TUI).
         results = run_remote_scripts_parallel(
             hosts,
             script,
@@ -448,6 +453,7 @@ class DockerExecutor(Executor):
             ssh_options=ssh_kwargs.get("ssh_options"),
             timeout=ssh_kwargs.get("timeout", 15),
             quiet=True,
+            allow_local=True,
         )
 
         # Map results back to input host order.
