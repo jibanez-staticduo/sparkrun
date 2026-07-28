@@ -46,7 +46,9 @@ def derive_benchmark_id(
     (declared serve configuration + user overrides): two recipes that share an
     intent — same model, port, parallelism — but differ in a serve argument
     (e.g. ``--speculative-config``) are different workloads and must never
-    resume into each other's results.  The fingerprint hashes declared
+    resume into each other's results.  Obtain it from
+    :func:`sparkrun.orchestration.job_metadata.derive_recipe_fingerprint`,
+    which is the single definition of *what* gets hashed: declared
     configuration only, never resolved artifacts or placement, so it is stable
     across relaunches of the same logical workload.
 

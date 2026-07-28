@@ -247,6 +247,45 @@ def test_cli_fresh_flag_sets_fresh_mode():
 # ---------------------------------------------------------------------------
 
 
+def test_should_remeasure_auto_honours_callback():
+    """AUTO delegates the decision to the caller's callback, both ways."""
+    from sparkrun.api._benchmark import _should_remeasure_complete_state
+
+    state = MagicMock()
+    seen = []
+
+    def cb(s):
+        seen.append(s)
+        return True
+
+    assert _should_remeasure_complete_state(ResumeMode.AUTO, cb, state) is True
+    assert seen == [state]
+    assert _should_remeasure_complete_state(ResumeMode.AUTO, lambda s: False, state) is False
+
+
+def test_should_remeasure_auto_without_callback_reuses():
+    """No callback (library default) → reuse; the caller warns about it."""
+    from sparkrun.api._benchmark import _should_remeasure_complete_state
+
+    assert _should_remeasure_complete_state(ResumeMode.AUTO, None, MagicMock()) is False
+
+
+def test_should_remeasure_explicit_resume_modes_never_prompt():
+    """IF_EXISTS / REQUIRED asked for a resume, so they reuse without consulting
+    the callback — even when one is wired (the CLI always wires one)."""
+    from sparkrun.api._benchmark import _should_remeasure_complete_state
+
+    called = []
+
+    def cb(s):
+        called.append(s)
+        return True
+
+    for mode in (ResumeMode.IF_EXISTS, ResumeMode.REQUIRED):
+        assert _should_remeasure_complete_state(mode, cb, MagicMock()) is False
+    assert called == []
+
+
 def test_api_on_complete_state_threaded_through():
     received = []
 

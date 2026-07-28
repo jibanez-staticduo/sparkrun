@@ -7,7 +7,6 @@ callers get the full flow with no Click / sys.exit coupling.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -143,6 +142,28 @@ def _write_consolidated(state_dir: Path, consolidated: dict[str, Any]) -> Path:
     p = state_dir / "consolidated.json"
     p.write_text(json.dumps(consolidated, indent=2))
     return p
+
+
+def _should_remeasure_complete_state(
+    resume_mode: "ResumeMode",
+    on_complete_state: "Callable[[Any], bool] | None",
+    existing_state: Any,
+) -> bool:
+    """Whether COMPLETE prior state should be discarded and re-measured.
+
+    "Resuming" COMPLETE state runs zero tasks and re-emits the previous run's
+    results into the new output — indistinguishable from a real measurement, so
+    it must never happen silently (the caller warns on the reuse path).
+
+    ``ResumeMode.AUTO`` delegates the choice to *on_complete_state* (the CLI
+    wires an interactive confirm); with no callback the library default is
+    reuse, matching prior behaviour.  ``IF_EXISTS`` / ``REQUIRED`` asked for a
+    resume explicitly, so they always reuse.  (``FRESH`` never reaches here —
+    it deletes the state before this decision.)
+    """
+    if resume_mode != ResumeMode.AUTO or on_complete_state is None:
+        return False
+    return bool(on_complete_state(existing_state))
 
 
 # ---------------------------------------------------------------------------
@@ -510,15 +531,15 @@ def _execute_benchmark(
 
     if tasks is not None:
         from sparkrun.benchmarking.run_state import BenchmarkRunState, derive_benchmark_id
+        from sparkrun.orchestration.job_metadata import derive_recipe_fingerprint
 
-        # Fingerprint the effective recipe configuration (canonical resolved
-        # content + user overrides) so two recipes sharing an intent — same
-        # model, port, parallelism — but differing in serve configuration
-        # (e.g. --speculative-config) derive distinct benchmark IDs.  Declared
-        # configuration only: resolved container digests and placement stay
-        # out, keeping the ID stable across relaunches of the same workload.
-        fp_raw = json.dumps(recipe.to_dict(overrides=overrides), sort_keys=True, default=str)
-        recipe_fingerprint = hashlib.sha256(fp_raw.encode()).hexdigest()[:12]
+        # The cluster_id's intent half — previously all derive_benchmark_id
+        # hashed — covers model, port and parallelism, so two recipes differing
+        # only in a serve argument (e.g. --speculative-config) collided and
+        # resumed into each other's results.  The fingerprint digests the
+        # declared serve configuration to separate them; it excludes resolved
+        # artifacts and placement, so the ID stays stable across relaunches.
+        recipe_fingerprint = derive_recipe_fingerprint(recipe, overrides)
 
         benchmark_id = derive_benchmark_id(
             cluster_id,
@@ -546,27 +567,17 @@ def _execute_benchmark(
                     shutil.rmtree(state_dir)
                     logger.debug("Deleted complete benchmark state at %s (--fresh)", state_dir)
                 existing_state = None
+            elif _should_remeasure_complete_state(resume_mode, on_complete_state, existing_state):
+                if state_dir and state_dir.exists():
+                    shutil.rmtree(state_dir)
+                    logger.debug("Deleted complete benchmark state at %s (user chose re-measure)", state_dir)
+                existing_state = None
             else:
-                # "Resuming" COMPLETE state runs zero tasks and re-emits the
-                # previous run's results into the new output — which looks
-                # exactly like a real measurement.  That must never happen
-                # silently.  AUTO consults the caller's callback (the CLI
-                # wires an interactive prompt); IF_EXISTS/REQUIRED asked for
-                # resume explicitly, so reuse — but say so.
-                remeasure = False
-                if resume_mode == ResumeMode.AUTO and on_complete_state is not None:
-                    remeasure = bool(on_complete_state(existing_state))
-                if remeasure:
-                    if state_dir and state_dir.exists():
-                        shutil.rmtree(state_dir)
-                        logger.debug("Deleted complete benchmark state at %s (user chose re-measure)", state_dir)
-                    existing_state = None
-                else:
-                    emitter.warning(
-                        "Prior benchmark state for %s is COMPLETE — re-emitting its recorded results; no requests will be sent. Use --fresh to re-measure."
-                        % benchmark_id
-                    )
-                    bench_result.resumed = True
+                emitter.warning(
+                    "Prior benchmark state for %s is COMPLETE — re-emitting its recorded results; no requests will be sent. Use --fresh to re-measure."
+                    % benchmark_id
+                )
+                bench_result.resumed = True
         else:
             if resume_mode == ResumeMode.FRESH:
                 if state_dir and state_dir.exists():

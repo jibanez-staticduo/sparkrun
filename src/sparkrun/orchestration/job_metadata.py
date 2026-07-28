@@ -24,11 +24,18 @@ from CLI inputs alone) can still recover workloads at stop / logs time:
 
 The composite ``cluster_id = "sparkrun_" + intent_id + "_" + placement_token``
 has two ``_`` separators (after ``sparkrun`` and after intent_id).
+
+Separately, :func:`derive_recipe_fingerprint` digests a recipe's full *serve
+configuration*.  It is **not** part of the cluster_id: the intent_id stays
+narrow on purpose so lookup paths keep matching a live workload, while
+consumers that must tell differently-configured workloads apart (benchmark
+identity) hash the fingerprint alongside it.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -205,6 +212,9 @@ def _resolve_override(key: str, overrides: dict | None, defaults: dict | None):
 INTENT_ID_LEN = 16
 PLACEMENT_TOKEN_BYTES = 6  # secrets.token_hex(PLACEMENT_TOKEN_BYTES) → PLACEMENT_TOKEN_LEN hex chars
 PLACEMENT_TOKEN_LEN = PLACEMENT_TOKEN_BYTES * 2
+# Length of the serve-configuration digest from :func:`derive_recipe_fingerprint`.
+# Not part of the cluster_id — it identifies *configuration*, not a workload.
+RECIPE_FINGERPRINT_LEN = 12
 
 _INTENT_ID_RE = re.compile(r"^[0-9a-f]{%d}$" % INTENT_ID_LEN)
 _PLACEMENT_TOKEN_RE = re.compile(r"^[0-9a-f]{%d}$" % PLACEMENT_TOKEN_LEN)
@@ -252,6 +262,84 @@ def generate_intent_id(recipe: "Recipe", overrides: dict | None = None) -> str:
 
     key = "\0".join(parts)
     return hashlib.sha256(key.encode()).hexdigest()[:INTENT_ID_LEN]
+
+
+def derive_recipe_fingerprint(recipe: "Recipe", overrides: dict | None = None) -> str:
+    """Deterministic :data:`RECIPE_FINGERPRINT_LEN`-char hex digest of a recipe's *serve configuration*.
+
+    The provenance peer of :func:`generate_intent_id`.  The intent_id answers
+    "which served endpoint is this?" and is deliberately narrow so ``stop`` /
+    ``status`` / ``logs`` keep finding a live workload across relaunches; this
+    answers "what exactly is being served?", so two recipes that share an
+    intent — same runtime, model, port, parallelism — but differ in a serve
+    argument (e.g. ``--max-num-batched-tokens``, ``--speculative-config``) are
+    distinguishable.  Consumers that must not conflate differently-configured
+    workloads hash this *alongside* the intent_id rather than widening the
+    intent_id itself (see
+    :func:`sparkrun.benchmarking.run_state.derive_benchmark_id`).
+
+    Hashes **declared** configuration only:
+
+    * the intent_id (runtime, model, port, served-model-name, parallelism)
+    * the resolved config chain — recipe ``defaults`` layered with *overrides*,
+      i.e. the serve-argument surface
+    * ``container``, ``command``, ``env``, ``model_revision``,
+      ``runtime_version``, ``layout``, ``min_nodes`` / ``max_nodes``.
+      ``command`` matters on its own: a serve flag hardcoded into the command
+      template (rather than declared under ``defaults``) never reaches the
+      config chain, so hashing the template is what catches it.
+    * ``mods`` and ``runtime_config`` — the latter absorbs unknown top-level
+      keys such as v1 ``build_args``, which change the image that gets built
+    * the recipe's *declared* ``pre_exec`` / ``post_exec`` / ``post_commands``,
+      read from the raw recipe so runtime- and builder-injected hooks don't
+      move the digest (v1 ``mods`` are injected into ``pre_exec`` during
+      resolution, which is why they are hashed from the declared list above)
+
+    Deliberately excluded, so the digest stays stable across relaunches of the
+    same logical workload: hosts and placement, resolved container digests /
+    pinned image SHAs, and ``metadata`` — the latter carries provenance plus
+    *auto-detected* model facts that a HuggingFace probe writes back into
+    ``recipe.metadata`` mid-run, so hashing it would make the digest depend on
+    network reachability.
+    """
+
+    def _val(value: Any) -> str:
+        # Canonical per-value encoding: sorts nested mapping keys (so a dict
+        # value's insertion order can't move the digest) while preserving list
+        # order (hook and arg sequence are semantically significant).
+        return json.dumps(value, sort_keys=True, default=str)
+
+    parts: list[str] = [generate_intent_id(recipe, overrides=overrides)]
+
+    config_chain = recipe.build_config_chain(overrides)
+    for key in sorted(config_chain.keys()):
+        parts.append("%s=%s" % (key, _val(config_chain.get(key))))
+
+    for attr in (
+        "container",
+        "command",
+        "model_revision",
+        "runtime_version",
+        "min_nodes",
+        "max_nodes",
+        "env",
+        "mods",
+        "runtime_config",
+    ):
+        parts.append("%s=%s" % (attr, _val(getattr(recipe, attr, None))))
+
+    layout = recipe.layout.to_dict() if getattr(recipe, "layout", None) is not None else None
+    parts.append("layout=%s" % _val(layout))
+
+    # Declared hooks only — ``recipe.pre_exec`` and friends are extended in
+    # place by v1 mods / builders during resolution (see core/mods.py), and
+    # those additions are resolved artifacts, not declared configuration.
+    raw = getattr(recipe, "_raw", None) or {}
+    for hook in ("pre_exec", "post_exec", "post_commands"):
+        parts.append("%s=%s" % (hook, _val(raw.get(hook) or [])))
+
+    key = "\0".join(parts)
+    return hashlib.sha256(key.encode()).hexdigest()[:RECIPE_FINGERPRINT_LEN]
 
 
 def generate_placement_token() -> str:
