@@ -3,14 +3,22 @@
 All remote operations in sparkrun are executed by generating scripts
 as Python strings and piping them to `ssh <host> bash -s` via stdin.
 No files are ever copied to remote hosts.
+
+A host in the target list may *be* the control machine (the single-node
+DGX Spark case, or a control node that is also a cluster member).  SSH to
+such a host only works when self-SSH has been configured, so the
+local-vs-SSH dispatch primitives (:func:`should_run_locally`,
+:func:`run_local_script`) live here alongside :class:`RemoteResult`, and
+the fan-out helpers can honour them via ``allow_local=True``.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sparkrun.utils.shell import quote, quote_list, args_list_to_shell_str, stdin_bytes
 
@@ -66,6 +74,74 @@ class RemoteResult:
         """Get the last non-empty line of stdout (useful for extracting IPs etc)."""
         lines = [line for line in self.stdout.strip().splitlines() if line.strip()]
         return lines[-1] if lines else ""
+
+
+# ---------------------------------------------------------------------------
+# Local execution / dispatch
+# ---------------------------------------------------------------------------
+
+
+def should_run_locally(host: str, ssh_user: str | None = None) -> bool:
+    """True if *host* is local AND no cross-user SSH is needed.
+
+    Use this instead of :func:`~sparkrun.utils.is_local_host` at
+    execution dispatch points (where the code decides "run locally via
+    subprocess" vs "run via SSH").  Keep ``is_local_host`` for pure
+    address-identity checks (e.g. "is this IP me?").
+
+    Returns ``True`` when the host is local and *ssh_user* is ``None``
+    or matches the current OS user.
+    """
+    from sparkrun.utils import is_local_host
+
+    if not is_local_host(host):
+        return False
+    if ssh_user is None:
+        return True
+    return ssh_user == os.environ.get("USER", "root")
+
+
+def run_local_script(script: str, dry_run: bool = False, timeout: int | None = None) -> RemoteResult:
+    """Execute a script locally via subprocess.
+
+    Args:
+        script: Bash script content to execute.
+        dry_run: If True, log the script but don't execute.
+        timeout: Wall-clock cap in seconds.  Mirrors the SSH path's
+            ``timeout``: a local dispatch must not be able to hang a
+            caller (status polling, teardown) that bounded the remote
+            path.  A timeout is reported as rc 124, like ``timeout(1)``.
+
+    Returns:
+        RemoteResult with host set to ``"localhost"``.
+    """
+    if dry_run:
+        script_lines = script.count("\n")
+        logger.info("[dry-run] Would execute locally (%d lines, %d bytes)", script_lines, len(script))
+        return RemoteResult(host="localhost", returncode=0, stdout="[dry-run]", stderr="")
+
+    try:
+        proc = subprocess.run(
+            ["bash", "-s"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        logger.warning("Local execution timed out after %ss", timeout)
+        return RemoteResult(
+            host="localhost",
+            returncode=124,
+            stdout=_decode(e.stdout),
+            stderr=(_decode(e.stderr) + ("\n" if e.stderr else "")) + "local execution timed out after %ss" % timeout,
+        )
+    return RemoteResult(
+        host="localhost",
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
 
 
 def _decode(raw: bytes | str | None) -> str:
@@ -192,6 +268,7 @@ def run_remote_script(
     timeout: int | None = None,
     dry_run: bool = False,
     quiet: bool = False,
+    allow_local: bool = False,
 ) -> RemoteResult:
     """Execute a script on a remote host via stdin piping.
 
@@ -208,6 +285,9 @@ def run_remote_script(
         timeout: Overall execution timeout in seconds.
         dry_run: If True, log the script but don't execute.
         quiet: If True, downgrade failure logging from WARNING to DEBUG.
+        allow_local: Run the script directly (no SSH) when *host* is this
+            machine — see :func:`run_remote_scripts_parallel` for why this
+            is opt-in.
 
     Returns:
         RemoteResult with returncode, stdout, stderr.
@@ -216,6 +296,10 @@ def run_remote_script(
     if dry_run:
         logger.info("[dry-run] Would execute on %s (%d lines, %d bytes)", host, script_lines, len(script))
         return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
+
+    if allow_local and should_run_locally(host, ssh_user):
+        logger.debug("  Dispatching locally (no SSH) for: %s", host)
+        return replace(run_local_script(script, timeout=timeout), host=host)
 
     cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
     cmd.extend(["bash", "-s"])
@@ -575,6 +659,7 @@ def run_remote_scripts_parallel(
     dry_run: bool = False,
     quiet: bool = False,
     max_workers: int | None = None,
+    allow_local: bool = False,
 ) -> list[RemoteResult]:
     """Execute the same script on multiple hosts in parallel using threads.
 
@@ -590,6 +675,14 @@ def run_remote_scripts_parallel(
         max_workers: Cap on concurrent SSH workers.  Defaults to
             :data:`DEFAULT_MAX_PARALLEL_SSH`; the effective pool size is
             ``min(len(hosts), max_workers)``.
+        allow_local: Run the script directly (no SSH) on any host that
+            :func:`should_run_locally` accepts.  **Opt-in**, because for
+            some callers SSH-to-self is the point, not an accident:
+            ``api.setup`` probes and meshes SSH credentials and must
+            really connect.  Callers that just want the script's output
+            (status discovery, hardware probes, teardown) pass ``True``
+            so they work on a host without self-SSH configured.  Results
+            are re-keyed to the caller's host string either way.
 
     Returns:
         List of RemoteResult, one per host (order not guaranteed).
@@ -598,23 +691,28 @@ def run_remote_scripts_parallel(
 
     logger.info("  Running script in parallel on %d hosts: %s", len(hosts), ", ".join(hosts))
 
+    local_hosts = {h for h in hosts if should_run_locally(h, ssh_user)} if allow_local else set()
+    if local_hosts:
+        logger.debug("  Dispatching locally (no SSH) for: %s", ", ".join(sorted(local_hosts)))
+
+    def _dispatch(host: str) -> RemoteResult:
+        if host in local_hosts:
+            return replace(run_local_script(script, dry_run=dry_run, timeout=timeout), host=host)
+        return run_remote_script(
+            host,
+            script,
+            ssh_user=ssh_user,
+            ssh_key=ssh_key,
+            ssh_options=ssh_options,
+            timeout=timeout,
+            dry_run=dry_run,
+            quiet=quiet,
+        )
+
     t0 = time.monotonic()
     results: list[RemoteResult] = []
     with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(hosts), max_workers)) as executor:
-        futures = {
-            executor.submit(
-                run_remote_script,
-                host,
-                script,
-                ssh_user=ssh_user,
-                ssh_key=ssh_key,
-                ssh_options=ssh_options,
-                timeout=timeout,
-                dry_run=dry_run,
-                quiet=quiet,
-            ): host
-            for host in hosts
-        }
+        futures = {executor.submit(_dispatch, host): host for host in hosts}
         for future in as_completed(futures):
             result = future.result()
             results.append(result)

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.cluster_manager import ClusterDefinition, ClusterStatusResult
     from sparkrun.core.recipe import Recipe
     from sparkrun.core.scheduler import RankAssignment
 
@@ -196,9 +196,47 @@ class StopResult:
     hosts_targeted: tuple[str, ...]
     """Hosts the stop command was issued against."""
     containers_removed: int
-    """Total count of containers/processes successfully stopped."""
+    """Count of containers/processes actually removed, as reported by the
+    teardown itself — not an assumption of one per host."""
     errors: tuple[str, ...] = ()
     """Human-readable error messages for any hosts that failed."""
+    hosts_failed: tuple[str, ...] = ()
+    """Hosts whose teardown did not confirm.  Non-empty means containers
+    may still be running (and holding VRAM); job metadata is deliberately
+    retained so the workload can still be found and stopped."""
+
+    @property
+    def success(self) -> bool:
+        """True when every targeted host confirmed teardown."""
+        return not self.hosts_failed and not self.errors
+
+
+@dataclass(frozen=True)
+class StopAllResult:
+    """Outputs of :func:`sparkrun.api.stop_all`."""
+
+    discovered: "ClusterStatusResult"
+    """The discovery snapshot the teardown acted on (also what the CLI
+    renders), so callers don't have to re-query to describe what was
+    found."""
+    jobs_stopped: int
+    """Discovered jobs (cluster groups + solo entries) whose containers
+    all confirmed teardown."""
+    containers_removed: int
+    """Containers actually removed, summed across hosts."""
+    hosts_stopped: tuple[str, ...] = ()
+    """Hosts whose teardown confirmed."""
+    hosts_failed: dict[str, str] = field(default_factory=dict)
+    """Host → error for teardowns that did not confirm."""
+    discovery_errors: dict[str, str] = field(default_factory=dict)
+    """Host → error for hosts that could not be queried at all.  These are
+    *not* "nothing to stop" — an unqueryable host may be running
+    containers we never saw."""
+
+    @property
+    def success(self) -> bool:
+        """True when every host was queried and every teardown confirmed."""
+        return not self.hosts_failed and not self.discovery_errors
 
 
 # --------------------------------------------------------------------------

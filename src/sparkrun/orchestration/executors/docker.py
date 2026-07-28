@@ -431,11 +431,8 @@ class DockerExecutor(Executor):
         Unreachable hosts are omitted from :attr:`ClusterStatus.hosts`;
         callers can detect this via ``status.for_host(h) is None``.
         """
-        from dataclasses import replace as _dc_replace
-
         from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy
         from sparkrun.core.hardware import default_dgx_spark_hardware
-        from sparkrun.orchestration.primitives import run_local_script, should_run_locally
         from sparkrun.orchestration.ssh import run_remote_scripts_parallel
 
         if not hosts:
@@ -443,30 +440,21 @@ class DockerExecutor(Executor):
 
         ssh_kwargs = ssh_kwargs or {}
         script = "docker ps --no-trunc --format '{{json .}}' 2>/dev/null || true\n"
-
-        # Dispatch local-vs-SSH per host (the same partition
-        # run_command_on_host and try_clear_page_cache use): a bare SSH to
-        # localhost fails on hosts without self-SSH configured, which would
-        # make every local workload invisible to status discovery — and
-        # everything downstream of it (stop --all, cluster status,
-        # scheduler occupancy).
-        ssh_user = ssh_kwargs.get("ssh_user")
-        local_hosts = [h for h in hosts if should_run_locally(h, ssh_user)]
-        remote_hosts = [h for h in hosts if not should_run_locally(h, ssh_user)]
-
-        results = [_dc_replace(run_local_script(script), host=h) for h in local_hosts]
-        if remote_hosts:
-            results.extend(
-                run_remote_scripts_parallel(
-                    remote_hosts,
-                    script,
-                    ssh_user=ssh_user,
-                    ssh_key=ssh_kwargs.get("ssh_key"),
-                    ssh_options=ssh_kwargs.get("ssh_options"),
-                    timeout=ssh_kwargs.get("timeout", 15),
-                    quiet=True,
-                )
-            )
+        # ``allow_local=True``: a bare SSH to localhost fails on a host
+        # without self-SSH configured, which would make every local
+        # workload invisible to status discovery — and to everything
+        # downstream of it (stop --all, cluster status, scheduler
+        # occupancy, the monitor TUI).
+        results = run_remote_scripts_parallel(
+            hosts,
+            script,
+            ssh_user=ssh_kwargs.get("ssh_user"),
+            ssh_key=ssh_kwargs.get("ssh_key"),
+            ssh_options=ssh_kwargs.get("ssh_options"),
+            timeout=ssh_kwargs.get("timeout", 15),
+            quiet=True,
+            allow_local=True,
+        )
 
         # Map results back to input host order.
         by_host = {r.host: r for r in results}

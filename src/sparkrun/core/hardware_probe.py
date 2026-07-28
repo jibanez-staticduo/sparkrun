@@ -330,10 +330,14 @@ def probe_host(
         logger.info("[dry-run] Would probe host %s", host)
         return HostHardware(notes="dry-run probe")
 
+    # ``allow_local=True``: the probed host may be this machine, and a
+    # single-node cluster without self-SSH would otherwise probe as
+    # "hardware probe failed".
     result = run_remote_script(
         host,
         generate_combined_probe_script(),
         timeout=30,
+        allow_local=True,
         **(ssh_kwargs or {}),
     )
     if not result.success:
@@ -377,6 +381,7 @@ def probe_hosts(
         hosts,
         generate_combined_probe_script(),
         timeout=30,
+        allow_local=True,
         **kw,
     )
 
