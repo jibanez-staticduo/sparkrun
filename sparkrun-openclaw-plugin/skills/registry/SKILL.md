@@ -64,10 +64,13 @@ sparkrun list --all                         # include hidden registry recipes
 sparkrun list --registry <name>             # filter by registry
 sparkrun list --runtime vllm                # filter by runtime (vllm, sglang, llama-cpp)
 sparkrun list <query>                       # filter by name
+sparkrun list @<registry>                   # shorthand for --registry <registry>
+sparkrun list @<registry>/<query>           # that registry, filtered by <query>
 
 # Search for recipes by name, model, runtime, or description (contains-match)
 sparkrun recipe search <query>
 sparkrun recipe search <query> --registry <name> --runtime sglang
+sparkrun recipe search @<registry>/<query>  # registry-scoped shorthand
 
 # Inspect a specific known recipe (by exact name or file path)
 sparkrun recipe show <recipe> [--tp N]

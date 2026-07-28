@@ -452,6 +452,16 @@ used by repos hosted under allowed GitHub organizations (`spark-arena`, `scitrer
 lists registries, `@registry/` lists recipes from that registry. Falls back to showing registry names when recipe cache
 isn't populated.
 
+**Implicit registry scope**: the positional QUERY of `recipe list` / `recipe search` (and the top-level `list` /
+`search` aliases) accepts the same `@registry` syntax — `@community` and `@community/` mean `--registry community`,
+and anything after the `/` becomes the remaining query (`@community/qwen`). `_common.resolve_registry_filter()` is
+the single resolver for both spellings: it strips the scope, rejects a scope that conflicts with an explicit
+`--registry`, then validates the resulting name — unknown or disabled registries error out (listing the available
+ones) rather than silently printing "No recipes found", whether the name arrived via the shorthand or `--registry`
+(matching `registry list-benchmark-profiles`, which already validated upfront). A scoped query implies
+`include_hidden` (same as `--registry`). The `RECIPE_QUERY` param type completes `@` into `@registry/` and delegates
+to `RECIPE_NAME` past the slash.
+
 ### Model & Container Distribution
 
 Before launching, sparkrun can pre-sync models and container images from the control machine to target hosts:

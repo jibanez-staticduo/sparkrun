@@ -8,6 +8,7 @@ from sparkrun import __version__
 from .ext import PluggableGroup
 from ._common import (
     RECIPE_NAME,
+    RECIPE_QUERY,
     REGISTRY_NAME,
     RUNTIME_NAME,
     _setup_logging,
@@ -90,12 +91,16 @@ main.add_command(arena)
 @main.command("list")
 @click.option("--registry", type=REGISTRY_NAME, default=None, help="Filter by registry name")
 @click.option("--runtime", type=RUNTIME_NAME, default=None, help="Filter by runtime (e.g. vllm, sglang, llama-cpp)")
-@click.argument("query", required=False)
+@click.argument("query", type=RECIPE_QUERY, required=False)
 @click.option("--all", "-a", "show_all", is_flag=True, help="Include hidden registry recipes")
 @json_option()
 @click.pass_context
 def list_cmd(ctx, registry, runtime, query, show_all, output_json):
-    """List available recipes (alias for 'recipe list')."""
+    """List available recipes (alias for 'recipe list').
+
+    QUERY may be scoped to a registry with the ``@registry`` shorthand
+    (``@community`` or ``@community/qwen``).
+    """
     ctx.invoke(recipe_list, registry=registry, runtime=runtime, query=query, show_all=show_all, output_json=output_json)
 
 
@@ -113,10 +118,14 @@ def show(ctx, recipe_name, no_vram, tensor_parallel, gpu_mem):
 @main.command("search")
 @click.option("--registry", type=REGISTRY_NAME, default=None, help="Filter by registry name")
 @click.option("--runtime", type=RUNTIME_NAME, default=None, help="Filter by runtime (e.g. vllm, sglang, llama-cpp)")
-@click.argument("query")
+@click.argument("query", type=RECIPE_QUERY)
 @click.pass_context
 def search_cmd(ctx, registry, runtime, query):
-    """Search for recipes by name, model, or description (alias for 'recipe search')."""
+    """Search for recipes by name, model, or description (alias for 'recipe search').
+
+    QUERY may be scoped to a registry with the ``@registry`` shorthand
+    (``@community`` or ``@community/qwen``).
+    """
     ctx.invoke(recipe_search, registry=registry, runtime=runtime, query=query)
 
 

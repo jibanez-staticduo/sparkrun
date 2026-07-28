@@ -334,6 +334,52 @@ def _recipe_name_looks_like_path(name: str) -> bool:
     return False
 
 
+def resolve_registry_filter(query, registry, registry_mgr):
+    """Resolve the registry filter for a list/search command.
+
+    Handles the implicit ``@registry`` scope in *query* — ``@community``,
+    ``@community/`` and ``@community/qwen`` are shorthand for
+    ``--registry community``, with anything after the ``/`` kept as the
+    remaining query (``qwen`` in the last example).
+
+    Whichever way the registry arrives — the shorthand or an explicit
+    ``--registry`` — it is validated the same way, so a typo reports the
+    available registries instead of silently listing nothing.
+
+    Args:
+        query: Raw positional query (may be None).
+        registry: Explicit ``--registry`` value (may be None).
+        registry_mgr: Initialized ``RegistryManager`` used to validate the name.
+
+    Returns:
+        Tuple of (registry, query) with any scope stripped from the query.
+        A scope with no remaining query yields ``None`` for the query.
+
+    Raises:
+        click.UsageError: Unknown/disabled registry, or a scope that conflicts
+            with an explicit ``--registry``.
+    """
+    if query and query.startswith("@"):
+        scope, _, rest = query[1:].partition("/")
+        if scope:  # a bare "@" names no registry — leave it as a plain query
+            if registry is not None and registry != scope:
+                raise click.UsageError("Conflicting registry: '@%s' in the query vs --registry %s." % (scope, registry))
+            registry, query = scope, (rest.strip() or None)
+
+    if registry is None:
+        return registry, query
+
+    entries = registry_mgr.list_registries()
+    match = next((e for e in entries if e.name == registry), None)
+    if match is None:
+        known = ", ".join(sorted(e.name for e in entries)) or "(none configured)"
+        raise click.UsageError("Unknown registry '%s'. Available registries: %s" % (registry, known))
+    if not match.enabled:
+        raise click.UsageError("Registry '%s' is disabled. Enable it with `sparkrun registry enable %s`." % (registry, registry))
+
+    return registry, query
+
+
 def _load_recipe(config, recipe_name, resolve=True, retry_after_update=False):
     """Find, load, and return a recipe.
 
@@ -904,6 +950,37 @@ class RegistryNameType(click.ParamType):
 
 
 REGISTRY_NAME = RegistryNameType()
+
+
+class RecipeQueryType(click.ParamType):
+    """Click parameter type for list/search queries with ``@registry`` scoping.
+
+    Completion only kicks in for the ``@`` prefix — a free-text query has
+    nothing to complete against. ``@`` lists registry names as ``@name/``
+    (type ``dir`` so the shell doesn't append a space) and ``@name/`` falls
+    through to recipe completion within that registry.
+    """
+
+    name = "query"
+
+    def shell_complete(self, ctx, param, incomplete):
+        if not incomplete.startswith("@"):
+            return []
+        try:
+            _, registry_mgr = _get_config_and_registry()
+            if "/" in incomplete:
+                return RECIPE_NAME.shell_complete(ctx, param, incomplete)
+            prefix = incomplete[1:]  # strip @
+            return [
+                click.shell_completion.CompletionItem("@%s/" % reg.name, type="dir")
+                for reg in registry_mgr.list_registries()
+                if reg.enabled and reg.name.startswith(prefix)
+            ]
+        except Exception:
+            return []
+
+
+RECIPE_QUERY = RecipeQueryType()
 
 
 class RuntimeNameType(click.ParamType):
