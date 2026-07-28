@@ -13,6 +13,12 @@ from sparkrun.utils.shell import stdin_bytes
 
 logger = logging.getLogger(__name__)
 
+# Floor for how long the watchdog waits on a freshly-connected host before
+# giving up and retrying it.  Generous relative to the sampling interval: an
+# SSH handshake to a cold host can take several seconds, and a needless
+# reconnect costs another handshake.
+FIRST_SAMPLE_TIMEOUT = 30.0
+
 # Column names matching host_monitor.sh CSV field order (single source of truth).
 MONITOR_COLUMNS = (
     "timestamp",
@@ -92,6 +98,10 @@ class HostMonitorState:
     error: str | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
     last_updated: float | None = field(default=None, repr=False)
+    # Monotonic stamp of the most recent connect attempt.  Distinct from
+    # ``last_updated`` (set only once a sample parses) so the watchdog can also
+    # time out a host that never delivers a first sample.
+    connect_started: float | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -388,6 +398,10 @@ class ClusterMonitor:
         """Launch an SSH subprocess and reader thread for a single *host*."""
         from sparkrun.orchestration.ssh import build_ssh_cmd
 
+        # Stamped before the attempt so the watchdog's first-sample timer is
+        # armed even when Popen itself fails below.
+        self.states[host].connect_started = time.monotonic()
+
         cmd = build_ssh_cmd(
             host,
             ssh_user=self.ssh_kwargs.get("ssh_user"),
@@ -471,6 +485,11 @@ class ClusterMonitor:
     def _watchdog(self) -> None:
         """Periodically check for stale host data and reconnect."""
         stale_threshold = self.interval * 5
+        # A host that never delivers a first sample has no ``last_updated`` to
+        # go stale, so it needs its own deadline measured from the connect
+        # attempt — otherwise a boot race (sshd not up yet), a half-open TCP
+        # connection, or a silently-dropped SSH wedges that host forever.
+        first_sample_timeout = max(stale_threshold, FIRST_SAMPLE_TIMEOUT)
         while self._started:
             time.sleep(self.interval)
             if not self._started:
@@ -479,7 +498,18 @@ class ClusterMonitor:
             for host in self.hosts:
                 state = self.states[host]
                 if state.last_updated is None:
-                    continue  # still connecting or already in error
+                    if state.connect_started is None:
+                        continue  # never started (deploy-gated backends)
+                    waiting = now - state.connect_started
+                    if waiting > first_sample_timeout:
+                        logger.warning(
+                            "Host %s produced no data %.1fs after connecting (timeout %.1fs), reconnecting",
+                            host,
+                            waiting,
+                            first_sample_timeout,
+                        )
+                        self._reconnect_host(host, reason="no data since connect")
+                    continue
                 age = now - state.last_updated
                 if age > stale_threshold:
                     logger.warning(
@@ -490,7 +520,7 @@ class ClusterMonitor:
                     )
                     self._reconnect_host(host)
 
-    def _reconnect_host(self, host: str) -> None:
+    def _reconnect_host(self, host: str, reason: str = "stale data") -> None:
         """Kill the stale SSH process for *host* and start a fresh one."""
         state = self.states[host]
 
@@ -509,9 +539,12 @@ class ClusterMonitor:
                 except subprocess.TimeoutExpired:
                     pass
 
-        state.error = "stale data — reconnecting"
-        # Reset timestamp so the watchdog doesn't re-trigger immediately.
-        state.last_updated = time.monotonic()
+        state.error = "%s — reconnecting" % reason
+        # Re-arm the staleness timer, but only for a host that actually has
+        # data: leaving ``last_updated`` None for a never-connected host keeps
+        # the "not None ⟺ we have a sample" invariant, and _start_host re-arms
+        # it below by stamping a fresh connect_started.
+        state.last_updated = time.monotonic() if state.latest is not None else None
 
         self._start_host(host)
 
