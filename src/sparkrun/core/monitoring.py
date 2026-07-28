@@ -539,12 +539,23 @@ class ClusterMonitor:
                 except subprocess.TimeoutExpired:
                     pass
 
+        # Read before mutating: ``last_updated is not None`` means this host has
+        # produced a sample at some point, which decides which of the watchdog's
+        # two deadlines it belongs on below.
+        had_data = state.last_updated is not None
+
         state.error = "%s — reconnecting" % reason
-        # Re-arm the staleness timer, but only for a host that actually has
-        # data: leaving ``last_updated`` None for a never-connected host keeps
-        # the "not None ⟺ we have a sample" invariant, and _start_host re-arms
-        # it below by stamping a fresh connect_started.
-        state.last_updated = time.monotonic() if state.latest is not None else None
+        # Drop the last sample.  It describes a host we are no longer connected
+        # to, and keeping it makes an outage indistinguishable from live-but-idle
+        # telemetry for any consumer that reads ``sample`` without checking
+        # ``error`` (the CLI table and TUI both render None as "no data" plus the
+        # error, so clearing it is also what they want).
+        state.latest = None
+        # Re-arm the staleness timer for a host that has had data, so it keeps
+        # retrying on the fast (interval * 5) cadence while it is down.  A host
+        # that never sampled stays at None and remains on the first-sample
+        # deadline, which _start_host re-arms by stamping connect_started.
+        state.last_updated = time.monotonic() if had_data else None
 
         self._start_host(host)
 

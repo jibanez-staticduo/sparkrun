@@ -213,6 +213,92 @@ def test_fresh_host_with_data_is_not_reconnected(monitor_with_recorded_starts, m
 
 
 # --------------------------------------------------------------------------
+# Loss and recovery of a host that was previously healthy
+# --------------------------------------------------------------------------
+
+
+def test_disconnected_host_keeps_retrying_while_down(monitor_with_recorded_starts, monkeypatch):
+    """A node that stays down is retried every cycle, not just once.
+
+    One reconnect attempt would strand the host if the node happened to still be
+    unreachable at that instant; the monitor must keep trying so it recovers
+    whenever the node comes back.
+    """
+    clock = _Clock()
+    mon, started = monitor_with_recorded_starts()
+    state = mon.states["h1"]
+    state.latest = MonitorSample(hostname="h1")
+    state.last_updated = clock.now
+
+    # interval=2 → 10s threshold; every 12s tick is one more failed retry.
+    _drive_watchdog(mon, monkeypatch, clock=clock, advance_per_tick=12, passes=4)
+
+    assert started == ["h1", "h1", "h1", "h1"]
+
+
+def test_reconnect_clears_the_last_sample(monitor_with_recorded_starts, monkeypatch):
+    """The stale sample is dropped, so an outage can't read as live telemetry.
+
+    Keeping it would leave ``--json`` emitting plausible frozen numbers under
+    ``sample`` for the whole outage, visible as stale only to a consumer that
+    also checks ``error``.
+    """
+    clock = _Clock()
+    mon, _started = monitor_with_recorded_starts()
+    state = mon.states["h1"]
+    state.latest = MonitorSample(hostname="h1", cpu_usage_pct="42")
+    state.last_updated = clock.now
+
+    _drive_watchdog(mon, monkeypatch, clock=clock, advance_per_tick=12)
+
+    assert state.latest is None
+    assert state.error == "stale data — reconnecting"
+
+
+def test_cleared_sample_keeps_host_on_the_fast_staleness_cadence(monitor_with_recorded_starts, monkeypatch):
+    """Clearing ``latest`` must not demote the host to the first-sample deadline.
+
+    ``last_updated`` — not ``latest`` — is what records "this host has had data".
+    Keying the re-arm off the sample would push a downed-but-known host onto the
+    30s first-sample timer instead of the 10s staleness one, slowing recovery.
+    """
+    clock = _Clock()
+    mon, started = monitor_with_recorded_starts()
+    state = mon.states["h1"]
+    state.latest = MonitorSample(hostname="h1")
+    state.last_updated = clock.now
+
+    _drive_watchdog(mon, monkeypatch, clock=clock, advance_per_tick=12)
+
+    assert state.latest is None  # sample dropped ...
+    assert state.last_updated is not None  # ... but still on the staleness path
+    assert len(started) == 1
+
+    # A second 12s tick trips the 10s staleness threshold again, not the 30s one.
+    _drive_watchdog(mon, monkeypatch, clock=clock, advance_per_tick=12)
+    assert len(started) == 2
+
+
+def test_recovered_host_restores_sample_and_clears_error():
+    """Once the node returns, a parsed line makes the host healthy again."""
+    mon = ClusterMonitor(["h1"], {}, interval=2)
+    state = mon.states["h1"]
+    state.error = "stale data — reconnecting"
+    state.latest = None
+
+    line = ",".join("42" for _ in monitoring.MONITOR_COLUMNS)
+    proc = mock.MagicMock()
+    proc.stdout = iter([line + "\n"])
+    proc.poll.return_value = 0
+
+    mon._reader("h1", proc)
+
+    assert state.latest is not None
+    assert state.error is None
+    assert state.last_updated is not None
+
+
+# --------------------------------------------------------------------------
 # _start_host stamps the connect time
 # --------------------------------------------------------------------------
 
