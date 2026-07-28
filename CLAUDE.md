@@ -452,15 +452,42 @@ used by repos hosted under allowed GitHub organizations (`spark-arena`, `scitrer
 lists registries, `@registry/` lists recipes from that registry. Falls back to showing registry names when recipe cache
 isn't populated.
 
+### Recipe Catalog ("what recipes exist?")
+
+All recipe *enumeration* flows through one function, **`api.search_recipes(query, …) -> list[RecipeSummary]`**
+(`api/_recipes.py`) — the console-free peer of `api.status` for the catalog rather than the cluster. It merges the
+configured registries with working-directory recipes, applies the registry/runtime filters, and returns typed
+`RecipeSummary` rows (`api/_models.py`; `.to_dict()` yields the legacy `core.recipe.recipe_summary` mapping the CLI
+formatters and `--json` consume). `sparkrun list` / `sparkrun recipe search` and their aliases are thin renderers over
+it, and the desktop sidecar calls it directly instead of reaching into `RegistryManager`.
+
+Two knobs carry the semantic difference between the commands:
+
+| Knob            | `list`  | `search` | Meaning                                                                       |
+|-----------------|---------|----------|-------------------------------------------------------------------------------|
+| `unique_names`  | `True`  | `False`  | One row per unqualified name (locals first) vs every copy                     |
+| `include_local` | `True`  | `True`   | Include CWD recipes (dropped anyway when a registry filter is set)            |
+
+`unique_names` is why `list` shows a name once while `search` shows all of its variants: a registry's recipe dir is
+scanned with `rglob`, so `3x-spark-cluster/foo.yaml` and `4x-spark-cluster/foo.yaml` are *different recipes sharing a
+qualified name*. Only literal repeats (same resolved path, e.g. via shared-clone symlinks) are dropped unconditionally
+— never dedupe the catalog by name.
+
 **Implicit registry scope**: the positional QUERY of `recipe list` / `recipe search` (and the top-level `list` /
-`search` aliases) accepts the same `@registry` syntax — `@community` and `@community/` mean `--registry community`,
-and anything after the `/` becomes the remaining query (`@community/qwen`). `_common.resolve_registry_filter()` is
-the single resolver for both spellings: it strips the scope, rejects a scope that conflicts with an explicit
-`--registry`, then validates the resulting name — unknown or disabled registries error out (listing the available
-ones) rather than silently printing "No recipes found", whether the name arrived via the shorthand or `--registry`
-(matching `registry list-benchmark-profiles`, which already validated upfront). A scoped query implies
-`include_hidden` (same as `--registry`). The `RECIPE_QUERY` param type completes `@` into `@registry/` and delegates
-to `RECIPE_NAME` past the slash.
+`search` aliases) accepts the same `@registry` syntax recipe *names* use — `@community` and `@community/` mean
+`--registry community`, and anything after the `/` becomes the remaining query (`@community/qwen`).
+`core/registry.py:resolve_registry_filter()` is the single resolver for both spellings (exposed as
+`api.resolve_recipe_filter` for callers that need to name the resolved filter, e.g. in an empty-result message): it
+strips the scope, rejects a scope that conflicts with an explicit `--registry`, then validates the resulting name —
+unknown or disabled registries raise `RegistryFilterError` (→ `api.InvalidRegistryFilter` → `click.UsageError`)
+listing the available ones, rather than silently yielding "No recipes found", whether the name arrived via the
+shorthand or `--registry` (matching `registry list-benchmark-profiles`, which already validated upfront). A registry
+filter implies `include_hidden` — naming a registry outranks its visibility default. The `RECIPE_QUERY` param type
+completes `@` into `@registry/` and delegates to `RECIPE_NAME` past the slash.
+
+`core.recipe.recipe_matches_query()` is the one matching predicate (substring over name / file / model /
+description), shared by `RegistryManager.search_recipes` and the CWD scan so a local recipe is found on the same
+terms as a registry one.
 
 ### Model & Container Distribution
 

@@ -63,6 +63,27 @@ class RecipeNotFound(SparkrunError):
     """Named recipe could not be resolved across configured registries."""
 
 
+class InvalidRegistryFilter(SparkrunError):
+    """A recipe listing was scoped to a registry that cannot be used.
+
+    Raised by :func:`sparkrun.api.search_recipes` when the ``registry``
+    filter — or the ``@registry`` scope carried by the query — names a
+    registry that is unknown or disabled, or contradicts an explicit
+    ``registry`` argument.  Discriminate with :attr:`reason`
+    (``"unknown"`` / ``"disabled"`` / ``"conflict"``); :attr:`available`
+    carries the configured registry names for the error message.
+
+    Surfaced when :mod:`sparkrun.core.registry` raises
+    :class:`~sparkrun.core.registry.RegistryFilterError`.
+    """
+
+    def __init__(self, message: str, *, registry: str = "", reason: str = "unknown", available: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.registry = registry
+        self.reason = reason
+        self.available = available
+
+
 class HostsUnreachable(SparkrunError):
     """One or more hosts could not be reached over SSH.
 
@@ -141,6 +162,7 @@ __all__ = [
     "InsufficientCapacity",
     "LayoutRequired",
     "RecipeNotFound",
+    "InvalidRegistryFilter",
     "HostsUnreachable",
     "JobNotFound",
     "AmbiguousWorkload",

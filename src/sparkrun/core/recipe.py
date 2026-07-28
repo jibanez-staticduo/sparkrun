@@ -1848,6 +1848,27 @@ def list_recipes(
     return recipes
 
 
+#: Recipe summary fields a free-text query is matched against.
+RECIPE_QUERY_FIELDS: tuple[str, ...] = ("name", "file", "model", "description")
+
+
+def recipe_matches_query(entry: dict[str, Any], query: str | None) -> bool:
+    """Return True when a recipe summary matches a free-text *query*.
+
+    Case-insensitive substring match over :data:`RECIPE_QUERY_FIELDS`. An
+    empty/None query matches everything.
+
+    This is the single matching predicate shared by
+    ``RegistryManager.search_recipes`` and the local (CWD) recipe search, so
+    a recipe sitting in the working directory is found on the same terms as
+    one from a registry.
+    """
+    if not query:
+        return True
+    needle = query.lower()
+    return any(needle in str(entry.get(f, "")).lower() for f in RECIPE_QUERY_FIELDS)
+
+
 def filter_recipes(
     recipes: list[dict[str, Any]],
     *,

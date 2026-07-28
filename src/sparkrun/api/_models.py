@@ -290,10 +290,89 @@ class JobInfo:
     sparkrun cluster_id (data-quality issue)."""
 
 
+@dataclass(frozen=True)
+class RecipeSummary:
+    """A single entry returned by :func:`sparkrun.api.search_recipes`.
+
+    A cheap projection of a recipe YAML — enough to render a catalog row
+    without paying for version migration, resolver chains, or env
+    expansion (see ``sparkrun.core.recipe.recipe_summary``).  Load the
+    real thing with :func:`sparkrun.api.resolve_recipe` once the user has
+    picked one.
+
+    Fields beyond the ones modelled here are exposed verbatim under
+    :attr:`metadata`, and :meth:`to_dict` returns that mapping — the shape
+    the CLI formatters and JSON output consume.
+    """
+
+    name: str
+    """Qualified name — ``@registry/stem`` for a registry recipe, the bare
+    file stem for one discovered in the working directory."""
+    file: str
+    """File stem, i.e. the name that can be typed unqualified."""
+    path: str
+    model: str = ""
+    runtime: str = ""
+    description: str = ""
+    min_nodes: int = 1
+    registry: str | None = None
+    """Owning registry, or ``None`` for a working-directory recipe."""
+    builder: str | None = None
+    tensor_parallel: int | None = None
+    """``defaults.tensor_parallel``, or ``None`` when the recipe leaves it
+    to the runtime."""
+    gpu_memory_utilization: float | None = None
+    """``defaults.gpu_memory_utilization``, or ``None`` when unset."""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_summary(cls, entry: dict[str, Any]) -> "RecipeSummary":
+        """Build from a ``core.recipe.recipe_summary`` mapping."""
+        return cls(
+            name=str(entry.get("name", "")),
+            file=str(entry.get("file", "")),
+            path=str(entry.get("path", "")),
+            model=str(entry.get("model", "")),
+            runtime=str(entry.get("runtime", "")),
+            description=str(entry.get("description", "")),
+            min_nodes=_as_int(entry.get("min_nodes"), default=1) or 1,
+            registry=entry.get("registry") or None,
+            builder=entry.get("builder") or None,
+            tensor_parallel=_as_int(entry.get("tp")),
+            gpu_memory_utilization=_as_float(entry.get("gpu_mem")),
+            metadata=dict(entry),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the underlying recipe-summary mapping."""
+        return dict(self.metadata)
+
+
+def _as_int(value: Any, *, default: int | None = None) -> int | None:
+    """Coerce a recipe default to int, or *default* when absent/unparseable."""
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, *, default: float | None = None) -> float | None:
+    """Coerce a recipe default to float, or *default* when absent/unparseable."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 __all__ = [
     "RunOptions",
     "RunResult",
     "StopResult",
     "LogLine",
     "JobInfo",
+    "RecipeSummary",
 ]

@@ -28,6 +28,93 @@ class RegistryError(Exception):
     pass
 
 
+class RegistryFilterError(RegistryError):
+    """A recipe listing was scoped to a registry that cannot be used.
+
+    Raised by :func:`resolve_registry_filter` for all three ways a registry
+    filter can be wrong, discriminated by :attr:`reason`:
+
+    * ``"unknown"`` — no registry by that name is configured.
+    * ``"disabled"`` — the registry exists but is disabled.
+    * ``"conflict"`` — an ``@registry`` query scope contradicts an
+      explicitly-supplied registry filter.
+
+    :attr:`available` lists the configured registry names so callers can
+    render a useful message without a second lookup.
+    """
+
+    def __init__(self, message: str, *, registry: str, reason: str, available: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.registry = registry
+        self.reason = reason
+        self.available = available
+
+
+def resolve_registry_filter(
+    query: str | None,
+    registry: str | None,
+    registry_manager: "RegistryManager",
+) -> tuple[str | None, str | None]:
+    """Resolve the registry filter for a recipe listing or search.
+
+    Handles the ``@registry`` scope shorthand in *query* — ``@community``
+    and ``@community/`` mean "the community registry", and anything after
+    the ``/`` is kept as the remaining free-text query, so
+    ``@community/qwen`` is that registry filtered by ``qwen``. A bare ``@``
+    names no registry and is left alone as a plain query.
+
+    Whichever way the registry arrives — the shorthand or an explicit
+    *registry* argument — it is validated the same way, so a typo raises
+    instead of silently yielding an empty result set.
+
+    Args:
+        query: Free-text query, optionally carrying an ``@registry`` scope.
+        registry: Explicit registry filter (may be None).
+        registry_manager: Manager used to validate the resulting name.
+
+    Returns:
+        ``(registry, query)`` with any scope stripped off the query. A scope
+        with no remaining query yields ``None`` for the query.
+
+    Raises:
+        RegistryFilterError: Unknown or disabled registry, or a scope that
+            conflicts with *registry*.
+    """
+    if query and query.startswith("@"):
+        scope, _, rest = query[1:].partition("/")
+        if scope:  # a bare "@" names no registry — leave it as a plain query
+            if registry is not None and registry != scope:
+                raise RegistryFilterError(
+                    "Conflicting registry: '@%s' in the query vs --registry %s." % (scope, registry),
+                    registry=scope,
+                    reason="conflict",
+                )
+            registry, query = scope, (rest.strip() or None)
+
+    if registry is None:
+        return registry, query
+
+    entries = registry_manager.list_registries()
+    available = tuple(sorted(e.name for e in entries))
+    match = next((e for e in entries if e.name == registry), None)
+    if match is None:
+        raise RegistryFilterError(
+            "Unknown registry '%s'. Available registries: %s" % (registry, ", ".join(available) or "(none configured)"),
+            registry=registry,
+            reason="unknown",
+            available=available,
+        )
+    if not match.enabled:
+        raise RegistryFilterError(
+            "Registry '%s' is disabled. Enable it with `sparkrun registry enable %s`." % (registry, registry),
+            registry=registry,
+            reason="disabled",
+            available=available,
+        )
+
+    return registry, query
+
+
 @dataclass
 class RegistryEntry:
     """Represents a recipe registry source.
@@ -1421,8 +1508,9 @@ class RegistryManager:
         Returns:
             List of recipe metadata dicts with 'registry' field added
         """
+        from sparkrun.core.recipe import recipe_matches_query
+
         results = []
-        query_lower = query.lower()
         registries = self._load_registries()
 
         for entry in registries:
@@ -1434,13 +1522,7 @@ class RegistryManager:
             if recipe_dir is None:
                 continue
             for recipe in self._list_dir_recipes(recipe_dir, entry.name):
-                searchable = [
-                    recipe.get("name", "").lower(),
-                    recipe.get("file", "").lower(),
-                    recipe.get("model", "").lower(),
-                    recipe.get("description", "").lower(),
-                ]
-                if any(query_lower in s for s in searchable):
+                if recipe_matches_query(recipe, query):
                     results.append(recipe)
 
         return results

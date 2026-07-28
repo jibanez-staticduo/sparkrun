@@ -5,18 +5,20 @@ party automation, the CLI itself) depend on.  Surfaces:
 
 - **Data models** — :class:`RunOptions`, :class:`RunResult`,
   :class:`StopResult`, :class:`LogLine`, :class:`JobInfo`,
-  :class:`BenchmarkOptions`, :class:`BenchmarkResult`,
-  :class:`ProgressEvent`, :class:`ResumeMode`.
+  :class:`RecipeSummary`, :class:`BenchmarkOptions`,
+  :class:`BenchmarkResult`, :class:`ProgressEvent`, :class:`ResumeMode`.
 - **Errors** — :class:`SparkrunError` and typed subclasses
   (:class:`InsufficientCapacity`, :class:`LayoutRequired`,
-  :class:`RecipeNotFound`, :class:`HostsUnreachable`,
-  :class:`JobNotFound`, :class:`TrustRejected`,
-  :class:`BenchmarkFailed`, :class:`NoResumableState`,
-  :class:`CategoryNotFound`, :class:`AmbiguousCategoryError`,
+  :class:`RecipeNotFound`, :class:`InvalidRegistryFilter`,
+  :class:`HostsUnreachable`, :class:`JobNotFound`,
+  :class:`TrustRejected`, :class:`BenchmarkFailed`,
+  :class:`NoResumableState`, :class:`CategoryNotFound`,
+  :class:`AmbiguousCategoryError`,
   :class:`FrameworkCategoryMismatch`).
 - **Functions** — ``run``, ``stop``, ``logs``, ``status``,
-  ``schedule``, ``list_jobs``, ``benchmark`` (added incrementally in
-  subsequent tasks; this module re-exports them as they land).
+  ``schedule``, ``list_jobs``, ``search_recipes``, ``benchmark``
+  (added incrementally in subsequent tasks; this module re-exports
+  them as they land).
 
 The API never writes to ``stdout`` / ``stderr`` and never calls
 ``sys.exit``.  Errors are raised as :class:`SparkrunError`
@@ -48,6 +50,7 @@ from sparkrun.api._errors import (
     FrameworkCategoryMismatch,
     HostsUnreachable,
     InsufficientCapacity,
+    InvalidRegistryFilter,
     JobNotFound,
     LayoutRequired,
     NoResumableState,
@@ -61,11 +64,13 @@ from sparkrun.api._logs import logs
 from sparkrun.api._models import (
     JobInfo,
     LogLine,
+    RecipeSummary,
     RunOptions,
     RunResult,
     StopAllResult,
     StopResult,
 )
+from sparkrun.api._recipes import resolve_recipe_filter, search_recipes
 from sparkrun.api._run import run
 from sparkrun.api._schedule import schedule
 from sparkrun.api._status import status, status_report
@@ -88,6 +93,7 @@ __all__ = [
     "StopAllResult",
     "LogLine",
     "JobInfo",
+    "RecipeSummary",
     # Benchmark data models
     "BenchmarkOptions",
     "BenchmarkResult",
@@ -98,6 +104,7 @@ __all__ = [
     "InsufficientCapacity",
     "LayoutRequired",
     "RecipeNotFound",
+    "InvalidRegistryFilter",
     "HostsUnreachable",
     "JobNotFound",
     "AmbiguousWorkload",
@@ -121,6 +128,8 @@ __all__ = [
     "live_monitor",
     "LiveMonitorSession",
     "list_jobs",
+    "search_recipes",
+    "resolve_recipe_filter",
     "benchmark",
     "resume_benchmark",
 ]
