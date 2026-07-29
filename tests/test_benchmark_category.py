@@ -402,6 +402,36 @@ def test_find_in_registries_category_filter_narrows_matches(tmp_path: Path):
     assert [p for _, p in matches_tools] == [files["tools-throughput"]]
 
 
+def test_find_in_registries_prefers_yaml_over_same_stem_yml(tmp_path: Path):
+    """`twin.yaml` + `twin.yml` in one registry is one profile, not an ambiguity.
+
+    Reporting both made ``ProfileAmbiguousError`` list ``@reg/twin`` twice and
+    advise "use @registry/name" — advice no name can satisfy.
+    """
+    init_sparkrun()
+    root = tmp_path / "registries"
+    bench_dir = root / "reg" / "benchmarks"
+    bench_dir.mkdir(parents=True)
+    yaml_profile = _write_profile(bench_dir / "twin.yaml", {"framework": "llama-benchy"})
+    _write_profile(bench_dir / "twin.yml", {"framework": "llama-benchy"})
+
+    rm = _FakeRegistryManager(root, [_FakeEntry("reg", "benchmarks")])
+    assert rm.find_benchmark_profile_in_registries("twin") == [("reg", yaml_profile)]
+
+
+def test_find_in_registries_category_filter_falls_through_to_yml(tmp_path: Path):
+    """A `.yaml` of the wrong category must not mask a `.yml` of the right one."""
+    init_sparkrun()
+    root = tmp_path / "registries"
+    bench_dir = root / "reg" / "benchmarks"
+    bench_dir.mkdir(parents=True)
+    _write_profile(bench_dir / "twin.yaml", {"framework": "tool-eval-bench"})  # derived: tools
+    yml_profile = _write_profile(bench_dir / "twin.yml", {"framework": "llama-benchy"})  # derived: performance
+
+    rm = _FakeRegistryManager(root, [_FakeEntry("reg", "benchmarks")])
+    assert rm.find_benchmark_profile_in_registries("twin", category="performance") == [("reg", yml_profile)]
+
+
 def test_list_benchmark_profiles_emits_category_and_filters(tmp_path: Path):
     init_sparkrun()
     rm, _files = _make_registry_fixture(tmp_path)

@@ -1477,7 +1477,7 @@ class RegistryManager:
         """List all recipes in a directory with metadata.
 
         Args:
-            recipe_dir: Directory to scan for .yaml recipe files.
+            recipe_dir: Directory to scan for ``.yaml`` / ``.yml`` recipe files.
             registry_name: Name of the registry this directory belongs to.
 
         Returns:
@@ -1486,10 +1486,10 @@ class RegistryManager:
         if not recipe_dir.is_dir():
             return []
 
-        from sparkrun.core.recipe import recipe_summary
+        from sparkrun.core.recipe import iter_recipe_files, recipe_summary
 
         recipes = []
-        for f in sorted(recipe_dir.rglob("*.yaml")):
+        for f in iter_recipe_files(recipe_dir):
             entry = recipe_summary(f, registry_name=registry_name)
             if entry is not None:
                 recipes.append(entry)
@@ -1592,18 +1592,28 @@ class RegistryManager:
             recipe_dir = self._recipe_dir(entry)
             if recipe_dir is None:
                 continue
-            # Flat lookup first (existing behavior)
+            # Flat lookup first (existing behavior). A same-stem `.yaml` and
+            # `.yml` side by side are one recipe spelled two ways, not an
+            # ambiguity — `.yaml` wins, since no scoped name could tell the
+            # two apart anyway.
             found = False
             for ext in (".yaml", ".yml"):
                 candidate = recipe_dir / (name + ext)
                 if candidate.exists():
                     matches.append((entry.name, candidate))
                     found = True
+                    break
 
-            # If flat lookup found nothing, search subdirectories by stem
+            # If flat lookup found nothing, search subdirectories by stem.
+            # Same extension rule, applied per containing directory: two
+            # subdirs holding the stem stay two distinct matches.
             if not found:
+                seen_dirs: set[Path] = set()
                 for ext in (".yaml", ".yml"):
                     for candidate in sorted(recipe_dir.rglob(f"{name}{ext}")):
+                        if candidate.parent in seen_dirs:
+                            continue
+                        seen_dirs.add(candidate.parent)
                         matches.append((entry.name, candidate))
 
         return matches
@@ -1826,12 +1836,20 @@ class RegistryManager:
             benchmark_dir = self._benchmark_dir(entry)
             if benchmark_dir is None:
                 continue
+            # `.yaml` wins over a same-stem `.yml` (see
+            # find_recipe_in_registries), so one registry contributes at most
+            # one match and ProfileAmbiguousError stays purely cross-registry —
+            # where its `@registry/name` advice is actually followable. The
+            # category filter still falls through to `.yml`: a `.yaml` of the
+            # wrong category doesn't mask a `.yml` of the right one.
             for ext in (".yaml", ".yml"):
                 candidate = benchmark_dir / (name + ext)
-                if candidate.exists():
-                    if category is not None and _profile_category(candidate) != category:
-                        continue
-                    matches.append((entry.name, candidate))
+                if not candidate.exists():
+                    continue
+                if category is not None and _profile_category(candidate) != category:
+                    continue
+                matches.append((entry.name, candidate))
+                break
         return matches
 
     def list_benchmark_profiles(

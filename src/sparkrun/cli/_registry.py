@@ -509,7 +509,7 @@ def export_metadata(ctx, output, include_hidden):
     from pathlib import Path
 
     from vpd.next.util import read_yaml
-    from sparkrun.core.recipe import Recipe
+    from sparkrun.core.recipe import Recipe, iter_recipe_files
     from sparkrun.core.parallelism import extract_parallelism_meta
     from sparkrun.models.download import parse_gguf_model_spec
 
@@ -533,7 +533,8 @@ def export_metadata(ctx, output, include_hidden):
             continue
 
         recipe_count = 0
-        for f in sorted(recipe_dir.rglob("*.yaml"), key=lambda p: (len(p.relative_to(recipe_dir).parts), p.name)):
+        recipe_files = iter_recipe_files(recipe_dir)
+        for f in sorted(recipe_files, key=lambda p: (len(p.relative_to(recipe_dir).parts), p.name)):
             try:
                 data = read_yaml(str(f))
                 if not isinstance(data, dict):

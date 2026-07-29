@@ -607,6 +607,68 @@ class TestRecipeDiscovery:
         matches = mgr.find_recipe_in_registries("dup")
         assert matches == [("reg", recipe_dir / "dup.yaml")]
 
+    def test_same_stem_yaml_and_yml_is_one_match_not_an_ambiguity(self, reg_dirs):
+        """`foo.yaml` + `foo.yml` in one dir is one recipe spelled twice — .yaml wins.
+
+        Reporting both would raise an "ambiguous" error whose suggested fix is
+        impossible: no scoped name distinguishes two files with the same stem.
+        """
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        nested = recipe_dir / "sub"
+        nested.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+
+        (recipe_dir / "twin.yaml").write_text("model: a\n")
+        (recipe_dir / "twin.yml").write_text("model: b\n")
+        assert mgr.find_recipe_in_registries("twin") == [("reg", recipe_dir / "twin.yaml")]
+
+        # Same rule in the recursive phase, applied per directory.
+        (nested / "nested-twin.yaml").write_text("model: a\n")
+        (nested / "nested-twin.yml").write_text("model: b\n")
+        assert mgr.find_recipe_in_registries("nested-twin") == [("reg", nested / "nested-twin.yaml")]
+
+    def test_recursive_phase_keeps_same_stem_in_different_subdirs(self, reg_dirs):
+        """Per-directory extension collapsing must not collapse distinct subdirs."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        (cache / "reg" / ".git").mkdir(parents=True, exist_ok=True)
+        for sub in ("a", "b"):
+            (recipe_dir / sub).mkdir(parents=True)
+            (recipe_dir / sub / "twin.yaml").write_text("model: %s\n" % sub)
+        # A .yml alongside one of them is still collapsed into its own dir's .yaml
+        (recipe_dir / "a" / "twin.yml").write_text("model: shadow\n")
+
+        assert mgr.find_recipe_in_registries("twin") == [
+            ("reg", recipe_dir / "a" / "twin.yaml"),
+            ("reg", recipe_dir / "b" / "twin.yaml"),
+        ]
+
+    def test_yml_only_recipe_is_findable_and_listed(self, reg_dirs):
+        """A `.yml`-only recipe must be both runnable and visible in the catalog."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        nested = recipe_dir / "sub"
+        nested.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+        with open(nested / "yml-only.yml", "w") as f:
+            yaml.dump({"name": "Yml Only", "model": "test", "runtime": "vllm"}, f)
+
+        # Lookup already accepted .yml...
+        assert mgr.find_recipe_in_registries("yml-only") == [("reg", nested / "yml-only.yml")]
+        # ...but the catalog globbed *.yaml only, so it was invisible.
+        listed = {r["file"] for r in mgr.search_recipes("yml-only")}
+        assert listed == {"yml-only"}
+
 
 class TestQualifiedRecipeName:
     """Test RegistryManager.qualified_recipe_name path-qualified rendering."""
