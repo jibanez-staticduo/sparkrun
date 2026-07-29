@@ -29,6 +29,7 @@ from sparkrun.benchmarking.llama_benchy import LlamaBenchyFramework
 from sparkrun.benchmarking.tool_eval_bench import ToolEvalBenchFramework
 from sparkrun.core.benchmark_profiles import (
     BenchmarkSpec,
+    ProfileAmbiguousError,
     ProfileError,
     find_benchmark_profile,
 )
@@ -435,6 +436,110 @@ def test_find_in_registries_category_filter_falls_through_to_yml(tmp_path: Path)
 
     rm = _FakeRegistryManager(root, [_FakeEntry("reg", "benchmarks")])
     assert rm.find_benchmark_profile_in_registries("twin", category="performance") == [("reg", yml_profile)]
+
+
+def _real_registry(tmp_path: Path, entries):
+    """Build a real RegistryManager over cached dirs (needs qualified_asset_name)."""
+    from sparkrun.core.registry import RegistryEntry, RegistryManager
+
+    config, cache = tmp_path / "config", tmp_path / "cache"
+    config.mkdir(exist_ok=True)
+    cache.mkdir(exist_ok=True)
+    mgr = RegistryManager(config, cache)
+    mgr._save_registries(
+        [RegistryEntry(name=n, url="https://example.com/%s" % n, subpath="recipes", benchmark_subpath="benchmarks") for n in entries]
+    )
+    for n in entries:
+        (cache / n / ".git").mkdir(parents=True, exist_ok=True)
+    return mgr, cache
+
+
+def test_scoped_profile_ambiguity_raises_with_typeable_labels(tmp_path: Path):
+    """Two nested same-stem profiles in one registry must not be silently guessed."""
+    init_sparkrun()
+    mgr, cache = _real_registry(tmp_path, ["reg"])
+    bench = cache / "reg" / "benchmarks"
+    for sub in ("a-suite", "b-suite"):
+        (bench / sub).mkdir(parents=True)
+        _write_profile(bench / sub / "twin.yaml", {"framework": "llama-benchy"})
+
+    cfg = _FakeConfig(tmp_path / "config")
+    with pytest.raises(ProfileAmbiguousError) as exc_info:
+        find_benchmark_profile("@reg/twin", cfg, registry_manager=mgr)
+
+    err = exc_info.value
+    assert err.labels == ["@reg/a-suite/twin", "@reg/b-suite/twin"]
+    assert len(set(err.labels)) == 2
+    assert "is ambiguous" in str(err)
+
+    # Every emitted label resolves — the advice is followable.
+    for label in err.labels:
+        assert find_benchmark_profile(label, cfg, registry_manager=mgr).parent.name in ("a-suite", "b-suite")
+    assert find_benchmark_profile("@reg/b-suite/twin", cfg, registry_manager=mgr) == bench / "b-suite" / "twin.yaml"
+
+
+def test_unscoped_profile_ambiguity_labels_are_path_qualified(tmp_path: Path):
+    """Cross-registry profile ambiguity carries path-qualified labels too."""
+    init_sparkrun()
+    mgr, cache = _real_registry(tmp_path, ["reg-a", "reg-b"])
+    flat = cache / "reg-a" / "benchmarks"
+    flat.mkdir(parents=True)
+    _write_profile(flat / "dup.yaml", {"framework": "llama-benchy"})
+    nested = cache / "reg-b" / "benchmarks" / "suite"
+    nested.mkdir(parents=True)
+    _write_profile(nested / "dup.yaml", {"framework": "llama-benchy"})
+
+    cfg = _FakeConfig(tmp_path / "config")
+    with pytest.raises(ProfileAmbiguousError) as exc_info:
+        find_benchmark_profile("dup", cfg, registry_manager=mgr)
+
+    assert exc_info.value.labels == ["@reg-a/dup", "@reg-b/suite/dup"]
+
+
+def test_find_in_registries_reaches_nested_profile(tmp_path: Path):
+    """Benchmark dirs are scanned recursively, like recipe dirs.
+
+    A flat same-stem profile in another registry must not suppress it — the
+    per-registry fallback is shared with recipes, so this is the profile-side
+    proof of the same rule.
+    """
+    init_sparkrun()
+    root = tmp_path / "registries"
+    flat_dir = root / "flat-reg" / "benchmarks"
+    nested_dir = root / "nested-reg" / "benchmarks" / "suite"
+    flat_dir.mkdir(parents=True)
+    nested_dir.mkdir(parents=True)
+    flat = _write_profile(flat_dir / "shared.yaml", {"framework": "llama-benchy"})
+    nested = _write_profile(nested_dir / "shared.yaml", {"framework": "llama-benchy"})
+
+    rm = _FakeRegistryManager(root, [_FakeEntry("flat-reg", "benchmarks"), _FakeEntry("nested-reg", "benchmarks")])
+    assert rm.find_benchmark_profile_in_registries("shared") == [("flat-reg", flat), ("nested-reg", nested)]
+
+
+def test_flat_profile_still_beats_nested_within_one_registry(tmp_path: Path):
+    """Flat wins inside a registry — recursion is a fallback, not a merge."""
+    init_sparkrun()
+    root = tmp_path / "registries"
+    bench_dir = root / "reg" / "benchmarks"
+    (bench_dir / "suite").mkdir(parents=True)
+    flat = _write_profile(bench_dir / "dup.yaml", {"framework": "llama-benchy"})
+    _write_profile(bench_dir / "suite" / "dup.yaml", {"framework": "llama-benchy"})
+
+    rm = _FakeRegistryManager(root, [_FakeEntry("reg", "benchmarks")])
+    assert rm.find_benchmark_profile_in_registries("dup") == [("reg", flat)]
+
+
+def test_nested_profiles_are_listed_by_the_catalog(tmp_path: Path):
+    """Catalog and lookup share a scanner, so they cannot disagree."""
+    init_sparkrun()
+    root = tmp_path / "registries"
+    bench_dir = root / "reg" / "benchmarks"
+    (bench_dir / "suite").mkdir(parents=True)
+    _write_profile(bench_dir / "flat.yaml", {"framework": "llama-benchy"})
+    _write_profile(bench_dir / "suite" / "nested.yaml", {"framework": "llama-benchy"})
+
+    rm = _FakeRegistryManager(root, [_FakeEntry("reg", "benchmarks")])
+    assert {p["file"] for p in rm.list_benchmark_profiles()} == {"flat", "nested"}
 
 
 def test_list_benchmark_profiles_emits_category_and_filters(tmp_path: Path):

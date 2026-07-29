@@ -177,13 +177,72 @@ class RegistryAsset:
 
 #: Recipes: nested by model family, ``.yaml`` or ``.yml``.
 RECIPE_ASSET = RegistryAsset("recipe", "subpath")
-#: Benchmark profiles: flat today (catalog and lookup agree on that).
-BENCHMARK_ASSET = RegistryAsset("benchmark profile", "benchmark_subpath", recursive=False)
+#: Benchmark profiles: nested like recipes, so a registry can group profiles
+#: by suite or hardware without their names becoming unreachable.
+BENCHMARK_ASSET = RegistryAsset("benchmark profile", "benchmark_subpath")
 #: Tuning configs: shape-based JSON under ``<tuning>/<runtime>/``.  Only the
 #: directory resolution is shared — lookup is by runtime, not by stem.
 TUNING_ASSET = RegistryAsset("tuning config", "tuning_subpath", extensions=(".json",))
 #: Shared mods (run.sh + supporting files).  Directory resolution only.
 MODS_ASSET = RegistryAsset("mods", "mods_subpath")
+
+
+def format_ambiguity(kind: str, name: str, matches: list[tuple[str, Path]], labels: list[str]) -> str:
+    """Build the message shared by recipe and benchmark-profile ambiguity errors.
+
+    Kept as a formatter rather than a base class: the two error types live in
+    hierarchies callers already catch (``RecipeError`` / ``ProfileError``), and
+    the only thing genuinely common is the wording.
+
+    Args:
+        kind: Capitalized noun for the asset ("Recipe", "Benchmark profile").
+        name: The name that was ambiguous.
+        matches: The ``(registry, path)`` matches.
+        labels: Typeable ``@registry/...`` names, parallel to *matches*.
+
+    Returns:
+        A message naming where the collision is and how to resolve it.
+    """
+    registries = {reg for reg, _ in matches}
+    where = (
+        "in registry '%s'" % next(iter(registries))
+        if len(registries) == 1
+        else "in multiple registries: %s" % ", ".join(sorted(registries))
+    )
+    return "%s '%s' is ambiguous — %d matches %s (%s). Use the full name to specify." % (
+        kind,
+        name,
+        len(matches),
+        where,
+        ", ".join(labels),
+    )
+
+
+def iter_asset_files(directory: Path, asset: RegistryAsset) -> list[Path]:
+    """Return a directory's asset files, sorted, one per stem per directory.
+
+    This is the *catalog* peer of :func:`_scan_asset_dir` (which resolves one
+    name), and it applies the same rules so listing and lookup can never
+    disagree — an asset that is runnable is listed, and vice versa.
+
+    Covers every extension the asset declares. A same-stem ``.yaml`` and
+    ``.yml`` in one directory are one asset spelled two ways, so ``.yaml``
+    wins; the same stem in *different* directories stays two distinct assets,
+    so this never dedupes the catalog by name.
+
+    Args:
+        directory: Directory to scan.
+        asset: Which kind of asset to list.
+
+    Returns:
+        Sorted list of asset file paths.
+    """
+    globber = directory.rglob if asset.recursive else directory.glob
+    chosen: dict[tuple[Path, str], Path] = {}
+    for ext in asset.extensions:
+        for f in globber("*" + ext):
+            chosen.setdefault((f.parent, f.stem), f)
+    return sorted(chosen.values())
 
 
 def _scan_asset_dir(
@@ -1649,10 +1708,10 @@ class RegistryManager:
         if not recipe_dir.is_dir():
             return []
 
-        from sparkrun.core.recipe import iter_recipe_files, recipe_summary
+        from sparkrun.core.recipe import recipe_summary
 
         recipes = []
-        for f in iter_recipe_files(recipe_dir):
+        for f in iter_asset_files(recipe_dir, RECIPE_ASSET):
             entry = recipe_summary(f, registry_name=registry_name)
             if entry is not None:
                 recipes.append(entry)
@@ -1936,7 +1995,10 @@ class RegistryManager:
             benchmark_dir = self._benchmark_dir(entry)
             if benchmark_dir is None:
                 continue
-            for f in sorted(benchmark_dir.glob("*.yaml")) + sorted(benchmark_dir.glob("*.yml")):
+            # Shares the lookup scanner, so the catalog and
+            # find_benchmark_profile_in_registries can never disagree about
+            # which files exist.
+            for f in iter_asset_files(benchmark_dir, BENCHMARK_ASSET):
                 # Read metadata from the profile
                 profile_name = f.stem
                 description = ""

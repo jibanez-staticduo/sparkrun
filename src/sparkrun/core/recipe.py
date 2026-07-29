@@ -771,16 +771,9 @@ class RecipeAmbiguousError(RecipeError):
         self.name = name
         self.matches = matches
         self.labels = labels if labels is not None else ["@%s/%s" % (reg, Path(p).stem) for reg, p in matches]
-        registries = {reg for reg, _ in matches}
-        where = (
-            "in registry '%s'" % next(iter(registries))
-            if len(registries) == 1
-            else "in multiple registries: %s" % ", ".join(sorted(registries))
-        )
-        super().__init__(
-            "Recipe '%s' is ambiguous — %d matches %s (%s). Use the full name to specify."
-            % (name, len(matches), where, ", ".join(self.labels))
-        )
+        from sparkrun.core.registry import format_ambiguity
+
+        super().__init__(format_ambiguity("Recipe", name, matches, self.labels))
 
 
 class Recipe:
@@ -1804,40 +1797,6 @@ def find_recipe_in_registry(name: str, registry_name: str, registry_manager: Reg
     raise RecipeError("Recipe '%s' not found in registry '%s'" % (name, registry_name))
 
 
-#: Extensions a recipe file may use, in precedence order.
-RECIPE_EXTENSIONS: tuple[str, ...] = (".yaml", ".yml")
-
-
-def iter_recipe_files(directory: Path, *, recursive: bool = True) -> list[Path]:
-    """Return a directory's recipe files, sorted, one per stem per directory.
-
-    Covers **both** ``.yaml`` and ``.yml``. Lookup has always accepted either,
-    but catalog scans globbed only ``*.yaml``, so a ``.yml`` recipe was
-    runnable yet invisible to ``sparkrun list`` / ``search``.
-
-    A same-stem ``.yaml`` and ``.yml`` in one directory are one recipe spelled
-    two ways — ``.yaml`` wins, matching
-    :meth:`~sparkrun.core.registry.RegistryManager.find_recipe_in_registries`.
-    The same stem in *different* directories stays two distinct recipes (a
-    registry's recipe dir is scanned recursively), so this never dedupes the
-    catalog by name.
-
-    Args:
-        directory: Directory to scan.
-        recursive: Scan subdirectories too (the registry default). Pass False
-            for flat-only scans.
-
-    Returns:
-        Sorted list of recipe file paths.
-    """
-    globber = directory.rglob if recursive else directory.glob
-    chosen: dict[tuple[Path, str], Path] = {}
-    for ext in RECIPE_EXTENSIONS:
-        for f in globber("*" + ext):
-            chosen.setdefault((f.parent, f.stem), f)
-    return sorted(chosen.values())
-
-
 def recipe_summary(path: Path, registry_name: str | None = None) -> dict[str, Any] | None:
     """Build a lightweight recipe summary dict from a YAML file.
 
@@ -1882,6 +1841,8 @@ def list_recipes(
     local_files: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
     """List all available recipes with name and path."""
+    from sparkrun.core.registry import RECIPE_ASSET, iter_asset_files
+
     recipes: list[dict[str, Any]] = []
     seen_names: set[str] = set()
 
@@ -1914,7 +1875,7 @@ def list_recipes(
                         registry_name = reg.name
                         break
 
-        for f in iter_recipe_files(search_dir):
+        for f in iter_asset_files(search_dir, RECIPE_ASSET):
             if f.stem not in seen_names:
                 seen_names.add(f.stem)
                 entry = recipe_summary(f, registry_name=registry_name)

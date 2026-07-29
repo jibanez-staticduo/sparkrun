@@ -426,6 +426,32 @@ Two recipe format versions exist: v1 (eugr-style, auto-detected by `recipe_versi
 The `RegistryManager` (`core/registry.py`) tracks recipe collections from remote git repos using sparse checkouts.
 Registries are stored in `~/.config/sparkrun/registries.yaml`; cached clones live under `~/.cache/sparkrun/registries/`.
 
+**Registry assets** — recipes, benchmark profiles, tuning configs and mods are all "a named file under a per-registry
+subdirectory", so the shape is data, not four code paths. `RegistryAsset` (`RECIPE_ASSET`, `BENCHMARK_ASSET`,
+`TUNING_ASSET`, `MODS_ASSET`) names the subpath field, whether the scan recurses, and the extension precedence; the
+generic machinery hangs off it:
+
+| Function                   | Role                                                                                     |
+|----------------------------|------------------------------------------------------------------------------------------|
+| `_iter_registries`         | the one enabled / visibility / name filter (every scan routes through it)                  |
+| `asset_dir`                | `<cache>/<entry.<subpath_field>>` when it exists — the four `_*_dir` accessors wrap this   |
+| `find_asset_in_registries` | resolve one name; per-registry flat-then-recursive, optional `accept` predicate            |
+| `iter_asset_files`         | the *catalog* peer — same rules, so listing and lookup can never disagree                  |
+| `qualified_asset_name`     | the typeable `@registry/<relpath>` label used to disambiguate                              |
+
+Two rules are shared by every asset kind and are the reason the scan is not a plain `rglob`:
+
+- **Flat beats nested, per registry.** A flat `<dir>/<name>.yaml` wins and suppresses that registry's recursive scan —
+  but never another registry's (the bug fixed in #227).
+- **`.yaml` beats a same-stem `.yml`, per directory.** They are one asset spelled two ways; treating them as two would
+  produce an "ambiguous" error no name could resolve. The same stem in *different* subdirectories stays two distinct
+  assets, so the catalog is never deduped by name.
+
+Ambiguity therefore means "genuinely several assets", and both `RecipeAmbiguousError` and `ProfileAmbiguousError` carry
+path-qualified `labels` (shared wording via `format_ambiguity`). Tuning configs and mods share only `asset_dir` —
+tuning lookup is by runtime and returns a collection, so it is deliberately not routed through
+`find_asset_in_registries`.
+
 **Default registry initialization** (first run, no `registries.yaml`):
 
 1. `_load_registries()` → no file → `_default_registries()`

@@ -23,16 +23,39 @@ class ProfileError(Exception):
 
 
 class ProfileAmbiguousError(ProfileError):
-    """Raised when a profile name matches multiple registries."""
+    """Raised when a profile name matches more than one registry profile.
 
-    def __init__(self, name: str, matches: list[tuple[str, Path]]):
+    Ambiguity is not only *across* registries: a registry's benchmark dir is
+    scanned recursively, so ``a/foo.yaml`` and ``b/foo.yaml`` in the same
+    registry are two different profiles matching the stem ``foo``.
+
+    ``labels`` holds one user-typeable ``@registry/...`` name per entry in
+    ``matches`` (see :meth:`RegistryManager.qualified_asset_name`), so callers
+    can present options that are actually distinguishable.  When omitted it
+    degrades to ``@registry/<stem>``.
+    """
+
+    def __init__(self, name: str, matches: list[tuple[str, Path]], labels: list[str] | None = None):
         self.name = name
         self.matches = matches
-        reg_names = [reg for reg, _ in matches]
-        super().__init__(
-            "Benchmark profile '%s' found in multiple registries: %s. "
-            "Use @registry/%s to disambiguate." % (name, ", ".join(reg_names), name)
-        )
+        self.labels = labels if labels is not None else ["@%s/%s" % (reg, Path(p).stem) for reg, p in matches]
+        from sparkrun.core.registry import format_ambiguity
+
+        super().__init__(format_ambiguity("Benchmark profile", name, matches, self.labels))
+
+
+def _ambiguous_profile(name: str, matches: list[tuple[str, Path]], registry_manager) -> ProfileAmbiguousError:
+    """Build a :class:`ProfileAmbiguousError` with path-qualified labels.
+
+    Mirrors ``recipe._ambiguous``: labels come from
+    :meth:`RegistryManager.qualified_asset_name`, so two nested matches in one
+    registry render as distinct, re-typeable names rather than the same
+    ``@registry/stem`` twice.
+    """
+    from sparkrun.core.registry import BENCHMARK_ASSET
+
+    labels = [registry_manager.qualified_asset_name(reg, path, BENCHMARK_ASSET) for reg, path in matches]
+    return ProfileAmbiguousError(name, matches, labels=labels)
 
 
 def find_benchmark_profile(
@@ -50,8 +73,16 @@ def find_benchmark_profile(
     3. Local benchmarking directory (~/.config/sparkrun/benchmarking/)
     4. Registry search with ambiguity detection
 
+    Registry benchmark dirs are scanned recursively (flat wins), so a name can
+    match several profiles — across registries or at several paths within one.
+    That raises rather than guessing, and the error's labels are always
+    ``@registry/...``-scoped, hence re-typeable: an unscoped ``suite/foo``
+    would be intercepted by step 1 as a filesystem path, ``@reg/suite/foo``
+    would not.
+
     Args:
-        name: Profile name, path, or @registry/name
+        name: Profile name, path, or @registry/name (the scope may carry a
+            subpath, e.g. ``@official/suite/foo``).
         config: SparkrunConfig instance
         registry_manager: Optional RegistryManager for registry search
         include_hidden: If True, include hidden registries
@@ -65,7 +96,7 @@ def find_benchmark_profile(
 
     Raises:
         ProfileError: If profile not found.
-        ProfileAmbiguousError: If bare name matches multiple registries.
+        ProfileAmbiguousError: If the name matches multiple profiles.
     """
     # Parse @registry/ prefix
     from sparkrun.utils import parse_scoped_name
@@ -92,8 +123,12 @@ def find_benchmark_profile(
             category=category,
         )
         scoped_matches = [(reg, path) for reg, path in matches if reg == scoped_registry]
-        if scoped_matches:
+        if len(scoped_matches) == 1:
             return scoped_matches[0][1]
+        # A benchmark dir is scanned recursively, so one stem can match several
+        # files in the *same* registry. Don't guess which the caller meant.
+        if scoped_matches:
+            raise _ambiguous_profile(lookup_name, scoped_matches, registry_manager)
         if category is not None:
             raise ProfileError(
                 "Benchmark profile '%s' not found in registry '%s' for category '%s'" % (lookup_name, scoped_registry, category)
@@ -124,7 +159,7 @@ def find_benchmark_profile(
         if len(matches) == 1:
             return matches[0][1]
         elif len(matches) > 1:
-            raise ProfileAmbiguousError(lookup_name, matches)
+            raise _ambiguous_profile(lookup_name, matches, registry_manager)
 
     if category is not None:
         raise ProfileError("Benchmark profile '%s' not found for category '%s'" % (lookup_name, category))
