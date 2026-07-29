@@ -583,6 +583,69 @@ class TestRecipeDiscovery:
         registry_names = {m[0] for m in matches}
         assert registry_names == {"reg-a", "reg-b"}
 
+        # Flat still wins *within* a registry: reg-a resolves to the flat file,
+        # not a rglob hit. This is the invariant the per-registry fallback must
+        # preserve — assert on paths, not just registry names.
+        by_registry = dict(matches)
+        assert by_registry["reg-a"] == recipe_dir_a / "my-model-vllm.yaml"
+        assert by_registry["reg-b"] == nested_dir_b / "my-model-vllm.yaml"
+
+    def test_find_recipe_prefers_flat_over_nested_within_one_registry(self, reg_dirs):
+        """A registry with both a flat and a nested same-stem recipe yields only the flat one."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        nested_dir = recipe_dir / "variants"
+        nested_dir.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+        for target in (recipe_dir / "dup.yaml", nested_dir / "dup.yaml"):
+            with open(target, "w") as f:
+                yaml.dump({"name": "Dup", "model": "test"}, f)
+
+        matches = mgr.find_recipe_in_registries("dup")
+        assert matches == [("reg", recipe_dir / "dup.yaml")]
+
+
+class TestQualifiedRecipeName:
+    """Test RegistryManager.qualified_recipe_name path-qualified rendering."""
+
+    def test_nested_path_is_qualified_with_subdirs(self, reg_dirs):
+        """A nested match renders as @registry/<subdir>/<stem>, which is re-typeable."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        nested = recipe_dir / "qwen3.6" / "vllm"
+        nested.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+        path = nested / "qwen3.6-27b.yaml"
+        path.write_text("model: test\n")
+
+        assert mgr.qualified_recipe_name("reg", path) == "@reg/qwen3.6/vllm/qwen3.6-27b"
+
+    def test_flat_path_renders_as_bare_name(self, reg_dirs):
+        """A flat match has no subdirs, so the label is the familiar @registry/name."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        recipe_dir.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+        path = recipe_dir / "flat.yaml"
+        path.write_text("model: test\n")
+
+        assert mgr.qualified_recipe_name("reg", path) == "@reg/flat"
+
+    def test_unknown_registry_falls_back_to_stem(self, reg_dirs):
+        """An unknown/uncached registry degrades to the bare stem rather than raising."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+        mgr._save_registries([])
+
+        assert mgr.qualified_recipe_name("nope", Path("/tmp/somewhere/thing.yaml")) == "@nope/thing"
+
 
 class TestRegistryEntryNewFields:
     """Test new RegistryEntry fields."""

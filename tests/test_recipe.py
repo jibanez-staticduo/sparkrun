@@ -1684,6 +1684,143 @@ class TestFindRecipePrefix:
         with pytest.raises(RecipeError, match="not found in registry"):
             find_recipe("@reg1/nonexistent", registry_manager=mgr)
 
+    def test_scoped_find_reaches_nested_recipe_despite_flat_match_elsewhere(self, tmp_path):
+        """Regression (PR #227): @reg-b/name must resolve a nested recipe.
+
+        A flat same-stem file in *another* registry used to suppress the
+        recursive scan for every registry, so an explicitly-scoped lookup
+        reported "not found" with no user-side workaround. The other registry
+        here is invisible, which was the nastiest form of the bug: a hidden
+        registry silently breaking a scoped lookup.
+        """
+        from sparkrun.core.recipe import find_recipe
+        from sparkrun.core.registry import RegistryManager, RegistryEntry
+
+        config = tmp_path / "config"
+        cache = tmp_path / "cache"
+        config.mkdir()
+        cache.mkdir()
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries(
+            [
+                RegistryEntry(name="reg-a", url="https://example.com/a", subpath="recipes", visible=False),
+                RegistryEntry(name="reg-b", url="https://example.com/b", subpath="recipes"),
+            ]
+        )
+
+        flat_dir = cache / "reg-a" / "recipes"
+        flat_dir.mkdir(parents=True)
+        (cache / "reg-a" / ".git").mkdir(exist_ok=True)
+        with open(flat_dir / "shared-stem.yaml", "w") as f:
+            yaml.dump({"name": "Flat", "model": "test", "runtime": "vllm"}, f)
+
+        nested_dir = cache / "reg-b" / "recipes" / "family"
+        nested_dir.mkdir(parents=True)
+        (cache / "reg-b" / ".git").mkdir(exist_ok=True)
+        with open(nested_dir / "shared-stem.yaml", "w") as f:
+            yaml.dump({"name": "Nested", "model": "test", "runtime": "vllm"}, f)
+
+        assert find_recipe("@reg-b/shared-stem", registry_manager=mgr) == nested_dir / "shared-stem.yaml"
+        assert find_recipe("@reg-a/shared-stem", registry_manager=mgr) == flat_dir / "shared-stem.yaml"
+
+    def test_scoped_find_ambiguous_within_one_registry_raises(self, tmp_path):
+        """Two nested same-stem recipes in one registry must not be silently guessed."""
+        from sparkrun.core.recipe import find_recipe, RecipeAmbiguousError
+        from sparkrun.core.registry import RegistryManager, RegistryEntry
+
+        config = tmp_path / "config"
+        cache = tmp_path / "cache"
+        config.mkdir()
+        cache.mkdir()
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        (cache / "reg" / ".git").mkdir(parents=True, exist_ok=True)
+        for sub in ("3x-spark-cluster", "4x-spark-cluster"):
+            (recipe_dir / sub).mkdir(parents=True)
+            with open(recipe_dir / sub / "topo.yaml", "w") as f:
+                yaml.dump({"name": sub, "model": "test", "runtime": "vllm"}, f)
+
+        with pytest.raises(RecipeAmbiguousError) as exc_info:
+            find_recipe("@reg/topo", registry_manager=mgr)
+
+        err = exc_info.value
+        assert len(err.matches) == 2
+        # Labels must be distinguishable — a bare @reg/topo twice is useless.
+        assert err.labels == ["@reg/3x-spark-cluster/topo", "@reg/4x-spark-cluster/topo"]
+        assert len(set(err.labels)) == 2
+        assert "3x-spark-cluster/topo" in str(err)
+
+        # ...and each label is re-typeable to resolve the ambiguity.
+        for label in err.labels:
+            resolved = find_recipe(label, registry_manager=mgr)
+            assert resolved.parent.name in ("3x-spark-cluster", "4x-spark-cluster")
+        assert find_recipe("@reg/4x-spark-cluster/topo", registry_manager=mgr) == recipe_dir / "4x-spark-cluster" / "topo.yaml"
+
+    def test_unscoped_ambiguity_labels_are_path_qualified(self, tmp_path):
+        """Cross-registry ambiguity carries path-qualified labels too."""
+        from sparkrun.core.recipe import find_recipe, RecipeAmbiguousError
+        from sparkrun.core.registry import RegistryManager, RegistryEntry
+
+        config = tmp_path / "config"
+        cache = tmp_path / "cache"
+        config.mkdir()
+        cache.mkdir()
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries(
+            [
+                RegistryEntry(name="reg-a", url="https://example.com/a", subpath="recipes"),
+                RegistryEntry(name="reg-b", url="https://example.com/b", subpath="recipes"),
+            ]
+        )
+
+        flat_dir = cache / "reg-a" / "recipes"
+        flat_dir.mkdir(parents=True)
+        (cache / "reg-a" / ".git").mkdir(exist_ok=True)
+        with open(flat_dir / "dup.yaml", "w") as f:
+            yaml.dump({"name": "Flat", "model": "test", "runtime": "vllm"}, f)
+
+        nested_dir = cache / "reg-b" / "recipes" / "family"
+        nested_dir.mkdir(parents=True)
+        (cache / "reg-b" / ".git").mkdir(exist_ok=True)
+        with open(nested_dir / "dup.yaml", "w") as f:
+            yaml.dump({"name": "Nested", "model": "test", "runtime": "vllm"}, f)
+
+        with pytest.raises(RecipeAmbiguousError) as exc_info:
+            find_recipe("dup", registry_manager=mgr)
+
+        assert exc_info.value.labels == ["@reg-a/dup", "@reg-b/family/dup"]
+
+    def test_find_recipe_in_registry_ambiguous_raises(self, tmp_path):
+        """find_recipe_in_registry() must not silently take the first sorted hit."""
+        from sparkrun.core.recipe import find_recipe_in_registry, RecipeAmbiguousError
+        from sparkrun.core.registry import RegistryManager, RegistryEntry
+
+        config = tmp_path / "config"
+        cache = tmp_path / "cache"
+        config.mkdir()
+        cache.mkdir()
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        (cache / "reg" / ".git").mkdir(parents=True, exist_ok=True)
+        for sub in ("a", "b"):
+            (recipe_dir / sub).mkdir(parents=True)
+            with open(recipe_dir / sub / "twin.yaml", "w") as f:
+                yaml.dump({"name": sub, "model": "test", "runtime": "vllm"}, f)
+
+        with pytest.raises(RecipeAmbiguousError):
+            find_recipe_in_registry("twin", "reg", mgr)
+
+        # A unique stem still resolves normally.
+        with open(recipe_dir / "solo.yaml", "w") as f:
+            yaml.dump({"name": "Solo", "model": "test", "runtime": "vllm"}, f)
+        assert find_recipe_in_registry("solo", "reg", mgr) == recipe_dir / "solo.yaml"
+
 
 class TestIsRecipeFile:
     """Test is_recipe_file() validation."""

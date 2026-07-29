@@ -400,12 +400,15 @@ def _load_recipe(config, recipe_name, resolve=True, retry_after_update=False):
     registry_mgr.ensure_initialized()
 
     def _prompt_disambiguation(err):
-        click.echo("Recipe '%s' found in multiple registries:" % err.name)
-        for i, (reg, path) in enumerate(err.matches, 1):
-            click.echo("  %d. @%s/%s" % (i, reg, err.name))
+        # Labels are path-qualified (@reg/subdir/name), so nested matches within
+        # one registry are distinguishable — a bare @reg/name would print the
+        # same option twice. Each label is re-typeable as a scoped recipe name.
+        click.echo("Recipe '%s' matches %d recipes:" % (err.name, len(err.matches)))
+        for i, label in enumerate(err.labels, 1):
+            click.echo("  %d. %s" % (i, label))
         click.echo()
         choice = click.prompt(
-            "Select registry",
+            "Select recipe",
             type=click.IntRange(1, len(err.matches)),
             default=1,
         )

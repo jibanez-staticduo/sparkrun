@@ -670,9 +670,25 @@ Search order:
 2. **URL** — HTTP/HTTPS fetched and cached
 3. **File path** — exact or with `.yaml`/`.yml` extension
 4. **CWD scan** — `.yaml`/`.yml` files that are valid recipes (must have `model`, `container`, resolvable `runtime`)
-5. **Registry search** — flat + recursive lookup across all enabled registries
+5. **Registry search** — flat + recursive lookup, applied **independently per registry**
 
-Ambiguous names (same recipe in multiple registries) raise an error — use `@registry/name` to disambiguate.
+Each enabled registry is searched on its own terms: a flat `<recipe-dir>/<name>.yaml` wins within that
+registry, and only if that registry has no flat match is its recipe dir scanned recursively. A flat hit in
+one registry never suppresses the recursive scan of another — so a recipe that lives only in a
+subdirectory stays reachable even when a different registry has a flat file with the same stem.
+
+Because the scan is recursive, a bare stem is not always unique *within* one registry —
+`a/foo.yaml` and `b/foo.yaml` are two different recipes. Any name matching more than one recipe raises an
+error rather than guessing, listing path-qualified names you can use verbatim:
+
+```
+Recipe 'foo' is ambiguous — 2 matches in registry 'official' (@official/a/foo, @official/b/foo).
+Use the full name to specify.
+```
+
+`@registry/name` disambiguates across registries, and `@registry/subdir/name` disambiguates within one
+(the scope is split on the first `/`, so everything after it is a path under the registry's recipe dir).
+When stdin is a TTY the CLI offers these as a numbered prompt instead of erroring.
 
 ---
 

@@ -1538,6 +1538,37 @@ class RegistryManager:
                 return entry.name
         return None
 
+    def qualified_recipe_name(self, registry_name: str, path: Path) -> str:
+        """Render a registry recipe path as a user-typeable ``@registry/...`` name.
+
+        A registry's recipe dir is scanned recursively, so a bare stem is not
+        always unique within one registry (``a/foo.yaml`` and ``b/foo.yaml``
+        are different recipes).  This returns the *disambiguating* name — the
+        extension-less path relative to the registry's recipe dir — which
+        :func:`~sparkrun.core.recipe.find_recipe` accepts verbatim because
+        ``parse_scoped_name`` splits only on the first ``/``:
+        ``@official/qwen3.6/vllm/qwen3.6-27b-fp8-mtp-vllm``.
+
+        Falls back to the bare stem when the path is not under the registry's
+        recipe dir (or the registry is unknown / not cached).
+
+        Args:
+            registry_name: Registry the path was matched in.
+            path: Path to the recipe file.
+
+        Returns:
+            A name of the form ``@<registry>/<relative-path-without-extension>``.
+        """
+        for entry in self._load_registries():
+            if entry.name != registry_name:
+                continue
+            recipe_dir = self._recipe_dir(entry)
+            if recipe_dir and path.is_relative_to(recipe_dir):
+                rel = path.relative_to(recipe_dir).with_suffix("")
+                return "@%s/%s" % (registry_name, rel.as_posix())
+            break
+        return "@%s/%s" % (registry_name, path.stem)
+
     def find_recipe_in_registries(self, name: str, include_hidden: bool = False) -> list[tuple[str, Path]]:
         """Find a recipe by file stem across all registries.
 

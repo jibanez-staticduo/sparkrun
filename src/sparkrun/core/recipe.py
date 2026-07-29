@@ -755,13 +755,32 @@ class RecipeUntrustedHostError(RecipeError):
 
 
 class RecipeAmbiguousError(RecipeError):
-    """Raised when a recipe name matches multiple registries."""
+    """Raised when a recipe name matches more than one registry recipe.
 
-    def __init__(self, name: str, matches: list[tuple[str, Path]]):
+    Ambiguity is not only *across* registries: a registry's recipe dir is
+    scanned recursively, so ``a/foo.yaml`` and ``b/foo.yaml`` in the same
+    registry are two different recipes matching the stem ``foo``.
+
+    ``labels`` holds one user-typeable ``@registry/...`` name per entry in
+    ``matches`` (see :meth:`RegistryManager.qualified_recipe_name`), so
+    callers can present options that are actually distinguishable.  When
+    omitted it degrades to ``@registry/<stem>``.
+    """
+
+    def __init__(self, name: str, matches: list[tuple[str, Path]], labels: list[str] | None = None):
         self.name = name
         self.matches = matches
-        registries = ", ".join(reg for reg, _ in matches)
-        super().__init__("Recipe '%s' found in multiple registries: %s. Use @registry/%s to specify." % (name, registries, name))
+        self.labels = labels if labels is not None else ["@%s/%s" % (reg, Path(p).stem) for reg, p in matches]
+        registries = {reg for reg, _ in matches}
+        where = (
+            "in registry '%s'" % next(iter(registries))
+            if len(registries) == 1
+            else "in multiple registries: %s" % ", ".join(sorted(registries))
+        )
+        super().__init__(
+            "Recipe '%s' is ambiguous — %d matches %s (%s). Use the full name to specify."
+            % (name, len(matches), where, ", ".join(self.labels))
+        )
 
 
 class Recipe:
@@ -1653,6 +1672,17 @@ class Recipe:
         return dest
 
 
+def _ambiguous(name: str, matches: list[tuple[str, Path]], registry_manager: RegistryManager) -> RecipeAmbiguousError:
+    """Build a :class:`RecipeAmbiguousError` with path-qualified labels.
+
+    Labels come from :meth:`RegistryManager.qualified_recipe_name`, so two
+    nested matches in one registry render as distinct, re-typeable names
+    rather than the same ``@registry/stem`` twice.
+    """
+    labels = [registry_manager.qualified_recipe_name(reg, path) for reg, path in matches]
+    return RecipeAmbiguousError(name, matches, labels=labels)
+
+
 def find_recipe(
     name: str,
     search_paths: list[Path] | None = None,
@@ -1671,7 +1701,8 @@ def find_recipe(
     5. Registry file-stem matching (if registry_manager provided)
 
     Raises:
-        RecipeAmbiguousError: If name matches multiple registries without @scope.
+        RecipeAmbiguousError: If name matches multiple recipes — either across
+            registries (no @scope) or at multiple paths within the scoped one.
         RecipeError: If recipe not found.
     """
     # Parse @registry/name prefix
@@ -1686,8 +1717,14 @@ def find_recipe(
             include_hidden=True,
         )
         scoped_matches = [(reg, path) for reg, path in matches if reg == scoped_registry]
-        if scoped_matches:
+        if len(scoped_matches) == 1:
             return scoped_matches[0][1]
+        # A registry's recipe dir is scanned recursively, so one stem can match
+        # several files in the *same* registry. Silently taking the first sorted
+        # hit would pick a recipe the user never named (e.g. the 3x-cluster
+        # variant when they meant the 4x one) — surface it instead.
+        if scoped_matches:
+            raise _ambiguous(lookup_name, scoped_matches, registry_manager)
         raise RecipeError("Recipe '%s' not found in registry '%s'" % (lookup_name, scoped_registry))
 
     # 1. Check if it's a direct path
@@ -1733,7 +1770,7 @@ def find_recipe(
             _registry_name, recipe_path = matches[0]
             return recipe_path
         elif len(matches) > 1:
-            raise RecipeAmbiguousError(lookup_name, matches)
+            raise _ambiguous(lookup_name, matches, registry_manager)
 
     search_desc = [str(p) for p in (search_paths or [])]
     if registry_manager:
@@ -1753,12 +1790,17 @@ def find_recipe_in_registry(name: str, registry_name: str, registry_manager: Reg
         Path to the recipe file.
 
     Raises:
+        RecipeAmbiguousError: If the name matches several paths in that registry.
         RecipeError: If recipe not found in that registry.
     """
     matches = registry_manager.find_recipe_in_registries(name, include_hidden=True)
-    for reg, path in matches:
-        if reg == registry_name:
-            return path
+    scoped = [(reg, path) for reg, path in matches if reg == registry_name]
+    if len(scoped) == 1:
+        return scoped[0][1]
+    if scoped:
+        # Recursive scan means one stem can match several files in a single
+        # registry; don't guess which one the caller meant.
+        raise _ambiguous(name, scoped, registry_manager)
     raise RecipeError("Recipe '%s' not found in registry '%s'" % (name, registry_name))
 
 
