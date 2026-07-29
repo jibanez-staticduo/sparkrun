@@ -183,6 +183,23 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
             # downstream consumers don't surface a fake one.
             placement_token = ""
 
+    # 3a-bis. Evict this intent's superseded deployments.  ``exclude_intent_id``
+    # above told the scheduler "my own containers aren't foreign load, I'm
+    # replacing them" — this is the half that actually replaces them.  It is a
+    # no-op on the deterministic (greedy) path, where the relaunch reuses the
+    # prior cluster_id and the runtime's step-1 cleanup already removes those
+    # containers by name.
+    if not options.dry_run:
+        _evict_superseded_deployments(
+            intent_id=intent_id,
+            cluster_id_for_launch=cluster_id_for_launch,
+            candidate_hosts=hosts,
+            target_hosts=host_list,
+            cluster_def=cluster_def,
+            config=config,
+            sctx=sctx,
+        )
+
     # 3b. Experimental k8s JobSet path (gated by the api.run.k8s feature flag).
     # When the resolved executor is k8s AND the flag is on, route to the
     # native Kubernetes launcher instead of the SSH-oriented launch_inference.
@@ -321,6 +338,107 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
 
     emit_run_telemetry(config, result=run_result, recipe=recipe, cluster=cluster_def, options=options)
     return run_result
+
+
+def _evict_superseded_deployments(
+    *,
+    intent_id: str,
+    cluster_id_for_launch: str,
+    candidate_hosts: list[str],
+    target_hosts: list[str],
+    cluster_def,
+    config,
+    sctx: "SparkrunContext | None",
+) -> list[str]:
+    """Stop this intent's earlier deployments that sit on the hosts we're about to use.
+
+    A launch's ``cluster_id`` is ``sparkrun_<intent_id>_<placement_token>``.
+    Under a *deterministic* scheduler (greedy) the token is derived from the
+    host set, so a relaunch reuses the prior cluster_id and the runtime's
+    "Step 1: clean up existing containers" removes the previous deployment by
+    name.  Under a **status-aware scheduler** (``occupancy-*``) the token is
+    freshly random, so the new cluster_id can never match the old containers'
+    names — step 1 becomes a no-op and the previous deployment keeps running,
+    holding VRAM/RAM and the serve port (issue #223).
+
+    ``resolve_effective_hosts(..., exclude_intent_id=...)`` has already
+    subtracted this intent's occupancy from the scheduling snapshot on the
+    premise that the relaunch *replaces* it.  This function is the half that
+    makes that premise true.
+
+    Scope is deliberately narrow:
+
+    * **Same intent only.**  Foreign workloads are never touched — a second
+      recipe sharing the cluster is a capacity question for the scheduler,
+      not something a launch may unilaterally kill.
+    * **Only deployments overlapping** *target_hosts*.  Running the same
+      intent twice on disjoint host subsets is a supported use of the random
+      placement token (see :func:`generate_placement_token`), so a
+      non-overlapping sibling deployment is left alone.
+    * An overlapping deployment is torn down **across every host it occupies**
+      within *candidate_hosts*, not just the overlapping ones — half a
+      distributed job is dead weight either way.
+
+    Best-effort: discovery or teardown failures are logged and swallowed so
+    they can't block a launch that may well succeed anyway.
+
+    Returns the cluster_ids that were evicted (empty when there was nothing
+    to do).
+    """
+    import sparkrun.api as api
+    from sparkrun.orchestration.executor import query_status_for_cluster
+    from sparkrun.orchestration.primitives import build_ssh_kwargs
+
+    try:
+        status = query_status_for_cluster(
+            cluster_def,
+            list(candidate_hosts),
+            ssh_kwargs=build_ssh_kwargs(config) if config else {},
+            config=config,
+            v=sctx.variables if sctx is not None else None,
+        )
+    except Exception as e:
+        logger.debug("Could not query cluster status for eviction; skipping: %s", e)
+        return []
+
+    prefix = "sparkrun_%s_" % intent_id
+    target = set(target_hosts)
+    # cluster_id -> every host in the snapshot it occupies (insertion-ordered).
+    occupied: dict[str, list[str]] = {}
+    overlapping: list[str] = []
+    for entry in status.hosts:
+        for workload in entry.workloads:
+            cid = workload.cluster_id
+            if cid == cluster_id_for_launch:
+                continue
+            if workload.intent_id != intent_id and not cid.startswith(prefix):
+                continue
+            hosts_for_cid = occupied.setdefault(cid, [])
+            if entry.host not in hosts_for_cid:
+                hosts_for_cid.append(entry.host)
+            if entry.host in target and cid not in overlapping:
+                overlapping.append(cid)
+
+    evicted: list[str] = []
+    for cid in overlapping:
+        logger.info(
+            "Replacing earlier deployment %s of this workload on %s",
+            cid,
+            ", ".join(occupied[cid]),
+        )
+        try:
+            result = api.stop(cluster_id=cid, hosts=occupied[cid], cluster=cluster_def, sctx=sctx)
+        except Exception as e:
+            logger.warning("Could not stop earlier deployment %s: %s — it may still hold GPU memory", cid, e)
+            continue
+        if result.hosts_failed:
+            logger.warning(
+                "Teardown of earlier deployment %s did not confirm on %s — it may still hold GPU memory",
+                cid,
+                ", ".join(result.hosts_failed),
+            )
+        evicted.append(cid)
+    return evicted
 
 
 def _build_executor_overrides(options: RunOptions) -> dict[str, Any]:
