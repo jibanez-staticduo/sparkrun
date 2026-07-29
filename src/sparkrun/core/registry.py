@@ -11,7 +11,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import yaml
 
@@ -146,6 +146,82 @@ class RegistryEntry:
     benchmark_subpath: str = ""
     mods_subpath: str = ""
     trusted: bool = False
+
+
+@dataclass(frozen=True)
+class RegistryAsset:
+    """A kind of per-registry file that sparkrun resolves by file stem.
+
+    Recipes and benchmark profiles differ only in *where* they live and *how
+    deep* the scan goes.  Everything around that — which registries are
+    eligible, extension precedence, flat-beats-nested, the ``@registry/...``
+    label used to disambiguate — is identical, so it lives once in
+    :meth:`RegistryManager.find_asset_in_registries` and is parameterized by
+    an instance of this class.
+
+    Attributes:
+        kind: Human-readable noun for messages ("recipe", "benchmark profile").
+        subpath_field: :class:`RegistryEntry` attribute naming the subdirectory.
+        recursive: Scan subdirectories when the flat lookup misses.  Recipe
+            registries nest by model family; benchmark registries are flat.
+        extensions: Accepted file extensions, in precedence order — the first
+            one that exists wins, so a same-stem ``.yaml`` and ``.yml`` in one
+            directory are one asset spelled two ways, not an ambiguity.
+    """
+
+    kind: str
+    subpath_field: str
+    recursive: bool = True
+    extensions: tuple[str, ...] = (".yaml", ".yml")
+
+
+#: Recipes: nested by model family, ``.yaml`` or ``.yml``.
+RECIPE_ASSET = RegistryAsset("recipe", "subpath")
+#: Benchmark profiles: flat today (catalog and lookup agree on that).
+BENCHMARK_ASSET = RegistryAsset("benchmark profile", "benchmark_subpath", recursive=False)
+#: Tuning configs: shape-based JSON under ``<tuning>/<runtime>/``.  Only the
+#: directory resolution is shared — lookup is by runtime, not by stem.
+TUNING_ASSET = RegistryAsset("tuning config", "tuning_subpath", extensions=(".json",))
+#: Shared mods (run.sh + supporting files).  Directory resolution only.
+MODS_ASSET = RegistryAsset("mods", "mods_subpath")
+
+
+def _scan_asset_dir(
+    base: Path,
+    name: str,
+    asset: RegistryAsset,
+    accept: Callable[[Path], bool] | None = None,
+) -> list[Path]:
+    """Return one registry's matches for *name*, newest rules applied.
+
+    Flat wins: if ``<base>/<name>.<ext>`` exists it is the answer and no
+    recursive scan happens.  Otherwise — and only when the asset is recursive —
+    subdirectories are scanned, keeping at most one match per containing
+    directory so the same stem in two subdirs stays two distinct assets.
+
+    *accept* (used for the benchmark category filter) rejects a candidate
+    without masking the next one: a wrong-category ``.yaml`` still lets a
+    right-category ``.yml`` in the same directory through.
+    """
+    for ext in asset.extensions:
+        candidate = base / (name + ext)
+        if candidate.exists() and (accept is None or accept(candidate)):
+            return [candidate]
+
+    if not asset.recursive:
+        return []
+
+    seen_dirs: set[Path] = set()
+    found: list[Path] = []
+    for ext in asset.extensions:
+        for candidate in sorted(base.rglob(name + ext)):
+            if candidate.parent in seen_dirs:
+                continue
+            if accept is not None and not accept(candidate):
+                continue
+            seen_dirs.add(candidate.parent)
+            found.append(candidate)
+    return found
 
 
 # Git URLs whose .sparkrun/registry.yaml manifests are used for first-run
@@ -485,18 +561,112 @@ class RegistryManager:
         """
         return self.cache_root / name
 
-    def _recipe_dir(self, entry: RegistryEntry) -> Path | None:
-        """Get the recipe directory within a cached registry.
+    def _iter_registries(
+        self,
+        *,
+        include_hidden: bool = False,
+        only: str | None = None,
+    ) -> Iterator[RegistryEntry]:
+        """Yield eligible registries, applying the standard filters once.
 
         Args:
-            entry: Registry entry
+            include_hidden: Yield invisible registries too.  Callers that do
+                not filter on visibility at all pass True.
+            only: Restrict to this registry name.
+
+        Yields:
+            Enabled registry entries passing the filters, in config order.
+        """
+        for entry in self._load_registries():
+            if not entry.enabled:
+                continue
+            if only is not None and entry.name != only:
+                continue
+            if not include_hidden and not entry.visible:
+                continue
+            yield entry
+
+    def asset_dir(self, entry: RegistryEntry, asset: RegistryAsset) -> Path | None:
+        """Get an asset directory within a cached registry.
+
+        Args:
+            entry: Registry entry.
+            asset: Which kind of asset directory to resolve.
 
         Returns:
-            Path to the recipe directory, or None if not cached
+            Path to the directory, or None when the registry does not declare
+            one or it is not cached.
         """
-        cache_dir = self._cache_dir(entry.name)
-        recipe_path = cache_dir / entry.subpath
-        return recipe_path if recipe_path.exists() else None
+        subpath = getattr(entry, asset.subpath_field, "")
+        if not subpath:
+            return None
+        path = self._cache_dir(entry.name) / subpath
+        return path if path.exists() else None
+
+    def find_asset_in_registries(
+        self,
+        name: str,
+        asset: RegistryAsset,
+        *,
+        include_hidden: bool = False,
+        accept: Callable[[Path], bool] | None = None,
+    ) -> list[tuple[str, Path]]:
+        """Find an asset by file stem across registries.
+
+        Each registry is searched **independently** (see
+        :func:`_scan_asset_dir`): a flat hit in one registry never suppresses
+        another registry's recursive scan.
+
+        Args:
+            name: File stem to find (may include a subpath, e.g. ``fam/foo``).
+            asset: Which kind of asset to look for.
+            include_hidden: Include assets from invisible registries.
+            accept: Optional per-candidate predicate (e.g. a category filter).
+
+        Returns:
+            List of ``(registry_name, path)`` tuples for disambiguation.
+        """
+        matches: list[tuple[str, Path]] = []
+        for entry in self._iter_registries(include_hidden=include_hidden):
+            base = self.asset_dir(entry, asset)
+            if base is None:
+                continue
+            matches.extend((entry.name, path) for path in _scan_asset_dir(base, name, asset, accept))
+        return matches
+
+    def qualified_asset_name(self, registry_name: str, path: Path, asset: RegistryAsset) -> str:
+        """Render an asset path as a user-typeable ``@registry/...`` name.
+
+        A recursive scan means a bare stem is not always unique within one
+        registry (``a/foo.yaml`` and ``b/foo.yaml`` are different assets), so
+        this returns the *disambiguating* name — the extension-less path
+        relative to the asset directory.  ``parse_scoped_name`` splits only on
+        the first ``/``, so the result is accepted verbatim by the resolvers:
+        ``@official/qwen3.6/vllm/qwen3.6-27b-fp8-mtp-vllm``.
+
+        Falls back to the bare stem when the path is not under that registry's
+        asset dir (or the registry is unknown / not cached).
+
+        Args:
+            registry_name: Registry the path was matched in.
+            path: Path to the asset file.
+            asset: Which kind of asset the path refers to.
+
+        Returns:
+            A name of the form ``@<registry>/<relative-path-without-extension>``.
+        """
+        for entry in self._load_registries():
+            if entry.name != registry_name:
+                continue
+            base = self.asset_dir(entry, asset)
+            if base and path.is_relative_to(base):
+                return "@%s/%s" % (registry_name, path.relative_to(base).with_suffix("").as_posix())
+            break
+        return "@%s/%s" % (registry_name, path.stem)
+
+    def _recipe_dir(self, entry: RegistryEntry) -> Path | None:
+        """Get the recipe directory within a cached registry."""
+        return self.asset_dir(entry, RECIPE_ASSET)
 
     def _default_registries(self) -> list[RegistryEntry]:
         """Return the default registry list.
@@ -1457,14 +1627,7 @@ class RegistryManager:
             List of paths to recipe directories (only from enabled registries)
         """
         paths = []
-        registries = self._load_registries()
-
-        for entry in registries:
-            if not entry.enabled:
-                continue
-            if not include_hidden and not entry.visible:
-                continue
-
+        for entry in self._iter_registries(include_hidden=include_hidden):
             recipe_dir = self._recipe_dir(entry)
             if recipe_dir:
                 paths.append(recipe_dir)
@@ -1511,13 +1674,7 @@ class RegistryManager:
         from sparkrun.core.recipe import recipe_matches_query
 
         results = []
-        registries = self._load_registries()
-
-        for entry in registries:
-            if not entry.enabled:
-                continue
-            if not include_hidden and not entry.visible:
-                continue
+        for entry in self._iter_registries(include_hidden=include_hidden):
             recipe_dir = self._recipe_dir(entry)
             if recipe_dir is None:
                 continue
@@ -1529,10 +1686,9 @@ class RegistryManager:
 
     def registry_for_path(self, path: Path) -> str | None:
         """Return the registry name that owns the given path, or None."""
-        registries = self._load_registries()
-        for entry in registries:
-            if not entry.enabled:
-                continue
+        # Ownership is not a visibility question — a hidden registry still owns
+        # its files, so this deliberately does not filter on `visible`.
+        for entry in self._iter_registries(include_hidden=True):
             recipe_dir = self._recipe_dir(entry)
             if recipe_dir and path.is_relative_to(recipe_dir):
                 return entry.name
@@ -1559,15 +1715,7 @@ class RegistryManager:
         Returns:
             A name of the form ``@<registry>/<relative-path-without-extension>``.
         """
-        for entry in self._load_registries():
-            if entry.name != registry_name:
-                continue
-            recipe_dir = self._recipe_dir(entry)
-            if recipe_dir and path.is_relative_to(recipe_dir):
-                rel = path.relative_to(recipe_dir).with_suffix("")
-                return "@%s/%s" % (registry_name, rel.as_posix())
-            break
-        return "@%s/%s" % (registry_name, path.stem)
+        return self.qualified_asset_name(registry_name, path, RECIPE_ASSET)
 
     def find_recipe_in_registries(self, name: str, include_hidden: bool = False) -> list[tuple[str, Path]]:
         """Find a recipe by file stem across all registries.
@@ -1581,57 +1729,11 @@ class RegistryManager:
         Returns:
             List of (registry_name, recipe_path) tuples for disambiguation
         """
-        matches = []
-        registries = self._load_registries()
-
-        for entry in registries:
-            if not entry.enabled:
-                continue
-            if not include_hidden and not entry.visible:
-                continue
-            recipe_dir = self._recipe_dir(entry)
-            if recipe_dir is None:
-                continue
-            # Flat lookup first (existing behavior). A same-stem `.yaml` and
-            # `.yml` side by side are one recipe spelled two ways, not an
-            # ambiguity — `.yaml` wins, since no scoped name could tell the
-            # two apart anyway.
-            found = False
-            for ext in (".yaml", ".yml"):
-                candidate = recipe_dir / (name + ext)
-                if candidate.exists():
-                    matches.append((entry.name, candidate))
-                    found = True
-                    break
-
-            # If flat lookup found nothing, search subdirectories by stem.
-            # Same extension rule, applied per containing directory: two
-            # subdirs holding the stem stay two distinct matches.
-            if not found:
-                seen_dirs: set[Path] = set()
-                for ext in (".yaml", ".yml"):
-                    for candidate in sorted(recipe_dir.rglob(f"{name}{ext}")):
-                        if candidate.parent in seen_dirs:
-                            continue
-                        seen_dirs.add(candidate.parent)
-                        matches.append((entry.name, candidate))
-
-        return matches
+        return self.find_asset_in_registries(name, RECIPE_ASSET, include_hidden=include_hidden)
 
     def _tuning_dir(self, entry: RegistryEntry) -> Path | None:
-        """Get the tuning directory within a cached registry.
-
-        Args:
-            entry: Registry entry
-
-        Returns:
-            Path to the tuning directory, or None if not available
-        """
-        if not entry.tuning_subpath:
-            return None
-        cache_dir = self._cache_dir(entry.name)
-        tuning_path = cache_dir / entry.tuning_subpath
-        return tuning_path if tuning_path.exists() else None
+        """Get the tuning directory within a cached registry."""
+        return self.asset_dir(entry, TUNING_ASSET)
 
     def find_tuning_configs(self, runtime: str, registry_name: str | None = None) -> list[tuple[str, Path]]:
         """Find tuning config files for a given runtime.
@@ -1649,11 +1751,9 @@ class RegistryManager:
             List of (registry_name, config_path) tuples
         """
         matches = []
-        for entry in self._load_registries():
-            if not entry.enabled or not entry.tuning_subpath:
-                continue
-            if registry_name and entry.name != registry_name:
-                continue
+        # Tuning lookup is not visibility-filtered; `_tuning_dir` already
+        # returns None for a registry that declares no tuning subpath.
+        for entry in self._iter_registries(include_hidden=True, only=registry_name or None):
             tuning_dir = self._tuning_dir(entry)
             if tuning_dir is None:
                 continue
@@ -1674,9 +1774,7 @@ class RegistryManager:
             List of dicts with registry, runtime, file, and path fields.
         """
         configs = []
-        for entry in self._load_registries():
-            if not entry.enabled or not entry.tuning_subpath:
-                continue
+        for entry in self._iter_registries(include_hidden=True):
             tuning_dir = self._tuning_dir(entry)
             if tuning_dir is None:
                 continue
@@ -1697,19 +1795,8 @@ class RegistryManager:
         return configs
 
     def _mods_dir(self, entry: RegistryEntry) -> Path | None:
-        """Get the mods directory within a cached registry.
-
-        Args:
-            entry: Registry entry
-
-        Returns:
-            Path to the mods directory, or None if not configured/available
-        """
-        if not entry.mods_subpath:
-            return None
-        cache_dir = self._cache_dir(entry.name)
-        mods_path = cache_dir / entry.mods_subpath
-        return mods_path if mods_path.exists() else None
+        """Get the mods directory within a cached registry."""
+        return self.asset_dir(entry, MODS_ASSET)
 
     def ensure_registry_on_host(
         self,
@@ -1796,19 +1883,8 @@ class RegistryManager:
         return remote_clone_dir
 
     def _benchmark_dir(self, entry: RegistryEntry) -> Path | None:
-        """Get benchmark directory within a cached registry.
-
-        Args:
-            entry: Registry entry to look up.
-
-        Returns:
-            Path to the benchmark directory, or None if not available
-        """
-        if not entry.benchmark_subpath:
-            return None
-        cache_dir = self._cache_dir(entry.name)
-        benchmark_path = cache_dir / entry.benchmark_subpath
-        return benchmark_path if benchmark_path.exists() else None
+        """Get benchmark directory within a cached registry."""
+        return self.asset_dir(entry, BENCHMARK_ASSET)
 
     def find_benchmark_profile_in_registries(
         self,
@@ -1827,30 +1903,8 @@ class RegistryManager:
         Returns:
             List of (registry_name, profile_path) tuples for disambiguation
         """
-        matches = []
-        for entry in self._load_registries():
-            if not entry.enabled:
-                continue
-            if not include_hidden and not entry.visible:
-                continue
-            benchmark_dir = self._benchmark_dir(entry)
-            if benchmark_dir is None:
-                continue
-            # `.yaml` wins over a same-stem `.yml` (see
-            # find_recipe_in_registries), so one registry contributes at most
-            # one match and ProfileAmbiguousError stays purely cross-registry —
-            # where its `@registry/name` advice is actually followable. The
-            # category filter still falls through to `.yml`: a `.yaml` of the
-            # wrong category doesn't mask a `.yml` of the right one.
-            for ext in (".yaml", ".yml"):
-                candidate = benchmark_dir / (name + ext)
-                if not candidate.exists():
-                    continue
-                if category is not None and _profile_category(candidate) != category:
-                    continue
-                matches.append((entry.name, candidate))
-                break
-        return matches
+        accept = None if category is None else (lambda p: _profile_category(p) == category)
+        return self.find_asset_in_registries(name, BENCHMARK_ASSET, include_hidden=include_hidden, accept=accept)
 
     def list_benchmark_profiles(
         self,
@@ -1873,15 +1927,12 @@ class RegistryManager:
         import yaml
 
         profiles = []
-        for entry in self._load_registries():
-            if not entry.enabled:
-                continue
-            if registry_name and entry.name != registry_name:
-                continue
-            # When a specific registry is requested by name, skip the
-            # visibility filter — the user is explicitly targeting it.
-            if not registry_name and not include_hidden and not entry.visible:
-                continue
+        # Naming a registry outranks its visibility default — the user is
+        # explicitly targeting it, so the visibility filter is dropped.
+        for entry in self._iter_registries(
+            include_hidden=include_hidden or bool(registry_name),
+            only=registry_name or None,
+        ):
             benchmark_dir = self._benchmark_dir(entry)
             if benchmark_dir is None:
                 continue

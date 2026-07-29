@@ -345,6 +345,11 @@ class _FakeRegistryManager:
     # Reuse the real implementations — they only depend on the methods above.
     from sparkrun.core.registry import RegistryManager as _Real
 
+    # Generic asset seam the profile methods delegate to.
+    _iter_registries = _Real._iter_registries
+    asset_dir = _Real.asset_dir
+    find_asset_in_registries = _Real.find_asset_in_registries
+
     _benchmark_dir = _Real._benchmark_dir
     find_benchmark_profile_in_registries = _Real.find_benchmark_profile_in_registries
     list_benchmark_profiles = _Real.list_benchmark_profiles
