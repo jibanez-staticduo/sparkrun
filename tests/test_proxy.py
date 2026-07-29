@@ -1628,6 +1628,104 @@ class TestLaunchInferenceAutoPort:
         mock_fap.assert_called_once_with("10.0.0.1", 8000, ssh_kwargs={}, dry_run=True)
 
 
+class TestAutoPortDoesNotMoveIdentity:
+    """``auto_port`` must not change the workload's *identity*.
+
+    ``generate_intent_id`` hashes the port, and the ``auto_port`` probe
+    rewrites ``overrides["port"]`` in place.  If the cluster_id were derived
+    after that, a workload's identity would depend on which port happened to
+    be free — and every lookup path (``stop`` / ``logs`` / ``--ensure`` /
+    proxy discovery), which derives from the recipe's *requested* port, would
+    fail to find the running job.  The proxy is the caller that sets
+    ``auto_port=True``.
+    """
+
+    HOSTS = ["10.0.0.1"]
+
+    def _recipe(self):
+        from sparkrun.core.recipe import Recipe
+
+        return Recipe(
+            {
+                "sparkrun_version": "2",
+                "runtime": "vllm",
+                "model": "test/m",
+                "mode": "solo",
+                "defaults": {"port": 8000},
+            }
+        )
+
+    def _launch(self, recipe, overrides, *, available_port):
+        from sparkrun.core.launcher import launch_inference
+
+        mock_runtime = MagicMock()
+        mock_runtime.resolve_container.return_value = "test:latest"
+        mock_runtime.is_delegating_runtime.return_value = True
+        mock_runtime.generate_command.return_value = "serve cmd"
+        mock_runtime.run.return_value = 0
+
+        mock_config = MagicMock()
+        mock_config.hf_cache_dir = "/tmp/cache"
+        mock_config.cache_dir = "/tmp/cache"
+
+        with (
+            patch("sparkrun.orchestration.primitives.build_ssh_kwargs", return_value={}),
+            patch("sparkrun.orchestration.primitives.find_available_port", return_value=available_port),
+            patch("sparkrun.orchestration.job_metadata.save_job_metadata"),
+        ):
+            return launch_inference(
+                recipe=recipe,
+                runtime=mock_runtime,
+                host_list=list(self.HOSTS),
+                overrides=overrides,
+                config=mock_config,
+                is_solo=True,
+                auto_port=True,
+                dry_run=True,
+            )
+
+    def test_cluster_id_reflects_requested_port_not_the_probed_one(self):
+        """The port was taken and the probe moved to 8002 — the cluster_id must
+        still be the one the lookup paths compute from the requested 8000."""
+        from sparkrun.orchestration.job_metadata import derive_cluster_id
+
+        recipe = self._recipe()
+        overrides: dict = {}
+
+        result = self._launch(recipe, overrides, available_port=8002)
+
+        assert result.serve_port == 8002  # actually bound where the probe landed
+        assert result.cluster_id == derive_cluster_id(recipe, self.HOSTS, overrides={})
+        # ...and specifically NOT the identity the shifted port would produce.
+        assert result.cluster_id != derive_cluster_id(recipe, self.HOSTS, overrides={"port": 8002})
+
+    def test_identity_is_stable_across_differing_probe_results(self):
+        """Two loads of the same recipe landing on different free ports share
+        one identity, so the second replaces the first instead of leaking it."""
+        first = self._launch(self._recipe(), {}, available_port=8000)
+        second = self._launch(self._recipe(), {}, available_port=8003)
+
+        assert first.cluster_id == second.cluster_id
+
+    def test_actual_port_still_reaches_metadata_for_routing(self):
+        """Identity is declarative (requested port); the bound port is factual
+        and must still flow into overrides → job metadata → proxy routing."""
+        overrides: dict = {}
+
+        result = self._launch(self._recipe(), overrides, available_port=8002)
+
+        assert overrides["port"] == 8002
+        assert result.serve_port == 8002
+
+    def test_explicitly_requested_port_still_distinguishes_workloads(self):
+        """A deliberate ``--port`` is part of the identity — two intentional
+        deployments on different ports stay distinct."""
+        a = self._launch(self._recipe(), {"port": 8000}, available_port=8000)
+        b = self._launch(self._recipe(), {"port": 9000}, available_port=9000)
+
+        assert a.cluster_id != b.cluster_id
+
+
 # =====================================================================
 # Tests: CLI commands
 # =====================================================================

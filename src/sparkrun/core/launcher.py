@@ -622,6 +622,18 @@ def launch_inference(
     )
     effective_transfer_mode = transfer_result.mode
 
+    # Derive the deterministic cluster_id from recipe + (trimmed) hosts.
+    #
+    # This MUST precede port resolution below.  ``generate_intent_id`` hashes
+    # the port, and the ``auto_port`` probe rewrites ``overrides["port"]`` in
+    # place — so deriving afterwards would make the workload's *identity*
+    # depend on whichever port happened to be free at launch.  Every lookup
+    # path (``stop`` / ``logs`` / ``--ensure`` / proxy discovery) derives from
+    # the recipe's *requested* port, so the identity must too, or none of them
+    # can find the running job.  The identity is declarative (what was asked
+    # for); the *actual* bound port is factual and travels in job metadata.
+    cluster_id = cluster_id_override or derive_cluster_id(recipe, host_list, overrides=overrides)
+
     # -- Port resolution --
     if auto_port:
         from sparkrun.orchestration.primitives import find_available_port
@@ -639,9 +651,6 @@ def launch_inference(
     else:
         config_chain = recipe.build_config_chain(overrides)
         serve_port = int(config_chain.get("port") or 8000)
-
-    # Derive deterministic cluster_id from recipe + (trimmed) hosts
-    cluster_id = cluster_id_override or derive_cluster_id(recipe, host_list, overrides=overrides)
 
     # Resolve container image
     container_image = runtime.resolve_container(recipe, overrides)
