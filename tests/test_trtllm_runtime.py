@@ -8,6 +8,7 @@ import yaml
 
 from sparkrun.core.recipe import Recipe
 from sparkrun.runtimes.trtllm import TrtllmRuntime
+from sparkrun.core.log_source import MODE_FILE, MODE_STDOUT
 
 
 # --- Basic properties ---
@@ -658,28 +659,23 @@ def test_cluster_log_mode():
 class TestTrtllmFollowLogs:
     """Test TrtllmRuntime.follow_logs()."""
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_solo(self, mock_stream):
+    def test_follow_logs_solo(self, log_sources_spy):
         """Single-host trtllm tails serve log in solo container."""
-        runtime = TrtllmRuntime()
-        runtime.follow_logs(hosts=["10.0.0.1"], cluster_id="test0")
+        TrtllmRuntime().follow_logs(hosts=["10.0.0.1"], cluster_id="test0")
 
-        mock_stream.assert_called_once()
-        assert mock_stream.call_args[0][1] == "test0_solo"
+        (source,) = log_sources_spy[0].sources
+        assert (source.container, source.mode) == ("test0_solo", MODE_FILE)
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_remote_logs")
-    def test_follow_logs_cluster(self, mock_stream):
-        """Multi-host trtllm follows docker logs on _node_0 container."""
-        runtime = TrtllmRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1", "10.0.0.2"],
-            cluster_id="mycluster",
-        )
+    def test_follow_logs_cluster(self, log_sources_spy):
+        """Multi-host trtllm reads container stdout on _node_0 (mpirun output goes to stdout).
 
-        mock_stream.assert_called_once()
-        args = mock_stream.call_args
-        assert args[0][0] == "10.0.0.1"
-        assert args[0][1] == "mycluster_node_0"
+        The only in-tree runtime whose cluster mode is genuinely
+        ``docker logs``-shaped.
+        """
+        TrtllmRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster")
+
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "mycluster_node_0", MODE_STDOUT)
 
 
 # --- Command-hint detection ---

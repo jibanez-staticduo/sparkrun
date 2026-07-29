@@ -4216,9 +4216,9 @@ class TestLogCommand:
         assert "--hosts" in result.output
         assert "TARGET" in result.output
 
-    def test_log_calls_follow_logs(self, runner, reset_bootstrap):
-        """sparkrun logs calls runtime.follow_logs with correct args."""
-        with mock.patch.object(SglangRuntime, "follow_logs") as mock_follow:
+    def test_log_calls_api_logs(self, runner, reset_bootstrap):
+        """sparkrun logs renders api.logs, addressing the workload by recipe."""
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(
                 main,
                 [
@@ -4231,10 +4231,12 @@ class TestLogCommand:
                 ],
             )
 
-            assert result.exit_code == 0
-            mock_follow.assert_called_once()
-            call_kwargs = mock_follow.call_args.kwargs
-            assert call_kwargs["cluster_id"].startswith("sparkrun_")
+            assert result.exit_code == 0, result.output
+            mock_logs.assert_called_once()
+            call_kwargs = mock_logs.call_args.kwargs
+            # Recipe target: no literal cluster_id, resolved by live intent instead.
+            assert mock_logs.call_args.args[0] is None
+            assert call_kwargs["recipe"] is not None
             assert call_kwargs["tail"] == 50
 
     def test_log_help_shows_follow_and_lines(self, runner):
@@ -4247,32 +4249,29 @@ class TestLogCommand:
 
     def test_log_bare_does_not_follow(self, runner, reset_bootstrap):
         """Called bare, logs dumps (follow=False) and shows all lines (tail=None)."""
-        with mock.patch.object(SglangRuntime, "follow_logs") as mock_follow:
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(main, ["logs", _TEST_RECIPE_NAME, "--hosts", "localhost"])
 
-            assert result.exit_code == 0
-            mock_follow.assert_called_once()
-            call_kwargs = mock_follow.call_args.kwargs
+            assert result.exit_code == 0, result.output
+            call_kwargs = mock_logs.call_args.kwargs
             assert call_kwargs["follow"] is False
             assert call_kwargs["tail"] is None
 
     def test_log_follow_flag_attaches(self, runner, reset_bootstrap):
         """-f/--follow sets follow=True on the runtime call."""
-        with mock.patch.object(SglangRuntime, "follow_logs") as mock_follow:
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(main, ["logs", _TEST_RECIPE_NAME, "--hosts", "localhost", "-f"])
 
-            assert result.exit_code == 0
-            mock_follow.assert_called_once()
-            assert mock_follow.call_args.kwargs["follow"] is True
+            assert result.exit_code == 0, result.output
+            assert mock_logs.call_args.kwargs["follow"] is True
 
     def test_log_lines_option_sets_tail(self, runner, reset_bootstrap):
         """-n N limits the number of lines (tail=N) without following."""
-        with mock.patch.object(SglangRuntime, "follow_logs") as mock_follow:
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(main, ["logs", _TEST_RECIPE_NAME, "--hosts", "localhost", "-n", "25"])
 
-            assert result.exit_code == 0
-            mock_follow.assert_called_once()
-            call_kwargs = mock_follow.call_args.kwargs
+            assert result.exit_code == 0, result.output
+            call_kwargs = mock_logs.call_args.kwargs
             assert call_kwargs["tail"] == 25
             assert call_kwargs["follow"] is False
 
@@ -5159,12 +5158,19 @@ class TestClusterUserInCLICommands:
 
     def test_logs_uses_cluster_user(self, runner, cluster_with_user, reset_bootstrap, monkeypatch):
         """logs with --cluster should use the cluster's SSH user."""
-        captured_config = {}
+        captured = {}
 
-        def mock_follow_logs(self, hosts=None, cluster_id=None, config=None, **kw):
-            captured_config["ssh_user"] = config.ssh_user if config else None
+        def _capture(executor, sources, **kwargs):
+            captured["ssh_user"] = (kwargs.get("ssh_kwargs") or {}).get("ssh_user")
+            return iter(())
 
-        monkeypatch.setattr(SglangRuntime, "follow_logs", mock_follow_logs)
+        # Assert on the SSH user the reader actually connects as — the
+        # observable end of "logs uses the cluster's user".
+        monkeypatch.setattr("sparkrun.orchestration.logs.read_log_sources", _capture)
+        monkeypatch.setattr(
+            "sparkrun.api._resolve.discover_cluster_id_by_intent",
+            lambda *a, **kw: "sparkrun_aabbccddeeff0011_aabbccddeeff",
+        )
         # Prevent real git clones when ensure_initialized sees empty cache
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock.Mock(returncode=1, stderr="mocked"))
 
@@ -5177,8 +5183,8 @@ class TestClusterUserInCLICommands:
                 "userlab",
             ],
         )
-        assert result.exit_code == 0
-        assert captured_config.get("ssh_user") == "labadmin"
+        assert result.exit_code == 0, result.output
+        assert captured.get("ssh_user") == "labadmin"
 
     def test_run_dry_run_uses_cluster_user(self, runner, cluster_with_user, reset_bootstrap, monkeypatch):
         """run --dry-run with --cluster should use the cluster's SSH user."""
@@ -5627,33 +5633,23 @@ class TestStopLogsClusterIdAndOverrides:
         assert "No job metadata" in result.output
 
     def test_logs_with_port_override(self, runner, config_setup, reset_bootstrap):
-        """Verify --port is passed through to derive_cluster_id in logs."""
-        mock_runtime = mock.Mock()
-        mock_runtime.follow_logs = mock.Mock()
-        with (
-            mock.patch("sparkrun.core.bootstrap.get_runtime", return_value=mock_runtime),
-            mock.patch("sparkrun.orchestration.job_metadata.derive_cluster_id", return_value="sparkrun_aabbccdd1122") as mock_gen,
-            mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr="mocked")),
-        ):
+        """--port reaches api.logs as an override.
+
+        The port participates in the intent, so a workload launched on a
+        non-default port is only findable when the override is threaded
+        through to the intent computation.
+        """
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(
                 main,
-                [
-                    "logs",
-                    _TEST_RECIPE_NAME,
-                    "--cluster",
-                    "test-cluster",
-                    "--port",
-                    "8001",
-                ],
+                ["logs", _TEST_RECIPE_NAME, "--cluster", "test-cluster", "--port", "8001"],
             )
-            assert result.exit_code == 0
-            call_kwargs = mock_gen.call_args
-            overrides = call_kwargs.kwargs.get("overrides") or (call_kwargs[1].get("overrides") if len(call_kwargs) > 1 else None)
-            assert overrides is not None
+            assert result.exit_code == 0, result.output
+            overrides = mock_logs.call_args.kwargs["overrides"]
             assert overrides.get("port") == 8001
 
     def test_logs_by_cluster_id(self, runner, config_setup, reset_bootstrap):
-        """Logs by cluster ID loads metadata and calls runtime.follow_logs."""
+        """Logs by cluster ID resolves hosts from metadata and renders api.logs."""
         cache_root = config_setup["cache_root"]
         jobs_dir = cache_root / "jobs"
         jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -5666,15 +5662,46 @@ class TestStopLogsClusterIdAndOverrides:
         }
         (jobs_dir / "aabbccdd1122.yaml").write_text(yaml.safe_dump(meta))
 
-        mock_runtime = mock.Mock()
-        mock_runtime.follow_logs = mock.Mock()
-        with mock.patch("sparkrun.core.bootstrap.get_runtime", return_value=mock_runtime):
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(main, ["logs", "aabbccdd1122"])
-            assert result.exit_code == 0
-            mock_runtime.follow_logs.assert_called_once()
-            call_kwargs = mock_runtime.follow_logs.call_args
-            assert call_kwargs.kwargs["cluster_id"] == "sparkrun_aabbccdd1122"
-            assert call_kwargs.kwargs["hosts"] == ["10.0.0.1"]
+            assert result.exit_code == 0, result.output
+            assert mock_logs.call_args.args[0] == "sparkrun_aabbccdd1122"
+            assert mock_logs.call_args.kwargs["hosts"] == ("10.0.0.1",)
+
+    def test_logs_renders_api_lines_verbatim(self, runner, config_setup, reset_bootstrap):
+        """Single-source output is echoed unprefixed, so it stays pipe-friendly."""
+        from sparkrun.core.log_source import LogLine
+
+        lines = [
+            LogLine(host="10.0.0.1", container="c_solo", text="first"),
+            LogLine(host="10.0.0.1", container="c_solo", text="second"),
+        ]
+        with mock.patch("sparkrun.api.logs", return_value=iter(lines)):
+            result = runner.invoke(main, ["logs", _TEST_RECIPE_NAME, "--cluster", "test-cluster"])
+
+        assert result.exit_code == 0, result.output
+        assert "first" in result.output
+        assert "second" in result.output
+        assert "[10.0.0.1/" not in result.output
+
+    def test_logs_all_sources_prefixes_and_requests_all_scope(self, runner, config_setup, reset_bootstrap):
+        """-a asks for every source and labels lines so interleaved output is readable."""
+        from sparkrun.core.log_source import SCOPE_ALL, LogLine
+
+        lines = [
+            LogLine(host="10.0.0.1", container="c_node_0", text="from head", role="node_0", rank=0),
+            LogLine(host="10.0.0.2", container="c_node_1", text="from worker", role="node_1", rank=1),
+        ]
+        with mock.patch("sparkrun.api.logs", return_value=iter(lines)) as mock_logs:
+            result = runner.invoke(
+                main,
+                ["logs", _TEST_RECIPE_NAME, "--hosts", "10.0.0.1,10.0.0.2", "-a"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert mock_logs.call_args.kwargs["scope"] == SCOPE_ALL
+        assert "[10.0.0.1/node_0] from head" in result.output
+        assert "[10.0.0.2/node_1] from worker" in result.output
 
 
 class TestFormatJobCommandsAndLabel:

@@ -9,6 +9,15 @@ from typing import Any, TYPE_CHECKING
 
 from scitrera_app_framework import Plugin, Variables, ext_parse_bool
 
+from sparkrun.core.log_source import (
+    MODE_FILE,
+    MODE_STDOUT,
+    SCOPE_ALL,
+    SCOPE_HEAD,
+    SERVE_LOG_PATH,
+    LogSource,
+)
+
 if TYPE_CHECKING:
     from sparkrun.core.backend_select import BackendBundle
     from sparkrun.core.cluster_manager import ClusterDefinition
@@ -754,6 +763,108 @@ class RuntimePlugin(Plugin):
 
     # --- Log following interface ---
 
+    def log_sources(
+        self,
+        cluster_id: str,
+        hosts: list[str],
+        *,
+        is_solo: bool = False,
+        scope: str = SCOPE_HEAD,
+    ) -> list["LogSource"]:
+        """Describe where this workload's output lives, as data.
+
+        The declarative half of the log path: the runtime knows *what* to
+        read (which containers, and whether each one's output is on the
+        container's stdout or in an in-container file), the executor knows
+        *how* to read it on its substrate, and
+        :func:`sparkrun.api.logs` composes the two.  Returning a list rather
+        than printing is what lets the CLI, the desktop sidecar, and
+        ``--json`` all render the same stream.
+
+        Naming is derived from :meth:`_head_container_name` rather than
+        re-branching on :meth:`cluster_strategy`, so a runtime that
+        overrides the head name gets consistent worker names for free
+        (llama.cpp declares the ``native`` strategy but uses the
+        ``head``/``worker`` scheme — one override, not two).
+
+        Args:
+            cluster_id: Cluster identifier the containers are named for.
+            hosts: Cluster hosts; ``hosts[0]`` is the head. Rank *i* maps to
+                ``hosts[i]``, matching the positional convention the ranked
+                teardown path uses.
+            is_solo: Force the single-container solo shape.
+            scope: :data:`SCOPE_HEAD` (default) for just the primary log,
+                :data:`SCOPE_ALL` to also name every worker/rank.
+
+        Returns:
+            Sources ordered head-first, then workers by rank — which is also
+            the grouping order a non-follow read emits them in.
+        """
+        executor = self._resolve_executor()
+        host_list = list(hosts) or ["localhost"]
+
+        if is_solo or len(host_list) <= 1:
+            return [
+                LogSource(
+                    host=host_list[0],
+                    container=executor.container_name(cluster_id, "solo"),
+                    role="solo",
+                    rank=0,
+                    mode=MODE_FILE,
+                    path=SERVE_LOG_PATH,
+                )
+            ]
+
+        head_mode = MODE_FILE if self._cluster_log_mode() == "file" else MODE_STDOUT
+        head_name = self._head_container_name(cluster_id)
+        # Ranked scheme ({cid}_node_N) vs head/worker scheme ({cid}_head +
+        # {cid}_worker), decided by what the head-name hook actually returned.
+        ranked = head_name == executor.node_container_name(cluster_id, 0)
+
+        head = LogSource(
+            host=host_list[0],
+            container=head_name,
+            role="node_0" if ranked else "head",
+            rank=0,
+            mode=head_mode,
+            path=SERVE_LOG_PATH if head_mode == MODE_FILE else None,
+        )
+        if scope != SCOPE_ALL:
+            return [head]
+
+        sources = [head]
+        for rank, host in enumerate(host_list[1:], start=1):
+            sources.append(self._worker_log_source(cluster_id, host, rank, ranked=ranked, head_mode=head_mode))
+        return sources
+
+    def _worker_log_source(
+        self,
+        cluster_id: str,
+        host: str,
+        rank: int,
+        *,
+        ranked: bool,
+        head_mode: str,
+    ) -> "LogSource":
+        """Describe one worker's log source (hook for :meth:`log_sources`).
+
+        Workers inherit the head's mode by default because a runtime
+        launches every node the same way — llama.cpp's RPC workers, like its
+        head, go through ``generate_exec_serve_script`` and write to the
+        in-container serve log.  Ray is the exception (its workers run
+        ``ray start --block`` as PID 1 and never host a serve process), and
+        overrides this.
+        """
+        executor = self._resolve_executor()
+        return LogSource(
+            host=host,
+            container=(executor.node_container_name(cluster_id, rank) if ranked else executor.container_name(cluster_id, "worker")),
+            role=("node_%d" % rank) if ranked else "worker",
+            rank=rank,
+            mode=head_mode,
+            path=SERVE_LOG_PATH if head_mode == MODE_FILE else None,
+        )
+
     def follow_logs(
         self,
         hosts: list[str],
@@ -762,84 +873,36 @@ class RuntimePlugin(Plugin):
         dry_run: bool = False,
         tail: int | None = 100,
         follow: bool = True,
+        scope: str = SCOPE_HEAD,
     ) -> None:
-        """Print container logs, optionally following (``docker logs`` semantics).
+        """Print this workload's logs, optionally following.
 
-        Solo mode tails the serve log file inside the container
-        (``/tmp/sparkrun_serve.log``), which is the correct approach
-        for all runtimes using the sleep-infinity + exec pattern.
-
-        Cluster mode delegates to :meth:`_follow_cluster_logs`, which
-        subclasses should override.
+        A thin printing shim over :meth:`log_sources` +
+        :func:`~sparkrun.orchestration.logs.print_log_sources`, kept for the
+        post-launch attach in ``cli/_run.py`` (which streams inline during a
+        launch rather than rendering an :func:`sparkrun.api.logs` iterator).
+        Sharing the source machinery means the attach and ``sparkrun logs``
+        can't disagree about which container to read.
 
         Args:
             tail: Number of existing log lines to show; ``None`` shows
                 the whole log.
             follow: When ``True`` (default — post-launch attach), keep
                 streaming new lines; when ``False``, dump and exit.
+            scope: :data:`SCOPE_HEAD` (default) or :data:`SCOPE_ALL`.
         """
-        if len(hosts) <= 1:
-            from sparkrun.orchestration.primitives import build_ssh_kwargs
-            from sparkrun.orchestration.ssh import stream_container_file_logs
-
-            host = hosts[0] if hosts else "localhost"
-            container_name = self._resolve_executor().container_name(cluster_id, "solo")
-            ssh_kwargs = build_ssh_kwargs(config)
-            stream_container_file_logs(
-                host,
-                container_name,
-                tail=tail,
-                dry_run=dry_run,
-                follow=follow,
-                **ssh_kwargs,
-            )
-            return
-
-        self._follow_cluster_logs(hosts, cluster_id, config, dry_run, tail, follow=follow)
-
-    def _follow_cluster_logs(
-        self,
-        hosts: list[str],
-        cluster_id: str,
-        config: SparkrunConfig | None,
-        dry_run: bool,
-        tail: int | None,
-        follow: bool = True,
-    ) -> None:
-        """Print logs for a multi-node cluster, optionally following.
-
-        Uses :meth:`_cluster_log_mode` and :meth:`_head_container_name`
-        to determine the log tailing strategy and target container.
-        Subclasses control behaviour by overriding those hooks rather
-        than this method.
-        """
+        from sparkrun.orchestration.logs import print_log_sources
         from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-        ssh_kwargs = build_ssh_kwargs(config)
-        container_name = self._head_container_name(cluster_id)
-
-        if self._cluster_log_mode() == "file":
-            from sparkrun.orchestration.ssh import stream_container_file_logs
-
-            stream_container_file_logs(
-                hosts[0],
-                container_name,
-                tail=tail,
-                dry_run=dry_run,
-                follow=follow,
-                **ssh_kwargs,
-            )
-        else:
-            from sparkrun.orchestration.ssh import stream_remote_logs
-
-            stream_remote_logs(
-                hosts[0],
-                container_name,
-                tail=tail,
-                dry_run=dry_run,
-                follow=follow,
-                **ssh_kwargs,
-            )
+        sources = self.log_sources(cluster_id, hosts, is_solo=len(hosts) <= 1, scope=scope)
+        print_log_sources(
+            self._resolve_executor(),
+            sources,
+            follow=follow,
+            tail=tail,
+            ssh_kwargs=build_ssh_kwargs(config),
+            dry_run=dry_run,
+        )
 
     def get_head_container_name(self, cluster_id: str, is_solo: bool = False) -> str:
         """Return the expected head/solo container name for *cluster_id*.

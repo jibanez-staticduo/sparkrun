@@ -260,3 +260,30 @@ def sample_sglang_recipe_data() -> dict[str, Any]:
         },
         "command": "python3 -m sglang.launch_server --model-path {model} --port {port}",
     }
+
+
+@pytest.fixture
+def log_sources_spy(monkeypatch):
+    """Capture what ``RuntimePlugin.follow_logs`` hands to the log reader.
+
+    ``follow_logs`` is a printing shim over
+    :meth:`~sparkrun.runtimes.base.RuntimePlugin.log_sources` +
+    :func:`~sparkrun.orchestration.logs.print_log_sources`, so intercepting
+    the latter records the resolved sources — host, container name, and
+    file-vs-stdout mode.  That is the observable behaviour the older
+    ``stream_container_file_logs`` / ``stream_remote_logs`` mocks stood in
+    for, asserted directly instead of via which helper got called (and
+    without spawning a reader subprocess).
+
+    Yields a list of captured calls, each with ``.sources`` plus the
+    ``follow`` / ``tail`` / ``dry_run`` / ``ssh_kwargs`` keywords.
+    """
+    from types import SimpleNamespace
+
+    calls: list[Any] = []
+
+    def _capture(executor, sources, **kwargs):
+        calls.append(SimpleNamespace(executor=executor, sources=list(sources), **kwargs))
+
+    monkeypatch.setattr("sparkrun.orchestration.logs.print_log_sources", _capture)
+    return calls

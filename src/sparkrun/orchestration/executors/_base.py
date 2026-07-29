@@ -25,6 +25,7 @@ from sparkrun.utils.shell import b64_encode_cmd, quote
 if TYPE_CHECKING:
     from sparkrun.core.cluster_status import ClusterStatus
     from sparkrun.core.hardware import HostHardware
+    from sparkrun.core.log_source import LogSource
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +431,29 @@ class Executor(Plugin):
     ) -> str:
         """Generate a container logs command string."""
         ...
+
+    def read_logs_cmd(
+        self,
+        source: "LogSource",
+        *,
+        follow: bool = False,
+        tail: int | None = None,
+    ) -> str:
+        """Generate the command that reads *source* on this substrate.
+
+        The read-path peer of :meth:`logs_cmd`: the runtime says *what* to
+        read (:class:`~sparkrun.core.log_source.LogSource`), the executor
+        says *how* to read it here.
+
+        The default ignores ``source.mode`` / ``source.path`` and reads the
+        substrate's own log stream — correct for every executor whose
+        workload writes to something the substrate already captures
+        (``kubectl logs`` for k8s; the host logfile ``run_cmd`` redirects to
+        for ``local``).  Only executors with an in-container filesystem
+        indirection — docker, whose sleep-infinity containers hide the serve
+        log from ``docker logs`` — need to override.
+        """
+        return self.logs_cmd(source.container, follow=follow, tail=tail)
 
     @abstractmethod
     def status_cmd(self, container_name: str) -> str:

@@ -1,9 +1,8 @@
 """Unit tests for sparkrun.runtimes.vllm_distributed (VllmDistributedRuntime)."""
 
-from unittest import mock
-
 from sparkrun.core.recipe import Recipe
 from sparkrun.runtimes.vllm_distributed import VllmDistributedRuntime
+from sparkrun.core.log_source import MODE_FILE
 
 
 def test_vllm_distributed_runtime_name():
@@ -397,31 +396,19 @@ def test_vllm_distributed_bool_flags():
 class TestVllmDistributedFollowLogs:
     """Test VllmDistributedRuntime.follow_logs()."""
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_solo_uses_file_logs(self, mock_stream):
+    def test_follow_logs_solo_uses_file_logs(self, log_sources_spy):
         """Single-host vllm-distributed tails serve log file inside solo container."""
-        runtime = VllmDistributedRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1"],
-            cluster_id="test0",
-        )
+        VllmDistributedRuntime().follow_logs(hosts=["10.0.0.1"], cluster_id="test0")
 
-        mock_stream.assert_called_once()
-        assert mock_stream.call_args[0][1] == "test0_solo"
+        (source,) = log_sources_spy[0].sources
+        assert (source.container, source.mode) == ("test0_solo", MODE_FILE)
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_cluster_uses_node_0(self, mock_stream):
-        """Multi-host vllm-distributed follows the _node_0 container (file mode, sleep-infinity + exec)."""
-        runtime = VllmDistributedRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1", "10.0.0.2"],
-            cluster_id="mycluster",
-        )
+    def test_follow_logs_cluster_uses_node_0(self, log_sources_spy):
+        """Multi-host vllm-distributed follows the _node_0 container (file mode)."""
+        VllmDistributedRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster")
 
-        mock_stream.assert_called_once()
-        args = mock_stream.call_args
-        assert args[0][0] == "10.0.0.1"
-        assert args[0][1] == "mycluster_node_0"
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "mycluster_node_0", MODE_FILE)
 
 
 def test_vllm_distributed_overrides_in_command():

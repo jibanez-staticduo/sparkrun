@@ -182,6 +182,27 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         """vLLM uses sleep-infinity + exec, so tail the serve log file."""
         return "file"
 
+    def _worker_log_source(self, cluster_id, host, rank, *, ranked: bool, head_mode: str):
+        """Ray workers log to container stdout, not to a serve log.
+
+        The one runtime where workers don't share the head's log mode: only
+        the head execs ``vllm serve`` (into ``/tmp/sparkrun_serve.log``),
+        while a worker container's PID 1 *is* ``ray start --block``, so its
+        output is the container's own stdout and ``docker logs`` is the
+        right reader.  Ranks live inside the Ray cluster rather than mapping
+        to containers, so worker sources carry no rank.
+        """
+        from sparkrun.core.log_source import MODE_STDOUT, LogSource
+
+        return LogSource(
+            host=host,
+            container=self._resolve_executor().container_name(cluster_id, "worker"),
+            role="worker",
+            rank=None,
+            mode=MODE_STDOUT,
+            path=None,
+        )
+
     # --- Cluster launch / stop ---
 
     def _stop_cluster(

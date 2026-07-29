@@ -1,9 +1,8 @@
 """Unit tests for sparkrun.runtimes.sglang (SglangRuntime)."""
 
-from unittest import mock
-
 from sparkrun.core.recipe import Recipe
 from sparkrun.runtimes.sglang import SglangRuntime
+from sparkrun.core.log_source import MODE_FILE, SCOPE_ALL
 
 
 # --- SglangRuntime Tests ---
@@ -361,31 +360,30 @@ def test_sglang_overrides_in_command():
 class TestSglangFollowLogs:
     """Test SglangRuntime.follow_logs()."""
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_solo_uses_file_logs(self, mock_stream):
+    def test_follow_logs_solo_uses_file_logs(self, log_sources_spy):
         """Single-host sglang tails serve log file inside solo container."""
-        runtime = SglangRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1"],
-            cluster_id="test0",
-        )
+        SglangRuntime().follow_logs(hosts=["10.0.0.1"], cluster_id="test0")
 
-        mock_stream.assert_called_once()
-        assert mock_stream.call_args[0][1] == "test0_solo"
+        (source,) = log_sources_spy[0].sources
+        assert (source.container, source.mode) == ("test0_solo", MODE_FILE)
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_cluster_uses_node_0(self, mock_stream):
+    def test_follow_logs_cluster_uses_node_0(self, log_sources_spy):
         """Multi-host sglang follows the _node_0 container (file mode, sleep-infinity + exec)."""
-        runtime = SglangRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1", "10.0.0.2"],
-            cluster_id="mycluster",
-        )
+        SglangRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster")
 
-        mock_stream.assert_called_once()
-        args = mock_stream.call_args
-        assert args[0][0] == "10.0.0.1"
-        assert args[0][1] == "mycluster_node_0"
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "mycluster_node_0", MODE_FILE)
+
+    def test_scope_all_names_each_rank(self, log_sources_spy):
+        """Native runtimes name one ranked container per host, rank i on hosts[i]."""
+        SglangRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2", "10.0.0.3"], cluster_id="mycluster", scope=SCOPE_ALL)
+
+        sources = log_sources_spy[0].sources
+        assert [(s.host, s.container, s.rank) for s in sources] == [
+            ("10.0.0.1", "mycluster_node_0", 0),
+            ("10.0.0.2", "mycluster_node_1", 1),
+            ("10.0.0.3", "mycluster_node_2", 2),
+        ]
 
 
 def test_sglang_pp_size_in_generated_command():

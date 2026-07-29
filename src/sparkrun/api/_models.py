@@ -243,19 +243,11 @@ class StopAllResult:
 # Logs
 # --------------------------------------------------------------------------
 
-
-@dataclass(frozen=True)
-class LogLine:
-    """A single line yielded by :func:`sparkrun.api.logs`."""
-
-    host: str
-    container: str
-    text: str
-    stream: str = "stdout"
-    """``"stdout"`` or ``"stderr"`` — best-effort, may be ``"stdout"`` if
-    the executor doesn't preserve stream identity."""
-    timestamp: float | None = None
-    """Epoch seconds parsed from the log line, when available."""
+# ``LogLine`` is defined in ``core.log_source`` alongside ``LogSource`` so
+# that ``orchestration.logs`` can produce it without importing ``api``
+# (layering: cli → api → {core, orchestration}).  Re-exported here because
+# ``sparkrun.api.LogLine`` is the stable public path.
+from sparkrun.core.log_source import LogLine, LogSource  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -373,6 +365,7 @@ __all__ = [
     "RunResult",
     "StopResult",
     "LogLine",
+    "LogSource",
     "JobInfo",
     "RecipeSummary",
 ]

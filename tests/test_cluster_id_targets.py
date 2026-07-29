@@ -29,20 +29,17 @@ def test_logs_accepts_status_short_canonical_id() -> None:
         "runtime": "sglang",
         "hosts": ["10.24.11.13"],
     }
-    runtime = mock.Mock()
-    runtime.follow_logs = mock.Mock()
 
     with (
         mock.patch("sparkrun.orchestration.job_metadata.load_job_metadata", return_value=meta),
-        mock.patch("sparkrun.core.bootstrap.get_runtime", return_value=runtime),
+        mock.patch("sparkrun.api.logs", return_value=iter(())) as api_logs,
     ):
         result = CliRunner().invoke(main, ["logs", _BARE_CANONICAL])
 
     assert result.exit_code == 0, result.output
-    runtime.follow_logs.assert_called_once()
-    call_kwargs = runtime.follow_logs.call_args.kwargs
-    assert call_kwargs["cluster_id"] == _FULL_CANONICAL
-    assert call_kwargs["hosts"] == ["10.24.11.13"]
+    api_logs.assert_called_once()
+    assert api_logs.call_args.args[0] == _FULL_CANONICAL
+    assert api_logs.call_args.kwargs["hosts"] == ("10.24.11.13",)
 
 
 def test_stop_accepts_status_short_canonical_id() -> None:

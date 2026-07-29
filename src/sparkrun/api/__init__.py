@@ -64,6 +64,7 @@ from sparkrun.api._logs import logs
 from sparkrun.api._models import (
     JobInfo,
     LogLine,
+    LogSource,
     RecipeSummary,
     RunOptions,
     RunResult,
@@ -92,6 +93,7 @@ __all__ = [
     "StopResult",
     "StopAllResult",
     "LogLine",
+    "LogSource",
     "JobInfo",
     "RecipeSummary",
     # Benchmark data models

@@ -238,7 +238,7 @@ def test_discover_cluster_id_sweeps_whole_host_scope(monkeypatch):
     """``stop <recipe>`` intent-discovery sweeps the whole host scope, so a job
     launched under the native ``local`` executor (invisible to ``docker ps``) is
     still found — not just docker workloads."""
-    from sparkrun.api._stop import _discover_cluster_id_by_intent
+    from sparkrun.api._resolve import discover_cluster_id_by_intent
     from sparkrun.core.cluster_manager import ClusterDefinition
     from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
     from sparkrun.orchestration.executors.docker import DockerExecutor
@@ -258,7 +258,7 @@ def test_discover_cluster_id_sweeps_whole_host_scope(monkeypatch):
         ),
     )
 
-    found = _discover_cluster_id_by_intent(
+    found = discover_cluster_id_by_intent(
         intent,
         ["h1"],
         cluster_def=ClusterDefinition(name="c", hosts=["h1"]),
@@ -285,12 +285,48 @@ def test_logs_unknown_cluster_raises_job_not_found(tmp_path):
             list(gen)
 
 
-def test_logs_returns_iterator_with_explicit_hosts(tmp_path):
-    """``api.logs`` returns an iterator when given explicit hosts."""
-    # We can't easily iterate without a real subprocess, but we can
-    # assert the call signature returns something iterable.
-    gen = api.logs("sparkrun_anyid", hosts=("h1",), cache_dir=str(tmp_path), tail=10)
-    assert hasattr(gen, "__iter__")
+def test_logs_without_metadata_refuses_to_guess(tmp_path):
+    """Hosts alone aren't enough: without job metadata there is no runtime, and
+    without a runtime sparkrun cannot know the container name or whether the
+    output lives on container stdout or in the in-container serve log.
+
+    This used to return an iterator that silently read ``{cid}_solo`` via
+    ``docker logs`` — the wrong container for Ray runtimes and an empty stream
+    for every sleep-infinity + exec runtime.  Failing with an actionable
+    message beats streaming nothing.
+    """
+    with pytest.raises(api.JobNotFound) as exc:
+        api.logs("sparkrun_anyid", hosts=("h1",), cache_dir=str(tmp_path), tail=10)
+    assert "recipe" in str(exc.value)
+
+
+def test_logs_returns_iterator_when_metadata_names_the_runtime(tmp_path):
+    """With metadata recording the runtime, ``api.logs`` returns a lazy iterator.
+
+    Resolution happens eagerly (so bad targets raise at call time); only the
+    reading is deferred, so no subprocess is spawned by the call itself.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    # A *resolved* runtime name, which is what save_job_metadata records for a
+    # loaded recipe ("vllm" is resolved to vllm-ray / vllm-distributed at load).
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cluster_id, recipe, ["h1"], cache_dir=str(tmp_path))
+
+    gen = api.logs(cluster_id, hosts=("h1",), cache_dir=str(tmp_path), tail=10)
+    assert isinstance(gen, Iterator)
+
+
+def test_logs_rejects_unknown_scope(tmp_path):
+    with pytest.raises(api.SparkrunError):
+        api.logs("sparkrun_anyid", hosts=("h1",), scope="everything", cache_dir=str(tmp_path))
+
+
+def test_logs_requires_cluster_id_or_recipe():
+    with pytest.raises(api.SparkrunError):
+        api.logs()
 
 
 # --------------------------------------------------------------------------

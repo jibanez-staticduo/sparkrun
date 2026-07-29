@@ -20,6 +20,7 @@ import sys
 import click
 
 import sparkrun.api as api
+from sparkrun.core.log_source import SCOPE_ALL, SCOPE_HEAD
 
 from ._common import (
     TARGET,
@@ -225,13 +226,25 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
     help="Number of log lines to show (default: all). Use with -f to set scrollback before following.",
 )
 @click.option("--follow", "-f", "follow", is_flag=True, default=False, help="Stay attached and stream new log lines (Ctrl-C to stop)")
+@click.option(
+    "--all-sources",
+    "-a",
+    "all_sources",
+    is_flag=True,
+    default=False,
+    help="Read every worker/rank too, not just the head. Following interleaves them in arrival order.",
+)
 @click.pass_context
-def logs_cmd(ctx, target, hosts, hosts_file, cluster_name, tp_override, port, served_model_name, lines, follow, config_path=None):
+def logs_cmd(
+    ctx, target, hosts, hosts_file, cluster_name, tp_override, port, served_model_name, lines, follow, all_sources, config_path=None
+):
     """Show logs of a running workload (``docker logs`` / ``journalctl`` semantics).
 
     Called bare, dumps the workload's logs and exits.  Use ``-n`` to limit how
     many lines are shown, and ``-f``/``--follow`` to stay attached and stream
-    new output.
+    new output.  ``-a``/``--all-sources`` reads every worker as well as the
+    head; with ``-f`` those streams interleave in arrival order, and without it
+    each source is dumped in full, head first, then workers by rank.
 
     TARGET can be a recipe name or a cluster ID (from sparkrun status output).
 
@@ -241,95 +254,69 @@ def logs_cmd(ctx, target, hosts, hosts_file, cluster_name, tp_override, port, se
 
       sparkrun logs glm-4.7-flash-awq --cluster mylab -n 200
 
-      sparkrun logs e5f6a7b8 -f
+      sparkrun logs e5f6a7b8 -f -a
     """
     sctx = _get_context(ctx)
 
     cluster_id_arg = _is_cluster_id(target)
     overrides = build_cluster_id_overrides(port=port, served_model_name=served_model_name, tp_override=tp_override)
+    scope = SCOPE_ALL if all_sources else SCOPE_HEAD
 
+    # Both targets render the same ``api.logs`` iterator; they differ only in
+    # how the workload is addressed (literal id vs recipe → live intent
+    # discovery).  Host resolution stays here because the cluster_id form can
+    # fall back to the hosts recorded in job metadata.
     if cluster_id_arg is not None:
-        # Cluster ID target — load metadata so we can route to the same
-        # runtime that launched the workload.  This keeps the existing
-        # behaviour for SGLang/vLLM runtime-specific follow_logs (which
-        # may attach to multiple containers) while delegating the simple
-        # head-container case to api.logs.
-        _show_logs_by_cluster_id(sctx, cluster_id_arg, target, hosts, hosts_file, cluster_name, lines, follow)
+        host_list = resolve_hosts_with_metadata_fallback(
+            hosts,
+            hosts_file,
+            cluster_name,
+            sctx.config,
+            _load_job_metadata(sctx, cluster_id_arg),
+            target,
+            sctx=sctx,
+        )
+        _render_logs(sctx, cluster_id=cluster_id_arg, hosts=host_list, scope=scope, lines=lines, follow=follow)
         return
 
-    # Recipe target — derive the cluster_id via the recipe + hosts path
-    # and then route to the runtime's follow_logs (multi-container aware).
-    _show_logs_by_recipe(sctx, target, hosts, hosts_file, cluster_name, overrides, lines, follow)
+    # Recipe target — resolve through the CLI's loader so cwd-discovered
+    # recipes and registry disambiguation behave as they do for ``run``, then
+    # let api.logs find the live workload by intent.
+    recipe, _path, _reg = _load_recipe(sctx.config, target)
+    host_list, _ = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, sctx.config, sctx=sctx)
+    _render_logs(sctx, recipe=recipe, hosts=host_list, overrides=overrides, scope=scope, lines=lines, follow=follow)
 
 
-def _show_logs_by_cluster_id(sctx, cluster_id, target, hosts, hosts_file, cluster_name, lines, follow):
-    """Show logs for a cluster_id, picking the right runtime when possible.
-
-    Uses the recipe-aware ``runtime.follow_logs`` (attaches to multiple
-    containers in cluster mode) when metadata records a runtime; falls
-    back to ``api.logs`` head-container streaming for the simple case.
-    """
-    from sparkrun.core.bootstrap import get_runtime
+def _load_job_metadata(sctx, cluster_id):
     from sparkrun.orchestration.job_metadata import load_job_metadata
 
-    config = sctx.config
-    v = sctx.variables
-    meta = load_job_metadata(cluster_id, cache_dir=str(config.cache_dir))
+    return load_job_metadata(cluster_id, cache_dir=str(sctx.config.cache_dir))
 
-    runtime = None
-    runtime_name = meta.get("runtime") if meta else None
-    if runtime_name:
-        try:
-            runtime = get_runtime(runtime_name, v)
-        except ValueError as e:
-            click.echo("Error: %s" % e, err=True)
-            sys.exit(1)
 
-    host_list = resolve_hosts_with_metadata_fallback(
-        hosts,
-        hosts_file,
-        cluster_name,
-        config,
-        meta,
-        target,
-        sctx=sctx,
-    )
+def _render_logs(sctx, *, cluster_id=None, recipe=None, hosts, overrides=None, scope, lines, follow):
+    """Render the ``api.logs`` iterator — the CLI's whole job for logs.
 
-    if runtime is not None:
-        runtime.follow_logs(hosts=host_list, cluster_id=cluster_id, config=config, tail=lines, follow=follow)
-        return
-
-    # No runtime context — stream via api.logs (head container only).
+    Lines are prefixed with their source's ``host/role`` only when more than
+    one source is in play, so the common single-source case stays clean enough
+    to pipe.
+    """
     try:
-        for line in api.logs(cluster_id, hosts=tuple(host_list), tail=lines, follow=follow, cache_dir=str(config.cache_dir), sctx=sctx):
-            click.echo(line.text)
-    except api.JobNotFound as e:
+        stream = api.logs(
+            cluster_id,
+            recipe=recipe,
+            hosts=tuple(hosts),
+            overrides=overrides,
+            scope=scope,
+            tail=lines,
+            follow=follow,
+            cache_dir=str(sctx.config.cache_dir),
+            sctx=sctx,
+        )
+        multi = scope == SCOPE_ALL and len(hosts) > 1
+        for line in stream:
+            click.echo("[%s/%s] %s" % (line.host, line.role, line.text) if multi else line.text)
+    except (api.JobNotFound, api.AmbiguousWorkload, api.SparkrunError) as e:
         click.echo("Error: %s" % e, err=True)
         sys.exit(1)
-
-
-def _show_logs_by_recipe(sctx, recipe_name, hosts, hosts_file, cluster_name, overrides, lines, follow):
-    """Show logs for a recipe target — uses the runtime's multi-container ``follow_logs``."""
-    from sparkrun.core.bootstrap import get_runtime
-    from sparkrun.orchestration.job_metadata import derive_cluster_id
-
-    config = sctx.config
-    v = sctx.variables
-
-    # Use the CLI's recipe loader so cwd-discovered recipes (tests
-    # monkey-patch ``discover_cwd_recipes``) and registry disambiguation
-    # prompts work the same as for ``sparkrun run``.
-    recipe, _path, _reg = _load_recipe(config, recipe_name)
-    try:
-        runtime = get_runtime(recipe.runtime, v)
-    except ValueError as e:
-        click.echo("Error: %s" % e, err=True)
-        sys.exit(1)
-
-    host_list, _ = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
-
-    # Derive cluster_id consistent with what api.run / api.schedule would
-    # have produced — no separate trimming step; the host list as
-    # supplied IS the effective list at the API boundary.
-    cluster_id = derive_cluster_id(recipe, host_list, overrides=overrides)
-    runtime.follow_logs(hosts=host_list, cluster_id=cluster_id, config=config, tail=lines, follow=follow)
+    except KeyboardInterrupt:
+        click.echo("")  # leave the shell prompt on its own line

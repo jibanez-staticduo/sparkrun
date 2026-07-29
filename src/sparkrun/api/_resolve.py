@@ -262,7 +262,63 @@ def resolve_runtime(
         raise SparkrunError("Cannot resolve runtime %r: %s" % (recipe.runtime, e)) from e
 
 
+def discover_cluster_id_by_intent(
+    intent_id: str,
+    target_hosts: list[str],
+    *,
+    cluster_def,
+    cache_dir: str | None = None,
+    sctx: "SparkrunContext | None" = None,
+) -> str:
+    """Find the running cluster_id whose intent prefix matches *intent_id*.
+
+    The shared "which live workload does this recipe mean?" resolver behind
+    ``api.stop(recipe=…)`` and ``api.logs(recipe=…)``.
+
+    Status-driven rather than derived: it queries the cluster via the single
+    cross-executor source (:func:`~sparkrun.orchestration.executor.query_status_for_cluster`,
+    so a job launched under *any* backend is discoverable) and filters
+    ``running_cluster_ids()`` for those starting with
+    ``"sparkrun_" + intent_id + "_"``.  Deriving the *full* cluster_id
+    instead would require guessing the placement token, which a load-aware
+    scheduler randomizes and a host-set change invalidates — the whole point
+    of separating intent from placement.  The user's host scope is the
+    authoritative discovery range.
+
+    Raises:
+        JobNotFound: no running workload matches the intent.
+        AmbiguousWorkload: more than one does (carries ``cluster_ids``).
+    """
+    from sparkrun.api._errors import AmbiguousWorkload, JobNotFound
+    from sparkrun.orchestration.executor import query_status_for_cluster
+    from sparkrun.orchestration.primitives import build_ssh_kwargs
+
+    config = sctx.config if sctx is not None else None
+    ssh_kwargs = build_ssh_kwargs(config) if config else {}
+
+    status = query_status_for_cluster(
+        cluster_def,
+        list(target_hosts),
+        ssh_kwargs=ssh_kwargs,
+        config=config,
+        v=sctx.variables if sctx is not None else None,
+    )
+
+    prefix = "sparkrun_%s_" % intent_id
+    matches = sorted({cid for cid in status.running_cluster_ids() if cid.startswith(prefix)})
+
+    if not matches:
+        raise JobNotFound("No running workload matches intent %s on hosts %s" % (intent_id, target_hosts))
+    if len(matches) > 1:
+        raise AmbiguousWorkload(
+            "Multiple workloads match this recipe/intent on hosts %s: %s. Re-invoke with an explicit cluster_id." % (target_hosts, matches),
+            cluster_ids=matches,
+        )
+    return matches[0]
+
+
 __all__ = [
+    "discover_cluster_id_by_intent",
     "resolve_recipe",
     "resolve_cluster",
     "resolve_runtime",

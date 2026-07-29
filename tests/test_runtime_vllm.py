@@ -1,10 +1,9 @@
 """Unit tests for sparkrun.runtimes.vllm_ray (VllmRayRuntime)."""
 
-from unittest import mock
-
 from sparkrun.core.recipe import Recipe
 from sparkrun.runtimes.vllm_ray import VllmRayRuntime
 from sparkrun.runtimes.vllm_distributed import VllmDistributedRuntime
+from sparkrun.core.log_source import MODE_FILE, MODE_STDOUT, SCOPE_ALL
 
 
 # --- VllmRuntime Tests ---
@@ -344,29 +343,35 @@ def test_vllm_overrides_in_command():
 class TestVllmFollowLogs:
     """Test VllmRuntime.follow_logs()."""
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_solo_tails_serve_log(self, mock_stream):
+    def test_follow_logs_solo_tails_serve_log(self, log_sources_spy):
         """Single-host vllm tails serve log in solo container."""
-        runtime = VllmRayRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1"],
-            cluster_id="test0",
-        )
+        VllmRayRuntime().follow_logs(hosts=["10.0.0.1"], cluster_id="test0")
 
-        mock_stream.assert_called_once()
-        assert mock_stream.call_args[0][0] == "10.0.0.1"
-        assert mock_stream.call_args[0][1] == "test0_solo"
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "test0_solo", MODE_FILE)
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_cluster_tails_serve_log_on_head(self, mock_stream):
-        """Multi-host vllm tails serve log in _head container on hosts[0]."""
-        runtime = VllmRayRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1", "10.0.0.2"],
-            cluster_id="mycluster",
-        )
+    def test_follow_logs_cluster_tails_serve_log_on_head(self, log_sources_spy):
+        """Multi-host vllm tails serve log in _head container on hosts[0].
 
-        mock_stream.assert_called_once()
-        args = mock_stream.call_args
-        assert args[0][0] == "10.0.0.1"
-        assert args[0][1] == "mycluster_head"
+        This is the case ``api.logs`` used to get wrong: it hardcoded
+        ``{cid}_node_0`` and ``docker logs``, so a Ray job asked for a
+        container that doesn't exist.
+        """
+        VllmRayRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster")
+
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "mycluster_head", MODE_FILE)
+
+    def test_ray_workers_read_container_stdout_not_a_serve_log(self, log_sources_spy):
+        """Ray workers are the one case where workers don't share the head's mode.
+
+        Only the head execs ``vllm serve`` into the in-container serve log; a
+        worker's PID 1 *is* ``ray start --block``, so its output is container
+        stdout and it carries no rank.
+        """
+        VllmRayRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster", scope=SCOPE_ALL)
+
+        head, worker = log_sources_spy[0].sources
+        assert (head.container, head.mode) == ("mycluster_head", MODE_FILE)
+        assert (worker.host, worker.container, worker.mode) == ("10.0.0.2", "mycluster_worker", MODE_STDOUT)
+        assert worker.rank is None

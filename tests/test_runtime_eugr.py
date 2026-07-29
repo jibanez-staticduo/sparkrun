@@ -6,6 +6,7 @@ import pytest
 from sparkrun.core.recipe import Recipe
 from sparkrun.runtimes.vllm_ray import VllmRayRuntime
 from sparkrun.runtimes.eugr_vllm_ray import EugrVllmRayRuntime
+from sparkrun.core.log_source import MODE_FILE
 
 
 # --- EugrVllmRuntime Tests ---
@@ -322,29 +323,16 @@ class TestEugrPreServe:
 class TestEugrFollowLogs:
     """Test EugrVllmRuntime.follow_logs() — inherited from VllmRuntime."""
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_solo_tails_serve_log(self, mock_stream):
+    def test_follow_logs_solo_tails_serve_log(self, log_sources_spy):
         """Single-host eugr tails serve log in solo container (inherited)."""
-        runtime = EugrVllmRayRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1"],
-            cluster_id="test0",
-        )
+        EugrVllmRayRuntime().follow_logs(hosts=["10.0.0.1"], cluster_id="test0")
 
-        mock_stream.assert_called_once()
-        assert mock_stream.call_args[0][0] == "10.0.0.1"
-        assert mock_stream.call_args[0][1] == "test0_solo"
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "test0_solo", MODE_FILE)
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_cluster_tails_head(self, mock_stream):
+    def test_follow_logs_cluster_tails_head(self, log_sources_spy):
         """Multi-host eugr tails serve log on head container (inherited from vllm)."""
-        runtime = EugrVllmRayRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1", "10.0.0.2"],
-            cluster_id="mycluster",
-        )
+        EugrVllmRayRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster")
 
-        mock_stream.assert_called_once()
-        args = mock_stream.call_args
-        assert args[0][0] == "10.0.0.1"
-        assert args[0][1] == "mycluster_head"
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "mycluster_head", MODE_FILE)

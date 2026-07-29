@@ -22,12 +22,14 @@ from sparkrun.orchestration.executors._base import (
     LABEL_RUNTIME,
     Executor,
 )
+from sparkrun.core.log_source import MODE_FILE, SERVE_LOG_PATH
 from sparkrun.orchestration.job_metadata import INTENT_ID_LEN, PLACEMENT_TOKEN_LEN
 from sparkrun.utils.shell import args_list_to_shell_str, assert_safe_mount_source, b64_wrap_bash, quote
 
 if TYPE_CHECKING:
     from sparkrun.core.cluster_status import ClusterStatus
     from sparkrun.core.hardware import HostHardware
+    from sparkrun.core.log_source import LogSource
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +396,42 @@ class DockerExecutor(Executor):
             parts.extend(["--tail", str(tail)])
         parts.append(container_name)
         return args_list_to_shell_str(parts)
+
+    def read_logs_cmd(
+        self,
+        source: "LogSource",
+        *,
+        follow: bool = False,
+        tail: int | None = None,
+    ) -> str:
+        """Read *source* via ``docker logs`` or an in-container ``tail``.
+
+        Docker is the one substrate that needs the distinction.  sparkrun's
+        sleep-infinity + exec launch makes container PID 1 ``sleep infinity``
+        and redirects the serve process to a file *inside* the container, so
+        ``docker logs`` is structurally blind to it (``docker logs`` shows
+        PID 1's stdout — nothing).  ``scripts/exec_serve_detached.sh`` says
+        as much at the point of the redirect.  A :data:`MODE_FILE` source is
+        therefore read with ``docker exec … tail``; :data:`MODE_STDOUT`
+        sources (TRT-LLM cluster mode, Ray worker containers whose PID 1 *is*
+        ``ray start --block``) use ``docker logs``.
+
+        ``tail -F`` rather than ``-f``: the serve log is created by the
+        exec'd process slightly after the container starts, and ``-F`` waits
+        for a not-yet-existing file instead of erroring out.
+        """
+        if source.mode != MODE_FILE:
+            return self.logs_cmd(source.container, follow=follow, tail=tail)
+
+        path = source.path or SERVE_LOG_PATH
+        inner = ["tail"]
+        if follow:
+            inner.append("-F")
+        # ``-n +1`` emits the whole file from line 1; a concrete N emits the
+        # last N lines — matching stream_container_file_logs' semantics.
+        inner.extend(["-n", str(int(tail)) if tail is not None else "+1"])
+        inner.append(path)
+        return "docker exec %s %s" % (quote(source.container), " ".join(quote(part) for part in inner))
 
     def status_cmd(self, container_name: str) -> str:
         """Exit 0 iff a container named *container_name* is currently running."""

@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sparkrun.api._errors import AmbiguousWorkload, JobNotFound, SparkrunError
+from sparkrun.api._errors import JobNotFound, SparkrunError
 from sparkrun.api._models import StopResult
 
 if TYPE_CHECKING:
@@ -50,6 +50,7 @@ def stop(
             api calls (registry/cluster manager + config sharing).
     """
     from sparkrun.api._resolve import (
+        discover_cluster_id_by_intent,
         resolve_cluster,
         resolve_recipe,
     )
@@ -83,7 +84,7 @@ def stop(
         # whole point of separating intent from placement.  Here we
         # accept that the *user's* host scope is the authoritative
         # discovery range.
-        cluster_id = _discover_cluster_id_by_intent(
+        cluster_id = discover_cluster_id_by_intent(
             intent_id,
             target_hosts,
             cluster_def=cluster_def,
@@ -200,52 +201,6 @@ def stop(
         errors=tuple(errors),
         hosts_failed=hosts_failed,
     )
-
-
-def _discover_cluster_id_by_intent(
-    intent_id: str,
-    target_hosts: list[str],
-    *,
-    cluster_def,
-    cache_dir: str | None,
-    sctx: "SparkrunContext | None",
-) -> str:
-    """Find the running cluster_id whose intent prefix matches *intent_id*.
-
-    Strategy: query the cluster's status via the single, cross-executor source
-    (:func:`query_status_for_cluster` — sweeps every enabled executor on the
-    cluster's substrate, so a job launched under *any* backend, e.g. the native
-    ``local`` executor, is discoverable, not just docker), then filter
-    ``running_cluster_ids()`` for those starting with
-    ``"sparkrun_" + intent_id + "_"``.  Raises :class:`JobNotFound` on zero
-    matches and :class:`AmbiguousWorkload` on more than one.
-    """
-    from sparkrun.orchestration.executor import query_status_for_cluster
-    from sparkrun.orchestration.primitives import build_ssh_kwargs
-
-    config = sctx.config if sctx is not None else _maybe_load_config()
-    ssh_kwargs = build_ssh_kwargs(config) if config else {}
-
-    status = query_status_for_cluster(
-        cluster_def,
-        list(target_hosts),
-        ssh_kwargs=ssh_kwargs,
-        config=config,
-        v=sctx.variables if sctx is not None else None,
-    )
-    running_ids = status.running_cluster_ids()
-
-    new_prefix = "sparkrun_%s_" % intent_id
-    matches = sorted({cid for cid in running_ids if cid.startswith(new_prefix)})
-
-    if not matches:
-        raise JobNotFound("No running workload matches intent %s on hosts %s" % (intent_id, target_hosts))
-    if len(matches) > 1:
-        raise AmbiguousWorkload(
-            "Multiple workloads match this recipe/intent on hosts %s: %s. Re-invoke with an explicit cluster_id." % (target_hosts, matches),
-            cluster_ids=matches,
-        )
-    return matches[0]
 
 
 def _maybe_load_config():

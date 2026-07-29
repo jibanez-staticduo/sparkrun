@@ -1,10 +1,9 @@
 """Unit tests for sparkrun.runtimes.llama_cpp (LlamaCppRuntime)."""
 
-from unittest import mock
-
 import pytest
 from sparkrun.core.recipe import Recipe
 from sparkrun.runtimes.llama_cpp import LlamaCppRuntime
+from sparkrun.core.log_source import MODE_FILE, SCOPE_ALL
 
 
 def test_llama_cpp_runtime_name():
@@ -607,31 +606,31 @@ def test_llama_cpp_issue_204_commandless_equivalent():
 class TestLlamaCppFollowLogs:
     """Test LlamaCppRuntime.follow_logs()."""
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_solo_uses_file_logs(self, mock_stream):
+    def test_follow_logs_solo_uses_file_logs(self, log_sources_spy):
         """Single-host llama-cpp tails serve log file inside solo container."""
-        runtime = LlamaCppRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1"],
-            cluster_id="test0",
-        )
+        LlamaCppRuntime().follow_logs(hosts=["10.0.0.1"], cluster_id="test0")
 
-        mock_stream.assert_called_once()
-        assert mock_stream.call_args[0][1] == "test0_solo"
+        (source,) = log_sources_spy[0].sources
+        assert (source.container, source.mode) == ("test0_solo", MODE_FILE)
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_cluster_uses_file_logs_on_head(self, mock_stream):
+    def test_follow_logs_cluster_uses_file_logs_on_head(self, log_sources_spy):
         """Multi-host llama-cpp follows file logs on _head container (sleep-infinity + exec)."""
-        runtime = LlamaCppRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1", "10.0.0.2"],
-            cluster_id="mycluster",
-        )
+        LlamaCppRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster")
 
-        mock_stream.assert_called_once()
-        args = mock_stream.call_args
-        assert args[0][0] == "10.0.0.1"
-        assert args[0][1] == "mycluster_head"
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "mycluster_head", MODE_FILE)
+
+    def test_scope_all_uses_worker_names_not_ranked_names(self, log_sources_spy):
+        """llama.cpp declares the ``native`` strategy but uses head/worker naming.
+
+        Worker sources are derived from ``_head_container_name``, so its single
+        override is enough — no second place to keep in sync.
+        """
+        LlamaCppRuntime().follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster", scope=SCOPE_ALL)
+
+        sources = log_sources_spy[0].sources
+        assert [s.container for s in sources] == ["mycluster_head", "mycluster_worker"]
+        assert all(s.mode == MODE_FILE for s in sources)
 
 
 class TestLlamaCppValidateRecipe:

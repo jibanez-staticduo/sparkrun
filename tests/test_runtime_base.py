@@ -1,7 +1,6 @@
 """Unit tests for sparkrun.runtimes base class and cross-cutting orchestration helpers."""
 
 import re
-from unittest import mock
 
 from scitrera_app_framework import Variables
 from sparkrun.orchestration.job_metadata import (
@@ -11,6 +10,7 @@ from sparkrun.orchestration.job_metadata import (
 )
 from sparkrun.core.recipe import Recipe
 from sparkrun.runtimes.base import RuntimePlugin
+from sparkrun.core.log_source import MODE_FILE, MODE_STDOUT, SCOPE_ALL, SERVE_LOG_PATH
 
 
 # --- derive_cluster_id Tests ---
@@ -115,71 +115,53 @@ class _StubRuntime(RuntimePlugin):
 class TestBaseFollowLogs:
     """Test base RuntimePlugin.follow_logs()."""
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_solo(self, mock_stream):
-        """Base follow_logs calls stream_container_file_logs with solo container name."""
+    def test_follow_logs_solo(self, log_sources_spy):
+        """Solo mode reads the serve log file inside the ``_solo`` container."""
         runtime = _StubRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1"],
-            cluster_id="mytest0",
-            config=None,
-            dry_run=False,
-            tail=50,
-        )
+        runtime.follow_logs(hosts=["10.0.0.1"], cluster_id="mytest0", config=None, dry_run=False, tail=50)
 
-        mock_stream.assert_called_once_with(
-            "10.0.0.1",
-            "mytest0_solo",
-            tail=50,
-            dry_run=False,
-            follow=True,
-        )
+        (call,) = log_sources_spy
+        (source,) = call.sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "mytest0_solo", MODE_FILE)
+        assert source.path == SERVE_LOG_PATH
+        assert call.tail == 50
+        assert call.follow is True
+        assert call.dry_run is False
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_solo_no_follow(self, mock_stream):
-        """follow=False threads through to stream_container_file_logs (dump-and-exit)."""
+    def test_follow_logs_solo_no_follow(self, log_sources_spy):
+        """follow=False threads through to the reader (dump-and-exit)."""
         runtime = _StubRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1"],
-            cluster_id="mytest0",
-            config=None,
-            dry_run=False,
-            tail=None,
-            follow=False,
-        )
+        runtime.follow_logs(hosts=["10.0.0.1"], cluster_id="mytest0", config=None, dry_run=False, tail=None, follow=False)
 
-        mock_stream.assert_called_once_with(
-            "10.0.0.1",
-            "mytest0_solo",
-            tail=None,
-            dry_run=False,
-            follow=False,
-        )
+        (call,) = log_sources_spy
+        assert call.sources[0].container == "mytest0_solo"
+        assert call.tail is None
+        assert call.follow is False
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_container_file_logs")
-    def test_follow_logs_localhost_default(self, mock_stream):
+    def test_follow_logs_localhost_default(self, log_sources_spy):
         """Base follow_logs with empty hosts uses localhost."""
         runtime = _StubRuntime()
         runtime.follow_logs(hosts=[], cluster_id="sparkrun0")
 
-        mock_stream.assert_called_once()
-        args = mock_stream.call_args
-        assert args[0][0] == "localhost"
-        assert args[0][1] == "sparkrun0_solo"
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container) == ("localhost", "sparkrun0_solo")
 
-    @mock.patch("sparkrun.orchestration.ssh.stream_remote_logs")
-    def test_follow_logs_cluster_uses_docker_logs(self, mock_stream):
-        """Base _follow_cluster_logs streams docker logs on head node."""
+    def test_follow_logs_cluster_uses_docker_logs(self, log_sources_spy):
+        """A non-native strategy with ``docker`` log mode reads container stdout on the head."""
         runtime = _StubRuntime()
-        runtime.follow_logs(
-            hosts=["10.0.0.1", "10.0.0.2"],
-            cluster_id="test0",
-        )
+        runtime.follow_logs(hosts=["10.0.0.1", "10.0.0.2"], cluster_id="mycluster")
 
-        mock_stream.assert_called_once()
-        args = mock_stream.call_args
-        assert args[0][0] == "10.0.0.1"
-        assert args[0][1] == "test0_head"
+        (source,) = log_sources_spy[0].sources
+        assert (source.host, source.container, source.mode) == ("10.0.0.1", "mycluster_head", MODE_STDOUT)
+
+    def test_follow_logs_scope_all_names_every_worker(self, log_sources_spy):
+        """``scope='all'`` fans out to one source per host, head first."""
+        runtime = _StubRuntime()
+        runtime.follow_logs(hosts=["10.0.0.1", "10.0.0.2", "10.0.0.3"], cluster_id="mycluster", scope=SCOPE_ALL)
+
+        sources = log_sources_spy[0].sources
+        assert [s.host for s in sources] == ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+        assert [s.role for s in sources] == ["head", "worker", "worker"]
 
 
 # --- _augment_served_model_name tests ---
