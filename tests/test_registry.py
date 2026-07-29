@@ -544,6 +544,45 @@ class TestRecipeDiscovery:
         assert path.name == "qwen3-1.7b-vllm.yaml"
         assert "qwen3" in str(path)  # Verify it's in the subdirectory
 
+    def test_find_recipe_flat_match_does_not_hide_nested_in_other_registries(self, reg_dirs):
+        """Test that a flat match in one registry doesn't prevent rglob in another.
+
+        Bug: ``find_recipe_in_registries`` short-circuits on the first flat match
+        across *any* registry, skipping the ``rglob`` phase for all other registries.
+        A recipe that lives only in a subdirectory of registry B becomes invisible
+        when registry A has a flat recipe with the same stem.
+        """
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        entries = [
+            RegistryEntry(name="reg-a", url="https://example.com/a", subpath="recipes"),
+            RegistryEntry(name="reg-b", url="https://example.com/b", subpath="recipes"),
+        ]
+        mgr._save_registries(entries)
+
+        # Registry A: flat recipe at recipes/<name>.yaml
+        recipe_dir_a = cache / "reg-a" / "recipes"
+        recipe_dir_a.mkdir(parents=True)
+        (cache / "reg-a" / ".git").mkdir(exist_ok=True)
+        with open(recipe_dir_a / "my-model-vllm.yaml", "w") as f:
+            yaml.dump({"name": "Flat Recipe", "model": "test"}, f)
+
+        # Registry B: same recipe name, but ONLY in a subdirectory (no flat match)
+        recipe_dir_b = cache / "reg-b" / "recipes"
+        nested_dir_b = recipe_dir_b / "my-model"
+        nested_dir_b.mkdir(parents=True)
+        (cache / "reg-b" / ".git").mkdir(exist_ok=True)
+        with open(nested_dir_b / "my-model-vllm.yaml", "w") as f:
+            yaml.dump({"name": "Nested Recipe", "model": "test"}, f)
+
+        matches = mgr.find_recipe_in_registries("my-model-vllm")
+
+        # BOTH registries should appear in the results
+        assert len(matches) == 2, f"Expected 2 matches (flat in reg-a, nested in reg-b), got {len(matches)}: {matches}"
+        registry_names = {m[0] for m in matches}
+        assert registry_names == {"reg-a", "reg-b"}
+
 
 class TestRegistryEntryNewFields:
     """Test new RegistryEntry fields."""
