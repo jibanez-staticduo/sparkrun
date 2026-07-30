@@ -91,6 +91,24 @@ def _truthy(facts: dict[str, str], key: str) -> bool:
     return facts.get(key, "").strip() == "1"
 
 
+def _int_fact(facts: dict[str, str], key: str) -> int:
+    """Read a numeric probe fact, treating anything unparseable as 0.
+
+    A missing or malformed value means "the probe could not tell us", which
+    must read as *no finding* rather than as a finding of zero severity.
+    """
+    try:
+        return int(facts.get(key, "").strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+#: Shared remedy for both CDI failure modes (absent spec, stale spec). One
+#: string so the manual command can never drift from the wizard step that
+#: runs it.
+_CDI_REGENERATE = "sparkrun setup wizard%s (NVIDIA CDI step) — or: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"
+
+
 def _as_int(value: str | None) -> int:
     try:
         return int((value or "0").strip())
@@ -166,13 +184,28 @@ def _check_cdi_spec(state: HostState, ctx: CheckContext) -> CheckItem:
     if not _truthy(facts, "CHECK_NVIDIA_CTK"):
         return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", SKIP, "requires nvidia-ctk (see above)")
     if _truthy(facts, "CHECK_CDI_SPEC"):
+        # Present, but possibly stale: the spec pins absolute driver-library
+        # and device-node paths, and a driver upgrade moves them. Reported as
+        # WARN rather than FAIL because a spec may legitimately reference an
+        # optional path, and a false hard-failure on a working host is worse
+        # than a prompt to regenerate.
+        missing = _int_fact(facts, "CHECK_CDI_PATHS_MISSING")
+        checked = _int_fact(facts, "CHECK_CDI_PATHS_CHECKED")
+        if checked and missing:
+            return CheckItem(
+                "cdi_spec",
+                "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)",
+                WARN,
+                "%d of %d referenced paths missing — spec looks stale (driver upgraded?)" % (missing, checked),
+                _CDI_REGENERATE % ctx.cluster_flag,
+            )
         return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", OK)
     return CheckItem(
         "cdi_spec",
         "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)",
         FAIL,
         "/etc/cdi/nvidia.yaml missing or empty",
-        "sparkrun setup wizard%s (NVIDIA CDI step) — or: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml" % ctx.cluster_flag,
+        _CDI_REGENERATE % ctx.cluster_flag,
     )
 
 

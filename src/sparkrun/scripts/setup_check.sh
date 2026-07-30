@@ -31,7 +31,30 @@ fi
 # --- NVIDIA GPU / Container Toolkit / CDI ---
 command -v nvidia-smi >/dev/null 2>&1 && echo "CHECK_GPU_PRESENT=1" || echo "CHECK_GPU_PRESENT=0"
 command -v nvidia-ctk >/dev/null 2>&1 && echo "CHECK_NVIDIA_CTK=1" || echo "CHECK_NVIDIA_CTK=0"
-if [ -s /etc/cdi/nvidia.yaml ]; then echo "CHECK_CDI_SPEC=1"; else echo "CHECK_CDI_SPEC=0"; fi
+if [ -s /etc/cdi/nvidia.yaml ]; then
+    echo "CHECK_CDI_SPEC=1"
+    # Staleness. A CDI spec pins absolute host paths -- versioned driver
+    # libraries (libnvidia-ml.so.<driver>) and device nodes -- captured when it
+    # was generated. A driver upgrade replaces those files, leaving a spec that
+    # resolves to nothing; containers then fail to start with a CDI error that
+    # says nothing about the driver having moved. Counting how many referenced
+    # paths still exist detects that directly, and catches any other cause of a
+    # spec drifting from the host, rather than inferring it from a version
+    # string. Bounded to keep the probe cheap on a spec with many devices.
+    if [ -r /etc/cdi/nvidia.yaml ]; then
+        _cdi_checked=0
+        _cdi_missing=0
+        for _cdi_path in $(grep -oE '(hostPath|path): *"?/[^ "]+' /etc/cdi/nvidia.yaml 2>/dev/null \
+                | sed 's/.*: *"\?//' | sort -u | head -60); do
+            _cdi_checked=$((_cdi_checked + 1))
+            [ -e "$_cdi_path" ] || _cdi_missing=$((_cdi_missing + 1))
+        done
+        echo "CHECK_CDI_PATHS_CHECKED=$_cdi_checked"
+        echo "CHECK_CDI_PATHS_MISSING=$_cdi_missing"
+    fi
+else
+    echo "CHECK_CDI_SPEC=0"
+fi
 
 # --- earlyoom ---
 command -v earlyoom >/dev/null 2>&1 && echo "CHECK_EARLYOOM_INSTALLED=1" || echo "CHECK_EARLYOOM_INSTALLED=0"
