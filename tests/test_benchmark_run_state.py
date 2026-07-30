@@ -21,7 +21,13 @@ def test_derive_benchmark_id_stable(tmp_path: Path):
 
 
 def test_derive_benchmark_id_different_cluster(tmp_path: Path):
-    """Different cluster_id produces a different benchmark id."""
+    """Different (unparseable / legacy) cluster_id strings produce different IDs.
+
+    Note: when cluster_id parses as the canonical
+    ``sparkrun_<intent>_<placement>`` form, only the *intent* half drives the
+    benchmark id (so resumes work across relaunches that swap placement
+    tokens). See ``test_benchmark_resume_intent_id.py`` for that path.
+    """
     id1 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {"pp": [2048]}, None)
     id2 = derive_benchmark_id("cluster-xyz", "llama-benchy", "default", {"pp": [2048]}, None)
     assert id1 != id2
@@ -59,6 +65,39 @@ def test_derive_benchmark_id_format(tmp_path: Path):
     """ID must start with 'bench_' followed by exactly 12 hex characters."""
     bid = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None)
     assert re.fullmatch(r"bench_[0-9a-f]{12}", bid), f"Bad format: {bid!r}"
+
+
+def test_derive_benchmark_id_different_recipe_fingerprint(tmp_path: Path):
+    """Recipes sharing an intent but differing in content get distinct ids.
+
+    Two recipes with the same model/port/parallelism but a different serve
+    argument (different recipe fingerprint) are different workloads — resuming
+    one into the other's results would silently return wrong numbers.
+    """
+    id1 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="0" * 12)
+    id2 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="f" * 12)
+    assert id1 != id2
+
+
+def test_derive_benchmark_id_same_recipe_fingerprint_stable(tmp_path: Path):
+    """Same fingerprint (same declared workload) keeps the id stable across calls."""
+    id1 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="ab" * 6)
+    id2 = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="ab" * 6)
+    assert id1 == id2
+
+
+def test_derive_benchmark_id_no_fingerprint_back_compat(tmp_path: Path):
+    """Omitting the fingerprint is identical to passing None (legacy callers)."""
+    id_omitted = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None)
+    id_none = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint=None)
+    assert id_omitted == id_none
+
+
+def test_derive_benchmark_id_fingerprint_changes_id(tmp_path: Path):
+    """A fingerprinted id differs from the legacy un-fingerprinted id."""
+    id_legacy = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None)
+    id_fp = derive_benchmark_id("cluster-abc", "llama-benchy", "default", {}, None, recipe_fingerprint="0" * 12)
+    assert id_legacy != id_fp
 
 
 # ---------------------------------------------------------------------------

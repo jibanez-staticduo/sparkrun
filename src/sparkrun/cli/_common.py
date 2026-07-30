@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sys
@@ -47,7 +48,7 @@ def print_json(data: Any) -> None:
     click.echo(dumps_json(data))
 
 
-def _get_context(ctx) -> "SparkrunContext":
+def _get_context(ctx, config_path=None) -> "SparkrunContext":
     """Lazily create and cache a :class:`SparkrunContext` on the Click context.
 
     Calls ``init_sparkrun()`` and creates a ``SparkrunConfig``, bundling
@@ -58,18 +59,18 @@ def _get_context(ctx) -> "SparkrunContext":
     ``fixed_logger`` parameter means ``init_framework_desktop`` skips
     its own logging setup entirely.
     """
-    from sparkrun.core.context import SparkrunContext
-
     obj = ctx.ensure_object(dict)
-    sctx = obj.get("sparkrun_ctx")
+    sctx = obj.get("sparkrun_ctx", None)
     if sctx is not None:
         return sctx
 
     from sparkrun.core.bootstrap import init_sparkrun
     from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.context import SparkrunContext
 
     v = init_sparkrun()
-    config_path = obj.get("config_path")
+    if config_path is None:
+        config_path = obj.get("config_path")
     config = SparkrunConfig(config_path) if config_path else SparkrunConfig()
 
     from sparkrun.core.progress import LaunchProgress, Verbosity
@@ -185,94 +186,121 @@ def _get_config_and_registry(config_path=None):
     return config, registry_mgr
 
 
-def _apply_node_trimming(
+def resolve_effective_hosts_for_recipe(
     host_list: list[str],
     recipe,
     overrides: dict | None = None,
+    *,
+    cluster_def=None,
     runtime=None,
-    tp_override: int | None = None,
-    quiet: bool = False,
-) -> list[str]:
-    """Trim host list to match the runtime's required node count.
+    sctx: SparkrunContext | None = None,
+    solo: bool = False,
+) -> tuple[list[str], bool]:
+    """CLI-layer adapter around :func:`sparkrun.api._hosts.resolve_effective_hosts`.
 
-    When *runtime* is provided, delegates to
-    ``runtime.compute_required_nodes()`` which accounts for all
-    parallelism dimensions (TP, PP, etc.).  Falls back to TP-only
-    logic when no runtime is available (legacy path).
+    Replaces the legacy ``validate_and_prepare_hosts`` helper.  Treats
+    placement as a *structural* property: the scheduler's
+    ``hosts_used`` IS the effective host list — there is no separate
+    "required node count" step.
 
-    Used by run, stop, and logs to ensure they all derive the same
-    effective host list (and therefore the same cluster_id).
+    The helper is responsible for the three orthogonal CLI/recipe
+    constraints that sit outside the scheduler:
+
+    * ``solo`` (or ``recipe.mode == 'solo'``): force a one-host run.
+    * ``recipe.max_nodes``: hard upper bound on host count.
+    * Single-host short-circuit: when only one host is supplied the
+      scheduler is bypassed entirely.
+
+    Echoes the same human-readable notes the prior CLI helpers did
+    (``"Note: N nodes required, using N of M hosts"`` etc.) so console
+    output remains stable for existing tests and users.
 
     Args:
-        host_list: Resolved hosts.
-        recipe: Loaded recipe (used for defaults).
-        overrides: Optional CLI overrides (from --option).
-        runtime: Optional runtime plugin instance.
-        tp_override: Explicit --tp value (takes precedence).
-        quiet: Suppress logging.
+        host_list: Resolved hosts (CLI / cluster / file).
+        recipe: Loaded recipe.
+        overrides: CLI overrides (``-o key=value`` flattened).
+        cluster_def: Optional :class:`ClusterDefinition` carrying
+            per-host hardware (used by the scheduler for multi-GPU
+            placement).
+        sctx: Optional shared :class:`SparkrunContext`.
+        solo: ``--solo`` flag value.
 
     Returns:
-        Possibly trimmed host list.
+        ``(effective_host_list, is_solo)``.
+
+    Side effects:
+        ``click.echo``s human-readable summary lines and calls
+        ``sys.exit(1)`` on scheduler errors (mirroring legacy
+        behaviour).
     """
-    if len(host_list) <= 1:
-        return host_list
+    import sparkrun.api as api
+    from sparkrun.api._hosts import resolve_effective_hosts
 
-    effective_overrides = dict(overrides or {})
-    if tp_override is not None:
-        effective_overrides["tensor_parallel"] = tp_override
+    overrides = overrides or {}
 
-    if runtime is not None:
-        required = runtime.compute_required_nodes(recipe, effective_overrides)
-    else:
-        # Legacy fallback: TP-only
-        if tp_override is not None:
-            required = tp_override
-        else:
-            config_chain = recipe.build_config_chain(effective_overrides)
-            tp_val = config_chain.get("tensor_parallel")
-            required = int(tp_val) if tp_val is not None else None
-
-    if required is None or required >= len(host_list):
-        return host_list
-
-    trimmed = host_list[:required]
-    if not quiet:
-        logger.info(
-            "Required nodes=%d < %d hosts; using first %d: %s",
-            required,
-            len(host_list),
-            required,
-            ", ".join(trimmed),
+    try:
+        host_list, is_solo, notes, _placement = resolve_effective_hosts(
+            host_list,
+            recipe,
+            overrides,
+            cluster_def=cluster_def,
+            runtime=runtime,
+            sctx=sctx,
+            solo=solo,
         )
-    return trimmed
+    except api.InsufficientCapacity as e:
+        # ``resolve_effective_hosts`` already shaped the message (host-count
+        # vs occupancy) and attached the status snapshot for diagnostics.
+        click.echo("Error: %s" % e, err=True)
+        _render_capacity_diagnostics(getattr(e, "status", None), list(getattr(e, "host_list", ()) or host_list))
+        sys.exit(1)
+    except api.LayoutRequired as e:
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+    except api.SparkrunError as e:
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+
+    for note in notes:
+        click.echo(note)
+
+    return host_list, is_solo
 
 
-def _apply_tp_trimming(
-    host_list: list[str],
-    recipe,
-    overrides: dict | None = None,
-    tp_override: int | None = None,
-) -> list[str]:
-    """Trim host list to match tensor_parallel if TP < host count.
+def _render_capacity_diagnostics(cluster_status, host_list: list[str]) -> None:
+    """Echo a compact rundown of what's currently running, alongside a capacity error.
 
-    Backward-compatible alias for :func:`_apply_node_trimming` without
-    a runtime (TP-only legacy path).
-
-    Args:
-        host_list: Resolved hosts.
-        recipe: Loaded recipe (used for defaults).
-        overrides: Optional CLI overrides (from --option).
-        tp_override: Explicit --tp value (takes precedence).
-
-    Returns:
-        Possibly trimmed host list.
+    Uses the already-fetched :class:`ClusterStatus` snapshot — no new
+    SSH round-trip.  When the snapshot is missing (best-effort fetch
+    failed earlier) we point the user at the full ``cluster status``
+    command instead.
     """
-    return _apply_node_trimming(
-        host_list,
-        recipe,
-        overrides=overrides,
-        tp_override=tp_override,
-    )
+    if cluster_status is None or not getattr(cluster_status, "hosts", ()):
+        click.echo("", err=True)
+        click.echo("Run `sparkrun cluster status` to see what's running on the cluster.", err=True)
+        return
+
+    has_workloads = any(host_occ.workloads for host_occ in cluster_status.hosts)
+    if not has_workloads:
+        click.echo("", err=True)
+        click.echo("No sparkrun workloads detected on these hosts (capacity may be reserved off-cluster).", err=True)
+        click.echo("Run `sparkrun cluster status` for full details.", err=True)
+        return
+
+    click.echo("", err=True)
+    click.echo("Currently running on this cluster:", err=True)
+    for host_occ in cluster_status.hosts:
+        if not host_occ.workloads:
+            click.echo("  %-24s idle" % host_occ.host, err=True)
+            continue
+        for workload in host_occ.workloads:
+            label = workload.recipe_name or workload.cluster_id
+            click.echo(
+                "  %-24s %s (cluster_id=%s, %d rank(s))" % (host_occ.host, label, workload.cluster_id, workload.ranks_on_host),
+                err=True,
+            )
+    click.echo("", err=True)
+    click.echo("Stop a running job with `sparkrun stop <cluster_id>` (or `sparkrun stop --all`).", err=True)
 
 
 def _get_cluster_manager(v=None, sctx: SparkrunContext | None = None):
@@ -334,8 +362,24 @@ def _load_recipe(config, recipe_name, resolve=True, retry_after_update=False):
 
     # Handle remote URLs (e.g. spark-arena recipe links)
     if _is_recipe_url(recipe_name):
+        from sparkrun.core.recipe import RecipeUntrustedHostError
+
         logger.debug("Loading recipe from URL: %s", recipe_name)
-        cached_path = _fetch_and_cache_recipe(recipe_name)
+        try:
+            cached_path = _fetch_and_cache_recipe(recipe_name)
+        except RecipeUntrustedHostError as e:
+            # Off-allowlist https host: confirm interactively, else abort.
+            if sys.stdin.isatty() and click.confirm(
+                "Recipe URL host '%s' is not in the trusted allowlist. Fetch anyway?" % e.host,
+                default=False,
+            ):
+                cached_path = _fetch_and_cache_recipe(recipe_name, allow_untrusted_host=True)
+            else:
+                click.echo("Error: %s" % e, err=True)
+                sys.exit(1)
+        except RecipeError as e:
+            click.echo("Error: %s" % e, err=True)
+            sys.exit(1)
         try:
             recipe = Recipe.load(cached_path, resolve=resolve)
         except RecipeError as e:
@@ -343,6 +387,10 @@ def _load_recipe(config, recipe_name, resolve=True, retry_after_update=False):
             sys.exit(1)
         # Store URL as source for display/debugging
         recipe.source_path = recipe_name
+        # URL-sourced recipes are never auto-trusted (see
+        # core.launcher.resolve_recipe_trust): their hooks require
+        # --trust or interactive confirmation.
+        recipe.is_url_sourced = True
         # Registry manager still needed by callers (e.g. tuning sync)
         registry_mgr = config.get_registry_manager()
         registry_mgr.ensure_initialized()
@@ -352,12 +400,15 @@ def _load_recipe(config, recipe_name, resolve=True, retry_after_update=False):
     registry_mgr.ensure_initialized()
 
     def _prompt_disambiguation(err):
-        click.echo("Recipe '%s' found in multiple registries:" % err.name)
-        for i, (reg, path) in enumerate(err.matches, 1):
-            click.echo("  %d. @%s/%s" % (i, reg, err.name))
+        # Labels are path-qualified (@reg/subdir/name), so nested matches within
+        # one registry are distinguishable — a bare @reg/name would print the
+        # same option twice. Each label is re-typeable as a scoped recipe name.
+        click.echo("Recipe '%s' matches %d recipes:" % (err.name, len(err.matches)))
+        for i, label in enumerate(err.labels, 1):
+            click.echo("  %d. %s" % (i, label))
         click.echo()
         choice = click.prompt(
-            "Select registry",
+            "Select recipe",
             type=click.IntRange(1, len(err.matches)),
             default=1,
         )
@@ -439,6 +490,66 @@ def _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, v=None, sctx
     return host_list, cluster_mgr
 
 
+def with_host_context(func):
+    """Decorator that resolves hosts and cluster manager before the command runs.
+
+    Reads ``hosts``, ``hosts_file``, and ``cluster_name`` from the Click
+    kwargs already present (supplied by :func:`host_options`), calls
+    :func:`_resolve_hosts_or_exit`, and injects the results as additional
+    keyword arguments:
+
+    - ``host_list``   — resolved list of host strings
+    - ``cluster_mgr`` — :class:`ClusterManager` instance
+
+    The decorated function must accept ``**kwargs`` or declare ``host_list``
+    and ``cluster_mgr`` as explicit keyword parameters.
+
+    Usage::
+
+        @click.command()
+        @host_options
+        @with_host_context
+        def my_cmd(hosts, hosts_file, cluster_name, host_list, cluster_mgr):
+            ...
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        hosts = kwargs.get("hosts")
+        hosts_file = kwargs.get("hosts_file")
+        cluster_name = kwargs.get("cluster_name")
+
+        # Resolve sctx from Click context.  Two cases:
+        # 1. @click.pass_context — ctx is the first positional arg.
+        # 2. No @click.pass_context — use click.get_current_context() fallback.
+        sctx = None
+        ctx = None
+        if args and hasattr(args[0], "ensure_object"):
+            ctx = args[0]
+        else:
+            try:
+                ctx = click.get_current_context()
+            except RuntimeError:
+                pass
+
+        config = kwargs.get("config")
+        if config is None:
+            if ctx is not None:
+                sctx = _get_context(ctx)
+                config = sctx.config
+            else:
+                from sparkrun.core.config import SparkrunConfig
+
+                config = SparkrunConfig()
+
+        host_list, cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
+        kwargs["host_list"] = host_list
+        kwargs["cluster_mgr"] = cluster_mgr
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
 def _resolve_setup_context(hosts, hosts_file, cluster_name, config, user=None):
     """Resolve hosts, user, and SSH kwargs for setup commands."""
     import os
@@ -461,11 +572,29 @@ def _display_recipe_detail(recipe, show_vram=True, registry_name=None, cli_overr
     display_recipe_detail(recipe, show_vram=show_vram, registry_name=registry_name, cli_overrides=cli_overrides, cache_dir=cache_dir)
 
 
-def _display_vram_estimate(recipe, cli_overrides=None, auto_detect=True, cache_dir=None):
-    """Display VRAM estimation (delegates to cli_formatters)."""
+def _display_vram_estimate(
+    recipe,
+    cli_overrides=None,
+    auto_detect=True,
+    cache_dir=None,
+    cluster=None,
+    placement=None,
+):
+    """Display VRAM estimation (delegates to cli_formatters).
+
+    When *cluster* + *placement* are threaded through, the formatter
+    renders per-host fit alongside the legacy DGX-Spark single-line fit.
+    """
     from sparkrun.utils.cli_formatters import display_vram_estimate
 
-    display_vram_estimate(recipe, cli_overrides=cli_overrides, auto_detect=auto_detect, cache_dir=cache_dir)
+    display_vram_estimate(
+        recipe,
+        cli_overrides=cli_overrides,
+        auto_detect=auto_detect,
+        cache_dir=cache_dir,
+        cluster=cluster,
+        placement=placement,
+    )
 
 
 def _shell_rc_file(shell):
@@ -646,13 +775,20 @@ RECIPE_NAME = RecipeNameType()
 def _is_cluster_id(value: str) -> str | None:
     """Return normalized cluster_id if value looks like one, else None.
 
-    Recognizes full ``sparkrun_<hex>`` IDs and short 8-12 char hex strings.
+    Recognises two shapes:
+
+    * **Canonical**: ``sparkrun_<intent>_<placement_token>`` — full
+      intent + token.
+    * **Bare digest**: 8–12 hex chars or ``<intent>_<placement>``
+      digest from status output → normalised with a ``sparkrun_``
+      prefix so short-form CLI shortcuts keep working.
     """
     import re
 
     if value.startswith("sparkrun_"):
+        # API layer validates the full form at lookup time.
         return value
-    if re.fullmatch(r"[0-9a-f]{8,12}", value):
+    if re.fullmatch(r"(?:[0-9a-f]{8,12}|[0-9a-f]{16}_[0-9a-f]{12})", value):
         return "sparkrun_%s" % value
     return None
 
@@ -773,6 +909,37 @@ class RegistryNameType(click.ParamType):
 REGISTRY_NAME = RegistryNameType()
 
 
+class RecipeQueryType(click.ParamType):
+    """Click parameter type for list/search queries with ``@registry`` scoping.
+
+    Completion only kicks in for the ``@`` prefix — a free-text query has
+    nothing to complete against. ``@`` lists registry names as ``@name/``
+    (type ``dir`` so the shell doesn't append a space) and ``@name/`` falls
+    through to recipe completion within that registry.
+    """
+
+    name = "query"
+
+    def shell_complete(self, ctx, param, incomplete):
+        if not incomplete.startswith("@"):
+            return []
+        try:
+            _, registry_mgr = _get_config_and_registry()
+            if "/" in incomplete:
+                return RECIPE_NAME.shell_complete(ctx, param, incomplete)
+            prefix = incomplete[1:]  # strip @
+            return [
+                click.shell_completion.CompletionItem("@%s/" % reg.name, type="dir")
+                for reg in registry_mgr.list_registries()
+                if reg.enabled and reg.name.startswith(prefix)
+            ]
+        except Exception:
+            return []
+
+
+RECIPE_QUERY = RecipeQueryType()
+
+
 class RuntimeNameType(click.ParamType):
     """Click parameter type with shell completion for runtime names."""
 
@@ -841,114 +1008,36 @@ def _apply_recipe_overrides(
     recipe=None,
     **kwargs,
 ):
-    """Build overrides dict, apply to recipe, and resolve runtime.
+    """CLI wrapper around :func:`sparkrun.core.resolve.apply_recipe_overrides`.
 
-    Returns ``(recipe, overrides)`` — recipe is returned to make the
-    mutation explicit (runtime may change based on overrides).
-
-    When *recipe* is provided, ``recipe.resolve(overrides)`` is called
-    so that overrides can influence runtime resolution (e.g.
-    ``distributed_executor_backend=ray`` switches vllm-distributed to
-    vllm-ray).
+    Validates the ``--option/-o`` tuple first via :func:`_parse_options`
+    (which echoes ``"Error: --option must be key=value..."`` and exits on
+    malformed input, preserving the existing CLI behaviour), then defers
+    the override construction + runtime resolution to the console-free
+    core resolver.
     """
-    overrides = _parse_options(options)
-    if tensor_parallel is not None:
-        overrides["tensor_parallel"] = tensor_parallel
-    if pipeline_parallel is not None:
-        overrides["pipeline_parallel"] = pipeline_parallel
-    if data_parallel is not None:
-        overrides["data_parallel"] = data_parallel
-    if gpu_mem is not None:
-        overrides["gpu_memory_utilization"] = gpu_mem
-    if max_model_len is not None:
-        overrides["max_model_len"] = max_model_len
-    if image and recipe is not None:
-        recipe.container = image
+    from sparkrun.core.resolve import apply_recipe_overrides
 
-    for k, v in kwargs.items():
-        if v is not None:
-            overrides[k] = v
+    # Validate the option tuple up-front for the CLI's error message + exit
+    # code; the core resolver re-parses the (now-valid) tuple identically.
+    _parse_options(options)
 
-    # Apply env.* overrides to recipe.env directly
-    if recipe is not None:
-        for k, v in list(overrides.items()):
-            if k.startswith("env."):
-                recipe.env[k[4:]] = str(v)
-                del overrides[k]
-
-    # Resolve runtime with overrides visible to resolvers
-    if recipe is not None:
-        recipe.resolve(overrides)
-
-    return recipe, overrides
+    return apply_recipe_overrides(
+        options,
+        tensor_parallel=tensor_parallel,
+        pipeline_parallel=pipeline_parallel,
+        data_parallel=data_parallel,
+        gpu_mem=gpu_mem,
+        max_model_len=max_model_len,
+        image=image,
+        recipe=recipe,
+        **kwargs,
+    )
 
 
 def dry_run_option(f):
     """Common --dry-run flag."""
     return click.option("--dry-run", "-n", is_flag=True, help="Show what would be done")(f)
-
-
-def validate_and_prepare_hosts(
-    host_list: list[str],
-    recipe,
-    overrides: dict,
-    runtime,
-    solo: bool = False,
-) -> tuple[list[str], bool]:
-    """Validate node count, enforce max_nodes, and determine solo mode.
-
-    Returns ``(trimmed_host_list, is_solo)``.
-    Exits with an error on invalid configurations.
-    """
-    # Node count validation / trimming
-    if len(host_list) > 1 and not solo:
-        try:
-            required = runtime.compute_required_nodes(recipe, overrides)
-        except ValueError as e:
-            click.echo("Error: %s" % e, err=True)
-            sys.exit(1)
-        if required is not None:
-            if required > len(host_list):
-                click.echo(
-                    "Error: runtime requires %d nodes, but only %d hosts provided" % (required, len(host_list)),
-                    err=True,
-                )
-                sys.exit(1)
-            elif required < len(host_list):
-                original_count = len(host_list)
-                host_list = _apply_node_trimming(
-                    host_list,
-                    recipe,
-                    overrides,
-                    runtime=runtime,
-                )
-                click.echo("Note: %d nodes required, using %d of %d hosts" % (required, required, original_count))
-
-    # Enforce max_nodes
-    if recipe.max_nodes is not None and len(host_list) > recipe.max_nodes:
-        try:
-            req = runtime.compute_required_nodes(recipe, overrides)
-        except ValueError:
-            req = None
-        if req is not None and req > recipe.max_nodes:
-            click.echo(
-                "Error: runtime requires %d nodes (from parallelism settings), "
-                "but recipe '%s' specifies max_nodes=%d" % (req, recipe.qualified_name, recipe.max_nodes),
-                err=True,
-            )
-            sys.exit(1)
-        click.echo("Note: recipe max_nodes=%d, using %d of %d hosts" % (recipe.max_nodes, recipe.max_nodes, len(host_list)))
-        host_list = host_list[: recipe.max_nodes]
-
-    # Determine mode
-    is_solo = solo or len(host_list) <= 1
-    if recipe.mode == "solo":
-        is_solo = True
-    if is_solo and len(host_list) > 1:
-        click.echo("Note: solo mode enabled, using 1 of %d hosts" % len(host_list))
-        host_list = host_list[:1]
-
-    return host_list, is_solo
 
 
 def build_cluster_id_overrides(

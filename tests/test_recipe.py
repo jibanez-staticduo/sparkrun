@@ -51,6 +51,22 @@ def test_load_v2_recipe(tmp_recipe_dir: Path):
     assert recipe.command == "vllm serve {model} --port {port} --host {host}"
 
 
+def test_recipe_env_values_are_literal(tmp_path: Path, monkeypatch):
+    """Recipe env values must NOT expand control-machine variables.
+
+    A third-party recipe setting ``env: {LEAK: "$SECRET"}`` must not exfiltrate
+    a host secret into the container — the literal ``$SECRET`` is preserved.
+    """
+    monkeypatch.setenv("SECRET", "super-secret-value")
+    monkeypatch.setenv("HOME", "/home/victim")
+    recipe_file = tmp_path / "leaky.yaml"
+    recipe_file.write_text('model: test-model\nruntime: vllm\nenv:\n  LEAK: "$SECRET"\n  HOMEVAR: "$HOME/data"\n')
+    recipe = Recipe.load(recipe_file)
+
+    assert recipe.env["LEAK"] == "$SECRET"
+    assert recipe.env["HOMEVAR"] == "$HOME/data"
+
+
 def test_load_v1_recipe_migrates_to_eugr(tmp_recipe_dir: Path):
     """Load a v1 recipe with mods/build_args and verify it auto-sets eugr builder.
 
@@ -97,6 +113,45 @@ def test_load_v1_recipe_no_mods_still_eugr(tmp_recipe_dir: Path):
     # No runtime_config should be set for these keys
     assert recipe.runtime_config.get("build_args", []) == []
     assert recipe.runtime_config.get("mods", []) == []
+
+
+def test_v1_migration_preserves_non_string_defaults():
+    """v1 migration must not crash on non-string default values.
+
+    The brace-escape collapse only applies to string values; numeric defaults
+    (port, max_num_seqs, gpu_memory_utilization — as used by the eugr
+    DiffusionGemma recipes) are passed through untouched. Regression for the
+    ``'int' object has no attribute 'replace'`` crash (issue #213).
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-numeric",
+            "model": "google/diffusiongemma-26B-A4B-it",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {
+                "port": 8000,
+                "max_num_seqs": 10,
+                "gpu_memory_utilization": 0.8,
+                "max_model_len": 262144,
+            },
+        }
+    )
+    # from_dict already calls resolve(); reaching here means no crash.
+    assert recipe.defaults["port"] == 8000
+    assert recipe.defaults["max_num_seqs"] == 10
+    assert recipe.defaults["gpu_memory_utilization"] == 0.8
+    # string defaults still get their brace escapes collapsed
+    r2 = Recipe.from_dict(
+        {
+            "name": "v1-str",
+            "model": "m",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {"diffusion_config": '{{"canvas_length": 256}}'},
+        }
+    )
+    assert r2.defaults["diffusion_config"] == '{"canvas_length": 256}'
 
 
 def test_recipe_from_dict(sample_v2_recipe_data: dict[str, Any]):
@@ -147,6 +202,23 @@ def test_recipe_model_revision_not_in_runtime_config():
     assert "model_revision" not in recipe.runtime_config
 
 
+def test_recipe_mmproj_selector_swept_to_runtime_config():
+    """Top-level `mmproj:` selector is auto-swept into runtime_config (issue #204).
+
+    The launcher reads ``recipe.runtime_config['mmproj']`` to pick the
+    projector variant, so the sweep is load-bearing for vision GGUF support.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "vl",
+            "model": "unsloth/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M",
+            "runtime": "llama-cpp",
+            "mmproj": "F16",
+        }
+    )
+    assert recipe.runtime_config.get("mmproj") == "F16"
+
+
 def test_recipe_name_defaults_to_unnamed():
     """Recipe without name and no source_path should default to 'unnamed'."""
     recipe = Recipe.from_dict({"model": "test-model"})
@@ -180,6 +252,25 @@ def test_qualified_name_with_registry():
     recipe = Recipe.from_dict({"model": "test-model"})
     recipe.source_registry = "my-registry"
     assert recipe.qualified_name == "@my-registry/unnamed"
+
+
+def test_effective_served_model_name_falls_back_to_model():
+    """With no served_model_name set, the effective name is the model id."""
+    recipe = Recipe.from_dict({"model": "org/model", "runtime": "vllm"})
+    assert recipe.effective_served_model_name == "org/model"
+
+
+def test_effective_served_model_name_from_defaults():
+    """A recipe default for served_model_name is used when present."""
+    recipe = Recipe.from_dict({"model": "org/model", "runtime": "vllm", "defaults": {"served_model_name": "friendly"}})
+    assert recipe.effective_served_model_name == "friendly"
+
+
+def test_effective_served_model_name_cli_override_wins():
+    """A CLI override (applied via resolve) takes precedence over defaults."""
+    recipe = Recipe.from_dict({"model": "org/model", "runtime": "vllm", "defaults": {"served_model_name": "friendly"}})
+    recipe.resolve({"served_model_name": "cli-name"})
+    assert recipe.effective_served_model_name == "cli-name"
 
 
 def test_qualified_name_with_path(tmp_path):
@@ -363,6 +454,47 @@ def test_recipe_render_command_no_template():
     rendered = recipe.render_command(config)
 
     assert rendered is None
+
+
+def test_render_command_collapses_v1_brace_escapes():
+    """v1 recipes collapse ``{{``/``}}`` escapes after placeholder substitution.
+
+    eugr recipes write JSON-valued flags with doubled braces so the literal
+    braces survive ``{placeholder}`` substitution; ``render_command`` collapses
+    them back so the runtime receives valid JSON rather than ``{{...}}``.
+    Regression for issue #213.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-json",
+            "model": "google/diffusiongemma-26B-A4B-it",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {"port": 8000},
+            "command": "vllm serve m --port {port} --diffusion-config '{{\"canvas_length\": 256}}'",
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert "--diffusion-config '{\"canvas_length\": 256}'" in rendered
+    assert "{{" not in rendered
+    assert "}}" not in rendered
+    assert "--port 8000" in rendered
+
+
+def test_render_command_does_not_collapse_braces_for_v2():
+    """v2 recipes are unaffected by the v1 brace-escape collapse."""
+    recipe = Recipe.from_dict(
+        {
+            "name": "v2",
+            "model": "m",
+            "runtime": "vllm",
+            "command": "vllm serve m --x '{{literal}}'",
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert "{{literal}}" in rendered
 
 
 def test_render_command_fixes_trailing_space_continuations():
@@ -1252,8 +1384,11 @@ class TestResolverChain:
         assert recipe.runtime == "vllm-distributed"
         assert recipe.builder == "eugr"
 
-    def test_resolve_eugr_signals_mods(self):
-        """mods triggers eugr builder, runtime resolves to vllm-distributed."""
+    def test_resolve_eugr_signals_mods_alone_does_not_trigger_eugr(self):
+        """``mods`` alone no longer triggers the eugr builder — only ``build_args`` or
+        an eugr-specific container prefix does (see ``_resolve_eugr_signals``).
+        Runtime still resolves to vllm-distributed.
+        """
         recipe = Recipe.from_dict(
             {
                 "name": "Test",
@@ -1263,7 +1398,7 @@ class TestResolverChain:
             }
         )
         assert recipe.runtime == "vllm-distributed"
-        assert recipe.builder == "eugr"
+        assert recipe.builder == ""
 
     def test_resolve_vllm_defaults_to_distributed(self):
         """Bare vllm -> vllm-distributed."""
@@ -1548,6 +1683,143 @@ class TestFindRecipePrefix:
 
         with pytest.raises(RecipeError, match="not found in registry"):
             find_recipe("@reg1/nonexistent", registry_manager=mgr)
+
+    def test_scoped_find_reaches_nested_recipe_despite_flat_match_elsewhere(self, tmp_path):
+        """Regression (PR #227): @reg-b/name must resolve a nested recipe.
+
+        A flat same-stem file in *another* registry used to suppress the
+        recursive scan for every registry, so an explicitly-scoped lookup
+        reported "not found" with no user-side workaround. The other registry
+        here is invisible, which was the nastiest form of the bug: a hidden
+        registry silently breaking a scoped lookup.
+        """
+        from sparkrun.core.recipe import find_recipe
+        from sparkrun.core.registry import RegistryManager, RegistryEntry
+
+        config = tmp_path / "config"
+        cache = tmp_path / "cache"
+        config.mkdir()
+        cache.mkdir()
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries(
+            [
+                RegistryEntry(name="reg-a", url="https://example.com/a", subpath="recipes", visible=False),
+                RegistryEntry(name="reg-b", url="https://example.com/b", subpath="recipes"),
+            ]
+        )
+
+        flat_dir = cache / "reg-a" / "recipes"
+        flat_dir.mkdir(parents=True)
+        (cache / "reg-a" / ".git").mkdir(exist_ok=True)
+        with open(flat_dir / "shared-stem.yaml", "w") as f:
+            yaml.dump({"name": "Flat", "model": "test", "runtime": "vllm"}, f)
+
+        nested_dir = cache / "reg-b" / "recipes" / "family"
+        nested_dir.mkdir(parents=True)
+        (cache / "reg-b" / ".git").mkdir(exist_ok=True)
+        with open(nested_dir / "shared-stem.yaml", "w") as f:
+            yaml.dump({"name": "Nested", "model": "test", "runtime": "vllm"}, f)
+
+        assert find_recipe("@reg-b/shared-stem", registry_manager=mgr) == nested_dir / "shared-stem.yaml"
+        assert find_recipe("@reg-a/shared-stem", registry_manager=mgr) == flat_dir / "shared-stem.yaml"
+
+    def test_scoped_find_ambiguous_within_one_registry_raises(self, tmp_path):
+        """Two nested same-stem recipes in one registry must not be silently guessed."""
+        from sparkrun.core.recipe import find_recipe, RecipeAmbiguousError
+        from sparkrun.core.registry import RegistryManager, RegistryEntry
+
+        config = tmp_path / "config"
+        cache = tmp_path / "cache"
+        config.mkdir()
+        cache.mkdir()
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        (cache / "reg" / ".git").mkdir(parents=True, exist_ok=True)
+        for sub in ("3x-spark-cluster", "4x-spark-cluster"):
+            (recipe_dir / sub).mkdir(parents=True)
+            with open(recipe_dir / sub / "topo.yaml", "w") as f:
+                yaml.dump({"name": sub, "model": "test", "runtime": "vllm"}, f)
+
+        with pytest.raises(RecipeAmbiguousError) as exc_info:
+            find_recipe("@reg/topo", registry_manager=mgr)
+
+        err = exc_info.value
+        assert len(err.matches) == 2
+        # Labels must be distinguishable — a bare @reg/topo twice is useless.
+        assert err.labels == ["@reg/3x-spark-cluster/topo", "@reg/4x-spark-cluster/topo"]
+        assert len(set(err.labels)) == 2
+        assert "3x-spark-cluster/topo" in str(err)
+
+        # ...and each label is re-typeable to resolve the ambiguity.
+        for label in err.labels:
+            resolved = find_recipe(label, registry_manager=mgr)
+            assert resolved.parent.name in ("3x-spark-cluster", "4x-spark-cluster")
+        assert find_recipe("@reg/4x-spark-cluster/topo", registry_manager=mgr) == recipe_dir / "4x-spark-cluster" / "topo.yaml"
+
+    def test_unscoped_ambiguity_labels_are_path_qualified(self, tmp_path):
+        """Cross-registry ambiguity carries path-qualified labels too."""
+        from sparkrun.core.recipe import find_recipe, RecipeAmbiguousError
+        from sparkrun.core.registry import RegistryManager, RegistryEntry
+
+        config = tmp_path / "config"
+        cache = tmp_path / "cache"
+        config.mkdir()
+        cache.mkdir()
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries(
+            [
+                RegistryEntry(name="reg-a", url="https://example.com/a", subpath="recipes"),
+                RegistryEntry(name="reg-b", url="https://example.com/b", subpath="recipes"),
+            ]
+        )
+
+        flat_dir = cache / "reg-a" / "recipes"
+        flat_dir.mkdir(parents=True)
+        (cache / "reg-a" / ".git").mkdir(exist_ok=True)
+        with open(flat_dir / "dup.yaml", "w") as f:
+            yaml.dump({"name": "Flat", "model": "test", "runtime": "vllm"}, f)
+
+        nested_dir = cache / "reg-b" / "recipes" / "family"
+        nested_dir.mkdir(parents=True)
+        (cache / "reg-b" / ".git").mkdir(exist_ok=True)
+        with open(nested_dir / "dup.yaml", "w") as f:
+            yaml.dump({"name": "Nested", "model": "test", "runtime": "vllm"}, f)
+
+        with pytest.raises(RecipeAmbiguousError) as exc_info:
+            find_recipe("dup", registry_manager=mgr)
+
+        assert exc_info.value.labels == ["@reg-a/dup", "@reg-b/family/dup"]
+
+    def test_find_recipe_in_registry_ambiguous_raises(self, tmp_path):
+        """find_recipe_in_registry() must not silently take the first sorted hit."""
+        from sparkrun.core.recipe import find_recipe_in_registry, RecipeAmbiguousError
+        from sparkrun.core.registry import RegistryManager, RegistryEntry
+
+        config = tmp_path / "config"
+        cache = tmp_path / "cache"
+        config.mkdir()
+        cache.mkdir()
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        (cache / "reg" / ".git").mkdir(parents=True, exist_ok=True)
+        for sub in ("a", "b"):
+            (recipe_dir / sub).mkdir(parents=True)
+            with open(recipe_dir / sub / "twin.yaml", "w") as f:
+                yaml.dump({"name": sub, "model": "test", "runtime": "vllm"}, f)
+
+        with pytest.raises(RecipeAmbiguousError):
+            find_recipe_in_registry("twin", "reg", mgr)
+
+        # A unique stem still resolves normally.
+        with open(recipe_dir / "solo.yaml", "w") as f:
+            yaml.dump({"name": "Solo", "model": "test", "runtime": "vllm"}, f)
+        assert find_recipe_in_registry("solo", "reg", mgr) == recipe_dir / "solo.yaml"
 
 
 class TestIsRecipeFile:
@@ -2178,6 +2450,28 @@ class TestResolveWithOverrides:
         # Override to mp → should resolve to vllm-distributed
         recipe.resolve({"distributed_executor_backend": "mp"})
         assert recipe.runtime == "vllm-distributed"
+
+    def test_resolve_override_mp_beats_literal_command_ray(self):
+        """Legacy: --distributed-executor-backend ray hardcoded in command,
+        not in defaults. -o distributed_executor_backend=mp must still win."""
+        data = {
+            "model": "test-model",
+            "container": "img:latest",
+            "command": "vllm serve {model} --distributed-executor-backend ray",
+        }
+        recipe = Recipe.from_dict(data)
+        # No override: the command hint selects vllm-ray.
+        assert recipe.runtime == "vllm-ray"
+
+        recipe.resolve({"distributed_executor_backend": "mp"})
+        assert recipe.runtime == "vllm-distributed"
+
+        # And the lightweight resolver mirrors it.
+        from sparkrun.core.recipe import resolve_runtime
+
+        assert resolve_runtime(data) == "vllm-ray"
+        assert resolve_runtime(data, {"distributed_executor_backend": "mp"}) == "vllm-distributed"
+        assert resolve_runtime(data, {"distributed_executor_backend": "ray"}) == "vllm-ray"
 
     def test_resolve_non_affecting_overrides(self):
         """Overrides without runtime-affecting keys don't change runtime."""

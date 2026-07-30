@@ -1,8 +1,215 @@
-"""SSH mesh and management IP detection helpers for sparkrun setup."""
+"""SSH mesh, access bootstrap, and management IP detection helpers for sparkrun setup."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from pathlib import Path
+
 import click
+
+
+def _default_ssh_user() -> str:
+    """Return the local username, cross-platform.
+
+    ``os.environ["USER"]`` is POSIX-only: Windows sets ``USERNAME`` instead, so
+    the previous ``os.environ.get("USER", "root")`` meant every Windows control
+    machine opened its first SSH connection as ``root`` — a user that exists on
+    a DGX Spark but is never the one setup should be using.  ``getpass.getuser``
+    consults ``LOGNAME``/``USER``/``LNAME``/``USERNAME`` and then the password
+    database, so it works on both.
+
+    Returns an empty string when the username genuinely can't be determined;
+    callers should then prompt without a default rather than invent one.
+    """
+    import getpass
+
+    try:
+        return getpass.getuser() or ""
+    except Exception:
+        return ""
+
+
+@dataclass
+class SshAccessOutcome:
+    """Result of the control→host SSH access gate."""
+
+    #: Hosts we can reach non-interactively with key auth.
+    ok_hosts: list[str] = field(default_factory=list)
+    #: The (possibly corrected) SSH username to use downstream.
+    user: str = ""
+    #: True when a key was installed on at least one host during this gate.
+    bootstrapped: bool = False
+    #: Hosts still unreachable after any bootstrap attempt.
+    blocked: list[str] = field(default_factory=list)
+
+    @property
+    def all_ok(self) -> bool:
+        return bool(self.ok_hosts) and not self.blocked
+
+
+def _ensure_ssh_access(host_list, user, config, dry_run=False, yes=False):
+    """Verify — and when possible bootstrap — key-based SSH to *host_list*.
+
+    Every later setup phase assumes passwordless SSH works.  Running this first
+    turns "four screens of Permission denied from four separate probes" into a
+    single diagnosis and one offer to fix it.
+
+    On authentication failure the user is offered a key-based bootstrap: locate
+    or generate a local identity, then install its public key on each failing
+    host using password auth (one password prompt per host).  Success is
+    confirmed by re-probing, never by trusting the install's exit code.
+
+    Args:
+        host_list: Cluster hosts to check.
+        user: SSH username to try.
+        config: :class:`~sparkrun.core.config.SparkrunConfig` for key/options.
+        dry_run: Skip all network access and report success.
+        yes: Non-interactive; diagnose and advise, but never prompt.
+
+    Returns:
+        An :class:`SshAccessOutcome`.  ``user`` may differ from the argument if
+        the operator corrected it at the prompt.
+    """
+    from sparkrun.api.setup import (
+        SshAccessError,
+        ensure_local_key,
+        install_public_key_interactive,
+        probe_ssh_access,
+    )
+
+    if not host_list:
+        return SshAccessOutcome(ok_hosts=[], user=user)
+
+    if dry_run:
+        click.echo("[dry-run] Would verify SSH access to %d host(s) as '%s'." % (len(host_list), user))
+        return SshAccessOutcome(ok_hosts=list(host_list), user=user)
+
+    ssh_options = config.ssh_options if config else []
+    ssh_key = config.ssh_key if config else None
+
+    def _probe(as_user):
+        return probe_ssh_access(list(host_list), as_user, key=ssh_key, options=ssh_options)
+
+    click.echo("Checking SSH access to %d host(s) as '%s'..." % (len(host_list), user))
+    probes = _probe(user)
+    ok = [p.host for p in probes if p.ok]
+    if len(ok) == len(host_list):
+        click.echo("  All %d host(s) reachable with key-based SSH." % len(host_list))
+        return SshAccessOutcome(ok_hosts=ok, user=user)
+
+    auth_failed = [p for p in probes if p.auth_failed]
+    host_key_failed = [p for p in probes if p.host_key_failed]
+    unreachable = [p for p in probes if not p.reachable]
+
+    if ok:
+        click.echo("  Reachable: %s" % ", ".join(ok))
+    if auth_failed:
+        click.echo("  Authentication failed: %s" % ", ".join(p.host for p in auth_failed))
+    if host_key_failed:
+        click.echo("  Host key mismatch: %s" % ", ".join(p.host for p in host_key_failed), err=True)
+        click.echo("    The stored host key changed. Resolve manually before continuing:", err=True)
+        for p in host_key_failed:
+            click.echo("      ssh-keygen -R %s" % p.host, err=True)
+    if unreachable:
+        click.echo("  Not reachable: %s" % ", ".join(p.host for p in unreachable), err=True)
+        for p in unreachable:
+            if p.error:
+                click.echo("    %s: %s" % (p.host, p.error.splitlines()[0]), err=True)
+        click.echo("    Check the address, the network route, and that sshd is running.", err=True)
+
+    if not auth_failed:
+        return SshAccessOutcome(ok_hosts=ok, user=user, blocked=[p.host for p in probes if not p.ok])
+
+    click.echo()
+    if yes:
+        click.echo(
+            "SSH key authentication is not set up for '%s' on %d host(s)." % (user, len(auth_failed)),
+            err=True,
+        )
+        click.echo("Re-run without --yes to set it up interactively.", err=True)
+        return SshAccessOutcome(ok_hosts=ok, user=user, blocked=[p.host for p in auth_failed])
+
+    # A wrong username is the single most common cause of a clean
+    # "Permission denied (publickey,password)" on an untouched cluster, so
+    # offer to correct it before spending password prompts on the wrong user.
+    if not ok and click.confirm("Try a different SSH username first?", default=False):
+        new_user = click.prompt("SSH username", default=user or None)
+        if new_user and new_user != user:
+            user = new_user
+            click.echo("Re-checking SSH access as '%s'..." % user)
+            probes = _probe(user)
+            ok = [p.host for p in probes if p.ok]
+            if len(ok) == len(host_list):
+                click.echo("  All %d host(s) reachable with key-based SSH." % len(host_list))
+                return SshAccessOutcome(ok_hosts=ok, user=user)
+            auth_failed = [p for p in probes if p.auth_failed]
+            if not auth_failed:
+                return SshAccessOutcome(ok_hosts=ok, user=user, blocked=[p.host for p in probes if not p.ok])
+
+    if not click.confirm(
+        "Set up key-based SSH access to %d host(s) now?" % len(auth_failed),
+        default=True,
+    ):
+        return SshAccessOutcome(ok_hosts=ok, user=user, blocked=[p.host for p in auth_failed])
+
+    # Keep sparkrun's own key beside its config (mountable into a containerized
+    # daemon, and never mixed in with the user's personal identities).
+    key_dir = Path(config.config_path).parent / "ssh" if config is not None else None
+    try:
+        local_key = ensure_local_key(preferred=ssh_key, key_dir=key_dir)
+    except SshAccessError as e:
+        click.echo("Could not prepare a local SSH key: %s" % e, err=True)
+        return SshAccessOutcome(ok_hosts=ok, user=user, blocked=[p.host for p in auth_failed])
+
+    if local_key.generated:
+        click.echo("  Generated a new SSH key: %s" % local_key.path)
+        if config is not None:
+            try:
+                config.set("ssh.key", str(local_key.path))
+                config.save()
+                click.echo("  Recorded as ssh.key in %s" % config.config_path)
+            except Exception as e:
+                click.echo("  Warning: could not persist ssh.key: %s" % e, err=True)
+    else:
+        click.echo("  Using SSH key: %s" % local_key.path)
+
+    click.echo()
+    click.echo("Installing the public key on %d host(s)." % len(auth_failed))
+    click.echo("You will be prompted for %s's password once per host." % user)
+    click.echo()
+
+    attempted = []
+    for probe in auth_failed:
+        click.echo("  %s:" % probe.host)
+        try:
+            install_public_key_interactive(
+                probe.host,
+                user,
+                local_key.public_key,
+                options=ssh_options,
+            )
+        except SshAccessError as e:
+            click.echo("    %s" % e, err=True)
+            continue
+        except ValueError as e:
+            click.echo("    Refusing to install key: %s" % e, err=True)
+            continue
+        attempted.append(probe.host)
+
+    # The install's exit code is a hint; a passwordless probe is the proof.
+    click.echo()
+    click.echo("Verifying key-based access...")
+    probes = _probe(user)
+    ok = [p.host for p in probes if p.ok]
+    blocked = [p.host for p in probes if not p.ok]
+    if ok:
+        click.echo("  Key-based SSH working on %d/%d host(s)." % (len(ok), len(host_list)))
+    if blocked:
+        click.echo("  Still failing: %s" % ", ".join(blocked), err=True)
+        click.echo("  Install the key manually on those hosts:", err=True)
+        click.echo("    %s" % local_key.public_key, err=True)
+
+    return SshAccessOutcome(ok_hosts=ok, user=user, bootstrapped=bool(attempted), blocked=blocked)
 
 
 def _detect_and_update_mgmt_ips(host_list, cluster_name, cluster_mgr, ssh_kwargs, dry_run=False):
@@ -25,10 +232,9 @@ def _detect_and_update_mgmt_ips(host_list, cluster_name, cluster_mgr, ssh_kwargs
     Returns:
         The (possibly updated) host list.
     """
-    from sparkrun.orchestration.primitives import local_ip_for
     from sparkrun.orchestration.scripts import generate_ip_detect_script
     from sparkrun.orchestration.ssh import run_remote_scripts_parallel
-    from sparkrun.utils import is_valid_ip
+    from sparkrun.utils.net import is_valid_ip, local_ip_for
 
     if dry_run or not host_list:
         return host_list
@@ -121,6 +327,38 @@ def _detect_and_update_mgmt_ips(host_list, cluster_name, cluster_mgr, ssh_kwargs
     return host_list
 
 
+def _run_ssh_mesh_native(mesh_hosts, user, ssh_key=None, dry_run=False):
+    """Mesh SSH keys without a local POSIX shell (Windows control machines).
+
+    Thin console wrapper over :func:`sparkrun.api.setup.mesh_ssh_keys_native`.
+    Unlike the bash script it cannot prompt for passwords, so it needs
+    control→host key auth to already work — which the wizard's SSH access gate
+    (:func:`_ensure_ssh_access`) establishes beforehand.
+
+    Returns:
+        True when every host was meshed.
+    """
+    from sparkrun.api.setup import mesh_ssh_keys_native
+
+    click.echo("Meshing SSH keys (no local shell; using remote execution)...")
+    result = mesh_ssh_keys_native(list(mesh_hosts), user, key=ssh_key, dry_run=dry_run)
+
+    if dry_run:
+        click.echo("[dry-run] Would mesh SSH keys across %d host(s)." % len(mesh_hosts))
+        return True
+
+    for host, err in sorted(result.collect_failures.items()):
+        click.echo("  Could not read a key from %s: %s" % (host, err.splitlines()[0] if err else "unknown"), err=True)
+    for host, err in sorted(result.install_failures.items()):
+        click.echo("  Could not authorize keys on %s: %s" % (host, err.splitlines()[0] if err else "unknown"), err=True)
+
+    if result.public_keys:
+        click.echo("  Meshed %d host key(s) across %d host(s)." % (len(result.public_keys), len(mesh_hosts)))
+    if not result.ok:
+        click.echo("  Mesh incomplete. Run 'sparkrun setup ssh --diagnose' for details.", err=True)
+    return result.ok
+
+
 def _run_ssh_mesh(mesh_hosts, user, cluster_hosts=None, ssh_key=None, discover_ips=True, dry_run=False, control_is_member=False):
     """Run SSH mesh (mesh_ssh_keys.sh) and optionally discover/distribute host keys.
 
@@ -142,6 +380,8 @@ def _run_ssh_mesh(mesh_hosts, user, cluster_hosts=None, ssh_key=None, discover_i
     Returns:
         ``True`` if mesh completed successfully, ``False`` otherwise.
     """
+    import os
+    import shutil
     import subprocess
     from sparkrun.scripts import get_script_path
 
@@ -151,21 +391,38 @@ def _run_ssh_mesh(mesh_hosts, user, cluster_hosts=None, ssh_key=None, discover_i
 
     cluster_hosts = cluster_hosts or list(mesh_hosts)
 
-    # Phase 1: Mesh SSH keys
-    with get_script_path("mesh_ssh_keys.sh") as script_path:
-        cmd = ["bash", str(script_path), user] + mesh_hosts
-
+    # Phase 1: Mesh SSH keys.  ``mesh_ssh_keys.sh`` needs a POSIX shell on the
+    # *control* machine; fall back to the native implementation, which does all
+    # its shell work on the (always-Linux) cluster hosts.
+    #
+    # On Windows this applies even when a `bash` *is* on PATH.  Git Bash and WSL
+    # both take a POSIX view of the filesystem, so the Windows path to the
+    # bundled script is either escape-mangled or simply not addressable:
+    #
+    #   /bin/bash: C:UsersdrewDesktop...mesh_ssh_keys.sh: No such file or directory
+    if os.name == "nt" or shutil.which("bash") is None:
+        ok = _run_ssh_mesh_native(mesh_hosts, user, ssh_key=ssh_key, dry_run=dry_run)
         if dry_run:
-            click.echo("[dry-run] Would run SSH mesh:")
-            click.echo("  " + " ".join(cmd))
             if discover_ips:
                 click.echo("  Phase 2 (discover IPs + distribute host keys) would run after mesh.")
             return True
-
-        # Run interactively — the script prompts for passwords
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
+        if not ok:
             return False
+    else:
+        with get_script_path("mesh_ssh_keys.sh") as script_path:
+            cmd = ["bash", str(script_path), user] + mesh_hosts
+
+            if dry_run:
+                click.echo("[dry-run] Would run SSH mesh:")
+                click.echo("  " + " ".join(cmd))
+                if discover_ips:
+                    click.echo("  Phase 2 (discover IPs + distribute host keys) would run after mesh.")
+                return True
+
+            # Run interactively — the script prompts for passwords
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                return False
 
     # Phase 2: Distribute host keys for management IPs and discovered IPs
     if not discover_ips:

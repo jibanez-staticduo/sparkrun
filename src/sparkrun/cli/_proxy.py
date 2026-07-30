@@ -9,15 +9,16 @@ import click
 from ._common import (
     RECIPE_NAME,
     _apply_recipe_overrides,
+    _get_context,
     _load_recipe,
-    _resolve_hosts_or_exit,
     dry_run_option,
     host_options,
     json_option,
     print_json,
     recipe_override_options,
     resolve_cluster_config,
-    validate_and_prepare_hosts,
+    resolve_effective_hosts_for_recipe,
+    with_host_context,
 )
 
 
@@ -37,14 +38,41 @@ def proxy():
 
 @proxy.command()
 @click.option("--port", type=int, default=None, help="Proxy listen port (default: 4000)")
-@click.option("--host", "bind_host", default=None, help="Bind address (default: 0.0.0.0)")
-@click.option("--master-key", default=None, help="LiteLLM master_key (default: sk-sparkrun)")
+@click.option(
+    "--host",
+    "bind_host",
+    default=None,
+    help="Bind address — persisted to proxy.yaml (recommended: 127.0.0.1). Unconfigured legacy default is 0.0.0.0 (warns loudly).",
+)
+@click.option(
+    "--master-key",
+    default=None,
+    help="Bearer token for stateless LiteLLM auth (no DB required).",
+)
 @host_options
 @click.option("--foreground", is_flag=True, help="Run in foreground (default: daemonize)")
 @click.option("--no-auto-discover", is_flag=True, help="Disable periodic endpoint re-scanning")
 @click.option("--discover-interval", type=int, default=None, help="Seconds between discovery sweeps (default: 30)")
+@click.option(
+    "--restart",
+    is_flag=True,
+    default=False,
+    help="If the proxy is already running, stop it and start fresh with the new settings.",
+)
 @dry_run_option
-def start(port, bind_host, master_key, cluster_name, hosts, hosts_file, foreground, no_auto_discover, discover_interval, dry_run):
+def start(
+    port,
+    bind_host,
+    master_key,
+    cluster_name,
+    hosts,
+    hosts_file,
+    foreground,
+    no_auto_discover,
+    discover_interval,
+    restart,
+    dry_run,
+):
     """Start the inference proxy.
 
     Discovers running endpoints, generates LiteLLM config, and launches
@@ -58,111 +86,103 @@ def start(port, bind_host, master_key, cluster_name, hosts, hosts_file, foregrou
 
       sparkrun proxy start --foreground
     """
-    from sparkrun.proxy.config import ProxyConfig
-    from sparkrun.proxy.discovery import discover_endpoints
-    from sparkrun.proxy.engine import ProxyEngine, build_litellm_config, write_config
+    from sparkrun import api
 
-    proxy_cfg = ProxyConfig()
+    sctx = _get_context(click.get_current_context())
 
-    effective_port = port or proxy_cfg.port
-    effective_host = bind_host or proxy_cfg.host
-    effective_key = master_key if master_key is not None else proxy_cfg.master_key
-
-    # Resolve host filter and live discovery args
-    host_filter = _resolve_host_filter(cluster_name, hosts, hosts_file)
-    live_hosts, ssh_kwargs = _resolve_live_discovery_args(
-        cluster_name,
-        hosts,
-        hosts_file,
-        host_filter,
+    options = api.proxy.ProxyStartOptions(
+        port=port,
+        host=bind_host,
+        master_key=master_key,
+        host_filter=_resolve_host_filter(cluster_name, hosts, hosts_file),
+        cluster=cluster_name,
+        # --no-auto-discover forces off; absent, proxy.yaml decides.
+        auto_discover=False if no_auto_discover else None,
+        discover_interval=discover_interval,
+        foreground=foreground,
+        restart=restart,
+        dry_run=dry_run,
     )
 
-    # Discover endpoints
+    # Resolve the gateway before announcing anything: it is a pure config
+    # read, and a disabled/unknown gateway should fail before the (slow,
+    # SSH-backed) discovery sweep is advertised.
+    try:
+        api.proxy.resolve_gateway(sctx=sctx)
+    except api.proxy.GatewayUnavailable as exc:
+        click.echo("Error: %s" % exc, err=True)
+        sys.exit(1)
+
     click.echo("Discovering inference endpoints...")
-    endpoints = discover_endpoints(
-        host_filter=host_filter,
-        host_list=live_hosts,
-        ssh_kwargs=ssh_kwargs,
-    )
+    if foreground and not dry_run:
+        # Foreground blocks inside api.proxy.start until the gateway exits,
+        # so say what is happening before we hand over the terminal.
+        click.echo("Starting proxy in the foreground...")
 
-    healthy = [ep for ep in endpoints if ep.healthy]
+    try:
+        result = api.proxy.start(options, sctx=sctx)
+    except api.proxy.ProxyAlreadyRunning as exc:
+        # Settings supplied this run are saved even though the proxy was left
+        # alone, so say so before the error.
+        if exc.persisted:
+            click.echo("Saved proxy.yaml: %s" % ", ".join(exc.persisted))
+        click.echo(
+            "Error: %s Use --restart to apply new settings, or 'sparkrun proxy stop' first." % exc,
+            err=True,
+        )
+        sys.exit(1)
+    except (api.proxy.GatewayUnavailable, api.proxy.ProxyStartFailed) as exc:
+        click.echo("Error: %s" % exc, err=True)
+        sys.exit(1)
+
+    for warning in result.warnings:
+        click.echo("Warning: %s" % warning, err=True)
+    if result.persisted:
+        click.echo("Saved proxy.yaml: %s" % ", ".join(result.persisted))
+
+    healthy = [ep for ep in result.endpoints if ep.healthy]
     if not healthy:
-        if endpoints:
-            click.echo("Found %d endpoint(s) but none are healthy." % len(endpoints))
+        if result.endpoints:
+            click.echo("Found %d endpoint(s) but none are healthy." % len(result.endpoints))
         else:
             click.echo("No inference endpoints found.")
         click.echo("Load models with: sparkrun proxy load <recipe>")
     else:
         click.echo("Discovered %d healthy endpoint(s):" % len(healthy))
         for ep in healthy:
-            models_str = ", ".join(ep.actual_models) if ep.actual_models else ep.model
-            click.echo("  %s:%d — %s (%s)" % (ep.host, ep.port, models_str, ep.runtime))
+            click.echo("  %s:%d — %s (%s)" % (ep.host, ep.port, ", ".join(ep.models), ep.runtime))
 
-    # Generate config
-    config_dict = build_litellm_config(healthy, effective_key)
-
-    if dry_run:
+    if result.dry_run:
         click.echo("")
-        click.echo("[dry-run] Would write litellm config and start proxy on %s:%d" % (effective_host, effective_port))
-        aliases = proxy_cfg.aliases
+        click.echo("[dry-run] Would write litellm config and start proxy on %s:%d" % (result.host, result.port))
+        aliases = sctx.proxy_config.aliases
         if aliases:
             click.echo("[dry-run] Aliases: %s" % aliases)
         return
 
-    config_path = write_config(config_dict)
     click.echo("")
 
-    # Launch proxy
-    engine = ProxyEngine(
-        host=effective_host,
-        port=effective_port,
-        master_key=effective_key,
-    )
+    if result.restarted:
+        click.echo("Restarting proxy: replaced the previously-running instance.")
 
-    # Resolve auto-discover settings
-    auto_discover = not no_auto_discover and proxy_cfg.auto_discover
-    effective_interval = discover_interval or proxy_cfg.discover_interval
-
-    ad_kwargs = None
-    if auto_discover:
-        ad_kwargs = {
-            "interval": effective_interval,
-            "host_list": live_hosts,
-            "ssh_kwargs": ssh_kwargs,
-        }
-
-    # Check if already running
-    if engine.is_running():
-        click.echo("Proxy is already running (PID %s) on port %d." % (engine._read_pid(), engine.port))
-        click.echo("Use 'sparkrun proxy stop' first, or 'sparkrun proxy load <recipe>' to add models.")
+    if foreground:
+        if result.foreground_rc:
+            sys.exit(result.foreground_rc)
         return
 
-    click.echo("Starting proxy on %s:%d..." % (effective_host, effective_port))
-    rc = engine.start(
-        config_path=config_path,
-        foreground=foreground,
-        autodiscover_kwargs=ad_kwargs,
-    )
-    if rc != 0:
-        click.echo("Error: proxy failed to start (exit code %d)" % rc, err=True)
-        sys.exit(rc)
+    click.echo("Proxy started on %s:%d. API: http://localhost:%d/v1" % (result.host, result.port, result.port))
+    effective_key = sctx.proxy_config.master_key
+    if effective_key:
+        click.echo("Management API key: %s" % effective_key)
+    if result.auto_discover:
+        click.echo("Auto-discover enabled (every %ds)" % result.discover_interval)
 
-    if not foreground:
-        click.echo("Proxy started. API: http://localhost:%d/v1" % effective_port)
-        if effective_key:
-            click.echo("Management API key: %s" % effective_key)
-        if auto_discover:
-            click.echo("Auto-discover enabled (every %ds)" % effective_interval)
-
-        # Apply configured aliases via management API
-        aliases = proxy_cfg.aliases
-        if aliases:
-            import time
-
-            time.sleep(1)  # Brief delay for proxy readiness
-            added, _removed = engine.sync_aliases(aliases)
-            if added:
-                click.echo("Applied %d alias(es)." % added)
+    # Aliases are baked into the config at generation time; report the ones
+    # that actually resolved to a live backend.
+    if result.aliases_applied:
+        click.echo("Applied %d alias(es)." % len(result.aliases_applied))
+    if result.aliases_pending:
+        click.echo("Alias(es) awaiting their target model: %s" % ", ".join(result.aliases_pending))
 
 
 # ---------------------------------------------------------------------------
@@ -177,15 +197,16 @@ def stop(dry_run):
 
     Sends SIGTERM to the proxy process using the stored PID.
     """
-    from sparkrun.proxy.engine import ProxyEngine
+    from sparkrun import api
 
-    engine = ProxyEngine()
+    sctx = _get_context(click.get_current_context())
+    result = api.proxy.stop(dry_run=dry_run, sctx=sctx)
 
-    if not engine.is_running():
+    if not result.was_running:
         click.echo("No proxy is currently running.")
         return
 
-    if engine.stop(dry_run=dry_run):
+    if result.stopped:
         click.echo("Proxy stopped.")
     else:
         click.echo("Failed to stop proxy.", err=True)
@@ -201,77 +222,44 @@ def stop(dry_run):
 @json_option()
 def status(output_json):
     """Show proxy process status and registered models."""
-    from sparkrun.proxy.engine import ProxyEngine
+    from sparkrun import api
 
-    engine = ProxyEngine()
-    state = engine.get_state()
+    sctx = _get_context(click.get_current_context())
+    result = api.proxy.status(sctx=sctx)
 
-    if not state:
+    if not result.known:
         if output_json:
             print_json({"running": False})
             return
         click.echo("No proxy state found.")
         return
 
-    running = engine.is_running()
-
-    # Autodiscover status
-    ad_pid = state.get("autodiscover_pid")
-    ad_running = False
-    if ad_pid:
-        import os
-
-        try:
-            os.kill(int(ad_pid), 0)
-            ad_running = True
-        except (ProcessLookupError, PermissionError, ValueError):
-            pass
-
-    # Models (only if proxy is actually running)
-    model_list = []
-    if running:
-        for m in engine.list_models_via_api():
-            name = m.get("model_name", "?")
-            params = m.get("litellm_params", m.get("model_info", {}).get("litellm_params", {}))
-            api_base = params.get("api_base", "?")
-            model_list.append({"model_name": name, "api_base": api_base})
-
     if output_json:
-        data = {
-            "running": running,
-            "pid": state.get("pid"),
-            "host": state.get("host"),
-            "port": state.get("port"),
-            "started_at": state.get("started_at"),
-            "models": model_list,
-        }
-        if ad_pid:
-            data["autodiscover"] = {"pid": int(ad_pid), "running": ad_running}
-        print_json(data)
+        print_json(result.to_dict())
         return
 
-    click.echo("Proxy status: %s" % ("running" if running else "stopped (stale state)"))
-    click.echo("  PID:    %s" % state.get("pid", "?"))
-    click.echo("  Host:   %s" % state.get("host", "?"))
-    click.echo("  Port:   %s" % state.get("port", "?"))
-    click.echo("  Start:  %s" % state.get("started_at", "?"))
+    click.echo("Proxy status: %s" % ("running" if result.running else "stopped (stale state)"))
+    click.echo("  PID:     %s" % (result.pid if result.pid is not None else "?"))
+    click.echo("  Gateway: %s" % (result.gateway or "?"))
+    click.echo("  Host:    %s" % (result.host or "?"))
+    click.echo("  Port:    %s" % (result.port if result.port is not None else "?"))
+    click.echo("  Start:   %s" % (result.started_at or "?"))
 
-    if ad_pid:
-        if ad_running:
-            click.echo("  Auto-discover: running (PID %s)" % ad_pid)
+    if result.autodiscover_pid:
+        if result.autodiscover_running:
+            click.echo("  Auto-discover: running (PID %s)" % result.autodiscover_pid)
         else:
-            click.echo("  Auto-discover: stopped (stale PID %s)" % ad_pid)
+            click.echo("  Auto-discover: stopped (stale PID %s)" % result.autodiscover_pid)
 
-    if running:
-        if model_list:
-            click.echo("")
-            click.echo("Registered models (%d):" % len(model_list))
-            for m in model_list:
-                click.echo("  %s" % m["model_name"])
-                if m["api_base"] != "?":
-                    click.echo("    -> %s" % m["api_base"])
+    if result.running:
+        click.echo("")
+        if result.models:
+            click.echo("Registered models (%d):" % len(result.models))
+            for m in result.models:
+                click.echo("  %s" % m.model_name)
+                if m.api_base:
+                    click.echo("    -> %s" % m.api_base)
         else:
-            click.echo("")
             click.echo("No models registered (or management API unavailable).")
 
 
@@ -349,11 +337,11 @@ def models(refresh, output_json):
     Uses the management API to query the running proxy.
     With --refresh, re-discovers endpoints and adds new models.
     """
-    from sparkrun.proxy.engine import ProxyEngine
+    from sparkrun import api
 
-    engine = ProxyEngine()
+    sctx = _get_context(click.get_current_context())
 
-    if not engine.is_running():
+    if not api.proxy.status(sctx=sctx).running:
         if output_json:
             print_json([])
             return
@@ -361,36 +349,28 @@ def models(refresh, output_json):
         return
 
     if refresh:
-        from sparkrun.proxy.discovery import discover_endpoints
-
         if not output_json:
             click.echo("Re-discovering endpoints...")
-        endpoints = discover_endpoints()
-        healthy = [ep for ep in endpoints if ep.healthy]
-        added, removed = engine.sync_models(healthy)
+        try:
+            synced = api.proxy.sync(require_running=True, sctx=sctx)
+        except api.proxy.ProxyUpdateFailed as exc:
+            click.echo("Error: %s" % exc, err=True)
+            sys.exit(1)
         if not output_json:
-            if added or removed:
+            if synced.changed:
                 parts = []
-                if added:
-                    parts.append("added %d" % added)
-                if removed:
-                    parts.append("removed %d stale" % removed)
-                click.echo("Synced proxy models: %s." % ", ".join(parts))
+                if synced.added:
+                    parts.append("added %d" % synced.added)
+                if synced.removed:
+                    parts.append("removed %d stale" % synced.removed)
+                click.echo("Synced proxy models: %s (proxy restarted)." % ", ".join(parts))
             else:
                 click.echo("Proxy models already in sync.")
 
-    raw_models = engine.list_models_via_api()
-
-    # Normalize model entries for both output modes
-    model_list = []
-    for m in raw_models:
-        name = m.get("model_name", "?")
-        params = m.get("litellm_params", m.get("model_info", {}).get("litellm_params", {}))
-        api_base = params.get("api_base", "?")
-        model_list.append({"model_name": name, "api_base": api_base})
+    model_list = api.proxy.models(sctx=sctx)
 
     if output_json:
-        print_json(model_list)
+        print_json([m.to_dict() for m in model_list])
         return
 
     if not model_list:
@@ -399,7 +379,7 @@ def models(refresh, output_json):
 
     click.echo("Models (%d):" % len(model_list))
     for m in model_list:
-        click.echo("  %-40s -> %s" % (m["model_name"], m["api_base"]))
+        click.echo("  %-40s -> %s" % (m.model_name, m.api_base or "?"))
 
 
 # ---------------------------------------------------------------------------
@@ -425,22 +405,28 @@ def alias_add(alias_name, target_model):
 
       sparkrun proxy alias add my-model "Qwen/Qwen3-1.7B"
     """
-    from sparkrun.proxy.config import ProxyConfig
-    from sparkrun.proxy.engine import ProxyEngine
+    from sparkrun import api
 
-    proxy_cfg = ProxyConfig()
-    proxy_cfg.add_alias(alias_name, target_model)
-    proxy_cfg.save()
+    sctx = _get_context(click.get_current_context())
+
+    try:
+        result = api.proxy.add_alias(alias_name, target_model, sctx=sctx)
+    except api.proxy.ProxyUpdateFailed as exc:
+        # The alias is saved; only the running proxy failed to pick it up.
+        click.echo("Alias added: %s -> %s" % (alias_name, target_model))
+        click.echo("Error: %s" % exc, err=True)
+        sys.exit(1)
+
     click.echo("Alias added: %s -> %s" % (alias_name, target_model))
 
-    # Apply to running proxy via management API (no restart)
-    engine = ProxyEngine()
-    if engine.is_running():
-        if engine.add_alias_via_api(alias_name, target_model):
-            click.echo("Alias applied to running proxy.")
-        else:
-            click.echo("Warning: could not apply alias — target model '%s' not found in proxy." % target_model, err=True)
-            click.echo("The alias is saved and will apply when the target model is loaded.")
+    if not result.proxy_running:
+        return
+
+    if result.applied:
+        click.echo("Alias applied to running proxy (restarted).")
+    else:
+        click.echo("Note: target model '%s' is not currently served by the proxy." % target_model)
+        click.echo("The alias is saved and will apply when the target model is loaded.")
 
 
 @alias.command("remove")
@@ -452,38 +438,44 @@ def alias_remove(alias_name):
 
       sparkrun proxy alias remove my-model
     """
-    from sparkrun.proxy.config import ProxyConfig
-    from sparkrun.proxy.engine import ProxyEngine
+    from sparkrun import api
 
-    proxy_cfg = ProxyConfig()
-    if not proxy_cfg.remove_alias(alias_name):
+    sctx = _get_context(click.get_current_context())
+
+    try:
+        result = api.proxy.remove_alias(alias_name, sctx=sctx)
+    except api.proxy.ProxyUpdateFailed as exc:
+        # The alias is already removed from proxy.yaml at this point.
+        click.echo("Alias removed: %s" % alias_name)
+        click.echo("Error: %s" % exc, err=True)
+        sys.exit(1)
+
+    if not result.saved:
         click.echo("Alias '%s' not found." % alias_name)
         return
 
-    proxy_cfg.save()
     click.echo("Alias removed: %s" % alias_name)
 
-    # Remove from running proxy via management API (no restart)
-    engine = ProxyEngine()
-    if engine.is_running():
-        removed = engine.remove_alias_via_api(alias_name)
-        if removed:
-            click.echo("Removed %d alias entry/entries from running proxy." % removed)
-        else:
-            click.echo("Alias was not active in the running proxy.")
+    if not result.proxy_running:
+        return
+
+    if result.removed:
+        click.echo("Removed %d alias entry/entries from running proxy (restarted)." % result.removed)
+    else:
+        click.echo("Alias was not active in the running proxy.")
 
 
 @alias.command("list")
 @json_option()
 def alias_list(output_json):
     """List all configured aliases."""
-    from sparkrun.proxy.config import ProxyConfig
+    from sparkrun import api
 
-    proxy_cfg = ProxyConfig()
-    aliases = proxy_cfg.list_aliases()
+    sctx = _get_context(click.get_current_context())
+    aliases = api.proxy.list_aliases(sctx=sctx)
 
     if output_json:
-        print_json(dict(aliases))
+        print_json(aliases)
         return
 
     if not aliases:
@@ -492,7 +484,7 @@ def alias_list(output_json):
         return
 
     click.echo("Aliases:")
-    for name, target in aliases:
+    for name, target in aliases.items():
         click.echo("  %-30s -> %s" % (name, target))
 
 
@@ -508,6 +500,7 @@ def alias_list(output_json):
 @click.option("--solo", is_flag=True, help="Force single-node mode")
 @click.option("--port", type=int, default=None, help="Override serve port")
 @dry_run_option
+@with_host_context
 def load_cmd(
     recipe_name,
     hosts,
@@ -523,6 +516,8 @@ def load_cmd(
     solo,
     port,
     dry_run,
+    host_list=None,
+    cluster_mgr=None,
 ):
     """Load a model via sparkrun run and register with proxy.
 
@@ -572,11 +567,15 @@ def load_cmd(
         click.echo("Error: %s" % e, err=True)
         sys.exit(1)
 
-    # Resolve hosts
-    host_list, cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
-
     # Node count validation, max_nodes enforcement, and solo mode determination
-    host_list, is_solo = validate_and_prepare_hosts(host_list, recipe, overrides, runtime, solo=solo)
+    host_list, is_solo = resolve_effective_hosts_for_recipe(
+        host_list,
+        recipe,
+        overrides,
+        cluster_def=None,
+        sctx=sctx,
+        solo=solo,
+    )
 
     # Resolve cache dir, transfer mode, and transfer interface from cluster config
     cluster_cfg = resolve_cluster_config(cluster_name, hosts, hosts_file, cluster_mgr)
@@ -611,21 +610,23 @@ def load_cmd(
     click.echo("Model loaded: %s (port %d)" % (recipe_name, result.serve_port))
 
     if not dry_run:
-        # Try to register with running proxy
-        from sparkrun.proxy.engine import ProxyEngine
+        # Try to register with a running proxy.
+        from sparkrun import api
 
-        engine = ProxyEngine()
-        if engine.is_running():
+        if api.proxy.status(sctx=sctx).running:
             click.echo("Registering with proxy...")
-            from sparkrun.proxy.discovery import discover_endpoints
             import time
 
             time.sleep(2)  # Brief delay for server startup
-            endpoints = discover_endpoints()
-            healthy = [ep for ep in endpoints if ep.healthy]
-            added, removed = engine.sync_models(healthy)
-            if added:
-                click.echo("Registered %d model(s) with proxy." % added)
+            try:
+                synced = api.proxy.sync(require_running=True, sctx=sctx)
+            except api.proxy.ProxyUpdateFailed as exc:
+                click.echo("Error: %s" % exc, err=True)
+                sys.exit(1)
+            if synced.added:
+                click.echo("Registered %d model(s) with proxy (restarted)." % synced.added)
+            else:
+                click.echo("Warning: model did not appear in proxy discovery.", err=True)
 
 
 @proxy.command("unload")
@@ -643,67 +644,27 @@ def unload_cmd(ctx, recipe_name, hosts, hosts_file, cluster_name, dry_run):
     from sparkrun.cli._stop_logs import _stop_recipe
     from ._common import _get_context
 
-    config = _get_context(ctx).config
-    _stop_recipe(recipe_name, hosts, hosts_file, cluster_name, config, tp_override=None, dry_run=dry_run)
+    sctx = _get_context(ctx)
+    _stop_recipe(recipe_name, hosts, hosts_file, cluster_name, sctx.config, tp_override=None, dry_run=dry_run)
 
     if not dry_run:
-        # Sync proxy to remove the now-stale model entry
-        from sparkrun.proxy.engine import ProxyEngine
+        # Sync proxy to remove the now-stale model entry.
+        from sparkrun import api
 
-        engine = ProxyEngine()
-        if engine.is_running():
+        if api.proxy.status(sctx=sctx).running:
             click.echo("Syncing proxy models...")
-            from sparkrun.proxy.discovery import discover_endpoints
-
-            endpoints = discover_endpoints()
-            healthy = [ep for ep in endpoints if ep.healthy]
-            _added, removed = engine.sync_models(healthy)
-            if removed:
-                click.echo("Removed %d stale model(s) from proxy." % removed)
+            try:
+                synced = api.proxy.sync(require_running=True, sctx=sctx)
+            except api.proxy.ProxyUpdateFailed as exc:
+                click.echo("Error: %s" % exc, err=True)
+                sys.exit(1)
+            if synced.removed:
+                click.echo("Removed %d stale model(s) from proxy (restarted)." % synced.removed)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _resolve_live_discovery_args(
-    cluster_name: str | None,
-    hosts: str | None,
-    hosts_file: str | None,
-    host_filter: list[str] | None,
-) -> tuple[list[str] | None, dict | None]:
-    """Resolve host list and SSH kwargs for live container discovery.
-
-    Tries explicit CLI args first, then falls back to config defaults.
-    Returns ``(None, None)`` when no hosts can be resolved (caller
-    should fall back to metadata-only discovery).
-    """
-    try:
-        from sparkrun.core.config import SparkrunConfig
-        from sparkrun.orchestration.primitives import build_ssh_kwargs
-
-        config = SparkrunConfig()
-
-        live_hosts = host_filter
-        if not live_hosts:
-            live_hosts = config.default_hosts or None
-
-        if not live_hosts:
-            return None, None
-
-        # Apply cluster SSH user if applicable
-        if cluster_name:
-            from sparkrun.cli._common import _get_cluster_manager, resolve_cluster_config
-
-            cluster_mgr = _get_cluster_manager()
-            cluster_user = resolve_cluster_config(cluster_name, hosts, hosts_file, cluster_mgr).user
-            if cluster_user:
-                config.ssh_user = cluster_user
-
-        return live_hosts, build_ssh_kwargs(config)
-    except Exception:
-        return None, None
 
 
 def _resolve_host_filter(

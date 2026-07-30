@@ -882,3 +882,58 @@ class TestFetchSafetensorsSizeOrder:
 
         assert result == 17_500_000_000  # LFS size from tree, not API params
         assert downloaded == ["model.safetensors.index.json"]
+
+
+class TestTargetGpuMemory:
+    """Accelerator-aware GPU memory budget (fixes DGX-hardcoded estimate)."""
+
+    def test_override_scales_usable(self):
+        e = estimate_vram(model_vram=28.75, gpu_memory_utilization=0.5, total_gpu_memory_gb=48.0)
+        assert e.total_gpu_memory_gb == 48.0
+        assert e.usable_gpu_memory_gb == pytest.approx(24.0)  # 48 * 0.5
+
+    def test_default_is_dgx_spark(self):
+        from sparkrun.models.vram import DGX_SPARK_VRAM_GB
+
+        e = estimate_vram(model_vram=28.75, gpu_memory_utilization=0.5)
+        assert e.total_gpu_memory_gb == DGX_SPARK_VRAM_GB
+        assert e.usable_gpu_memory_gb == pytest.approx(DGX_SPARK_VRAM_GB * 0.5)
+
+    def test_total_set_without_utilization(self):
+        # total_gpu_memory_gb is populated even when no gpu_memory_utilization.
+        e = estimate_vram(model_vram=28.75, total_gpu_memory_gb=48.0)
+        assert e.total_gpu_memory_gb == 48.0
+
+    def test_fit_uses_target_memory(self):
+        # 28.75 GB weights fit a 48 GB card but not a 24 GB card.
+        e48 = estimate_vram(model_vram=28.75, total_gpu_memory_gb=48.0)
+        e24 = estimate_vram(model_vram=28.75, total_gpu_memory_gb=24.0)
+        assert e48.total_per_gpu_gb <= e48.total_gpu_memory_gb
+        assert e24.total_per_gpu_gb > e24.total_gpu_memory_gb
+
+
+class TestResolveTargetAccelerator:
+    def _cluster(self, model, mem):
+        from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+
+        class C:
+            hosts = ["h1"]
+            hosts_hardware = {"h1": HostHardware(accelerators=[AcceleratorSpec(vendor="nvidia", model=model, memory_gb=mem)])}
+
+        return C()
+
+    def test_resolves_from_cluster_hardware(self):
+        from sparkrun.utils.cli_formatters import _resolve_target_accelerator
+
+        mem, model = _resolve_target_accelerator(self._cluster("rtx-a6000", 48.0), None)
+        assert mem == 48.0 and model == "rtx-a6000"
+
+    def test_none_when_no_hardware(self):
+        from sparkrun.utils.cli_formatters import _resolve_target_accelerator
+
+        class C:
+            hosts = ["h1"]
+            hosts_hardware = {}
+
+        assert _resolve_target_accelerator(C(), None) == (None, None)
+        assert _resolve_target_accelerator(None, None) == (None, None)

@@ -1,4 +1,17 @@
-"""sparkrun stop and logs commands."""
+"""sparkrun stop and logs commands — thin wrappers around ``sparkrun.api``.
+
+The CLI layer parses Click flags, calls ``api.stop`` / ``api.logs``,
+catches typed :class:`SparkrunError` subclasses, and renders the
+results to the TTY.  Business logic (cluster_id derivation, executor
+selection from metadata, parallel host dispatch, log streaming)
+lives in :mod:`sparkrun.api`.
+
+``--all`` is no different: discovery and teardown live in
+:func:`sparkrun.api.stop_all`, and this module only prints the
+discovered workloads between the two and maps the result onto an exit
+code.  (It used to own that logic, which meant library callers — the
+desktop sidecar included — could neither do it nor inherit its fixes.)
+"""
 
 from __future__ import annotations
 
@@ -6,9 +19,11 @@ import sys
 
 import click
 
+import sparkrun.api as api
+from sparkrun.core.log_source import SCOPE_ALL, SCOPE_HEAD
+
 from ._common import (
     TARGET,
-    _apply_node_trimming,
     _get_context,
     _is_cluster_id,
     _load_recipe,
@@ -28,7 +43,6 @@ from ._common import (
 @click.option("--port", type=int, default=None, help="Override port (to match run-time override)")
 @click.option("--served-model-name", default=None, help="Override served model name (to match run-time override)")
 @dry_run_option
-# @click.option("--config", "config_path", default=None, help="Path to config file")
 @click.pass_context
 def stop(ctx, target, hosts, hosts_file, cluster_name, stop_all, tp_override, port, served_model_name, dry_run, config_path=None):
     """Stop a running workload.
@@ -56,90 +70,76 @@ def stop(ctx, target, hosts, hosts_file, cluster_name, stop_all, tp_override, po
         click.echo("Error: Must specify TARGET or --all.", err=True)
         sys.exit(1)
 
-    config = _get_context(ctx).config
+    sctx = _get_context(ctx)
+    config = sctx.config
 
     if stop_all:
-        _stop_all(hosts, hosts_file, cluster_name, config, dry_run)
-    elif _is_cluster_id(target) is not None:
-        _stop_by_cluster_id(target, hosts, hosts_file, cluster_name, config, dry_run)
-    else:
-        _stop_recipe(target, hosts, hosts_file, cluster_name, config, tp_override, dry_run, port=port, served_model_name=served_model_name)
-
-
-def _stop_all(hosts, hosts_file, cluster_name, config, dry_run):
-    """Discover and stop all sparkrun containers on the target hosts."""
-    from sparkrun.core.cluster_manager import query_cluster_status
-    from sparkrun.orchestration.docker import docker_stop_cmd
-    from sparkrun.orchestration.job_metadata import remove_job_metadata
-    from sparkrun.orchestration.primitives import build_ssh_kwargs
-    from sparkrun.orchestration.ssh import run_remote_command
-
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
-
-    ssh_kwargs = build_ssh_kwargs(config)
-
-    click.echo("Discovering sparkrun containers on %d host(s)..." % len(host_list))
-    result = query_cluster_status(host_list, ssh_kwargs=ssh_kwargs, cache_dir=str(config.cache_dir))
-
-    if result.total_containers == 0:
-        click.echo("No sparkrun containers running.")
+        _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=sctx)
         return
 
-    # Summarise what was found
-    jobs_count = len(result.groups) + len(result.solo_entries)
-    click.echo("Found %d job(s), %d container(s):" % (jobs_count, result.total_containers))
-    for cid, group in result.groups.items():
-        recipe_label = group.meta.get("recipe", "unknown")
-        click.echo("  %s (%s) — %d container(s)" % (cid, recipe_label, len(group.members)))
-    for entry in result.solo_entries:
-        click.echo("  %s on %s" % (entry.name, entry.host))
+    cluster_id = _is_cluster_id(target)
+    overrides = build_cluster_id_overrides(port=port, served_model_name=served_model_name, tp_override=tp_override)
 
-    # Build per-host container name mapping
-    host_containers: dict[str, list[str]] = {}
-    for cid, group in result.groups.items():
-        for host, role, status, image in group.members:
-            container_name = "%s_%s" % (cid, role)
-            host_containers.setdefault(host, []).append(container_name)
-    for entry in result.solo_entries:
-        host_containers.setdefault(entry.host, []).append(entry.name)
+    try:
+        if cluster_id is not None:
+            host_list = _hosts_for_cluster_id_target(target, hosts, hosts_file, cluster_name, config)
+            result = api.stop(
+                cluster_id=cluster_id,
+                hosts=tuple(host_list) if host_list else None,
+                cluster=cluster_name,
+                cache_dir=str(config.cache_dir),
+                sctx=sctx,
+            )
+        else:
+            # Resolve the recipe at the CLI layer so cwd-discovered recipes
+            # are honoured (the CLI patches ``discover_cwd_recipes`` for
+            # tests; api.stop's resolver doesn't see those overrides).
+            recipe, _path, _reg = _load_recipe(config, target)
+            host_list, _ = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
+            result = api.stop(
+                recipe=recipe,
+                hosts=tuple(host_list),
+                overrides=overrides,
+                cluster=cluster_name,
+                cache_dir=str(config.cache_dir),
+                sctx=sctx,
+            )
+    except api.AmbiguousWorkload as e:
+        click.echo(
+            "Error: Multiple workloads match this recipe/intent. Re-invoke with an explicit cluster_id (one of):",
+            err=True,
+        )
+        for cid in e.cluster_ids:
+            click.echo("  %s" % cid, err=True)
+        sys.exit(1)
+    except api.JobNotFound as e:
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+    except api.SparkrunError as e:
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
 
-    # Stop containers per host
-    click.echo("Stopping all containers...")
-    stopped_count = 0
-    for host, names in host_containers.items():
-        cmds = "; ".join(docker_stop_cmd(n) for n in names)
-        run_remote_command(host, cmds, timeout=30, dry_run=dry_run, **ssh_kwargs)
-        stopped_count += len(names)
-
-    # Clean up job metadata for discovered clusters (skip in dry-run mode)
-    if not dry_run:
-        for cid in result.groups:
-            remove_job_metadata(cid, cache_dir=str(config.cache_dir))
-        for entry in result.solo_entries:
-            solo_cid = entry.name.removesuffix("_solo") if entry.name.endswith("_solo") else entry.name
-            remove_job_metadata(solo_cid, cache_dir=str(config.cache_dir))
-
-    hosts_touched = len(host_containers)
-    click.echo("Stopped %d job(s) across %d host(s)." % (stopped_count, hosts_touched))
+    # A teardown that did not confirm is an error, not a warning: the
+    # containers may still be running.  Same contract as ``--all``.
+    for line in result.errors:
+        click.echo("Error: %s" % line, err=True)
+    click.echo("Workload stopped on %d host(s)." % len(result.hosts_targeted))
+    if not result.success:
+        sys.exit(1)
 
 
-def _stop_by_cluster_id(target, hosts, hosts_file, cluster_name, config, dry_run):
-    """Stop containers identified by cluster ID.
+def _hosts_for_cluster_id_target(target, hosts, hosts_file, cluster_name, config) -> list[str]:
+    """Resolve the host list for a cluster_id target.
 
-    First tries to load job metadata for host info.  When metadata is
-    unavailable (e.g. on a worker node that didn't launch the job),
-    falls back to resolving hosts from CLI flags or the default cluster
-    and stops containers by enumerating the known cluster_id patterns.
+    Mirrors the priority chain used by ``api.stop`` so we can pass an
+    explicit host list when CLI flags supply one (overriding any
+    metadata-recorded hosts).
     """
-    from sparkrun.orchestration.docker import enumerate_cluster_containers
-    from sparkrun.orchestration.job_metadata import load_job_metadata, remove_job_metadata
-    from sparkrun.orchestration.primitives import build_ssh_kwargs, cleanup_containers, cleanup_containers_local, should_run_locally
+    from sparkrun.orchestration.job_metadata import load_job_metadata
 
     cluster_id = _is_cluster_id(target)
     meta = load_job_metadata(cluster_id, cache_dir=str(config.cache_dir))
-
-    # Resolve hosts: CLI flags > metadata > default cluster
-    host_list = resolve_hosts_with_metadata_fallback(
+    return resolve_hosts_with_metadata_fallback(
         hosts,
         hosts_file,
         cluster_name,
@@ -148,67 +148,66 @@ def _stop_by_cluster_id(target, hosts, hosts_file, cluster_name, config, dry_run
         target,
     )
 
+
+def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
+    """Render ``sparkrun stop --all``.
+
+    Discovery and teardown live in :func:`sparkrun.api.stop_all`; this
+    prints the discovered workloads between the two (which is why the
+    snapshot is passed back in rather than re-queried) and translates the
+    result into output and an exit code.
+    """
+    from sparkrun.orchestration.primitives import build_ssh_kwargs
+
+    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
+
     ssh_kwargs = build_ssh_kwargs(config)
-    container_names = enumerate_cluster_containers(cluster_id, len(host_list))
 
-    is_local = len(host_list) == 1 and should_run_locally(host_list[0], ssh_kwargs.get("ssh_user"))
-    if is_local:
-        cleanup_containers_local(container_names, dry_run=dry_run)
-    else:
-        cleanup_containers(host_list, container_names, ssh_kwargs=ssh_kwargs, dry_run=dry_run)
+    click.echo("Discovering sparkrun containers on %d host(s)..." % len(host_list))
+    # Status flows from the single source, ``api.status_report`` (cluster-aware
+    # resolution + cross-executor merge + display classification).
+    discovered = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
 
-    if not dry_run:
-        remove_job_metadata(cluster_id, cache_dir=str(config.cache_dir))
+    # A host that errored during discovery may still be running containers —
+    # it must not silently read as "nothing to stop".
+    for err_host, err in sorted(discovered.errors.items()):
+        click.echo("Error: could not query %s: %s" % (err_host, err), err=True)
 
-    click.echo("Workload stopped on %d host(s)." % len(host_list))
+    if discovered.total_containers == 0:
+        if discovered.errors:
+            click.echo("No sparkrun containers found on the hosts that could be queried.")
+            sys.exit(1)
+        click.echo("No sparkrun containers running.")
+        return
 
+    # Summarise what was found
+    jobs_count = len(discovered.groups) + len(discovered.solo_entries)
+    click.echo("Found %d job(s), %d container(s):" % (jobs_count, discovered.total_containers))
+    for cid, group in discovered.groups.items():
+        recipe_label = group.meta.get("recipe", "unknown")
+        click.echo("  %s (%s) — %d container(s)" % (cid, recipe_label, len(group.members)))
+    for entry in discovered.solo_entries:
+        click.echo("  %s on %s" % (entry.name, entry.host))
 
-def _stop_recipe(recipe_name, hosts, hosts_file, cluster_name, config, tp_override, dry_run, port=None, served_model_name=None):
-    """Stop containers for a specific recipe (original behaviour)."""
-    from sparkrun.core.bootstrap import init_sparkrun, get_runtime
-
-    recipe, _recipe_path, _registry_mgr = _load_recipe(config, recipe_name)
-
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
-
-    # Resolve runtime for accurate node trimming (accounts for PP, etc.)
-    v = init_sparkrun()
-    try:
-        runtime = get_runtime(recipe.runtime, v)
-    except ValueError:
-        runtime = None
-
-    # Apply runtime-aware host trimming to match what 'run' used for cluster_id
-    try:
-        host_list = _apply_node_trimming(
-            host_list,
-            recipe,
-            tp_override=tp_override,
-            runtime=runtime,
-        )
-    except ValueError as e:
-        click.echo("Error: %s" % e, err=True)
-        sys.exit(1)
-
-    from sparkrun.orchestration.primitives import build_ssh_kwargs, cleanup_containers, cleanup_containers_local, should_run_locally
-    from sparkrun.orchestration.docker import enumerate_cluster_containers
-    from sparkrun.orchestration.job_metadata import generate_cluster_id
-
-    # Build overrides from --port and --served-model-name so cluster_id matches the run
-    cluster_id = generate_cluster_id(
-        recipe, host_list, overrides=build_cluster_id_overrides(port=port, served_model_name=served_model_name)
+    click.echo("Stopping all containers...")
+    result = api.stop_all(
+        host_list,
+        cluster=cluster_name or None,
+        cache_dir=str(config.cache_dir),
+        ssh_kwargs=ssh_kwargs,
+        dry_run=dry_run,
+        discovered=discovered,
+        sctx=sctx,
     )
-    ssh_kwargs = build_ssh_kwargs(config)
 
-    container_names = enumerate_cluster_containers(cluster_id, len(host_list))
-
-    is_local = len(host_list) == 1 and should_run_locally(host_list[0], ssh_kwargs.get("ssh_user"))
-    if is_local:
-        cleanup_containers_local(container_names, dry_run=dry_run)
-    else:
-        cleanup_containers(host_list, container_names, ssh_kwargs=ssh_kwargs, dry_run=dry_run)
-
-    click.echo("Workload stopped on %d host(s)." % len(host_list))
+    click.echo(
+        "Stopped %d job(s), %d container(s) across %d host(s)."
+        % (result.jobs_stopped, result.containers_removed, len(result.hosts_stopped))
+    )
+    for failed_host, err in sorted(result.hosts_failed.items()):
+        click.echo("Error: failed to stop containers on %s: %s" % (failed_host, err), err=True)
+    if not result.success:
+        sys.exit(1)
 
 
 @click.command("logs")
@@ -217,11 +216,35 @@ def _stop_recipe(recipe_name, hosts, hosts_file, cluster_name, config, tp_overri
 @click.option("--tp", "--tensor-parallel", "tp_override", type=int, default=None, help="Tensor parallel (to match host trimming from run)")
 @click.option("--port", type=int, default=None, help="Override port (to match run-time override)")
 @click.option("--served-model-name", default=None, help="Override served model name (to match run-time override)")
-@click.option("--tail", type=int, default=100, help="Number of log lines before following")
-# @click.option("--config", "config_path", default=None, help="Path to config file")
+@click.option(
+    "-n",
+    "--lines",
+    "--tail",
+    "lines",
+    type=int,
+    default=None,
+    help="Number of log lines to show (default: all). Use with -f to set scrollback before following.",
+)
+@click.option("--follow", "-f", "follow", is_flag=True, default=False, help="Stay attached and stream new log lines (Ctrl-C to stop)")
+@click.option(
+    "--all-sources",
+    "-a",
+    "all_sources",
+    is_flag=True,
+    default=False,
+    help="Read every worker/rank too, not just the head. Following interleaves them in arrival order.",
+)
 @click.pass_context
-def logs_cmd(ctx, target, hosts, hosts_file, cluster_name, tp_override, port, served_model_name, tail, config_path=None):
-    """Re-attach to logs of a running workload.
+def logs_cmd(
+    ctx, target, hosts, hosts_file, cluster_name, tp_override, port, served_model_name, lines, follow, all_sources, config_path=None
+):
+    """Show logs of a running workload (``docker logs`` / ``journalctl`` semantics).
+
+    Called bare, dumps the workload's logs and exits.  Use ``-n`` to limit how
+    many lines are shown, and ``-f``/``--follow`` to stay attached and stream
+    new output.  ``-a``/``--all-sources`` reads every worker as well as the
+    head; with ``-f`` those streams interleave in arrival order, and without it
+    each source is dumped in full, head first, then workers by rank.
 
     TARGET can be a recipe name or a cluster ID (from sparkrun status output).
 
@@ -229,100 +252,71 @@ def logs_cmd(ctx, target, hosts, hosts_file, cluster_name, tp_override, port, se
 
       sparkrun logs glm-4.7-flash-awq --hosts 192.168.11.13
 
-      sparkrun logs glm-4.7-flash-awq --cluster mylab --tail 200
+      sparkrun logs glm-4.7-flash-awq --cluster mylab -n 200
 
-      sparkrun logs e5f6a7b8
+      sparkrun logs e5f6a7b8 -f -a
     """
-    from sparkrun.core.bootstrap import get_runtime
-    from sparkrun.orchestration.job_metadata import generate_cluster_id
-
     sctx = _get_context(ctx)
-    v = sctx.variables
-    config = sctx.config
 
-    # Branch: cluster ID target
-    if _is_cluster_id(target) is not None:
-        cluster_id = _is_cluster_id(target)
-        from sparkrun.orchestration.job_metadata import load_job_metadata
+    cluster_id_arg = _is_cluster_id(target)
+    overrides = build_cluster_id_overrides(port=port, served_model_name=served_model_name, tp_override=tp_override)
+    scope = SCOPE_ALL if all_sources else SCOPE_HEAD
 
-        meta = load_job_metadata(cluster_id, cache_dir=str(config.cache_dir))
-
-        # Resolve runtime — from metadata if available, otherwise need hosts
-        # to discover the container and fall back to generic docker logs
-        runtime_name = meta.get("runtime") if meta else None
-        if runtime_name:
-            try:
-                runtime = get_runtime(runtime_name, v)
-            except ValueError as e:
-                click.echo("Error: %s" % e, err=True)
-                sys.exit(1)
-        else:
-            runtime = None
-
-        # Resolve hosts: CLI flags > metadata > default cluster
+    # Both targets render the same ``api.logs`` iterator; they differ only in
+    # how the workload is addressed (literal id vs recipe → live intent
+    # discovery).  Host resolution stays here because the cluster_id form can
+    # fall back to the hosts recorded in job metadata.
+    if cluster_id_arg is not None:
         host_list = resolve_hosts_with_metadata_fallback(
             hosts,
             hosts_file,
             cluster_name,
-            config,
-            meta,
+            sctx.config,
+            _load_job_metadata(sctx, cluster_id_arg),
             target,
             sctx=sctx,
         )
-
-        if runtime is not None:
-            runtime.follow_logs(
-                hosts=host_list,
-                cluster_id=cluster_id,
-                config=config,
-                tail=tail,
-            )
-        else:
-            # No metadata / unknown runtime — fall back to generic docker logs
-            from sparkrun.orchestration.primitives import build_ssh_kwargs
-            from sparkrun.orchestration.ssh import stream_remote_logs
-
-            ssh_kwargs = build_ssh_kwargs(config)
-            container_name = cluster_id + "_head" if len(host_list) > 1 else cluster_id + "_solo"
-            stream_remote_logs(host_list[0], container_name, tail=tail, **ssh_kwargs)
+        _render_logs(sctx, cluster_id=cluster_id_arg, hosts=host_list, scope=scope, lines=lines, follow=follow)
         return
 
-    # Branch: recipe name target (original path)
-    recipe_name = target
+    # Recipe target — resolve through the CLI's loader so cwd-discovered
+    # recipes and registry disambiguation behave as they do for ``run``, then
+    # let api.logs find the live workload by intent.
+    recipe, _path, _reg = _load_recipe(sctx.config, target)
+    host_list, _ = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, sctx.config, sctx=sctx)
+    _render_logs(sctx, recipe=recipe, hosts=host_list, overrides=overrides, scope=scope, lines=lines, follow=follow)
 
-    # Load recipe
-    recipe, _recipe_path, _registry_mgr = _load_recipe(config, recipe_name)
 
-    # Resolve hosts
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
+def _load_job_metadata(sctx, cluster_id):
+    from sparkrun.orchestration.job_metadata import load_job_metadata
 
-    # Resolve runtime so we call the correct follow_logs implementation
+    return load_job_metadata(cluster_id, cache_dir=str(sctx.config.cache_dir))
+
+
+def _render_logs(sctx, *, cluster_id=None, recipe=None, hosts, overrides=None, scope, lines, follow):
+    """Render the ``api.logs`` iterator — the CLI's whole job for logs.
+
+    Lines are prefixed with their source's ``host/role`` only when more than
+    one source is in play, so the common single-source case stays clean enough
+    to pipe.
+    """
     try:
-        runtime = get_runtime(recipe.runtime, v)
-    except ValueError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-
-    # Apply runtime-aware host trimming to match what 'run' used for cluster_id
-    try:
-        host_list = _apply_node_trimming(
-            host_list,
-            recipe,
-            tp_override=tp_override,
-            runtime=runtime,
+        stream = api.logs(
+            cluster_id,
+            recipe=recipe,
+            hosts=tuple(hosts),
+            overrides=overrides,
+            scope=scope,
+            tail=lines,
+            follow=follow,
+            cache_dir=str(sctx.config.cache_dir),
+            sctx=sctx,
         )
-    except ValueError as e:
+        multi = scope == SCOPE_ALL and len(hosts) > 1
+        for line in stream:
+            click.echo("[%s/%s] %s" % (line.host, line.role, line.text) if multi else line.text)
+    except (api.JobNotFound, api.AmbiguousWorkload, api.SparkrunError) as e:
         click.echo("Error: %s" % e, err=True)
         sys.exit(1)
-
-    # Build overrides from --port and --served-model-name so cluster_id matches the run
-    cluster_id = generate_cluster_id(
-        recipe, host_list, overrides=build_cluster_id_overrides(port=port, served_model_name=served_model_name)
-    )
-
-    runtime.follow_logs(
-        hosts=host_list,
-        cluster_id=cluster_id,
-        config=config,
-        tail=tail,
-    )
+    except KeyboardInterrupt:
+        click.echo("")  # leave the shell prompt on its own line

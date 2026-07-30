@@ -3,20 +3,57 @@
 All remote operations in sparkrun are executed by generating scripts
 as Python strings and piping them to `ssh <host> bash -s` via stdin.
 No files are ever copied to remote hosts.
+
+A host in the target list may *be* the control machine (the single-node
+DGX Spark case, or a control node that is also a cluster member).  SSH to
+such a host only works when self-SSH has been configured, so the
+local-vs-SSH dispatch primitives (:func:`should_run_locally`,
+:func:`run_local_script`) live here alongside :class:`RemoteResult`, and
+the fan-out helpers can honour them via ``allow_local=True``.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from sparkrun.utils.shell import quote, quote_list, args_list_to_shell_str
+from sparkrun.utils.shell import quote, quote_list, args_list_to_shell_str, stdin_bytes
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RSYNC_OPTIONS = ["-az", "--mkpath", "--partial", "--links"]
+
+# Default cap on concurrent SSH/rsync fan-out workers.  At 32+ hosts an
+# uncapped ``max_workers=len(hosts)`` spawns one SSH (or ``docker save|ssh
+# docker load`` pipeline) per host simultaneously, hitting sshd's
+# ``MaxStartups`` (default 10) and saturating the control node.  Capping the
+# thread pool bounds concurrency while leaving small clusters (<= cap hosts)
+# byte-for-byte unchanged.  Overridable via ``SparkrunConfig.max_parallel_ssh``
+# (``ssh.max_parallel_ssh`` in config.yaml).
+DEFAULT_MAX_PARALLEL_SSH = 20
+
+# Concurrency cap for head→worker fan-out inside the embedded
+# ``image_distribute.sh`` / ``model_distribute.sh`` scripts.  These run ON THE
+# HEAD and stream multi-GB transfers (``docker save | ssh docker load``, rsync)
+# out a single NIC/disk, so the cap is intentionally small — overlap connect
+# latency without saturating the head.  Distinct from
+# ``DEFAULT_MAX_PARALLEL_SSH`` (control-node SSH fan-out).
+HEAD_DISTRIBUTE_MAX_PARALLEL = 4
+
+
+def resolve_parallel_cap(n: int, cap: int | None = None) -> int:
+    """Return the worker count for a fan-out over *n* items.
+
+    ``min(n, cap)`` with ``cap`` defaulting to
+    :data:`DEFAULT_MAX_PARALLEL_SSH`.  Always returns at least ``1`` so a
+    ``ThreadPoolExecutor`` is never constructed with ``max_workers=0``.
+    """
+    if cap is None or cap <= 0:
+        cap = DEFAULT_MAX_PARALLEL_SSH
+    return max(1, min(n, cap))
 
 
 @dataclass
@@ -37,6 +74,89 @@ class RemoteResult:
         """Get the last non-empty line of stdout (useful for extracting IPs etc)."""
         lines = [line for line in self.stdout.strip().splitlines() if line.strip()]
         return lines[-1] if lines else ""
+
+
+# ---------------------------------------------------------------------------
+# Local execution / dispatch
+# ---------------------------------------------------------------------------
+
+
+def should_run_locally(host: str, ssh_user: str | None = None) -> bool:
+    """True if *host* is local AND no cross-user SSH is needed.
+
+    Use this instead of :func:`~sparkrun.utils.is_local_host` at
+    execution dispatch points (where the code decides "run locally via
+    subprocess" vs "run via SSH").  Keep ``is_local_host`` for pure
+    address-identity checks (e.g. "is this IP me?").
+
+    Returns ``True`` when the host is local and *ssh_user* is ``None``
+    or matches the current OS user.
+    """
+    from sparkrun.utils import is_local_host
+
+    if not is_local_host(host):
+        return False
+    if ssh_user is None:
+        return True
+    return ssh_user == os.environ.get("USER", "root")
+
+
+def run_local_script(script: str, dry_run: bool = False, timeout: int | None = None) -> RemoteResult:
+    """Execute a script locally via subprocess.
+
+    Args:
+        script: Bash script content to execute.
+        dry_run: If True, log the script but don't execute.
+        timeout: Wall-clock cap in seconds.  Mirrors the SSH path's
+            ``timeout``: a local dispatch must not be able to hang a
+            caller (status polling, teardown) that bounded the remote
+            path.  A timeout is reported as rc 124, like ``timeout(1)``.
+
+    Returns:
+        RemoteResult with host set to ``"localhost"``.
+    """
+    if dry_run:
+        script_lines = script.count("\n")
+        logger.info("[dry-run] Would execute locally (%d lines, %d bytes)", script_lines, len(script))
+        return RemoteResult(host="localhost", returncode=0, stdout="[dry-run]", stderr="")
+
+    try:
+        proc = subprocess.run(
+            ["bash", "-s"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        logger.warning("Local execution timed out after %ss", timeout)
+        return RemoteResult(
+            host="localhost",
+            returncode=124,
+            stdout=_decode(e.stdout),
+            stderr=(_decode(e.stderr) + ("\n" if e.stderr else "")) + "local execution timed out after %ss" % timeout,
+        )
+    return RemoteResult(
+        host="localhost",
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
+
+
+def _decode(raw: bytes | str | None) -> str:
+    """Normalize subprocess output to text.
+
+    Output is captured in binary mode (see :func:`_run_subprocess`), so this is
+    a decode in practice; ``errors="replace"`` keeps an odd byte from turning a
+    command failure into a UnicodeDecodeError. ``str`` is accepted unchanged so
+    a caller (or a test double) that already has text isn't a special case.
+    """
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    return raw.decode("utf-8", errors="replace")
 
 
 def _run_subprocess(
@@ -68,11 +188,14 @@ def _run_subprocess(
     """
     t0 = time.monotonic()
     try:
+        # Bytes in, bytes out: text mode would rewrite every "\n" in the script
+        # to os.linesep, which breaks the remote bash on a Windows control
+        # machine (see utils.shell.stdin_bytes).
         proc = subprocess.run(
             cmd,
-            input=input_data,
+            input=stdin_bytes(input_data) if input_data is not None else None,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=timeout,
             shell=shell,
         )
@@ -80,8 +203,8 @@ def _run_subprocess(
         result = RemoteResult(
             host=host,
             returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
+            stdout=_decode(proc.stdout),
+            stderr=_decode(proc.stderr),
         )
         if result.success:
             logger.debug("  %s <- %s OK (%.1fs)", label, host, elapsed)
@@ -93,7 +216,7 @@ def _run_subprocess(
                 host,
                 proc.returncode,
                 elapsed,
-                proc.stderr.strip()[:200],
+                result.stderr.strip()[:200],
             )
         return result
     except subprocess.TimeoutExpired:
@@ -145,6 +268,7 @@ def run_remote_script(
     timeout: int | None = None,
     dry_run: bool = False,
     quiet: bool = False,
+    allow_local: bool = False,
 ) -> RemoteResult:
     """Execute a script on a remote host via stdin piping.
 
@@ -161,6 +285,9 @@ def run_remote_script(
         timeout: Overall execution timeout in seconds.
         dry_run: If True, log the script but don't execute.
         quiet: If True, downgrade failure logging from WARNING to DEBUG.
+        allow_local: Run the script directly (no SSH) when *host* is this
+            machine — see :func:`run_remote_scripts_parallel` for why this
+            is opt-in.
 
     Returns:
         RemoteResult with returncode, stdout, stderr.
@@ -169,6 +296,10 @@ def run_remote_script(
     if dry_run:
         logger.info("[dry-run] Would execute on %s (%d lines, %d bytes)", host, script_lines, len(script))
         return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
+
+    if allow_local and should_run_locally(host, ssh_user):
+        logger.debug("  Dispatching locally (no SSH) for: %s", host)
+        return replace(run_local_script(script, timeout=timeout), host=host)
 
     cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
     cmd.extend(["bash", "-s"])
@@ -239,16 +370,16 @@ def run_remote_script_streaming(
         if quiet:
             proc = subprocess.run(
                 cmd,
-                input=script,
-                text=True,
+                input=stdin_bytes(script),
+                text=False,
                 timeout=timeout,
                 capture_output=True,
             )
         else:
             proc = subprocess.run(
                 cmd,
-                input=script,
-                text=True,
+                input=stdin_bytes(script),
+                text=False,
                 timeout=timeout,
                 # stdout/stderr go to terminal (no capture)
                 stdout=None,
@@ -329,33 +460,39 @@ def stream_remote_logs(
     ssh_user: str | None = None,
     ssh_key: str | None = None,
     ssh_options: list[str] | None = None,
-    tail: int = 100,
+    tail: int | None = 100,
     dry_run: bool = False,
+    follow: bool = True,
 ) -> None:
-    """Stream ``docker logs -f`` output to the terminal.
+    """Print ``docker logs`` output to the terminal, optionally following.
 
-    For remote hosts, runs ``ssh <host> docker logs -f --tail N <container>``.
-    For local hosts, runs ``docker logs -f --tail N <container>`` directly.
+    For remote hosts, runs ``ssh <host> docker logs [-f] [--tail N] <container>``.
+    For local hosts, runs ``docker logs [-f] [--tail N] <container>`` directly.
 
     The process's stdout/stderr are connected directly to the terminal
-    (no capture), so log output flows in real time.  A ``KeyboardInterrupt``
-    is caught so the user can press Ctrl-C to stop following without a
-    traceback.
+    (no capture), so log output flows in real time.  When *follow* is
+    ``True`` a ``KeyboardInterrupt`` is caught so the user can press
+    Ctrl-C to stop following without a traceback; when ``False`` the
+    command dumps the requested lines and returns (``docker logs``
+    semantics).
 
     Args:
         host: Target hostname or IP.  ``"localhost"``, ``"127.0.0.1"``,
             or ``""`` are treated as local.
-        container_name: Name of the Docker container to follow.
+        container_name: Name of the Docker container to read.
         ssh_user: Optional SSH username.
         ssh_key: Optional path to SSH private key.
         ssh_options: Additional SSH options.
-        tail: Number of existing log lines to show before following.
+        tail: Number of existing log lines to show.  ``None`` shows the
+            whole log (no ``--tail``).
         dry_run: If True, print the command that would run and return.
+        follow: When ``True`` (default), keep streaming new lines
+            (``-f``); when ``False``, dump and exit.
     """
     from sparkrun.orchestration.docker import docker_logs_cmd
     from sparkrun.orchestration.primitives import should_run_locally
 
-    logs_cmd = docker_logs_cmd(container_name, follow=True, tail=tail)
+    logs_cmd = docker_logs_cmd(container_name, follow=follow, tail=tail)
 
     if should_run_locally(host, ssh_user):
         cmd = logs_cmd.split()
@@ -367,7 +504,8 @@ def stream_remote_logs(
         logger.info("[dry-run] Would stream logs: %s", " ".join(cmd))
         return
 
-    logger.info("Following logs for container '%s' on %s (Ctrl-C to stop)...", container_name, host or "localhost")
+    if follow:
+        logger.info("Following logs for container '%s' on %s (Ctrl-C to stop)...", container_name, host or "localhost")
     try:
         subprocess.run(cmd)
     except KeyboardInterrupt:
@@ -381,14 +519,15 @@ def stream_container_file_logs(
     ssh_user: str | None = None,
     ssh_key: str | None = None,
     ssh_options: list[str] | None = None,
-    tail: int = 100,
+    tail: int | None = 100,
     dry_run: bool = False,
+    follow: bool = True,
 ) -> None:
-    """Stream a log file from inside a running container.
+    """Print a log file from inside a running container, optionally following.
 
-    Runs ``docker exec <container> tail -f --lines <N> <file>``.
-    Used for runtimes that exec the serve command inside a long-running
-    container (e.g. vLLM's ``sleep infinity`` + ``nohup serve``).
+    Runs ``docker exec <container> tail [-f] -n <N|+1> <file>``.  Used for
+    runtimes that exec the serve command inside a long-running container
+    (e.g. vLLM's ``sleep infinity`` + ``nohup serve``).
 
     Args:
         host: Target hostname or IP.
@@ -397,19 +536,19 @@ def stream_container_file_logs(
         ssh_user: Optional SSH username.
         ssh_key: Optional path to SSH private key.
         ssh_options: Additional SSH options.
-        tail: Number of existing log lines to show before following.
+        tail: Number of existing log lines to show.  ``None`` shows the
+            whole file (``tail -n +1``).
         dry_run: If True, print the command that would run and return.
+        follow: When ``True`` (default), keep streaming new lines
+            (``-f``); when ``False``, dump and exit.
     """
-    tail_cmd = [
-        "docker",
-        "exec",
-        container_name,
-        "tail",
-        "-f",
-        "--lines",
-        str(tail),
-        log_file,
-    ]
+    # ``tail -n +1`` emits the whole file from line 1; a concrete N emits
+    # the last N lines.  ``-f`` follows in either case.
+    lines_arg = "+1" if tail is None else str(tail)
+    tail_cmd = ["docker", "exec", container_name, "tail"]
+    if follow:
+        tail_cmd.append("-f")
+    tail_cmd += ["-n", lines_arg, log_file]
 
     from sparkrun.orchestration.primitives import should_run_locally
 
@@ -423,7 +562,8 @@ def stream_container_file_logs(
         logger.info("[dry-run] Would stream container file logs: %s", " ".join(cmd))
         return
 
-    logger.info("Following serve logs in container '%s' on %s (Ctrl-C to stop)...", container_name, host or "localhost")
+    if follow:
+        logger.info("Following serve logs in container '%s' on %s (Ctrl-C to stop)...", container_name, host or "localhost")
     try:
         subprocess.run(cmd)
     except KeyboardInterrupt:
@@ -518,6 +658,8 @@ def run_remote_scripts_parallel(
     timeout: int | None = None,
     dry_run: bool = False,
     quiet: bool = False,
+    max_workers: int | None = None,
+    allow_local: bool = False,
 ) -> list[RemoteResult]:
     """Execute the same script on multiple hosts in parallel using threads.
 
@@ -530,6 +672,17 @@ def run_remote_scripts_parallel(
         timeout: Per-host execution timeout in seconds.
         dry_run: If True, log the script but don't execute.
         quiet: If True, downgrade failure logging from WARNING to DEBUG.
+        max_workers: Cap on concurrent SSH workers.  Defaults to
+            :data:`DEFAULT_MAX_PARALLEL_SSH`; the effective pool size is
+            ``min(len(hosts), max_workers)``.
+        allow_local: Run the script directly (no SSH) on any host that
+            :func:`should_run_locally` accepts.  **Opt-in**, because for
+            some callers SSH-to-self is the point, not an accident:
+            ``api.setup`` probes and meshes SSH credentials and must
+            really connect.  Callers that just want the script's output
+            (status discovery, hardware probes, teardown) pass ``True``
+            so they work on a host without self-SSH configured.  Results
+            are re-keyed to the caller's host string either way.
 
     Returns:
         List of RemoteResult, one per host (order not guaranteed).
@@ -538,23 +691,28 @@ def run_remote_scripts_parallel(
 
     logger.info("  Running script in parallel on %d hosts: %s", len(hosts), ", ".join(hosts))
 
+    local_hosts = {h for h in hosts if should_run_locally(h, ssh_user)} if allow_local else set()
+    if local_hosts:
+        logger.debug("  Dispatching locally (no SSH) for: %s", ", ".join(sorted(local_hosts)))
+
+    def _dispatch(host: str) -> RemoteResult:
+        if host in local_hosts:
+            return replace(run_local_script(script, dry_run=dry_run, timeout=timeout), host=host)
+        return run_remote_script(
+            host,
+            script,
+            ssh_user=ssh_user,
+            ssh_key=ssh_key,
+            ssh_options=ssh_options,
+            timeout=timeout,
+            dry_run=dry_run,
+            quiet=quiet,
+        )
+
     t0 = time.monotonic()
     results: list[RemoteResult] = []
-    with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
-        futures = {
-            executor.submit(
-                run_remote_script,
-                host,
-                script,
-                ssh_user=ssh_user,
-                ssh_key=ssh_key,
-                ssh_options=ssh_options,
-                timeout=timeout,
-                dry_run=dry_run,
-                quiet=quiet,
-            ): host
-            for host in hosts
-        }
+    with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(hosts), max_workers)) as executor:
+        futures = {executor.submit(_dispatch, host): host for host in hosts}
         for future in as_completed(futures):
             result = future.result()
             results.append(result)
@@ -564,6 +722,63 @@ def run_remote_scripts_parallel(
     logger.info("  Parallel execution done: %d/%d OK (%.1fs total)", ok, len(results), elapsed)
 
     return results
+
+
+def verify_host_paths(
+    hosts: list[str],
+    paths: list[str],
+    ssh_kwargs: dict | None = None,
+) -> dict[str, list[str]]:
+    """Report host-filesystem *paths* that are absent on each of *hosts*.
+
+    Runs a single ``test -e`` sweep per host over SSH (in parallel), echoing
+    back every path that does not exist.  Returns ``{host: [missing, ...]}``
+    containing **only** hosts with at least one confirmed-missing path.
+
+    Tolerant by design — the same "safe degradation" contract as
+    :meth:`Executor.query_status`: a host whose SSH probe is unreachable or
+    errors is *omitted* (treated as "couldn't verify", never a false block), so
+    callers should raise only on the paths this function actively reports
+    missing.  This is the host-substrate implementation shared by the docker and
+    local executors' :meth:`Executor.verify_mount_sources`.
+
+    Args:
+        hosts: Target hostnames/IPs.
+        paths: Absolute host paths that must exist on every host.
+        ssh_kwargs: Connection settings (``ssh_user`` / ``ssh_key`` /
+            ``ssh_options`` / ``timeout``), as built by ``build_ssh_kwargs``.
+    """
+    if not hosts or not paths:
+        return {}
+
+    ssh_kwargs = ssh_kwargs or {}
+    requested = list(dict.fromkeys(paths))  # de-dupe, preserve order
+    # For each path, echo it verbatim (on its own line) iff it is missing.
+    script = "".join("if [ ! -e %s ]; then printf '%%s\\n' %s; fi\n" % (quote(p), quote(p)) for p in requested)
+
+    results = run_remote_scripts_parallel(
+        hosts,
+        script,
+        ssh_user=ssh_kwargs.get("ssh_user"),
+        ssh_key=ssh_kwargs.get("ssh_key"),
+        ssh_options=ssh_kwargs.get("ssh_options"),
+        timeout=ssh_kwargs.get("timeout", 15),
+        quiet=True,
+    )
+
+    requested_set = set(requested)
+    missing_by_host: dict[str, list[str]] = {}
+    for r in results:
+        # Unreachable / non-zero probe → couldn't verify → don't block.
+        if r.returncode != 0:
+            logger.debug("verify_host_paths: skipping unverifiable host %r (rc=%s)", r.host, r.returncode)
+            continue
+        missing = [ln for ln in (line.strip() for line in r.stdout.splitlines()) if ln in requested_set]
+        if missing:
+            # Preserve the requested order for a stable, readable error.
+            order = {p: i for i, p in enumerate(requested)}
+            missing_by_host[r.host] = sorted(set(missing), key=order.get)
+    return missing_by_host
 
 
 def run_remote_sudo_script(
@@ -848,6 +1063,7 @@ def run_pipeline_to_remotes_parallel(
     connect_timeout: int = 10,
     timeout: int | None = None,
     dry_run: bool = False,
+    max_workers: int | None = None,
 ) -> list[RemoteResult]:
     """Run a local-to-remote pipeline on multiple hosts in parallel.
 
@@ -864,6 +1080,11 @@ def run_pipeline_to_remotes_parallel(
         connect_timeout: SSH connection timeout in seconds.
         timeout: Per-host execution timeout in seconds.
         dry_run: If True, log but don't execute.
+        max_workers: Cap on concurrent pipeline workers.  Defaults to
+            :data:`DEFAULT_MAX_PARALLEL_SSH`; the effective pool size is
+            ``min(len(hosts), max_workers)``.  Pipelines stream multi-GB
+            ``docker save | ssh docker load`` data, so a tight cap also
+            protects control-node I/O.
 
     Returns:
         List of RemoteResult, one per host.
@@ -874,7 +1095,7 @@ def run_pipeline_to_remotes_parallel(
 
     t0 = time.monotonic()
     results: list[RemoteResult] = []
-    with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
+    with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(hosts), max_workers)) as executor:
         futures = {
             executor.submit(
                 run_pipeline_to_remote,
@@ -944,6 +1165,7 @@ def run_rsync_parallel(
     rsync_options: list[str] | None = None,
     timeout: int | None = None,
     dry_run: bool = False,
+    max_workers: int | None = None,
 ) -> list[RemoteResult]:
     """Rsync a local path to multiple hosts in parallel.
 
@@ -961,6 +1183,9 @@ def run_rsync_parallel(
         rsync_options: Override rsync flags.
         timeout: Per-host execution timeout in seconds.
         dry_run: If True, log but don't execute.
+        max_workers: Cap on concurrent rsync workers.  Defaults to
+            :data:`DEFAULT_MAX_PARALLEL_SSH`; the effective pool size is
+            ``min(len(hosts), max_workers)``.
 
     Returns:
         List of RemoteResult, one per host.
@@ -971,7 +1196,7 @@ def run_rsync_parallel(
 
     t0 = time.monotonic()
     results: list[RemoteResult] = []
-    with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
+    with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(hosts), max_workers)) as executor:
         futures = {
             executor.submit(
                 run_rsync,

@@ -7,14 +7,17 @@ from remote git repositories using sparse checkouts for efficiency.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import yaml
 
 from vpd.next.util import read_yaml
+
+from sparkrun.utils.shell import validate_git_url
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,93 @@ class RegistryError(Exception):
     """Exception raised for registry-specific errors."""
 
     pass
+
+
+class RegistryFilterError(RegistryError):
+    """A recipe listing was scoped to a registry that cannot be used.
+
+    Raised by :func:`resolve_registry_filter` for all three ways a registry
+    filter can be wrong, discriminated by :attr:`reason`:
+
+    * ``"unknown"`` — no registry by that name is configured.
+    * ``"disabled"`` — the registry exists but is disabled.
+    * ``"conflict"`` — an ``@registry`` query scope contradicts an
+      explicitly-supplied registry filter.
+
+    :attr:`available` lists the configured registry names so callers can
+    render a useful message without a second lookup.
+    """
+
+    def __init__(self, message: str, *, registry: str, reason: str, available: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.registry = registry
+        self.reason = reason
+        self.available = available
+
+
+def resolve_registry_filter(
+    query: str | None,
+    registry: str | None,
+    registry_manager: "RegistryManager",
+) -> tuple[str | None, str | None]:
+    """Resolve the registry filter for a recipe listing or search.
+
+    Handles the ``@registry`` scope shorthand in *query* — ``@community``
+    and ``@community/`` mean "the community registry", and anything after
+    the ``/`` is kept as the remaining free-text query, so
+    ``@community/qwen`` is that registry filtered by ``qwen``. A bare ``@``
+    names no registry and is left alone as a plain query.
+
+    Whichever way the registry arrives — the shorthand or an explicit
+    *registry* argument — it is validated the same way, so a typo raises
+    instead of silently yielding an empty result set.
+
+    Args:
+        query: Free-text query, optionally carrying an ``@registry`` scope.
+        registry: Explicit registry filter (may be None).
+        registry_manager: Manager used to validate the resulting name.
+
+    Returns:
+        ``(registry, query)`` with any scope stripped off the query. A scope
+        with no remaining query yields ``None`` for the query.
+
+    Raises:
+        RegistryFilterError: Unknown or disabled registry, or a scope that
+            conflicts with *registry*.
+    """
+    if query and query.startswith("@"):
+        scope, _, rest = query[1:].partition("/")
+        if scope:  # a bare "@" names no registry — leave it as a plain query
+            if registry is not None and registry != scope:
+                raise RegistryFilterError(
+                    "Conflicting registry: '@%s' in the query vs --registry %s." % (scope, registry),
+                    registry=scope,
+                    reason="conflict",
+                )
+            registry, query = scope, (rest.strip() or None)
+
+    if registry is None:
+        return registry, query
+
+    entries = registry_manager.list_registries()
+    available = tuple(sorted(e.name for e in entries))
+    match = next((e for e in entries if e.name == registry), None)
+    if match is None:
+        raise RegistryFilterError(
+            "Unknown registry '%s'. Available registries: %s" % (registry, ", ".join(available) or "(none configured)"),
+            registry=registry,
+            reason="unknown",
+            available=available,
+        )
+    if not match.enabled:
+        raise RegistryFilterError(
+            "Registry '%s' is disabled. Enable it with `sparkrun registry enable %s`." % (registry, registry),
+            registry=registry,
+            reason="disabled",
+            available=available,
+        )
+
+    return registry, query
 
 
 @dataclass
@@ -39,6 +129,11 @@ class RegistryEntry:
         tuning_subpath: Path within repo for tuning configs
         benchmark_subpath: Path within repo for benchmark profiles
         mods_subpath: Path within repo for shared mods (run.sh + supporting files)
+        trusted: Whether recipes from this registry auto-run lifecycle hooks
+            (pre_exec / post_exec / post_commands) without an interactive
+            confirmation prompt.  Defaults to False so user-added third-party
+            registries are untrusted until explicitly opted-in via
+            ``sparkrun registry trust <name>`` or ``registry add --trust``.
     """
 
     name: str
@@ -50,6 +145,155 @@ class RegistryEntry:
     tuning_subpath: str = ""
     benchmark_subpath: str = ""
     mods_subpath: str = ""
+    trusted: bool = False
+
+
+@dataclass(frozen=True)
+class RegistryAsset:
+    """A kind of per-registry file that sparkrun resolves by file stem.
+
+    Recipes and benchmark profiles differ only in *where* they live and *how
+    deep* the scan goes.  Everything around that — which registries are
+    eligible, extension precedence, flat-beats-nested, the ``@registry/...``
+    label used to disambiguate — is identical, so it lives once in
+    :meth:`RegistryManager.find_asset_in_registries` and is parameterized by
+    an instance of this class.
+
+    Attributes:
+        kind: Human-readable noun for messages ("recipe", "benchmark profile").
+        subpath_field: :class:`RegistryEntry` attribute naming the subdirectory.
+        recursive: Scan subdirectories when the flat lookup misses.  Recipe
+            registries nest by model family; benchmark registries are flat.
+        extensions: Accepted file extensions, in precedence order — the first
+            one that exists wins, so a same-stem ``.yaml`` and ``.yml`` in one
+            directory are one asset spelled two ways, not an ambiguity.
+    """
+
+    kind: str
+    subpath_field: str
+    recursive: bool = True
+    extensions: tuple[str, ...] = (".yaml", ".yml")
+
+
+#: Recipes: nested by model family, ``.yaml`` or ``.yml``.
+RECIPE_ASSET = RegistryAsset("recipe", "subpath")
+#: Benchmark profiles: nested like recipes, so a registry can group profiles
+#: by suite or hardware without their names becoming unreachable.
+BENCHMARK_ASSET = RegistryAsset("benchmark profile", "benchmark_subpath")
+#: Tuning configs: shape-based JSON under ``<tuning>/<runtime>/``.  Only the
+#: directory resolution is shared — lookup is by runtime, not by stem.
+TUNING_ASSET = RegistryAsset("tuning config", "tuning_subpath", extensions=(".json",))
+#: Shared mods (run.sh + supporting files).  Directory resolution only.
+MODS_ASSET = RegistryAsset("mods", "mods_subpath")
+
+
+def format_ambiguity(kind: str, name: str, matches: list[tuple[str, Path]], labels: list[str]) -> str:
+    """Build the message shared by recipe and benchmark-profile ambiguity errors.
+
+    Kept as a formatter rather than a base class: the two error types live in
+    hierarchies callers already catch (``RecipeError`` / ``ProfileError``), and
+    the only thing genuinely common is the wording.
+
+    Args:
+        kind: Capitalized noun for the asset ("Recipe", "Benchmark profile").
+        name: The name that was ambiguous.
+        matches: The ``(registry, path)`` matches.
+        labels: Typeable ``@registry/...`` names, parallel to *matches*.
+
+    Returns:
+        A message naming where the collision is and how to resolve it.
+    """
+    registries = {reg for reg, _ in matches}
+    where = (
+        "in registry '%s'" % next(iter(registries))
+        if len(registries) == 1
+        else "in multiple registries: %s" % ", ".join(sorted(registries))
+    )
+    return "%s '%s' is ambiguous — %d matches %s (%s). Use the full name to specify." % (
+        kind,
+        name,
+        len(matches),
+        where,
+        ", ".join(labels),
+    )
+
+
+def iter_asset_files(directory: Path, asset: RegistryAsset) -> list[Path]:
+    """Return a directory's asset files, sorted, one per stem per directory.
+
+    This is the *catalog* peer of :func:`_scan_asset_dir` (which resolves one
+    name), and it applies the same rules so listing and lookup can never
+    disagree — an asset that is runnable is listed, and vice versa.
+
+    Covers every extension the asset declares. A same-stem ``.yaml`` and
+    ``.yml`` in one directory are one asset spelled two ways, so ``.yaml``
+    wins; the same stem in *different* directories stays two distinct assets,
+    so this never dedupes the catalog by name.
+
+    Args:
+        directory: Directory to scan.
+        asset: Which kind of asset to list.
+
+    Returns:
+        Sorted list of asset file paths.
+    """
+    globber = directory.rglob if asset.recursive else directory.glob
+    chosen: dict[tuple[Path, str], Path] = {}
+    for ext in asset.extensions:
+        for f in globber("*" + ext):
+            chosen.setdefault((f.parent, f.stem), f)
+    return sorted(chosen.values())
+
+
+def _scan_asset_dir(
+    base: Path,
+    name: str,
+    asset: RegistryAsset,
+    accept: Callable[[Path], bool] | None = None,
+) -> list[Path]:
+    """Return one registry's matches for *name*, newest rules applied.
+
+    Flat wins: if ``<base>/<name>.<ext>`` exists it is the answer and no
+    recursive scan happens.  Otherwise — and only when the asset is recursive —
+    subdirectories are scanned, keeping at most one match per containing
+    directory so the same stem in two subdirs stays two distinct assets.
+
+    *accept* (used for the benchmark category filter) rejects a candidate
+    without masking the next one: a wrong-category ``.yaml`` still lets a
+    right-category ``.yml`` in the same directory through.
+    """
+    for ext in asset.extensions:
+        candidate = base / (name + ext)
+        if candidate.exists() and (accept is None or accept(candidate)):
+            return [candidate]
+
+    if not asset.recursive:
+        return []
+
+    seen_dirs: set[Path] = set()
+    found: list[Path] = []
+    for ext in asset.extensions:
+        for candidate in sorted(base.rglob(name + ext)):
+            if candidate.parent in seen_dirs:
+                continue
+            if accept is not None and not accept(candidate):
+                continue
+            seen_dirs.add(candidate.parent)
+            found.append(candidate)
+    return found
+
+
+# Git URLs whose .sparkrun/registry.yaml manifests are used for first-run
+# registry discovery (see RegistryManager._init_defaults_from_manifests).
+#
+# This list is **only** consulted during bootstrap-time manifest discovery.
+# It does NOT control trust: trust is now a per-registry ``trusted`` field
+# stored locally in ``registries.yaml`` (see ``RegistryEntry.trusted``).
+BOOTSTRAP_REGISTRY_URLS = [
+    "https://github.com/dbotwinick/sparkrun-recipe-registry.git",
+    "https://github.com/spark-arena/recipe-registry.git",
+    "https://github.com/spark-arena/community-recipe-registry.git",
+]
 
 
 FALLBACK_DEFAULT_REGISTRIES = [
@@ -61,6 +305,7 @@ FALLBACK_DEFAULT_REGISTRIES = [
         tuning_subpath="testing/tuning",
         benchmark_subpath="testing/benchmarking",
         visible=False,
+        trusted=True,
     ),
     RegistryEntry(
         name="official",
@@ -70,6 +315,7 @@ FALLBACK_DEFAULT_REGISTRIES = [
         tuning_subpath="tuning",
         benchmark_subpath="benchmarking",
         visible=True,
+        trusted=True,
     ),
     RegistryEntry(
         name="eugr",
@@ -78,6 +324,7 @@ FALLBACK_DEFAULT_REGISTRIES = [
         description="Official eugr/spark-vllm-docker repo recipes",
         mods_subpath="mods",
         visible=True,
+        trusted=True,
     ),
     RegistryEntry(
         name="sparkrun-transitional",
@@ -86,6 +333,7 @@ FALLBACK_DEFAULT_REGISTRIES = [
         description="Transitional registry for recipes",
         tuning_subpath="testing/tuning",
         visible=True,
+        trusted=True,
     ),
     RegistryEntry(
         name="experimental",
@@ -93,6 +341,7 @@ FALLBACK_DEFAULT_REGISTRIES = [
         subpath="experimental-recipes",
         description="Spark Arena registry for experimental recipes",
         visible=False,
+        trusted=True,
     ),
     RegistryEntry(
         name="community",
@@ -100,6 +349,7 @@ FALLBACK_DEFAULT_REGISTRIES = [
         subpath="recipes",
         description="Community recipe registry",
         visible=False,
+        trusted=True,
     ),
     RegistryEntry(
         name="atlas",
@@ -107,16 +357,28 @@ FALLBACK_DEFAULT_REGISTRIES = [
         subpath="recipes",
         description="Atlas recipes",
         visible=False,
+        trusted=True,
     ),
 ]
 
-# Git URLs whose .sparkrun/registry.yaml manifests are used for first-run
-# registry discovery (see RegistryManager._init_defaults_from_manifests).
-DEFAULT_REGISTRIES_GIT = [
-    "https://github.com/dbotwinick/sparkrun-recipe-registry.git",
-    "https://github.com/spark-arena/recipe-registry.git",
-    "https://github.com/spark-arena/community-recipe-registry.git",
-]
+
+def _normalize_registry_url(url: str) -> str:
+    """Canonicalize a git URL for comparison (drop trailing ``/`` and ``.git``)."""
+    normalized = (url or "").rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized
+
+
+def _default_trusted_urls() -> set[str]:
+    """Normalized URLs of every registry that ships ``trusted=True``.
+
+    The single source of truth for "which registries are trusted out of the
+    box", consumed by the legacy-config trust migration so a newly-trusted
+    default reaches upgrading users and not just fresh installs.
+    """
+    return {_normalize_registry_url(e.url) for e in FALLBACK_DEFAULT_REGISTRIES if e.trusted}
+
 
 # List of git URLs for registries that have been superseded and should be cleaned up.
 # Comparison strips trailing .git from entry URLs before matching.
@@ -224,6 +486,123 @@ def validate_registry_name(name: str, url: str) -> None:
     )
 
 
+_PROFILE_CATEGORY_CACHE: dict[tuple[str, float, int], str | None] = {}
+
+
+def _profile_category_from_data(data: Any) -> str | None:
+    """Extract a benchmark category from a parsed profile YAML mapping.
+
+    Resolution order: explicit ``category:`` (top-level or inside a
+    ``benchmark:`` block) → derived from the framework's ``primary_category``
+    → ``None`` (let callers default).
+    """
+    if not isinstance(data, dict):
+        return None
+
+    explicit = data.get("category")
+    block = data.get("benchmark") if isinstance(data.get("benchmark"), dict) else None
+    if explicit is None and block is not None:
+        explicit = block.get("category")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+
+    framework_name = data.get("framework")
+    if framework_name is None and block is not None:
+        framework_name = block.get("framework")
+    if not isinstance(framework_name, str) or not framework_name:
+        return None
+
+    try:
+        from sparkrun.core.bootstrap import get_benchmarking_framework
+    except Exception:
+        return None
+    try:
+        fw = get_benchmarking_framework(framework_name)
+    except Exception:
+        return None
+    return getattr(fw, "primary_category", None)
+
+
+def _profile_category(path: Path) -> str | None:
+    """Return the category for the profile at *path*, cached by (path, mtime, size)."""
+    try:
+        st = path.stat()
+        key = (str(path), st.st_mtime, st.st_size)
+    except OSError:
+        return None
+    cached = _PROFILE_CATEGORY_CACHE.get(key)
+    if cached is not None or key in _PROFILE_CATEGORY_CACHE:
+        return cached
+    try:
+        with open(path) as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        _PROFILE_CATEGORY_CACHE[key] = None
+        return None
+    cat = _profile_category_from_data(data)
+    _PROFILE_CATEGORY_CACHE[key] = cat
+    return cat
+
+
+def is_dir_link(path: Path) -> bool:
+    """True when *path* is a symlink **or** a Windows directory junction.
+
+    ``Path.is_symlink()`` reports False for junctions, so code that only checks
+    for symlinks will treat one as an ordinary directory — and then delete
+    *through* it, taking the shared clone's contents with it.
+    """
+    return path.is_symlink() or os.path.isjunction(path)
+
+
+def remove_dir_link(path: Path) -> None:
+    """Remove a link without following it. Junctions need ``rmdir``, not ``unlink``."""
+    if path.is_symlink():
+        path.unlink()
+    else:
+        os.rmdir(path)
+
+
+def link_directory(link: Path, target: Path) -> None:
+    """Point *link* at directory *target*, portably.
+
+    Windows grants the symlink privilege only to elevated processes (or with
+    Developer Mode enabled), so a plain symlink fails there with
+    ``WinError 1314: A required privilege is not held by the client``.  A
+    directory *junction* is the unprivileged equivalent for local paths, so fall
+    back to that rather than requiring every Windows user to elevate.
+
+    Raises:
+        OSError: Neither a symlink nor a junction could be created.
+    """
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as e:
+        if os.name != "nt":
+            raise
+        logger.debug("symlink %s -> %s failed (%s); falling back to a junction", link, target, e)
+
+    try:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        failed = result.returncode != 0 or not link.exists()
+        detail = (result.stderr or result.stdout or "").strip()
+    except OSError as e:
+        # Couldn't even launch mklink; report it as the link failure it is
+        # rather than letting a bare "No such file or directory: 'cmd'" escape.
+        failed, detail = True, str(e)
+
+    if failed:
+        raise OSError(
+            "Could not link %s -> %s: creating a symlink needs elevation or Developer Mode, "
+            "and the junction fallback failed: %s" % (link, target, detail)
+        )
+    logger.debug("Created junction %s -> %s", link, target)
+
+
 class RegistryManager:
     """Manages recipe registries with git-based syncing.
 
@@ -260,24 +639,118 @@ class RegistryManager:
         """
         return self.cache_root / name
 
-    def _recipe_dir(self, entry: RegistryEntry) -> Path | None:
-        """Get the recipe directory within a cached registry.
+    def _iter_registries(
+        self,
+        *,
+        include_hidden: bool = False,
+        only: str | None = None,
+    ) -> Iterator[RegistryEntry]:
+        """Yield eligible registries, applying the standard filters once.
 
         Args:
-            entry: Registry entry
+            include_hidden: Yield invisible registries too.  Callers that do
+                not filter on visibility at all pass True.
+            only: Restrict to this registry name.
+
+        Yields:
+            Enabled registry entries passing the filters, in config order.
+        """
+        for entry in self._load_registries():
+            if not entry.enabled:
+                continue
+            if only is not None and entry.name != only:
+                continue
+            if not include_hidden and not entry.visible:
+                continue
+            yield entry
+
+    def asset_dir(self, entry: RegistryEntry, asset: RegistryAsset) -> Path | None:
+        """Get an asset directory within a cached registry.
+
+        Args:
+            entry: Registry entry.
+            asset: Which kind of asset directory to resolve.
 
         Returns:
-            Path to the recipe directory, or None if not cached
+            Path to the directory, or None when the registry does not declare
+            one or it is not cached.
         """
-        cache_dir = self._cache_dir(entry.name)
-        recipe_path = cache_dir / entry.subpath
-        return recipe_path if recipe_path.exists() else None
+        subpath = getattr(entry, asset.subpath_field, "")
+        if not subpath:
+            return None
+        path = self._cache_dir(entry.name) / subpath
+        return path if path.exists() else None
+
+    def find_asset_in_registries(
+        self,
+        name: str,
+        asset: RegistryAsset,
+        *,
+        include_hidden: bool = False,
+        accept: Callable[[Path], bool] | None = None,
+    ) -> list[tuple[str, Path]]:
+        """Find an asset by file stem across registries.
+
+        Each registry is searched **independently** (see
+        :func:`_scan_asset_dir`): a flat hit in one registry never suppresses
+        another registry's recursive scan.
+
+        Args:
+            name: File stem to find (may include a subpath, e.g. ``fam/foo``).
+            asset: Which kind of asset to look for.
+            include_hidden: Include assets from invisible registries.
+            accept: Optional per-candidate predicate (e.g. a category filter).
+
+        Returns:
+            List of ``(registry_name, path)`` tuples for disambiguation.
+        """
+        matches: list[tuple[str, Path]] = []
+        for entry in self._iter_registries(include_hidden=include_hidden):
+            base = self.asset_dir(entry, asset)
+            if base is None:
+                continue
+            matches.extend((entry.name, path) for path in _scan_asset_dir(base, name, asset, accept))
+        return matches
+
+    def qualified_asset_name(self, registry_name: str, path: Path, asset: RegistryAsset) -> str:
+        """Render an asset path as a user-typeable ``@registry/...`` name.
+
+        A recursive scan means a bare stem is not always unique within one
+        registry (``a/foo.yaml`` and ``b/foo.yaml`` are different assets), so
+        this returns the *disambiguating* name — the extension-less path
+        relative to the asset directory.  ``parse_scoped_name`` splits only on
+        the first ``/``, so the result is accepted verbatim by the resolvers:
+        ``@official/qwen3.6/vllm/qwen3.6-27b-fp8-mtp-vllm``.
+
+        Falls back to the bare stem when the path is not under that registry's
+        asset dir (or the registry is unknown / not cached).
+
+        Args:
+            registry_name: Registry the path was matched in.
+            path: Path to the asset file.
+            asset: Which kind of asset the path refers to.
+
+        Returns:
+            A name of the form ``@<registry>/<relative-path-without-extension>``.
+        """
+        for entry in self._load_registries():
+            if entry.name != registry_name:
+                continue
+            base = self.asset_dir(entry, asset)
+            if base and path.is_relative_to(base):
+                return "@%s/%s" % (registry_name, path.relative_to(base).with_suffix("").as_posix())
+            break
+        return "@%s/%s" % (registry_name, path.stem)
+
+    def _recipe_dir(self, entry: RegistryEntry) -> Path | None:
+        """Get the recipe directory within a cached registry."""
+        return self.asset_dir(entry, RECIPE_ASSET)
 
     def _default_registries(self) -> list[RegistryEntry]:
         """Return the default registry list.
 
         On first run (no ``registries.yaml``), attempts manifest-based
-        discovery from ``DEFAULT_REGISTRIES_GIT``.  Discovered manifest
+        discovery from ``BOOTSTRAP_REGISTRY_URLS``.  Discovered manifest
         entries take priority; ``FALLBACK_DEFAULT_REGISTRIES`` entries are
         then layered on for any names not already present.  This lets git
         manifests override/refresh entries while hardcoded fallbacks fill
@@ -311,13 +784,22 @@ class RegistryManager:
     def _init_defaults_from_manifests(self) -> list[RegistryEntry]:
         """Try to discover default registries from git manifest files.
 
-        For each URL in ``DEFAULT_REGISTRIES_GIT``, clones the repo and reads
+        For each URL in ``BOOTSTRAP_REGISTRY_URLS``, clones the repo and reads
         its ``.sparkrun/registry.yaml`` manifest.  Entries are collected,
         deduplicated by name, and validated.
 
         URLs that fail to clone are skipped individually — successful URLs
         still contribute their entries (partial success).  Only if ALL URLs
         fail does this return ``[]``.
+
+        Entries discovered via this bootstrap path are marked as
+        ``trusted=True``.  Trust is granted by **sparkrun** because the
+        URL came from the curated ``BOOTSTRAP_REGISTRY_URLS`` list — the
+        manifest YAML itself does not (and cannot) dictate trust, even if
+        it sets ``trusted: true`` on its own entries.  The standalone
+        :meth:`_discover_manifest_entries` helper (used by
+        :meth:`add_registry_from_url`) keeps the manifest-derived default
+        of ``trusted=False`` and the bootstrap override happens here.
 
         This method does **not** save to ``registries.yaml``; the caller
         (:meth:`_default_registries`) handles persistence after layering
@@ -331,7 +813,7 @@ class RegistryManager:
         all_entries: list[RegistryEntry] = []
         seen_names: set[str] = set()
 
-        for url in DEFAULT_REGISTRIES_GIT:
+        for url in BOOTSTRAP_REGISTRY_URLS:
             try:
                 entries = self._discover_manifest_entries(url)
                 for entry in entries:
@@ -339,6 +821,10 @@ class RegistryManager:
                         logger.debug("Skipping duplicate manifest entry %r", entry.name)
                         continue
                     validate_registry_name(entry.name, entry.url)
+                    # Bootstrap-discovered entries are trusted because they
+                    # came in via the curated BOOTSTRAP_REGISTRY_URLS list,
+                    # not because the manifest declared itself trustworthy.
+                    entry.trusted = True
                     seen_names.add(entry.name)
                     all_entries.append(entry)
             except Exception as e:
@@ -369,9 +855,57 @@ class RegistryManager:
                 tuning_subpath=r.get("tuning_subpath", ""),
                 benchmark_subpath=r.get("benchmark_subpath", ""),
                 mods_subpath=r.get("mods_subpath", ""),
+                trusted=r.get("trusted", False),
             )
             for r in registries
         ]
+
+    def _needs_trust_migration(self) -> bool:
+        """Check whether the on-disk registries.yaml predates per-entry trust.
+
+        Returns True when the file exists, contains at least one entry, and
+        **no** entry carries a ``trusted`` key in the raw YAML.  A single
+        entry with ``trusted`` set (in either direction) signals a
+        post-migration file written by this version of sparkrun and
+        suppresses the one-time backfill — necessary because
+        :meth:`_save_registries` omits ``trusted: false`` by design
+        (mirroring the ``enabled``/``visible`` pattern).
+        """
+        try:
+            data = read_yaml(self._registries_path)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        registries = data.get("registries") or []
+        if not isinstance(registries, list) or not registries:
+            return False
+        for raw in registries:
+            if isinstance(raw, dict) and "trusted" in raw:
+                return False
+        return True
+
+    def _migrate_trust_field(self, entries: list[RegistryEntry]) -> list[RegistryEntry]:
+        """Backfill the ``trusted`` field for legacy registries.yaml files.
+
+        An entry is marked ``trusted=True`` when it matches a registry that
+        :data:`FALLBACK_DEFAULT_REGISTRIES` ships as trusted; everything else
+        retains ``trusted=False``.  The migrated list is then persisted via
+        :meth:`_save_registries` so the next load sees an explicit ``trusted``
+        field on every entry and the migration does not repeat.
+
+        Deriving this from the default registry list (rather than from
+        :data:`BOOTSTRAP_REGISTRY_URLS`, which exists for manifest discovery)
+        keeps a single source of truth for "which registries ship trusted" —
+        otherwise adding a trusted default silently fails to reach users
+        upgrading from a pre-trust ``registries.yaml``.
+        """
+        trusted_urls = _default_trusted_urls()
+        for entry in entries:
+            entry.trusted = _normalize_registry_url(entry.url) in trusted_urls
+        self._save_registries(entries)
+        logger.info("Migrated registries.yaml to per-registry trust model")
+        return entries
 
     def _load_registries(self) -> list[RegistryEntry]:
         """Load registries from YAML configuration.
@@ -382,6 +916,12 @@ class RegistryManager:
         if not self._registries_path.exists():
             logger.debug("No registries.yaml found, using defaults")
             return self._default_registries()
+
+        # One-time migration: if the file predates the per-entry ``trusted``
+        # field, backfill trust based on whether each entry's URL is in
+        # ``BOOTSTRAP_REGISTRY_URLS`` and persist the result.  Re-checks the
+        # raw YAML so repeated calls within a process don't re-trigger.
+        needs_migration = self._needs_trust_migration()
 
         try:
             entries = self._load_registries_from_file()
@@ -396,6 +936,8 @@ class RegistryManager:
                     )
                 else:
                     filtered.append(entry)
+            if needs_migration:
+                self._migrate_trust_field(filtered)
             return filtered
         except Exception as e:
             logger.warning("Failed to load registries.yaml: %s", e)
@@ -422,6 +964,8 @@ class RegistryManager:
                 d["benchmark_subpath"] = e.benchmark_subpath
             if e.mods_subpath:
                 d["mods_subpath"] = e.mods_subpath
+            if e.trusted:
+                d["trusted"] = True
             data_list.append(d)
 
         data = {"registries": data_list}
@@ -518,8 +1062,9 @@ class RegistryManager:
             else:
                 # Fresh sparse clone
                 clone_dir.mkdir(parents=True, exist_ok=True)
+                validate_git_url(url)
                 result = subprocess.run(
-                    ["git", "clone", "--filter=blob:none", "--sparse", str(url), str(clone_dir)],
+                    ["git", "clone", "--filter=blob:none", "--sparse", "--", url, str(clone_dir)],
                     capture_output=True,
                     text=True,
                     timeout=120,
@@ -555,17 +1100,18 @@ class RegistryManager:
         shared_dir = self._clone_dir_for_url(entry.url)
         per_registry_dir = self._cache_dir(entry.name)
 
-        # Remove old per-registry dir if it's a real directory (not a symlink)
-        if per_registry_dir.exists() and not per_registry_dir.is_symlink():
+        # Remove old per-registry dir if it's a real directory (not a link)
+        if per_registry_dir.exists() and not is_dir_link(per_registry_dir):
             import shutil
 
             shutil.rmtree(per_registry_dir)
 
-        # Create symlink: per_registry_dir -> shared_dir
+        # Link per_registry_dir -> shared_dir (junction on Windows; see
+        # link_directory for why a plain symlink isn't enough there).
         per_registry_dir.parent.mkdir(parents=True, exist_ok=True)
-        if per_registry_dir.is_symlink():
-            per_registry_dir.unlink()
-        per_registry_dir.symlink_to(shared_dir)
+        if is_dir_link(per_registry_dir):
+            remove_dir_link(per_registry_dir)
+        link_directory(per_registry_dir, shared_dir)
 
     def _clone_or_pull_single(self, entry: RegistryEntry) -> bool:
         """Clone or update a registry repository (single-URL implementation).
@@ -633,6 +1179,7 @@ class RegistryManager:
                 cache_dir.mkdir(parents=True, exist_ok=True)
 
                 # Shallow clone with blob filtering
+                validate_git_url(entry.url)
                 result = subprocess.run(
                     [
                         "git",
@@ -641,6 +1188,7 @@ class RegistryManager:
                         "1",
                         "--filter=blob:none",
                         "--sparse",
+                        "--",
                         entry.url,
                         str(cache_dir),
                     ],
@@ -713,8 +1261,13 @@ class RegistryManager:
 
         Raises:
             RegistryError: If a registry with the same name already exists,
-                or uses a reserved name prefix from a non-allowed URL.
+                uses a reserved name prefix from a non-allowed URL, or has
+                an invalid/unsafe git URL.
         """
+        try:
+            validate_git_url(entry.url)
+        except ValueError as exc:
+            raise RegistryError("Invalid registry URL: %s" % exc) from exc
         validate_registry_name(entry.name, entry.url)
         registries = self._load_registries()
         if any(r.name == entry.name for r in registries):
@@ -742,8 +1295,9 @@ class RegistryManager:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp) / "repo"
             git_env = self._git_env()
+            validate_git_url(url)
             result = subprocess.run(
-                ["git", "clone", "--depth=1", "--single-branch", str(url), str(tmp_path)],
+                ["git", "clone", "--depth=1", "--single-branch", "--", url, str(tmp_path)],
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -781,20 +1335,27 @@ class RegistryManager:
                 for reg_data in registries_data
             ]
 
-    def add_registry_from_url(self, url: str) -> list[RegistryEntry]:
+    def add_registry_from_url(self, url: str, trust: bool = False) -> list[RegistryEntry]:
         """Add registries by discovering them from a repo's .sparkrun/registry.yaml manifest.
 
         Clones the repo temporarily, reads the manifest, and adds all declared registries.
 
         Args:
             url: Git repository URL.
+            trust: If True, mark every newly-added entry as ``trusted=True``
+                after the add step.  Default False keeps user-added
+                registries untrusted until an explicit opt-in.
 
         Returns:
             List of RegistryEntry objects added.
 
         Raises:
-            RegistryError: If clone fails or no manifest found.
+            RegistryError: If clone fails, no manifest found, or URL is invalid.
         """
+        try:
+            validate_git_url(url)
+        except ValueError as exc:
+            raise RegistryError("Invalid registry URL: %s" % exc) from exc
         entries = self._discover_manifest_entries(url)
         added = []
         for entry in entries:
@@ -805,6 +1366,11 @@ class RegistryManager:
                 logger.info("Added registry '%s' from manifest", entry.name)
             except RegistryError:
                 logger.warning("Registry '%s' already exists, skipping", entry.name)
+        if trust and added:
+            # Flip the trust bit on every newly-added entry and persist.
+            for entry in added:
+                self.trust_registry(entry.name)
+                entry.trusted = True
         return added
 
     def remove_registry(self, name: str) -> None:
@@ -897,8 +1463,8 @@ class RegistryManager:
                 if cache_dir.exists():
                     import shutil
 
-                    if cache_dir.is_symlink():
-                        cache_dir.unlink()
+                    if is_dir_link(cache_dir):
+                        remove_dir_link(cache_dir)
                     else:
                         shutil.rmtree(cache_dir)
                 cleaned.append(entry.name)
@@ -937,8 +1503,8 @@ class RegistryManager:
         count = 0
         if self.cache_root.exists():
             for child in self.cache_root.iterdir():
-                if child.is_symlink():
-                    child.unlink()
+                if is_dir_link(child):
+                    remove_dir_link(child)
                     count += 1
                 elif child.is_dir():
                     shutil.rmtree(child)
@@ -1009,6 +1575,41 @@ class RegistryManager:
             RegistryError: If the registry is not found
         """
         self._set_registry_enabled(name, False)
+
+    def _set_registry_trusted(self, name: str, trusted: bool) -> None:
+        """Set the trusted state of a registry by name.
+
+        Args:
+            name: Registry name to modify.
+            trusted: Target trust state.
+
+        Raises:
+            RegistryError: If the registry is not found.
+        """
+        entries = self._load_registries()
+        for e in entries:
+            if e.name == name:
+                e.trusted = trusted
+                self._save_registries(entries)
+                logger.info("%s registry %s", "Trusted" if trusted else "Untrusted", name)
+                return
+        raise RegistryError("Registry %r not found" % name)
+
+    def trust_registry(self, name: str) -> None:
+        """Mark a registry as trusted (recipes from it get auto-trust for hooks).
+
+        Raises:
+            RegistryError: If the registry is not found.
+        """
+        self._set_registry_trusted(name, True)
+
+    def untrust_registry(self, name: str) -> None:
+        """Mark a registry as untrusted (recipes from it require --trust or prompt).
+
+        Raises:
+            RegistryError: If the registry is not found.
+        """
+        self._set_registry_trusted(name, False)
 
     def list_registries(self) -> list[RegistryEntry]:
         """List all configured registries.
@@ -1111,14 +1712,7 @@ class RegistryManager:
             List of paths to recipe directories (only from enabled registries)
         """
         paths = []
-        registries = self._load_registries()
-
-        for entry in registries:
-            if not entry.enabled:
-                continue
-            if not include_hidden and not entry.visible:
-                continue
-
+        for entry in self._iter_registries(include_hidden=include_hidden):
             recipe_dir = self._recipe_dir(entry)
             if recipe_dir:
                 paths.append(recipe_dir)
@@ -1131,7 +1725,7 @@ class RegistryManager:
         """List all recipes in a directory with metadata.
 
         Args:
-            recipe_dir: Directory to scan for .yaml recipe files.
+            recipe_dir: Directory to scan for ``.yaml`` / ``.yml`` recipe files.
             registry_name: Name of the registry this directory belongs to.
 
         Returns:
@@ -1143,7 +1737,7 @@ class RegistryManager:
         from sparkrun.core.recipe import recipe_summary
 
         recipes = []
-        for f in sorted(recipe_dir.rglob("*.yaml")):
+        for f in iter_asset_files(recipe_dir, RECIPE_ASSET):
             entry = recipe_summary(f, registry_name=registry_name)
             if entry is not None:
                 recipes.append(entry)
@@ -1162,40 +1756,51 @@ class RegistryManager:
         Returns:
             List of recipe metadata dicts with 'registry' field added
         """
-        results = []
-        query_lower = query.lower()
-        registries = self._load_registries()
+        from sparkrun.core.recipe import recipe_matches_query
 
-        for entry in registries:
-            if not entry.enabled:
-                continue
-            if not include_hidden and not entry.visible:
-                continue
+        results = []
+        for entry in self._iter_registries(include_hidden=include_hidden):
             recipe_dir = self._recipe_dir(entry)
             if recipe_dir is None:
                 continue
             for recipe in self._list_dir_recipes(recipe_dir, entry.name):
-                searchable = [
-                    recipe.get("name", "").lower(),
-                    recipe.get("file", "").lower(),
-                    recipe.get("model", "").lower(),
-                    recipe.get("description", "").lower(),
-                ]
-                if any(query_lower in s for s in searchable):
+                if recipe_matches_query(recipe, query):
                     results.append(recipe)
 
         return results
 
     def registry_for_path(self, path: Path) -> str | None:
         """Return the registry name that owns the given path, or None."""
-        registries = self._load_registries()
-        for entry in registries:
-            if not entry.enabled:
-                continue
+        # Ownership is not a visibility question — a hidden registry still owns
+        # its files, so this deliberately does not filter on `visible`.
+        for entry in self._iter_registries(include_hidden=True):
             recipe_dir = self._recipe_dir(entry)
             if recipe_dir and path.is_relative_to(recipe_dir):
                 return entry.name
         return None
+
+    def qualified_recipe_name(self, registry_name: str, path: Path) -> str:
+        """Render a registry recipe path as a user-typeable ``@registry/...`` name.
+
+        A registry's recipe dir is scanned recursively, so a bare stem is not
+        always unique within one registry (``a/foo.yaml`` and ``b/foo.yaml``
+        are different recipes).  This returns the *disambiguating* name — the
+        extension-less path relative to the registry's recipe dir — which
+        :func:`~sparkrun.core.recipe.find_recipe` accepts verbatim because
+        ``parse_scoped_name`` splits only on the first ``/``:
+        ``@official/qwen3.6/vllm/qwen3.6-27b-fp8-mtp-vllm``.
+
+        Falls back to the bare stem when the path is not under the registry's
+        recipe dir (or the registry is unknown / not cached).
+
+        Args:
+            registry_name: Registry the path was matched in.
+            path: Path to the recipe file.
+
+        Returns:
+            A name of the form ``@<registry>/<relative-path-without-extension>``.
+        """
+        return self.qualified_asset_name(registry_name, path, RECIPE_ASSET)
 
     def find_recipe_in_registries(self, name: str, include_hidden: bool = False) -> list[tuple[str, Path]]:
         """Find a recipe by file stem across all registries.
@@ -1209,53 +1814,11 @@ class RegistryManager:
         Returns:
             List of (registry_name, recipe_path) tuples for disambiguation
         """
-        matches = []
-        registries = self._load_registries()
-
-        for entry in registries:
-            if not entry.enabled:
-                continue
-            if not include_hidden and not entry.visible:
-                continue
-            recipe_dir = self._recipe_dir(entry)
-            if recipe_dir is None:
-                continue
-            # Flat lookup first (existing behavior)
-            for ext in (".yaml", ".yml"):
-                candidate = recipe_dir / (name + ext)
-                if candidate.exists():
-                    matches.append((entry.name, candidate))
-
-        # If flat lookup found nothing, search subdirectories by stem
-        if not matches:
-            for entry in registries:
-                if not entry.enabled:
-                    continue
-                if not include_hidden and not entry.visible:
-                    continue
-                recipe_dir = self._recipe_dir(entry)
-                if recipe_dir is None:
-                    continue
-                for ext in (".yaml", ".yml"):
-                    for candidate in sorted(recipe_dir.rglob(f"{name}{ext}")):
-                        matches.append((entry.name, candidate))
-
-        return matches
+        return self.find_asset_in_registries(name, RECIPE_ASSET, include_hidden=include_hidden)
 
     def _tuning_dir(self, entry: RegistryEntry) -> Path | None:
-        """Get the tuning directory within a cached registry.
-
-        Args:
-            entry: Registry entry
-
-        Returns:
-            Path to the tuning directory, or None if not available
-        """
-        if not entry.tuning_subpath:
-            return None
-        cache_dir = self._cache_dir(entry.name)
-        tuning_path = cache_dir / entry.tuning_subpath
-        return tuning_path if tuning_path.exists() else None
+        """Get the tuning directory within a cached registry."""
+        return self.asset_dir(entry, TUNING_ASSET)
 
     def find_tuning_configs(self, runtime: str, registry_name: str | None = None) -> list[tuple[str, Path]]:
         """Find tuning config files for a given runtime.
@@ -1273,11 +1836,9 @@ class RegistryManager:
             List of (registry_name, config_path) tuples
         """
         matches = []
-        for entry in self._load_registries():
-            if not entry.enabled or not entry.tuning_subpath:
-                continue
-            if registry_name and entry.name != registry_name:
-                continue
+        # Tuning lookup is not visibility-filtered; `_tuning_dir` already
+        # returns None for a registry that declares no tuning subpath.
+        for entry in self._iter_registries(include_hidden=True, only=registry_name or None):
             tuning_dir = self._tuning_dir(entry)
             if tuning_dir is None:
                 continue
@@ -1298,9 +1859,7 @@ class RegistryManager:
             List of dicts with registry, runtime, file, and path fields.
         """
         configs = []
-        for entry in self._load_registries():
-            if not entry.enabled or not entry.tuning_subpath:
-                continue
+        for entry in self._iter_registries(include_hidden=True):
             tuning_dir = self._tuning_dir(entry)
             if tuning_dir is None:
                 continue
@@ -1321,19 +1880,8 @@ class RegistryManager:
         return configs
 
     def _mods_dir(self, entry: RegistryEntry) -> Path | None:
-        """Get the mods directory within a cached registry.
-
-        Args:
-            entry: Registry entry
-
-        Returns:
-            Path to the mods directory, or None if not configured/available
-        """
-        if not entry.mods_subpath:
-            return None
-        cache_dir = self._cache_dir(entry.name)
-        mods_path = cache_dir / entry.mods_subpath
-        return mods_path if mods_path.exists() else None
+        """Get the mods directory within a cached registry."""
+        return self.asset_dir(entry, MODS_ASSET)
 
     def ensure_registry_on_host(
         self,
@@ -1371,6 +1919,7 @@ class RegistryManager:
         from sparkrun.utils.shell import quote
 
         entry = self.get_registry(name)
+        validate_git_url(entry.url)
         sparse_paths = list(self._sparse_checkout_paths_for_url(entry.url))
         if extra_sparse_paths:
             for p in extra_sparse_paths:
@@ -1419,82 +1968,67 @@ class RegistryManager:
         return remote_clone_dir
 
     def _benchmark_dir(self, entry: RegistryEntry) -> Path | None:
-        """Get benchmark directory within a cached registry.
-
-        Args:
-            entry: Registry entry to look up.
-
-        Returns:
-            Path to the benchmark directory, or None if not available
-        """
-        if not entry.benchmark_subpath:
-            return None
-        cache_dir = self._cache_dir(entry.name)
-        benchmark_path = cache_dir / entry.benchmark_subpath
-        return benchmark_path if benchmark_path.exists() else None
+        """Get benchmark directory within a cached registry."""
+        return self.asset_dir(entry, BENCHMARK_ASSET)
 
     def find_benchmark_profile_in_registries(
         self,
         name: str,
         include_hidden: bool = False,
+        category: str | None = None,
     ) -> list[tuple[str, Path]]:
         """Find benchmark profile by file stem across registries.
 
         Args:
             name: Profile file stem (e.g. 'spark-arena-v1')
             include_hidden: If True, include profiles from invisible registries
+            category: Optional category filter. When set, only profiles whose
+                declared (or framework-derived) category matches are returned.
 
         Returns:
             List of (registry_name, profile_path) tuples for disambiguation
         """
-        matches = []
-        for entry in self._load_registries():
-            if not entry.enabled:
-                continue
-            if not include_hidden and not entry.visible:
-                continue
-            benchmark_dir = self._benchmark_dir(entry)
-            if benchmark_dir is None:
-                continue
-            for ext in (".yaml", ".yml"):
-                candidate = benchmark_dir / (name + ext)
-                if candidate.exists():
-                    matches.append((entry.name, candidate))
-        return matches
+        accept = None if category is None else (lambda p: _profile_category(p) == category)
+        return self.find_asset_in_registries(name, BENCHMARK_ASSET, include_hidden=include_hidden, accept=accept)
 
     def list_benchmark_profiles(
         self,
         registry_name: str | None = None,
         include_hidden: bool = False,
+        category: str | None = None,
     ) -> list[dict[str, Any]]:
         """List all benchmark profiles across registries.
 
         Args:
             registry_name: If provided, only list from this registry
             include_hidden: If True, include profiles from invisible registries
+            category: Optional category filter. When set, only profiles whose
+                declared (or framework-derived) category matches are returned.
 
         Returns:
-            List of dicts with keys: registry, file, name, description, path
+            List of dicts with keys: registry, file, name, description, path,
+            category
         """
         import yaml
 
         profiles = []
-        for entry in self._load_registries():
-            if not entry.enabled:
-                continue
-            if registry_name and entry.name != registry_name:
-                continue
-            # When a specific registry is requested by name, skip the
-            # visibility filter — the user is explicitly targeting it.
-            if not registry_name and not include_hidden and not entry.visible:
-                continue
+        # Naming a registry outranks its visibility default — the user is
+        # explicitly targeting it, so the visibility filter is dropped.
+        for entry in self._iter_registries(
+            include_hidden=include_hidden or bool(registry_name),
+            only=registry_name or None,
+        ):
             benchmark_dir = self._benchmark_dir(entry)
             if benchmark_dir is None:
                 continue
-            for f in sorted(benchmark_dir.glob("*.yaml")) + sorted(benchmark_dir.glob("*.yml")):
+            # Shares the lookup scanner, so the catalog and
+            # find_benchmark_profile_in_registries can never disagree about
+            # which files exist.
+            for f in iter_asset_files(benchmark_dir, BENCHMARK_ASSET):
                 # Read metadata from the profile
                 profile_name = f.stem
                 description = ""
+                profile_category: str | None = None
                 try:
                     with open(f) as fh:
                         data = yaml.safe_load(fh) or {}
@@ -1507,8 +2041,11 @@ class RegistryManager:
                             description = metadata["description"]
                         if metadata.get("name") and not data.get("name"):
                             profile_name = metadata["name"]
+                    profile_category = _profile_category_from_data(data)
                 except Exception:
                     pass
+                if category is not None and profile_category != category:
+                    continue
                 profiles.append(
                     {
                         "registry": entry.name,
@@ -1516,6 +2053,7 @@ class RegistryManager:
                         "name": profile_name,
                         "description": description,
                         "path": str(f),
+                        "category": profile_category,
                     }
                 )
         return profiles

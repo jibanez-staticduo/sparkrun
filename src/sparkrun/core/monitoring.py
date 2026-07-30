@@ -9,7 +9,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from sparkrun.utils.shell import stdin_bytes
+
 logger = logging.getLogger(__name__)
+
+# Floor for how long the watchdog waits on a freshly-connected host before
+# giving up and retrying it.  Generous relative to the sampling interval: an
+# SSH handshake to a cold host can take several seconds, and a needless
+# reconnect costs another handshake.
+FIRST_SAMPLE_TIMEOUT = 30.0
 
 # Column names matching host_monitor.sh CSV field order (single source of truth).
 MONITOR_COLUMNS = (
@@ -90,6 +98,111 @@ class HostMonitorState:
     error: str | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
     last_updated: float | None = field(default=None, repr=False)
+    # Monotonic stamp of the most recent connect attempt.  Distinct from
+    # ``last_updated`` (set only once a sample parses) so the watchdog can also
+    # time out a host that never delivers a first sample.
+    connect_started: float | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class HostTelemetry:
+    """Clean per-host telemetry snapshot returned by a telemetry session.
+
+    The public, process-handle-free view of one host's latest resource
+    sample: ``sample`` carries the util/mem/temp fields (``None`` until the
+    first reading lands or when unavailable), ``error`` a human string when the
+    host's collection failed.  Produced by
+    :class:`~sparkrun.orchestration.telemetry.TelemetrySession` implementations
+    (host substrate wraps :class:`ClusterMonitor`; k8s/modal use their own).
+    """
+
+    host: str
+    sample: MonitorSample | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class HostActivity:
+    """Combined per-host view: resource telemetry + occupancy workloads.
+
+    The unit of a :class:`MonitorFrame` — pairs a host's live
+    :class:`MonitorSample` (util/mem/temp) with the workloads occupying it
+    (from ``api.status``, so docker + local + providers, not just docker).
+    Either side may be missing: ``telemetry=None`` before the first sample /
+    on a substrate with no telemetry provider; ``workloads=()`` when idle.
+    """
+
+    host: str
+    telemetry: MonitorSample | None = None
+    telemetry_error: str | None = None
+    workloads: tuple = field(default_factory=tuple)  # tuple[RunningWorkload, ...]
+    used_slots: int = 0
+    free_slots: int = 0
+    status_error: str | None = None
+
+
+@dataclass(frozen=True)
+class MonitorFrame:
+    """One snapshot of live cluster activity: telemetry + occupancy per host.
+
+    The substrate-agnostic frame produced by ``api.live_monitor`` /
+    ``LiveMonitorSession.frame()`` — a host cluster combines ``host_monitor.sh``
+    telemetry with docker+local occupancy; a k8s cluster would combine k8s
+    metrics with k8s occupancy — clients (the TUI, an SSE feed) see the same
+    shape.
+    """
+
+    hosts: tuple[HostActivity, ...] = field(default_factory=tuple)
+    queried_at: float = 0.0
+
+    def for_host(self, host: str) -> HostActivity | None:
+        for entry in self.hosts:
+            if entry.host == host:
+                return entry
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Canonical JSON serialization (shared by CLI ``monitor --json`` and the
+# desktop MonitorHub SSE, so every client sees one shape).
+# ---------------------------------------------------------------------------
+
+
+def serialize_activity(activity: HostActivity) -> dict:
+    """Serialize one :class:`HostActivity` to a JSON-safe row.
+
+    Shape: ``{host, error, sample, workloads, used_slots, free_slots}`` where
+    ``sample`` is the telemetry :class:`MonitorSample` dict (or ``None``) and
+    ``workloads`` carries the occupancy (all executors), each
+    ``{cluster_id, recipe, runtime, ranks_on_host, containers:[{name,role,status,image}]}``.
+    ``error`` folds the telemetry and status errors.
+    """
+    import dataclasses
+
+    workloads = []
+    for w in activity.workloads:
+        workloads.append(
+            {
+                "cluster_id": w.cluster_id,
+                "recipe": w.recipe_name,
+                "runtime": w.runtime_name,
+                "ranks_on_host": w.ranks_on_host,
+                "containers": [{"name": c.name, "role": c.role, "status": c.status, "image": c.image} for c in w.containers],
+            }
+        )
+    return {
+        "host": activity.host,
+        "error": activity.telemetry_error or activity.status_error,
+        "sample": dataclasses.asdict(activity.telemetry) if activity.telemetry is not None else None,
+        "workloads": workloads,
+        "used_slots": activity.used_slots,
+        "free_slots": activity.free_slots,
+    }
+
+
+def serialize_frame(frame: MonitorFrame) -> list[dict]:
+    """Serialize a :class:`MonitorFrame` to a list of per-host rows."""
+    return [serialize_activity(a) for a in frame.hosts]
 
 
 def parse_monitor_line(line: str) -> MonitorSample | None:
@@ -229,6 +342,25 @@ def prom2json_to_sample(metrics_list: list[dict], hostname: str) -> MonitorSampl
     return prometheus_to_sample(flat, hostname)
 
 
+def _ssh_start_error(exc: OSError, proc) -> str:
+    """Explain why a monitor's SSH died, not just how we noticed.
+
+    ssh that exits before we finish writing the script surfaces here as
+    ``[Errno 32] Broken pipe``, which says nothing useful — the actual reason
+    ("Permission denied (publickey)", "Host key verification failed", ...) went
+    to ssh's stderr. Prefer that when we can still read it.
+    """
+    if proc is not None:
+        try:
+            proc.wait(timeout=2)
+            err = (proc.stderr.read() or "").strip()
+            if err:
+                return err.splitlines()[-1]
+        except Exception:  # never let diagnosis raise over the original failure
+            logger.debug("could not read ssh stderr after %s", exc, exc_info=True)
+    return str(exc)
+
+
 class ClusterMonitor:
     """Manage parallel SSH monitor streams across cluster hosts.
 
@@ -266,6 +398,10 @@ class ClusterMonitor:
         """Launch an SSH subprocess and reader thread for a single *host*."""
         from sparkrun.orchestration.ssh import build_ssh_cmd
 
+        # Stamped before the attempt so the watchdog's first-sample timer is
+        # armed even when Popen itself fails below.
+        self.states[host].connect_started = time.monotonic()
+
         cmd = build_ssh_cmd(
             host,
             ssh_user=self.ssh_kwargs.get("ssh_user"),
@@ -274,6 +410,7 @@ class ClusterMonitor:
         )
         cmd.extend(["bash", "-s", "--", str(self.interval)])
 
+        proc = None
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -282,7 +419,9 @@ class ClusterMonitor:
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            proc.stdin.write(self._script)
+            # .buffer bypasses text-mode newline translation, which would
+            # CRLF-mangle the script when the control node is Windows.
+            proc.stdin.buffer.write(stdin_bytes(self._script))
             proc.stdin.close()
 
             self.states[host].process = proc
@@ -294,8 +433,9 @@ class ClusterMonitor:
             )
             thread.start()
         except OSError as e:
-            self.states[host].error = "Failed to start SSH: %s" % e
-            logger.warning("Failed to start monitor on %s: %s", host, e)
+            detail = _ssh_start_error(e, proc)
+            self.states[host].error = "SSH failed: %s" % detail
+            logger.warning("Failed to start monitor on %s: %s", host, detail)
 
     def stop(self) -> None:
         """Terminate all SSH subprocesses."""
@@ -345,6 +485,11 @@ class ClusterMonitor:
     def _watchdog(self) -> None:
         """Periodically check for stale host data and reconnect."""
         stale_threshold = self.interval * 5
+        # A host that never delivers a first sample has no ``last_updated`` to
+        # go stale, so it needs its own deadline measured from the connect
+        # attempt — otherwise a boot race (sshd not up yet), a half-open TCP
+        # connection, or a silently-dropped SSH wedges that host forever.
+        first_sample_timeout = max(stale_threshold, FIRST_SAMPLE_TIMEOUT)
         while self._started:
             time.sleep(self.interval)
             if not self._started:
@@ -353,7 +498,18 @@ class ClusterMonitor:
             for host in self.hosts:
                 state = self.states[host]
                 if state.last_updated is None:
-                    continue  # still connecting or already in error
+                    if state.connect_started is None:
+                        continue  # never started (deploy-gated backends)
+                    waiting = now - state.connect_started
+                    if waiting > first_sample_timeout:
+                        logger.warning(
+                            "Host %s produced no data %.1fs after connecting (timeout %.1fs), reconnecting",
+                            host,
+                            waiting,
+                            first_sample_timeout,
+                        )
+                        self._reconnect_host(host, reason="no data since connect")
+                    continue
                 age = now - state.last_updated
                 if age > stale_threshold:
                     logger.warning(
@@ -364,7 +520,7 @@ class ClusterMonitor:
                     )
                     self._reconnect_host(host)
 
-    def _reconnect_host(self, host: str) -> None:
+    def _reconnect_host(self, host: str, reason: str = "stale data") -> None:
         """Kill the stale SSH process for *host* and start a fresh one."""
         state = self.states[host]
 
@@ -383,9 +539,23 @@ class ClusterMonitor:
                 except subprocess.TimeoutExpired:
                     pass
 
-        state.error = "stale data — reconnecting"
-        # Reset timestamp so the watchdog doesn't re-trigger immediately.
-        state.last_updated = time.monotonic()
+        # Read before mutating: ``last_updated is not None`` means this host has
+        # produced a sample at some point, which decides which of the watchdog's
+        # two deadlines it belongs on below.
+        had_data = state.last_updated is not None
+
+        state.error = "%s — reconnecting" % reason
+        # Drop the last sample.  It describes a host we are no longer connected
+        # to, and keeping it makes an outage indistinguishable from live-but-idle
+        # telemetry for any consumer that reads ``sample`` without checking
+        # ``error`` (the CLI table and TUI both render None as "no data" plus the
+        # error, so clearing it is also what they want).
+        state.latest = None
+        # Re-arm the staleness timer for a host that has had data, so it keeps
+        # retrying on the fast (interval * 5) cadence while it is down.  A host
+        # that never sampled stays at None and remains on the first-sample
+        # deadline, which _start_host re-arms by stamping connect_started.
+        state.last_updated = time.monotonic() if had_data else None
 
         self._start_host(host)
 
@@ -492,6 +662,7 @@ class NvMonitorClusterMonitor:
         )
         cmd.extend(["bash", "-s", "--", str(self.port), str(self.interval)])
 
+        proc = None
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -500,7 +671,9 @@ class NvMonitorClusterMonitor:
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            proc.stdin.write(self._script)
+            # .buffer bypasses text-mode newline translation, which would
+            # CRLF-mangle the script when the control node is Windows.
+            proc.stdin.buffer.write(stdin_bytes(self._script))
             proc.stdin.close()
 
             self.states[host].process = proc
@@ -509,7 +682,7 @@ class NvMonitorClusterMonitor:
             thread = threading.Thread(target=self._reader, args=(host, proc), daemon=True)
             thread.start()
         except OSError as e:
-            self.states[host].error = "SSH failed: %s" % e
+            self.states[host].error = "SSH failed: %s" % _ssh_start_error(e, proc)
 
     def stop(self) -> None:
         """Terminate all SSH processes."""

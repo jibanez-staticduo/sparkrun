@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sparkrun"
-version = "0.2.40"
+version = "0.3.0"
 description = "Launch and manage Docker-based inference workloads on NVIDIA DGX Spark systems"
 readme = "README.md"
 license = "Apache-2.0"
@@ -27,6 +27,8 @@ dependencies = [
     "scitrera-app-framework==0.0.69",
     "vpd==0.9.13",
     "six==1.17.0", # transitive dependency of vpd but we pin the version for security reasons
+    "idna==3.15", # transitive (requests/huggingface-hub) pinned to the CVE-2026-45409 fix
+    "pygments==2.20.0", # transitive (rich/textual) pinned to the CVE-2026-4539 fix
     "click==8.3.3",
     "pyyaml==6.0.3",
     "huggingface-hub==1.8.0",
@@ -51,6 +53,8 @@ eugr-vllm = "sparkrun.runtimes.eugr_vllm_ray:EugrVllmRayRuntime"
 llama-cpp = "sparkrun.runtimes.llama_cpp:LlamaCppRuntime"
 trtllm = "sparkrun.runtimes.trtllm:TrtllmRuntime"
 atlas = "sparkrun.runtimes.atlas:AtlasRuntime"
+tokenary = "sparkrun.runtimes.tokenary:TokenaryRuntime"
+modular-max = "sparkrun.runtimes.modular_max:ModularMaxRuntime"
 
 [project.entry-points."sparkrun.benchmarking"]
 llama-benchy = "sparkrun.benchmarking.llama_benchy:LlamaBenchyFramework"
@@ -59,6 +63,11 @@ tool-eval-bench = "sparkrun.benchmarking.tool_eval_bench:ToolEvalBenchFramework"
 [project.entry-points."sparkrun.builders"]
 docker-pull = "sparkrun.builders.docker_pull:DockerPullBuilder"
 eugr = "sparkrun.builders.eugr:EugrBuilder"
+
+[project.entry-points."sparkrun.executors"]
+docker = "sparkrun.orchestration.executors.docker:DockerExecutor"
+local = "sparkrun.orchestration.executors.local:LocalExecutor"
+k8s = "sparkrun.orchestration.executors.k8s:K8sExecutor"
 
 [tool.setuptools.packages.find]
 where = ["src"]

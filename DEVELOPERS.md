@@ -3,7 +3,7 @@
 ## Quick Start
 
 ```bash
-git clone https://github.com/spark-arena/sparkrun.git -b develop
+git clone https://github.com/spark-arena/sparkrun.git -b develop-next
 cd sparkrun
 source dev.sh
 sparkrun --help
@@ -18,10 +18,12 @@ Requires [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/inst
 | Branch | Purpose |
 |--------|---------|
 | `main` | Stable releases. Protected — no direct pushes |
-| `develop` | Integration branch. **PRs target here** |
-| `feature/*` | Feature branches off `develop` |
+| `develop` | Release staging; the source of the `beta` update channel |
+| `develop-next` | Active integration; the source of the `alpha` update channel. **PRs target here** |
+| `feature/*` | Feature branches off `develop-next` |
 
-**All PRs should target `develop`**, not `main`. Releases are merged from `develop` → `main`.
+**All PRs should target `develop-next`**, not `develop` or `main`. Changes flow
+`feature/*` → `develop-next` → `develop` → `main`.
 
 ## Running Tests
 
@@ -219,7 +221,7 @@ python scripts/update-versions.py --check
 
 ## Commit Guidelines
 
-- Target `develop` branch for all PRs
+- Target the `develop-next` branch for all PRs
 - Keep commits atomic — one logical change per commit
 - Run `pytest` and `ruff check` before pushing
 - Use `--dry-run` to verify CLI changes produce correct Docker commands

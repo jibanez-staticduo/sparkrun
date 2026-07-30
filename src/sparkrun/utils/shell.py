@@ -6,6 +6,7 @@ Provides helpers for safely interpolating values into shell command strings.
 from __future__ import annotations
 
 import base64
+import os
 import re
 import shlex
 from typing import Any
@@ -18,6 +19,27 @@ class Quoted(str):
     multiple layers that each call :func:`quote`.  Long-term the goal is to
     quote only at the shell-assembly boundary, making this unnecessary.
     """
+
+
+def stdin_bytes(data: str) -> bytes:
+    """Encode *data* for a subprocess stdin pipe, with no newline translation.
+
+    Piping a script as ``str`` (``subprocess.run(..., text=True)``) wraps stdin
+    in a ``TextIOWrapper`` with ``newline=None``, which rewrites every ``\\n`` to
+    ``os.linesep``.  On a Windows control machine that appends a CR to every
+    line of a *bash* script, and the remote shell then reports::
+
+        set: -e^M: invalid option
+        bash: line 13: syntax error: unexpected end of file
+
+    (the CR is part of the argument, and a heredoc terminator with a trailing CR
+    never matches its opening delimiter).  Piping bytes bypasses the translation
+    entirely, so the remote sees exactly what was generated.
+
+    Any CRLF already present in *data* is normalized, since the remote is always
+    a POSIX shell.
+    """
+    return data.replace("\r\n", "\n").encode("utf-8")
 
 
 def quote(value: str) -> Quoted:
@@ -97,6 +119,30 @@ def quote_dict(d: dict) -> dict:
     return {k: shlex.quote(v) if isinstance(v, str) else v for k, v in d.items()}
 
 
+def validate_hostname(host: str) -> str:
+    """Validate and return a hostname or IP address, or raise ValueError.
+
+    Accepts RFC-1123-style hostnames and IPv4/IPv6 addresses.  The pattern
+    allows letters, digits, hyphens, underscores, and dots — no shell
+    metacharacters.  Labels must start and end with an alphanumeric character.
+
+    Args:
+        host: Hostname or IP address string to validate.
+
+    Returns:
+        The validated hostname (unchanged).
+
+    Raises:
+        ValueError: If *host* contains characters outside the allowed set or
+            does not match the expected structure.
+    """
+    if not host:
+        raise ValueError("Hostname must not be empty")
+    if not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?", host):
+        raise ValueError("Invalid hostname %r — contains shell-unsafe characters or bad structure" % host)
+    return host
+
+
 def validate_unix_username(user: str) -> str:
     """Validate and return a Unix username, or raise ValueError.
 
@@ -161,6 +207,142 @@ def safe_remote_path(value: str) -> str:
     if value == "~":
         return "$HOME"
     return value
+
+
+# Conservative allowlist for paths interpolated into a sudoers rule.  A
+# sudoers file is security-critical: a value containing whitespace, a newline,
+# or shell/sudoers metacharacters could append extra rules or commands.  Only
+# characters that appear in legitimate absolute filesystem paths are permitted.
+_SUDOERS_PATH_RE = re.compile(r"[A-Za-z0-9_./-]+")
+
+
+def validate_sudoers_path(value: str) -> str:
+    """Validate an absolute path destined for interpolation into a sudoers rule.
+
+    Requires an absolute path containing only ``[A-Za-z0-9_./-]`` — no
+    whitespace, newlines, or shell/sudoers metacharacters.  This is stricter
+    than :func:`assert_safe_path` because the interpolation target (a
+    ``/etc/sudoers.d`` rule) is a privilege-escalation primitive.
+
+    Args:
+        value: Path string to validate.
+
+    Returns:
+        The validated path (unchanged).
+
+    Raises:
+        ValueError: If *value* is empty, not absolute, or contains characters
+            outside the allowed set.
+    """
+    if not value:
+        raise ValueError("Sudoers path must not be empty")
+    if not value.startswith("/"):
+        raise ValueError("Sudoers path must be absolute: %r" % value)
+    if not _SUDOERS_PATH_RE.fullmatch(value):
+        raise ValueError("Unsafe character in sudoers path %r — possible privilege escalation" % value)
+    return value
+
+
+# Host directory subtrees that must never be bind-mounted into a workload
+# container.  Mounting any of these (or anything beneath them) hands the
+# container control of the host: root fs, system config, kernel/dev
+# pseudo-filesystems, runtime state (incl. the docker control socket under
+# /run /var/run), and root's home.  Prefix-matched, not exact, so e.g.
+# ``/etc/sudoers.d`` and ``/var/lib/docker`` style escalations are caught too.
+_FORBIDDEN_MOUNT_PREFIXES = (
+    "/etc",
+    "/boot",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/root",
+    "/run",
+    "/var/run",
+    "/var/lib/docker",
+)
+
+
+def assert_safe_mount_source(path: str) -> str:
+    """Reject host paths that are catastrophic to bind-mount into a container.
+
+    Defense-in-depth guard for ``docker -v`` sources that originate (even
+    indirectly) from a recipe or cluster config.  Mounting the host root, the
+    docker control socket, SSH keys, or kernel pseudo-filesystems gives the
+    containerized workload control of the host, so these are refused outright —
+    independent of recipe trust.  This complements (does not replace) the
+    trust gate that blocks untrusted recipes from supplying mounts at all.
+
+    The bind-mount is performed on a **remote** host whose symlink layout and
+    home directory differ from the control machine, so the guard validates the
+    *literal* path shape (must be absolute, no ``..`` components, not under a
+    forbidden subtree) rather than trusting control-machine ``realpath``
+    resolution.  A secondary local ``realpath`` check still rejects sources
+    that resolve to a catastrophic target via a control-machine symlink.
+
+    Returns *path* unchanged on success; raises :class:`ValueError` otherwise.
+    """
+    if not path:
+        raise ValueError("Empty bind-mount source path")
+
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        raise ValueError("Bind-mount source must be an absolute path: %r" % path)
+    if ".." in expanded.split(os.sep):
+        raise ValueError("Bind-mount source must not contain '..': %r" % path)
+
+    norm = os.path.normpath(expanded)
+    parts = norm.split(os.sep)
+    if norm == os.sep or any(norm == p or norm.startswith(p + os.sep) for p in _FORBIDDEN_MOUNT_PREFIXES):
+        raise ValueError("Refusing to bind-mount sensitive host path %r" % path)
+    if os.path.basename(norm) == "docker.sock":
+        raise ValueError("Refusing to bind-mount the docker control socket %r" % path)
+    # Any user's SSH key directory, matched by path component (not just the
+    # control machine's own ``~/.ssh``).
+    if ".ssh" in parts:
+        raise ValueError("Refusing to bind-mount an SSH key directory %r" % path)
+
+    # Secondary defense: a control-machine symlink that resolves onto a
+    # catastrophic target.
+    real = os.path.realpath(expanded)
+    if (
+        real == os.sep
+        or os.path.basename(real) == "docker.sock"
+        or any(real == p or real.startswith(p + os.sep) for p in _FORBIDDEN_MOUNT_PREFIXES)
+    ):
+        raise ValueError("Refusing to bind-mount sensitive host path %r (resolved to %r)" % (path, real))
+    return path
+
+
+_ALLOWED_GIT_URL_SCHEMES = ("https://", "git@", "ssh://", "file://")
+
+
+def validate_git_url(url: str) -> str:
+    """Validate a git URL against an allowlist of safe schemes.
+
+    Rejects URLs that could be interpreted as git command-line options (dash-
+    leading strings), use unsafe schemes like ``http://``, or are empty.
+    This mitigates CVE-2017-1000117-style option injection via URL arguments.
+
+    Allowed schemes: ``https://``, ``git@``, ``ssh://``, ``file://``.
+
+    Args:
+        url: The git URL to validate.
+
+    Returns:
+        The URL (stripped of leading/trailing whitespace) if valid.
+
+    Raises:
+        ValueError: If *url* is empty, starts with a dash, or uses a
+            disallowed scheme.
+    """
+    url = url.strip()
+    if not url:
+        raise ValueError("Git URL must not be empty")
+    if url.startswith("-"):
+        raise ValueError("Git URL must not start with '-' (option injection risk): %r" % url)
+    if not any(url.startswith(scheme) for scheme in _ALLOWED_GIT_URL_SCHEMES):
+        raise ValueError("Git URL %r uses a disallowed scheme. Allowed schemes: %s" % (url, ", ".join(_ALLOWED_GIT_URL_SCHEMES)))
+    return url
 
 
 def render_args_as_flags(args: dict[str, Any]) -> list[str]:

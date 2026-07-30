@@ -1,4 +1,10 @@
-"""sparkrun run command."""
+"""sparkrun run command — thin Click wrapper around :func:`sparkrun.api.run`.
+
+The CLI handles presentation concerns (banner, VRAM display, diagnostics
+emission, pre-launch summary, post-launch echoing) and delegates the
+actual launch orchestration to :func:`sparkrun.api.run`.  All
+``--option`` flags map onto :class:`sparkrun.api.RunOptions` fields.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,9 @@ from typing import Any
 
 import click
 
-from sparkrun.orchestration.distribution import DistributionError
+import sparkrun.api as api
+from sparkrun.orchestration.transfer import TransferError
+from sparkrun.runtimes.compatibility import IncompatibleHardwareError
 
 from ._common import (
     RECIPE_NAME,
@@ -18,17 +26,80 @@ from ._common import (
     _get_context,
     _is_recipe_url,
     _load_recipe,
-    _resolve_hosts_or_exit,
     _simplify_recipe_ref,
     dry_run_option,
     host_options,
     recipe_override_options,
     resolve_cluster_config,
-    validate_and_prepare_hosts,
+    resolve_effective_hosts_for_recipe,
+    with_host_context,
     HIDE_ADVANCED_OPTIONS,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_platforms(
+    host_list: list[str],
+    cluster=None,
+) -> tuple[str, list[tuple[str, str]] | None]:
+    """Build a platform summary string for the ``sparkrun run`` output block.
+
+    For each host, resolves hardware (from *cluster* if available, else
+    :func:`~sparkrun.core.hardware.default_dgx_spark_hardware`), picks the
+    matching :class:`~sparkrun.platforms.base.HardwarePlatformPlugin`, and
+    selects a :class:`~sparkrun.core.backend_select.BackendBundle`.  The
+    display line for each host is built as::
+
+        "<display_name> (<VENDOR> <MODEL>, <COLLECTIVE>)"
+
+    When all hosts produce the same display string the function returns that
+    single string with ``None`` for the per-host list (homogeneous).  When
+    hosts differ it returns ``("mixed", [(host, display_line), ...])``
+    (heterogeneous).
+
+    Errors for any individual host are silently swallowed — the host's line
+    falls back to ``"Unknown"`` so a bad fingerprint never crashes the
+    pre-launch summary.
+
+    Args:
+        host_list: Resolved list of target hosts.
+        cluster: Optional :class:`~sparkrun.core.cluster_manager.ClusterDefinition`
+            carrying per-host hardware metadata.
+
+    Returns:
+        ``(summary, per_host_or_none)`` where *per_host_or_none* is a list of
+        ``(host, line)`` tuples when heterogeneous, ``None`` when homogeneous.
+    """
+    from sparkrun.core.backend_select import NoMatchingBackendError, select_backends
+    from sparkrun.core.hardware import default_dgx_spark_hardware
+    from sparkrun import platforms as _platforms
+
+    def _host_line(host: str) -> str:
+        try:
+            hw = cluster.hardware_for(host) if cluster is not None else default_dgx_spark_hardware()
+            platform = _platforms.resolve_platform(hw)
+            pname = platform.display_name if platform is not None else "Unknown"
+            if hw.accelerators:
+                a = hw.accelerators[0]
+                accel_str = "%s %s" % (a.vendor.upper(), a.model.upper())
+            else:
+                accel_str = "CPU"
+            try:
+                bundle = select_backends(hw)
+                collective_str = bundle.collective.name.upper()
+                return "%s (%s, %s)" % (pname, accel_str, collective_str)
+            except NoMatchingBackendError:
+                return "%s (%s)" % (pname, accel_str)
+        except Exception:
+            return "Unknown"
+
+    lines = [_host_line(h) for h in host_list]
+
+    if len(set(lines)) == 1:
+        return lines[0], None
+
+    return "mixed", list(zip(host_list, lines))
 
 
 @click.command()
@@ -47,7 +118,14 @@ logger = logging.getLogger(__name__)
 @click.option("--served-model-name", default=None, help="Override served model name")
 @click.option("--ray-port", type=int, default=46379, help="Ray GCS port (vllm-ray)", hidden=HIDE_ADVANCED_OPTIONS)
 @click.option("--init-port", type=int, default=25000, help="vllm/SGLang distributed init port", hidden=HIDE_ADVANCED_OPTIONS)
-@click.option("--dashboard", is_flag=True, help="Enable Ray dashboard on head node", hidden=HIDE_ADVANCED_OPTIONS)
+@click.option(
+    "--dashboard/--no-dashboard",
+    "dashboard",
+    default=None,
+    help="Enable/disable the Ray dashboard on the head node (Ray runtimes only; binds 0.0.0.0 when on). "
+    "Overrides the recipe's runtime_config.dashboard; defaults to on.",
+    hidden=HIDE_ADVANCED_OPTIONS,
+)
 @click.option("--dashboard-port", type=int, default=8265, help="Ray dashboard port", hidden=HIDE_ADVANCED_OPTIONS)
 @dry_run_option
 @click.option("--foreground", is_flag=True, help="Run in foreground (don't detach)")
@@ -82,6 +160,21 @@ logger = logging.getLogger(__name__)
 @click.option(
     "--trust", is_flag=True, default=False, hidden=True, help="Trust post_commands from third-party registries without confirmation"
 )
+@click.option(
+    "--scheduler",
+    "scheduler_name",
+    default=None,
+    help="Registered scheduler name (e.g. 'greedy', 'occupancy-sparse', 'occupancy-dense'). Defaults to the recipe's scheduler field, then 'greedy'.",
+    hidden=HIDE_ADVANCED_OPTIONS,
+)
+@click.option(
+    "--rebuild/--no-rebuild",
+    "rebuild",
+    default=None,
+    help="Force the builder to produce a fresh image (no-op for docker-pull; forces a rebuild/fresh pull for eugr). "
+    "Overrides the recipe's builder_config.rebuild setting.",
+    hidden=HIDE_ADVANCED_OPTIONS,
+)
 @click.option("--label", "labels_override", multiple=True, help="Set meta data on a container (e.g., --label com.example.key=value)")
 @click.option(
     "--executor-args",
@@ -91,6 +184,7 @@ logger = logging.getLogger(__name__)
 )
 @click.argument("extra_args", nargs=-1, type=click.UNPROCESSED)
 @click.pass_context
+@with_host_context
 def run(
     ctx,
     recipe_name,
@@ -123,11 +217,15 @@ def run(
     transfer_mode,
     diagnostics_path,
     trust,
+    scheduler_name,
+    rebuild,
     labels_override,
     options,
     executor_args,
     extra_args,
     config_path=None,
+    host_list=None,
+    cluster_mgr=None,
 ):
     """Run an inference recipe.
 
@@ -146,7 +244,6 @@ def run(
       sparkrun run my-recipe.yaml -o attention_backend=triton -o max_model_len=4096
     """
     from sparkrun.core.bootstrap import get_runtime
-    from sparkrun.core.launcher import launch_inference
 
     sctx = _get_context(ctx)
     v = sctx.variables
@@ -156,8 +253,18 @@ def run(
     if solo:
         click.echo("Notice: --solo flag is not recommended; it is better to explicitly specify parallelism via e.g. --tp 1", err=True)
 
-    # Determine hosts
-    host_list, cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
+    # Resolve the named cluster definition when one is in play.  Carries
+    # per-host hardware metadata so downstream code can compute placement,
+    # fit, and per-host backend selection.  Falls back to None for
+    # explicit --hosts / --hosts-file (host-list-only path).
+    cluster_def = None
+    if cluster_mgr is not None and not hosts and not hosts_file:
+        _name = cluster_name or cluster_mgr.get_default()
+        if _name:
+            try:
+                cluster_def = cluster_mgr.get(_name)
+            except Exception:
+                cluster_def = None
 
     # Find and load recipe (defer resolution until overrides are built).
     # Retry after a registry refresh when the recipe isn't found, so that
@@ -182,6 +289,13 @@ def run(
         port=port,
         served_model_name=served_model_name,
     )
+
+    # --rebuild/--no-rebuild is a builder-agnostic override carried in
+    # builder_config so any builder (present or future) can honor it. Only
+    # override the recipe's own builder_config.rebuild when the flag was given
+    # explicitly (tri-state default None leaves the recipe value untouched).
+    if rebuild is not None:
+        recipe.builder_config["rebuild"] = rebuild
 
     # Validate recipe (after resolve so runtime is populated)
     issues = recipe.validate()
@@ -217,17 +331,29 @@ def run(
         else:
             host_source = "localhost"
 
-    # Node count validation, max_nodes enforcement, and solo mode determination
-    host_list, is_solo = validate_and_prepare_hosts(host_list, recipe, overrides, runtime, solo=solo)
+    # Resolve the effective host list via the scheduler (single source of
+    # truth): ``hosts_used`` IS the list run/stop/logs all share.  Applies
+    # solo / max_nodes as orthogonal constraints; multi-GPU hosts and
+    # explicit ``recipe.layout`` are honoured when ``cluster_def`` carries
+    # per-host hardware.
+    host_list, is_solo = resolve_effective_hosts_for_recipe(
+        host_list,
+        recipe,
+        overrides,
+        cluster_def=cluster_def,
+        runtime=runtime,
+        sctx=sctx,
+        solo=solo,
+    )
     if recipe.mode == "cluster" and is_solo and not solo:
         click.echo("Warning: Recipe requires cluster mode but only one host specified", err=True)
 
     # --ensure: check if job is already running, exit 0 if so
     if ensure:
-        from sparkrun.orchestration.job_metadata import check_job_running as _check_job, generate_cluster_id
+        from sparkrun.orchestration.job_metadata import check_job_running as _check_job, derive_cluster_id
         from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-        _cid = generate_cluster_id(recipe, host_list, overrides=overrides or None)
+        _cid = derive_cluster_id(recipe, host_list, overrides=overrides or None)
         _ssh_kw = build_ssh_kwargs(config)
         _status = _check_job(cluster_id=_cid, hosts=host_list, ssh_kwargs=_ssh_kw, cache_dir=str(config.cache_dir))
         if _status.running:
@@ -243,6 +369,28 @@ def run(
         config, transfer_mode_override=transfer_mode
     )
 
+    # Resolve effective scheduler name for display + downstream RunOptions.
+    # Scheduler selection chain: CLI flag → recipe.scheduler → cluster.scheduler
+    # → greedy default (FALLBACK_DEFAULT_SCHEDULER).  Look up the plugin so the
+    # banner reflects the *actually-resolved* name rather than a possibly-``None``
+    # selector — matches what ``api.run`` stamps on ``RunResult.scheduler``.
+    from sparkrun.core.scheduler import (
+        FALLBACK_DEFAULT_SCHEDULER,
+        default_scheduler_upgrade_hint,
+        get_scheduler,
+        resolve_scheduler_selector,
+    )
+
+    effective_scheduler, scheduler_defaulted = resolve_scheduler_selector(
+        cli=scheduler_name,
+        recipe=getattr(recipe, "scheduler", None),
+        cluster=getattr(cluster_def, "scheduler", None),
+    )
+    try:
+        display_scheduler = get_scheduler(effective_scheduler, v=v).scheduler_name
+    except Exception:
+        display_scheduler = effective_scheduler or FALLBACK_DEFAULT_SCHEDULER
+
     # Display summary before launch
     from sparkrun.core.config import SparkrunConfig
     from sparkrun.core.version import display_version
@@ -257,10 +405,60 @@ def run(
         click.echo("Mode:      solo")
     else:
         click.echo("Mode:      cluster (%d nodes)" % len(host_list))
+    _platform_summary, _per_host = _summarize_platforms(host_list, cluster_def)
+    click.echo("Platform:  %s" % _platform_summary)
+    if _per_host is not None:
+        for _h, _line in _per_host:
+            click.echo("  %-8s %s" % (_h + ":", _line))
+    click.echo("Scheduler: %s" % display_scheduler)
+    # When nothing in the chain selected a scheduler we fell back to the 0.2.x
+    # greedy default; recommend opting the cluster into occupancy-aware spreading.
+    if scheduler_defaulted and not is_solo:
+        click.echo(default_scheduler_upgrade_hint())
     if effective_transfer_mode not in ("auto", "local"):
         click.echo("Transfer:  %s" % effective_transfer_mode)
 
-    _display_vram_estimate(recipe, cli_overrides=overrides, auto_detect=True, cache_dir=local_cache_dir)
+    # Compute placement up-front when we have a cluster definition + multi-host
+    # workload, so the VRAM display can render per-host fit alongside the
+    # legacy DGX-Spark single-line summary.  Failures fall back silently —
+    # the legacy single-line fit always renders regardless.
+    display_placement = None
+    if cluster_def is not None and not is_solo:
+        try:
+            from sparkrun.core.limits import resolved_hardware_for_scheduling
+            from sparkrun.core.parallelism import extract_parallelism
+            from sparkrun.core.scheduler import SchedulingRequest
+
+            # Route through the *resolved* scheduler (not a bare greedy
+            # ``pack``) so the displayed per-host fit matches
+            # the scheduler the launch will actually use.  Pack against capped
+            # usable memory — the same caps the scheduler applies — and skip the
+            # live status query (display only): occupancy-aware schedulers then
+            # degrade to their greedy whole-GPU pack, which is the right shape for
+            # a pre-launch fit preview.
+            display_request = SchedulingRequest(
+                parallelism=extract_parallelism(recipe.build_config_chain(overrides)),
+                hosts=tuple(host_list),
+                host_hardware=resolved_hardware_for_scheduling(cluster_def, list(host_list)),
+                layout=recipe.layout,
+            )
+            display_placement = api.schedule(display_request, scheduler=effective_scheduler, sctx=sctx).assignment
+        except Exception:
+            display_placement = None
+
+    # A local (absolute-path) model has no HuggingFace repo id to auto-detect
+    # params from, so skip the HF lookup — the estimate falls back to recipe
+    # defaults rather than erroring on a bogus repo id.
+    from sparkrun.core.recipe import is_local_model_path
+
+    _display_vram_estimate(
+        recipe,
+        cli_overrides=overrides,
+        auto_detect=not is_local_model_path(recipe.model),
+        cache_dir=local_cache_dir,
+        cluster=cluster_def,
+        placement=display_placement,
+    )
 
     click.echo()
     click.echo("Hosts:     %s" % host_source)
@@ -329,39 +527,69 @@ def run(
             diag.phase_end("spark_diagnostics", error=str(e))
             logger.warning("Spark diagnostics collection failed: %s", e)
 
-    # Launch via shared pipeline
+    # Build the typed RunOptions for the library API.  The CLI already
+    # resolved the recipe, host list, cluster_def, and overrides above
+    # (so the banner / VRAM block could render those before launch);
+    # passing the loaded objects through avoids re-resolution inside
+    # ``api.run`` and preserves the cwd-recipe discovery the CLI does
+    # through ``_load_recipe``.  ``effective_scheduler`` was resolved
+    # above so the banner could display the actually-used name.
+
+    run_options = api.RunOptions(
+        recipe=recipe,
+        hosts=tuple(host_list),
+        cluster=cluster_def,
+        overrides=dict(overrides),
+        scheduler=effective_scheduler,
+        solo=is_solo,
+        dry_run=dry_run,
+        follow=not no_follow,
+        detached=not foreground,
+        trust=trust,
+        transfer_mode=effective_transfer_mode,
+        transfer_interface=effective_transfer_interface,
+        cache_dir=remote_cache_dir,
+        local_cache_dir=local_cache_dir,
+        port=port,
+        ray_port=ray_port,
+        dashboard_port=dashboard_port,
+        dashboard=dashboard,
+        init_port=init_port,
+        executor_config=cli_executor_opts or None,
+        rootful=rootful,
+        diagnostics_path=diagnostics_path,
+        cluster_id_override=cluster_id_override,
+        sync_tuning=not no_sync_tuning,
+        extra_docker_opts=tuple(executor_args) if executor_args else None,
+        topology=cluster_cfg.topology,
+        recipe_ref=recipe_ref,
+    )
+
+    # Launch via the library API; the API call internally drives
+    # ``launch_inference`` (which calls ``runtime.run``).  Tests that
+    # mock ``runtime.run`` still observe the call because the runtime
+    # layer is unchanged.
     if diag:
         diag.phase_start("launch")
     try:
-        result = launch_inference(
-            recipe=recipe,
-            runtime=runtime,
-            host_list=host_list,
-            overrides=overrides,
-            sctx=sctx,
-            is_solo=is_solo,
-            cache_dir=remote_cache_dir,
-            local_cache_dir=local_cache_dir,
-            transfer_mode=effective_transfer_mode,
-            transfer_interface=effective_transfer_interface,
-            recipe_ref=recipe_ref,
-            registry_mgr=registry_mgr,
-            sync_tuning=not no_sync_tuning,
-            dry_run=dry_run,
-            detached=not foreground,
-            follow=not no_follow,
-            ray_port=ray_port,
-            dashboard_port=dashboard_port,
-            dashboard=dashboard,
-            init_port=init_port,
-            topology=cluster_cfg.topology,
-            cluster_id_override=cluster_id_override,
-            executor_config=cli_executor_opts,
-            extra_docker_opts=list(executor_args) if executor_args else None,
-            rootless=not rootful,
-            auto_user=not rootful,
-        )
-    except DistributionError as e:
+        run_result = api.run(run_options, sctx=sctx)
+    except TransferError as e:
+        if diag:
+            diag.phase_end("launch", error=str(e))
+            diag.emit_error("launch", e)
+            diag.emit_summary()
+            diag.close()
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+    except IncompatibleHardwareError as e:
+        if diag:
+            diag.phase_end("launch", error=str(e))
+            diag.emit_error("launch", e)
+            diag.emit_summary()
+            diag.close()
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+    except api.SparkrunError as e:
         if diag:
             diag.phase_end("launch", error=str(e))
             diag.emit_error("launch", e)
@@ -376,6 +604,10 @@ def run(
             diag.emit_summary()
             diag.close()
         raise
+
+    # ``RunResult.launch_result`` is the raw LaunchResult — used by
+    # diagnostics emission, post-launch lifecycle, and crash logs.
+    result = run_result.launch_result
 
     if diag:
         diag.phase_end("launch")

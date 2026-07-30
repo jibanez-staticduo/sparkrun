@@ -1,0 +1,122 @@
+"""``sparkrun.api.status`` — inspect running workloads via the resolved Executor.
+
+The status surface routes through the *same* executor resolution chain
+the launcher uses (CLI > recipe > cluster > runtime > SparkrunConfig),
+so the inspector matches the launcher: whatever would have run a
+workload is what's asked about it.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sparkrun.core.cluster_manager import ClusterDefinition, ClusterStatusResult
+    from sparkrun.core.cluster_status import ClusterStatus
+    from sparkrun.core.context import SparkrunContext
+
+logger = logging.getLogger(__name__)
+
+
+def status(
+    hosts: list[str],
+    *,
+    executor: str | None = None,
+    cluster: "str | ClusterDefinition | None" = None,
+    ssh_kwargs: dict | None = None,
+    sctx: "SparkrunContext | None" = None,
+) -> "ClusterStatus":
+    """Return a :class:`ClusterStatus` snapshot of *hosts*.
+
+    Args:
+        hosts: Host list to inspect.
+        executor: Optional executor name override (CLI-level).  When
+            ``None``, the executor is resolved via the standard chain
+            with *cluster* providing the cluster row.
+        cluster: Named cluster or pre-loaded definition.  When set,
+            the cluster's ``executor`` / ``executor_config`` and
+            ``hosts_hardware`` flow into the resolution and the
+            query.  When ``None``, default executor is used and
+            hardware falls back to DGX Spark per host.
+        ssh_kwargs: Optional SSH connection kwargs (forwarded to the
+            executor's ``query_status``).
+        sctx: Optional shared :class:`SparkrunContext`.  Provides
+            cluster manager + SAF variables for chained-call sharing.
+
+    Returns:
+        A :class:`ClusterStatus` snapshot.  Unreachable hosts are
+        omitted from :attr:`ClusterStatus.hosts`; callers can detect
+        this with ``status.for_host(h) is None``.
+    """
+    from sparkrun.api._resolve import prepare_transport, resolve_cluster
+    from sparkrun.orchestration.executor import query_status_for_cluster
+
+    # Always end up with a populated ClusterDefinition; hosts are the
+    # explicit list passed in.
+    cluster_def = resolve_cluster(cluster, hosts, sctx=sctx)
+    # Refresh provider-backed connection details before any SSH (no-op for ssh).
+    prepare_transport(cluster_def)
+    v = sctx.variables if sctx is not None else None
+    config = sctx.config if sctx is not None else None
+    host_hardware = cluster_def.hosts_hardware or None
+
+    # The single status source: query every enabled executor on this cluster's
+    # substrate (its ``status_scope``) and merge.  For an SSH cluster that's
+    # docker + local (disjoint state on the same hosts); for a provider cluster
+    # (modal / k8s) it's that provider alone.  See ``query_status_for_cluster``.
+    return query_status_for_cluster(
+        cluster_def,
+        list(hosts),
+        executor=executor,
+        ssh_kwargs=ssh_kwargs,
+        host_hardware=host_hardware,
+        config=config,
+        v=v,
+    )
+
+
+def status_report(
+    hosts: list[str],
+    *,
+    executor: str | None = None,
+    cluster: "str | ClusterDefinition | None" = None,
+    ssh_kwargs: dict | None = None,
+    cache_dir: str | None = None,
+    sctx: "SparkrunContext | None" = None,
+) -> "ClusterStatusResult":
+    """Return a display-oriented :class:`ClusterStatusResult` for *hosts*.
+
+    The higher tier over :func:`status`: it takes the occupancy
+    :class:`~sparkrun.core.cluster_status.ClusterStatus` snapshot ``status``
+    produces and classifies it into cluster groups vs solo entries, enriches
+    each with cached job metadata, and derives idle hosts + relevant pending
+    ops.  Programmatic occupancy consumers (schedulers, discovery) should call
+    :func:`status` for the lean snapshot; the CLI display paths (``cluster
+    status``, ``stop --all``) call this.
+
+    Args mirror :func:`status`, plus:
+        cache_dir: Cache directory for job metadata + pending ops.  Falls back
+            to ``sctx.config.cache_dir`` then the default cache dir.
+
+    Returns:
+        A :class:`ClusterStatusResult`.
+    """
+    from sparkrun.core.cluster_manager import classify_cluster_status
+
+    snapshot = status(hosts, executor=executor, cluster=cluster, ssh_kwargs=ssh_kwargs, sctx=sctx)
+
+    if cache_dir is None and sctx is not None:
+        try:
+            cache_dir = str(sctx.config.cache_dir)
+        except Exception:
+            cache_dir = None
+    if cache_dir is None:
+        from sparkrun.core.config import DEFAULT_CACHE_DIR
+
+        cache_dir = str(DEFAULT_CACHE_DIR)
+
+    return classify_cluster_status(snapshot, cache_dir=cache_dir, host_list=list(hosts))
+
+
+__all__ = ["status", "status_report"]

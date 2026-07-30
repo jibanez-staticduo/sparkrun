@@ -19,12 +19,19 @@ def test_run_with_name_override(monkeypatch):
     monkeypatch.setattr("sparkrun.core.launcher.launch_inference", mock_launch)
 
     monkeypatch.setattr("sparkrun.core.launcher.post_launch_lifecycle", MagicMock())
-    monkeypatch.setattr("sparkrun.cli._run._resolve_hosts_or_exit", lambda *args, **kwargs: (["localhost"], None))
+    monkeypatch.setattr("sparkrun.cli._common._resolve_hosts_or_exit", lambda *args, **kwargs: (["localhost"], None))
     mock_recipe = MagicMock()
     mock_recipe.runtime = "vllm"
     mock_recipe.model = "test-model"
     mock_recipe.validate.return_value = []
     mock_recipe.mode = "solo"
+    # Task 9: ``api.run`` reads ``recipe.max_nodes`` and ``recipe.layout``
+    # while resolving placement; pin them so the orthogonal-constraint
+    # short-circuit doesn't crash on MagicMock attribute access.
+    mock_recipe.max_nodes = None
+    mock_recipe.layout = None
+    mock_recipe.post_exec = None
+    mock_recipe.post_commands = None
     mock_recipe.build_config_chain.return_value = {"port": 8000}
     monkeypatch.setattr("sparkrun.cli._run._load_recipe", lambda *args, **kwargs: (mock_recipe, "path", None))
 
@@ -38,7 +45,7 @@ def test_run_with_name_override(monkeypatch):
     mock_runtime.resolve_container.return_value = "img:latest"
     mock_runtime.validate_recipe.return_value = []
     monkeypatch.setattr("sparkrun.core.bootstrap.get_runtime", lambda *args, **kwargs: mock_runtime)
-    monkeypatch.setattr("sparkrun.cli._run.validate_and_prepare_hosts", lambda *args, **kwargs: (["localhost"], True))
+    monkeypatch.setattr("sparkrun.cli._run.resolve_effective_hosts_for_recipe", lambda *args, **kwargs: (["localhost"], True))
     monkeypatch.setattr("sparkrun.cli._run._display_vram_estimate", lambda *args, **kwargs: None)
 
     result = runner.invoke(main, ["run", "test-recipe", "--container-name", "custom-cluster-id", "--solo"])

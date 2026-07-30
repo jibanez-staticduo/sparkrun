@@ -23,7 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 class ProxyConfig:
-    """Manages proxy configuration stored in ``proxy.yaml``."""
+    """Manages proxy configuration stored in ``proxy.yaml``.
+
+    The canonical access path is :attr:`sparkrun.core.context.SparkrunContext.proxy_config`
+    (or :meth:`sparkrun.core.config.SparkrunConfig.get_proxy_config` for direct
+    callers without a ``sctx``).  Direct construction is reserved for the
+    auto-discover daemon (forked subprocess with no ``sctx``) and for tests
+    that need to point at a temporary config path.
+    """
 
     def __init__(self, config_path: Path | None = None):
         if config_path is None:
@@ -64,6 +71,28 @@ class ProxyConfig:
         return str(self._data.get("proxy", {}).get("host", DEFAULT_PROXY_HOST))
 
     @property
+    def host_configured(self) -> bool:
+        """True when a bind host has been explicitly persisted.
+
+        Distinguishes "user chose a bind host" from "fell back to the legacy
+        ``0.0.0.0`` default".  When False, the proxy keeps the legacy 0.0.0.0
+        bind for backward compatibility but emits a loud security warning.
+        """
+        return "host" in self._data.get("proxy", {})
+
+    @property
+    def gateway(self) -> str | None:
+        """Explicitly pinned gateway implementation, or ``None``.
+
+        The selector half of :mod:`sparkrun.proxy.gateway` — availability is a
+        feature flag in ``config.yaml``, *which* gateway to use is this key.
+        ``None`` (the normal case) means "resolve the default"; pinning a
+        gateway that is disabled is an error rather than a silent fallback.
+        """
+        val = self._data.get("proxy", {}).get("gateway")
+        return str(val) if val else None
+
+    @property
     def master_key(self) -> str | None:
         val = self._data.get("proxy", {}).get("master_key", DEFAULT_MASTER_KEY)
         return str(val) if val is not None else None
@@ -75,6 +104,17 @@ class ProxyConfig:
     @property
     def discover_interval(self) -> int:
         return int(self._data.get("proxy", {}).get("discover_interval", DEFAULT_DISCOVER_INTERVAL))
+
+    @property
+    def enable_ui(self) -> bool:
+        """True when an obsolete ``enable_ui`` is still set in proxy.yaml.
+
+        The LiteLLM ``/ui`` is not supported — it is DB-backed and its
+        ``schema.prisma`` requires PostgreSQL.  This survives only so
+        ``proxy start`` can warn about (and ignore) a stale key rather than
+        silently dropping a setting the user believes is active.
+        """
+        return bool(self._data.get("proxy", {}).get("enable_ui", False))
 
     def set_proxy(self, **kwargs: Any) -> None:
         """Update proxy settings (port, host, master_key, etc.)."""

@@ -1,0 +1,564 @@
+"""Unit tests for the Atlas runtime plugin."""
+
+import pytest
+
+from sparkrun.core.recipe import Recipe
+from sparkrun.runtimes.atlas import AtlasRuntime
+
+
+def _recipe(**overrides) -> Recipe:
+    base = {
+        "name": "test-recipe",
+        "model": "Sehyo/Qwen3.5-35B-A3B-NVFP4",
+        "runtime": "atlas",
+    }
+    base.update(overrides)
+    return Recipe.from_dict(base)
+
+
+# --- Identity / container ---
+
+
+def test_atlas_runtime_name():
+    runtime = AtlasRuntime()
+    assert runtime.runtime_name == "atlas"
+    assert runtime.cluster_strategy() == "native"
+
+
+def test_atlas_resolve_container_default():
+    """No container field → public Docker Hub image."""
+    runtime = AtlasRuntime()
+    assert runtime.resolve_container(_recipe()) == "avarok/atlas-gb10:latest"
+
+
+def test_atlas_resolve_container_from_recipe():
+    """Recipe container field wins."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(container="avarok/atlas-gb10:custom-tag")
+    assert runtime.resolve_container(recipe) == "avarok/atlas-gb10:custom-tag"
+
+
+# --- Solo command generation ---
+
+
+def test_atlas_generate_command_structured():
+    """Generates `atlas serve <model>` with mapped flags."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        defaults={
+            "port": 8888,
+            "max_model_len": 8192,
+            "kv_cache_dtype": "nvfp4",
+            "gpu_memory_utilization": 0.88,
+            "scheduling_policy": "slai",
+        },
+    )
+
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert cmd.startswith("spark serve Sehyo/Qwen3.5-35B-A3B-NVFP4")
+    assert "--port 8888" in cmd
+    assert "--max-seq-len 8192" in cmd
+    assert "--kv-cache-dtype nvfp4" in cmd
+    assert "--gpu-memory-utilization 0.88" in cmd
+    assert "--scheduling-policy slai" in cmd
+
+
+def test_atlas_generate_command_bool_flags():
+    """Boolean flags are present when truthy and absent when false."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        defaults={
+            "speculative": True,
+            "enable_prefix_caching": True,
+            "high_speed_swap": False,
+        },
+    )
+
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--speculative" in cmd
+    assert "--enable-prefix-caching" in cmd
+    assert "--high-speed-swap" not in cmd
+
+
+def test_atlas_high_speed_swap_subflags_render():
+    """High-speed-swap tuning keys map to their `--high-speed-swap-*` flags.
+
+    Regression: the `high_speed_swap` toggle was mapped but its required
+    sub-flags were not, so the feature could be turned on but not
+    configured from a recipe (Atlas requires `--high-speed-swap-dir`).
+    """
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        defaults={
+            "high_speed_swap": True,
+            "high_speed_swap_dir": "/mnt/nvme/atlas-hss",
+            "high_speed_swap_gb": 64,
+            "high_speed_swap_resident_blocks": 512,
+            "high_speed_swap_rank": 32,
+            "high_speed_swap_qd": 8,
+            "high_speed_swap_cache_blocks_per_seq": 64,
+        },
+    )
+
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--high-speed-swap" in cmd
+    assert "--high-speed-swap-dir /mnt/nvme/atlas-hss" in cmd
+    assert "--high-speed-swap-gb 64" in cmd
+    assert "--high-speed-swap-resident-blocks 512" in cmd
+    assert "--high-speed-swap-rank 32" in cmd
+    assert "--high-speed-swap-qd 8" in cmd
+    assert "--high-speed-swap-cache-blocks-per-seq 64" in cmd
+
+
+def test_atlas_disable_tool_grammar_and_fp8_kv_calibration_render():
+    """`disable_tool_grammar` and `fp8_kv_calibration_tokens` are emitted.
+
+    Regression: neither key was in `_ATLAS_FLAG_MAP`, so sparkrun silently
+    dropped both from the serve command even when a recipe set them. The
+    bool is rendered as a lowercase VALUE (not a bare toggle) because it
+    overrides MODEL.toml's `[behavior].disable_tool_grammar`.
+    """
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        defaults={
+            "disable_tool_grammar": True,
+            "fp8_kv_calibration_tokens": 256,
+        },
+    )
+
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--disable-tool-grammar true" in cmd
+    assert "--fp8-kv-calibration-tokens 256" in cmd
+
+
+def test_atlas_disable_tool_grammar_false_renders_lowercase():
+    """A falsy `disable_tool_grammar` still emits an explicit `false` value.
+
+    "absent" and "false" are genuinely different states for Atlas, so unlike
+    a bool toggle the flag must be present with a value even when disabled.
+    """
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"disable_tool_grammar": False})
+
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--disable-tool-grammar false" in cmd
+    # Never Python's `str(False)` == "False", which Atlas' Rust parser rejects.
+    assert "--disable-tool-grammar False" not in cmd
+
+
+def test_atlas_disable_tool_grammar_string_value_lowercased():
+    """A quoted string bool (`"True"`/`"FALSE"`) is folded to lowercase.
+
+    YAML `disable_tool_grammar: "True"` reaches the config as a str, not a
+    bool, so the `isinstance(val, bool)` path would miss it and emit the
+    Atlas-rejected `True` verbatim. Bool-ish strings are normalized too.
+    """
+    runtime = AtlasRuntime()
+    for raw, expected in (("True", "true"), ("FALSE", "false"), ("  true  ", "true")):
+        recipe = _recipe(defaults={"disable_tool_grammar": raw})
+        cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+        assert f"--disable-tool-grammar {expected}" in cmd
+
+
+def test_atlas_generate_command_from_template():
+    """Recipe with explicit command template renders it verbatim."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        command="atlas serve {model} --port {port}",
+        defaults={"port": 9000},
+    )
+
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert cmd == "atlas serve Sehyo/Qwen3.5-35B-A3B-NVFP4 --port 9000"
+
+
+def test_atlas_cli_overrides_defaults():
+    """CLI overrides take priority over recipe defaults."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"port": 8888})
+    cmd = runtime.generate_command(recipe, {"port": 9000}, is_cluster=False)
+    assert "--port 9000" in cmd
+    assert "--port 8888" not in cmd
+
+
+# --- Atlas-specific flags ---
+
+
+def test_atlas_mtp_and_speculative_flags():
+    """MTP speculative-decoding flags pass through correctly."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        defaults={
+            "speculative": True,
+            "mtp_quantization": "nvfp4",
+            "num_drafts": 2,
+        },
+    )
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--speculative" in cmd
+    assert "--mtp-quantization nvfp4" in cmd
+    assert "--num-drafts 2" in cmd
+
+
+def test_atlas_ep_size_first_class():
+    """`ep_size` maps to --ep-size (Atlas-specific but standardized in this runtime)."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"ep_size": 2})
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--ep-size 2" in cmd
+
+
+def test_atlas_skip_served_model_name():
+    """`skip_keys` suppresses --model-name (used by benchmark flow)."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"served_model_name": "my-alias", "port": 8888})
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False, skip_keys={"served_model_name"})
+    assert "--model-name" not in cmd
+
+
+# --- Cluster command generation ---
+
+
+def test_atlas_generate_command_cluster_head():
+    """Cluster mode head command includes --rank 0 / --master-addr / --master-port."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"tensor_parallel": 1, "ep_size": 2, "port": 8888})
+
+    cmd = runtime.generate_command(recipe, {}, is_cluster=True, num_nodes=2, head_ip="10.0.0.1")
+    assert "--rank 0" in cmd
+    assert "--world-size 2" in cmd
+    assert "--master-addr 10.0.0.1" in cmd
+    assert "--master-port 29500" in cmd
+    assert "--ep-size 2" in cmd
+    assert "--port 8888" in cmd
+
+
+def test_atlas_generate_node_command_worker_binds_port_zero():
+    """Workers must bind --port 0 — only rank 0 exposes the OpenAI API."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"ep_size": 2, "port": 8888})
+
+    head = runtime.generate_node_command(recipe, {}, head_ip="10.0.0.1", num_nodes=2, node_rank=0, init_port=29500)
+    worker = runtime.generate_node_command(recipe, {}, head_ip="10.0.0.1", num_nodes=2, node_rank=1, init_port=29500)
+
+    assert "--port 8888" in head
+    assert "--rank 0" in head
+    assert "--master-addr 10.0.0.1" in head
+    assert "--master-port 29500" in head
+
+    assert "--port 0" in worker
+    assert "--port 8888" not in worker
+    assert "--rank 1" in worker
+
+
+# --- validate_recipe ---
+
+
+def test_atlas_validate_recipe_solo():
+    """No parallelism → no validation issues (solo deployment is fine)."""
+    runtime = AtlasRuntime()
+    assert runtime.validate_recipe(_recipe()) == []
+
+
+@pytest.mark.parametrize(
+    "defaults",
+    [
+        {"tensor_parallel": 2, "ep_size": 2},  # overlapping mesh, world_size=2
+        {"ep_size": 2},  # pure EP, world_size=2
+        {"tensor_parallel": 2, "ep_size": 4},  # orthogonal mesh, world_size=8
+        {"tensor_parallel": 1, "ep_size": 1},  # no-op
+    ],
+)
+def test_atlas_validate_recipe_allows_multi_node(defaults):
+    """Multi-rank parallelism is no longer flagged as unsupported.
+
+    Atlas ran single-node-only in an earlier sparkrun integration, and
+    ``validate_recipe`` appended a "currently only supports single node"
+    issue for any ``world_size > 1``.  The restriction is lifted; because
+    ``recipe.validate()`` issues surface as *warnings* rather than errors,
+    leaving the check in place did not block a multi-node launch — it just
+    printed a false claim on every one.
+    """
+    runtime = AtlasRuntime()
+    assert runtime.validate_recipe(_recipe(defaults=defaults)) == []
+
+
+# --- Cluster env / docker opts ---
+
+
+def test_atlas_cluster_env_includes_rdma():
+    """Cluster env mirrors the validated GB10 RoCEv2 NCCL settings.
+
+    NCCL_SOCKET_IFNAME / NCCL_IB_HCA are populated by IB detection (cluster
+    config), not hardcoded here, so this test only asserts the runtime-level
+    constants that ride alongside.
+    """
+    runtime = AtlasRuntime()
+    env = runtime.get_cluster_env(head_ip="10.0.0.1", num_nodes=2)
+    assert env["NCCL_IB_DISABLE"] == "0"
+    assert env["NCCL_IB_ROCE_VERSION_NUM"] == "2"
+    assert env["NCCL_PROTO"] == "Simple"
+    assert "NCCL_IB_HCA" not in env  # comes from comm_env detection
+
+
+def test_atlas_extra_docker_opts_include_required_capabilities():
+    """IPC_LOCK / SYS_NICE / unconfined seccomp required by NCCL + io_uring paths."""
+    runtime = AtlasRuntime()
+    opts = runtime.get_extra_docker_opts()
+    joined = " ".join(opts)
+    assert "IPC_LOCK" in joined
+    assert "SYS_NICE" in joined
+    assert "seccomp=unconfined" in joined
+
+
+def test_atlas_clears_entrypoint_via_executor_config_default():
+    runtime = AtlasRuntime()
+    assert runtime.default_executor_config() == {"entrypoint": ""}
+    assert "--entrypoint" not in " ".join(runtime.get_extra_docker_opts())
+
+
+# --- validate_recipe ---
+
+
+def test_atlas_validate_recipe_valid():
+    runtime = AtlasRuntime()
+    assert runtime.validate_recipe(_recipe()) == []
+
+
+def test_atlas_validate_recipe_no_model():
+    runtime = AtlasRuntime()
+    recipe = Recipe.from_dict({"name": "test", "runtime": "atlas"})
+    issues = runtime.validate_recipe(recipe)
+    assert len(issues) == 1
+    assert "model is required" in issues[0]
+
+
+# --- Bool flag stripping (regression: bool flags were not stripped from
+# rendered command templates because they lived in a separate map) ---
+
+
+def test_atlas_skip_keys_strips_bool_flag_synthesized():
+    """Synthesized commands respect skip_keys for bool flags."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"speculative": True, "enable_prefix_caching": True})
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False, skip_keys={"speculative"})
+    assert "--speculative" not in cmd
+    assert "--enable-prefix-caching" in cmd
+
+
+def test_atlas_skip_keys_strips_bool_flag_from_template():
+    """Recipes with explicit command templates also strip bool flags via skip_keys."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        command="spark serve {model} --port {port} --enable-prefix-caching --speculative",
+        defaults={"port": 9000, "speculative": True, "enable_prefix_caching": True},
+    )
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False, skip_keys={"enable_prefix_caching"})
+    assert "--enable-prefix-caching" not in cmd
+    assert "--speculative" in cmd
+
+
+def test_atlas_skip_keys_strips_bool_flag_from_node_command():
+    """generate_node_command's strip path covers bool flags too."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        command="spark serve {model} --port {port} --high-speed-swap",
+        defaults={"port": 9000, "high_speed_swap": True},
+    )
+    head = runtime.generate_node_command(
+        recipe,
+        {},
+        head_ip="10.0.0.1",
+        num_nodes=2,
+        node_rank=0,
+        init_port=29500,
+        skip_keys={"high_speed_swap"},
+    )
+    assert "--high-speed-swap" not in head
+
+
+def test_atlas_bool_flag_falsy_omitted():
+    """Bool flags with falsy values are not emitted (regression for ext_parse_bool)."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"speculative": "false", "enable_prefix_caching": 0})
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--speculative" not in cmd
+    assert "--enable-prefix-caching" not in cmd
+
+
+# --- prepare(): speculative draft-model pre-sync ---
+
+
+def _draft_model_names(recipe) -> list[str]:
+    return [e.name for e in recipe.distribution_config.models.entries]
+
+
+def test_atlas_prepare_adds_draft_model_to_distribution():
+    """prepare() copies recipe defaults.draft_model into distribution_config."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"draft_model": "Sehyo/Qwen3.5-35B-Draft"})
+
+    assert "Sehyo/Qwen3.5-35B-Draft" not in _draft_model_names(recipe)
+    runtime.prepare(recipe, hosts=["10.0.0.1"])
+    assert "Sehyo/Qwen3.5-35B-Draft" in _draft_model_names(recipe)
+
+
+def test_atlas_prepare_no_draft_model_is_noop():
+    """prepare() does nothing when draft_model is absent."""
+    runtime = AtlasRuntime()
+    recipe = _recipe()
+    before = list(_draft_model_names(recipe))
+    runtime.prepare(recipe, hosts=["10.0.0.1"])
+    assert _draft_model_names(recipe) == before
+
+
+def test_atlas_prepare_dedupes_when_draft_equals_main_model():
+    """add_model dedups by name, so prepare() is safe even if draft matches main."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"draft_model": "Sehyo/Qwen3.5-35B-A3B-NVFP4"})
+    runtime.prepare(recipe, hosts=["10.0.0.1"])
+    names = _draft_model_names(recipe)
+    # Default entry holds the templated "{model}" placeholder; the draft
+    # is added as a separate entry (substitution happens later via resolve()).
+    assert names.count("Sehyo/Qwen3.5-35B-A3B-NVFP4") == 1
+
+
+def test_atlas_prepare_with_cli_override():
+    """prepare() respects CLI overrides via _effective_default."""
+    runtime = AtlasRuntime()
+    recipe = _recipe()
+    recipe._applied_overrides = {"draft_model": "override/draft"}
+    runtime.prepare(recipe, hosts=["10.0.0.1"])
+    assert "override/draft" in _draft_model_names(recipe)
+
+
+def test_atlas_draft_model_flag_still_renders():
+    """Regression: --draft-model still emits with new prepare() wiring."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"draft_model": "Sehyo/Qwen3.5-35B-Draft", "speculative": True})
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--draft-model Sehyo/Qwen3.5-35B-Draft" in cmd
+
+
+# --- Atlas resolve_api_key / --auth-token ---
+
+
+def test_atlas_resolve_api_key_from_defaults_api_key():
+    """defaults.api_key (portable key) is honored."""
+    recipe = _recipe(defaults={"api_key": "sk-portable"})
+    assert AtlasRuntime().resolve_api_key(recipe) == "sk-portable"
+
+
+def test_atlas_resolve_api_key_from_defaults_auth_token_alias():
+    """defaults.auth_token (runtime-native alias) is honored."""
+    recipe = _recipe(defaults={"auth_token": "sk-native"})
+    assert AtlasRuntime().resolve_api_key(recipe) == "sk-native"
+
+
+def test_atlas_resolve_api_key_canonical_beats_alias():
+    """api_key wins over auth_token when both are set."""
+    recipe = _recipe(defaults={"api_key": "sk-portable", "auth_token": "sk-native"})
+    assert AtlasRuntime().resolve_api_key(recipe) == "sk-portable"
+
+
+def test_atlas_resolve_api_key_overrides_take_priority():
+    """CLI override beats defaults."""
+    recipe = _recipe(defaults={"api_key": "sk-default"})
+    assert AtlasRuntime().resolve_api_key(recipe, {"api_key": "sk-cli"}) == "sk-cli"
+
+
+def test_atlas_resolve_api_key_none_when_unset():
+    """Returns None when no auth source is configured."""
+    assert AtlasRuntime().resolve_api_key(_recipe()) is None
+
+
+def test_atlas_resolve_api_key_no_env_fallback():
+    """Atlas has no documented env-var equivalent — env is not consulted."""
+    recipe = _recipe(env={"ATLAS_API_KEY": "sk-env"})
+    assert AtlasRuntime().resolve_api_key(recipe) is None
+
+
+def test_atlas_resolve_api_key_parses_inline_auth_token_flag():
+    """Literal --auth-token in a fixed command string is extracted."""
+    recipe = _recipe(
+        command="spark serve m --auth-token sk-inline --port 8080",
+    )
+    assert AtlasRuntime().resolve_api_key(recipe) == "sk-inline"
+
+
+def test_atlas_resolve_api_key_ignores_placeholder_in_command():
+    """`--auth-token {api_key}` placeholder is ignored — defaults path handles it."""
+    recipe = _recipe(
+        command="spark serve m --auth-token {api_key}",
+        defaults={"api_key": "sk-default"},
+    )
+    assert AtlasRuntime().resolve_api_key(recipe) == "sk-default"
+
+
+def test_atlas_api_key_emitted_as_auth_token_flag():
+    """defaults.api_key auto-emits as --auth-token on structured commands."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"port": 8080, "api_key": "sk-flag"})
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--auth-token sk-flag" in cmd
+
+
+def test_atlas_auth_token_alias_emitted_as_auth_token_flag():
+    """defaults.auth_token alias also auto-emits as --auth-token."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"port": 8080, "auth_token": "sk-alias"})
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert "--auth-token sk-alias" in cmd
+
+
+def test_atlas_no_duplicate_auth_token_when_both_keys_set():
+    """When both api_key and auth_token are set, --auth-token is emitted once."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(defaults={"api_key": "sk-canonical", "auth_token": "sk-alias"})
+    cmd = runtime.generate_command(recipe, {}, is_cluster=False)
+    assert cmd.count("--auth-token") == 1
+    # Canonical api_key wins
+    assert "--auth-token sk-canonical" in cmd
+    assert "sk-alias" not in cmd
+
+
+# --- world_size hook ---
+
+
+def test_atlas_world_size_tp_times_ep():
+    """Atlas world_size = tp * ep (orthogonal MoE mesh)."""
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.parallelism import ParallelismConfig
+
+    runtime = AtlasRuntime()
+    parallelism = ParallelismConfig(tensor_parallel=2, expert_parallel=4)
+    cluster = ClusterDefinition(name="c", hosts=["h1", "h2"])
+    assert runtime.world_size(parallelism, recipe=_recipe(), cluster=cluster) == 8
+
+
+def test_atlas_world_size_single_dim_defaults_to_one():
+    """tp=1, ep=1 → world_size 1 (single-node Atlas)."""
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.parallelism import ParallelismConfig
+
+    runtime = AtlasRuntime()
+    parallelism = ParallelismConfig()  # all defaults = 1
+    cluster = ClusterDefinition(name="c", hosts=["h1"])
+    assert runtime.world_size(parallelism, recipe=_recipe(), cluster=cluster) == 1
+
+
+def test_atlas_world_size_ignores_pp_and_dp():
+    """Atlas mesh math is tp*ep — pp/dp do not contribute."""
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.parallelism import ParallelismConfig
+
+    runtime = AtlasRuntime()
+    parallelism = ParallelismConfig(
+        tensor_parallel=2,
+        expert_parallel=3,
+        pipeline_parallel=5,
+        data_parallel=7,
+    )
+    cluster = ClusterDefinition(name="c", hosts=["h1"])
+    # tp * ep == 6, regardless of pp and dp.
+    assert runtime.world_size(parallelism, recipe=_recipe(), cluster=cluster) == 6

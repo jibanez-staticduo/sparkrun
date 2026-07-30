@@ -217,6 +217,48 @@ def test_setup_update_beta_uses_git(monkeypatch, tmp_path):
     assert _stored_channel(tmp_path) == "beta"
 
 
+def test_build_update_event_includes_channel():
+    from sparkrun.telemetry.events import build_update_event
+
+    event = build_update_event(
+        command="sparkrun update",
+        old_version="0.3.0",
+        new_version="0.3.0",
+        upgraded=True,
+        registries=[],
+        channel="alpha",
+        requested_channel="alpha",
+    )
+    assert event["channel"] == "alpha"
+    assert event["requested_channel"] == "alpha"
+
+
+def test_build_update_event_omits_channel_when_none():
+    from sparkrun.telemetry.events import build_update_event
+
+    event = build_update_event(
+        command="sparkrun update",
+        old_version="0.3.0",
+        new_version="0.3.0",
+        upgraded=False,
+        registries=[],
+    )
+    assert "channel" not in event
+    assert "requested_channel" not in event
+
+
+def test_top_update_survives_telemetry_failure(monkeypatch, tmp_path):
+    """A telemetry emit failure (e.g. a cross-version downgrade) must not crash update."""
+    import sparkrun.telemetry.emit as emit_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("telemetry shape mismatch across versions")
+
+    monkeypatch.setattr(emit_mod, "emit_update_event", boom)
+    result, _ = _run(monkeypatch, tmp_path, ["update", "--beta"])
+    assert result.exit_code == 0, result.output
+
+
 def test_setup_install_alpha_uses_git_and_persists(monkeypatch, tmp_path):
     _isolate_config(monkeypatch, tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path))

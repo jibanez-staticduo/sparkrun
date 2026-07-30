@@ -46,7 +46,7 @@ logging.addLevelName(VERBOSE, "VERBOSE")
 
 PHASE_LABELS: dict[int, str] = {
     1: "Preparing",
-    2: "Building image",
+    2: "Building",
     3: "Distributing resources",
     4: "Syncing tuning configs",
     5: "Launching runtime",

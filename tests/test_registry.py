@@ -17,6 +17,9 @@ from sparkrun.core.registry import (
     RegistryManager,
     _get_git_org,
     validate_registry_name,
+    is_dir_link,
+    link_directory,
+    remove_dir_link,
 )
 
 
@@ -541,6 +544,170 @@ class TestRecipeDiscovery:
         assert path.name == "qwen3-1.7b-vllm.yaml"
         assert "qwen3" in str(path)  # Verify it's in the subdirectory
 
+    def test_find_recipe_flat_match_does_not_hide_nested_in_other_registries(self, reg_dirs):
+        """Test that a flat match in one registry doesn't prevent rglob in another.
+
+        Bug: ``find_recipe_in_registries`` short-circuits on the first flat match
+        across *any* registry, skipping the ``rglob`` phase for all other registries.
+        A recipe that lives only in a subdirectory of registry B becomes invisible
+        when registry A has a flat recipe with the same stem.
+        """
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        entries = [
+            RegistryEntry(name="reg-a", url="https://example.com/a", subpath="recipes"),
+            RegistryEntry(name="reg-b", url="https://example.com/b", subpath="recipes"),
+        ]
+        mgr._save_registries(entries)
+
+        # Registry A: flat recipe at recipes/<name>.yaml
+        recipe_dir_a = cache / "reg-a" / "recipes"
+        recipe_dir_a.mkdir(parents=True)
+        (cache / "reg-a" / ".git").mkdir(exist_ok=True)
+        with open(recipe_dir_a / "my-model-vllm.yaml", "w") as f:
+            yaml.dump({"name": "Flat Recipe", "model": "test"}, f)
+
+        # Registry B: same recipe name, but ONLY in a subdirectory (no flat match)
+        recipe_dir_b = cache / "reg-b" / "recipes"
+        nested_dir_b = recipe_dir_b / "my-model"
+        nested_dir_b.mkdir(parents=True)
+        (cache / "reg-b" / ".git").mkdir(exist_ok=True)
+        with open(nested_dir_b / "my-model-vllm.yaml", "w") as f:
+            yaml.dump({"name": "Nested Recipe", "model": "test"}, f)
+
+        matches = mgr.find_recipe_in_registries("my-model-vllm")
+
+        # BOTH registries should appear in the results
+        assert len(matches) == 2, f"Expected 2 matches (flat in reg-a, nested in reg-b), got {len(matches)}: {matches}"
+        registry_names = {m[0] for m in matches}
+        assert registry_names == {"reg-a", "reg-b"}
+
+        # Flat still wins *within* a registry: reg-a resolves to the flat file,
+        # not a rglob hit. This is the invariant the per-registry fallback must
+        # preserve — assert on paths, not just registry names.
+        by_registry = dict(matches)
+        assert by_registry["reg-a"] == recipe_dir_a / "my-model-vllm.yaml"
+        assert by_registry["reg-b"] == nested_dir_b / "my-model-vllm.yaml"
+
+    def test_find_recipe_prefers_flat_over_nested_within_one_registry(self, reg_dirs):
+        """A registry with both a flat and a nested same-stem recipe yields only the flat one."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        nested_dir = recipe_dir / "variants"
+        nested_dir.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+        for target in (recipe_dir / "dup.yaml", nested_dir / "dup.yaml"):
+            with open(target, "w") as f:
+                yaml.dump({"name": "Dup", "model": "test"}, f)
+
+        matches = mgr.find_recipe_in_registries("dup")
+        assert matches == [("reg", recipe_dir / "dup.yaml")]
+
+    def test_same_stem_yaml_and_yml_is_one_match_not_an_ambiguity(self, reg_dirs):
+        """`foo.yaml` + `foo.yml` in one dir is one recipe spelled twice — .yaml wins.
+
+        Reporting both would raise an "ambiguous" error whose suggested fix is
+        impossible: no scoped name distinguishes two files with the same stem.
+        """
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        nested = recipe_dir / "sub"
+        nested.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+
+        (recipe_dir / "twin.yaml").write_text("model: a\n")
+        (recipe_dir / "twin.yml").write_text("model: b\n")
+        assert mgr.find_recipe_in_registries("twin") == [("reg", recipe_dir / "twin.yaml")]
+
+        # Same rule in the recursive phase, applied per directory.
+        (nested / "nested-twin.yaml").write_text("model: a\n")
+        (nested / "nested-twin.yml").write_text("model: b\n")
+        assert mgr.find_recipe_in_registries("nested-twin") == [("reg", nested / "nested-twin.yaml")]
+
+    def test_recursive_phase_keeps_same_stem_in_different_subdirs(self, reg_dirs):
+        """Per-directory extension collapsing must not collapse distinct subdirs."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        (cache / "reg" / ".git").mkdir(parents=True, exist_ok=True)
+        for sub in ("a", "b"):
+            (recipe_dir / sub).mkdir(parents=True)
+            (recipe_dir / sub / "twin.yaml").write_text("model: %s\n" % sub)
+        # A .yml alongside one of them is still collapsed into its own dir's .yaml
+        (recipe_dir / "a" / "twin.yml").write_text("model: shadow\n")
+
+        assert mgr.find_recipe_in_registries("twin") == [
+            ("reg", recipe_dir / "a" / "twin.yaml"),
+            ("reg", recipe_dir / "b" / "twin.yaml"),
+        ]
+
+    def test_yml_only_recipe_is_findable_and_listed(self, reg_dirs):
+        """A `.yml`-only recipe must be both runnable and visible in the catalog."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        nested = recipe_dir / "sub"
+        nested.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+        with open(nested / "yml-only.yml", "w") as f:
+            yaml.dump({"name": "Yml Only", "model": "test", "runtime": "vllm"}, f)
+
+        # Lookup already accepted .yml...
+        assert mgr.find_recipe_in_registries("yml-only") == [("reg", nested / "yml-only.yml")]
+        # ...but the catalog globbed *.yaml only, so it was invisible.
+        listed = {r["file"] for r in mgr.search_recipes("yml-only")}
+        assert listed == {"yml-only"}
+
+
+class TestQualifiedRecipeName:
+    """Test RegistryManager.qualified_recipe_name path-qualified rendering."""
+
+    def test_nested_path_is_qualified_with_subdirs(self, reg_dirs):
+        """A nested match renders as @registry/<subdir>/<stem>, which is re-typeable."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        nested = recipe_dir / "qwen3.6" / "vllm"
+        nested.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+        path = nested / "qwen3.6-27b.yaml"
+        path.write_text("model: test\n")
+
+        assert mgr.qualified_recipe_name("reg", path) == "@reg/qwen3.6/vllm/qwen3.6-27b"
+
+    def test_flat_path_renders_as_bare_name(self, reg_dirs):
+        """A flat match has no subdirs, so the label is the familiar @registry/name."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+        mgr._save_registries([RegistryEntry(name="reg", url="https://example.com/r", subpath="recipes")])
+        recipe_dir = cache / "reg" / "recipes"
+        recipe_dir.mkdir(parents=True)
+        (cache / "reg" / ".git").mkdir(exist_ok=True)
+        path = recipe_dir / "flat.yaml"
+        path.write_text("model: test\n")
+
+        assert mgr.qualified_recipe_name("reg", path) == "@reg/flat"
+
+    def test_unknown_registry_falls_back_to_stem(self, reg_dirs):
+        """An unknown/uncached registry degrades to the bare stem rather than raising."""
+        config, cache = reg_dirs
+        mgr = RegistryManager(config, cache)
+        mgr._save_registries([])
+
+        assert mgr.qualified_recipe_name("nope", Path("/tmp/somewhere/thing.yaml")) == "@nope/thing"
+
 
 class TestRegistryEntryNewFields:
     """Test new RegistryEntry fields."""
@@ -865,7 +1032,7 @@ class TestSharedClone:
         assert "other" not in paths
 
     def test_link_registry_to_shared(self, mgr, sample_entry):
-        """Test that _link_registry_to_shared creates a symlink."""
+        """Test that _link_registry_to_shared links to the shared clone."""
         # Create the shared dir
         shared = mgr._clone_dir_for_url(sample_entry.url)
         shared.mkdir(parents=True)
@@ -874,8 +1041,53 @@ class TestSharedClone:
         mgr._link_registry_to_shared(sample_entry)
 
         per_reg = mgr._cache_dir(sample_entry.name)
-        assert per_reg.is_symlink()
+        assert is_dir_link(per_reg)
         assert per_reg.resolve() == shared.resolve()
+
+    def test_link_registry_to_shared_is_idempotent(self, mgr, sample_entry):
+        """Re-linking an already-linked registry must not fail or duplicate."""
+        shared = mgr._clone_dir_for_url(sample_entry.url)
+        (shared / sample_entry.subpath).mkdir(parents=True)
+
+        mgr._link_registry_to_shared(sample_entry)
+        mgr._link_registry_to_shared(sample_entry)
+
+        per_reg = mgr._cache_dir(sample_entry.name)
+        assert is_dir_link(per_reg)
+        assert per_reg.resolve() == shared.resolve()
+
+
+class TestDirectoryLinks:
+    """Portable directory links (symlink, or a junction on Windows)."""
+
+    def test_link_directory_and_detection(self, tmp_path):
+        target = tmp_path / "shared"
+        (target / "recipes").mkdir(parents=True)
+        link = tmp_path / "per-registry"
+
+        link_directory(link, target)
+
+        assert is_dir_link(link)
+        assert (link / "recipes").is_dir()
+        assert not is_dir_link(target)
+
+    def test_remove_dir_link_keeps_the_target(self, tmp_path):
+        """Removing the link must never delete through to the shared clone.
+
+        A junction reports ``is_symlink() == False``, so code that only tests for
+        symlinks would treat one as a plain directory and recursively delete the
+        shared clone's contents.
+        """
+        target = tmp_path / "shared"
+        (target / "recipes").mkdir(parents=True)
+        (target / "recipes" / "r.yaml").write_text("model: m\n")
+        link = tmp_path / "per-registry"
+        link_directory(link, target)
+
+        remove_dir_link(link)
+
+        assert not link.exists()
+        assert (target / "recipes" / "r.yaml").read_text() == "model: m\n"
 
 
 class TestManifestParsing:
@@ -1494,16 +1706,16 @@ class TestInitDefaultsFromManifests:
 
         from sparkrun.core import registry as reg_module
 
-        original = reg_module.DEFAULT_REGISTRIES_GIT
+        original = reg_module.BOOTSTRAP_REGISTRY_URLS
         try:
-            reg_module.DEFAULT_REGISTRIES_GIT = [
+            reg_module.BOOTSTRAP_REGISTRY_URLS = [
                 "https://example.com/bad-repo",
                 "https://example.com/good-repo",
             ]
             with mock.patch.object(mgr, "_discover_manifest_entries", side_effect=fake_discover):
                 result = mgr._init_defaults_from_manifests()
         finally:
-            reg_module.DEFAULT_REGISTRIES_GIT = original
+            reg_module.BOOTSTRAP_REGISTRY_URLS = original
 
         assert len(result) == 1
         assert result[0].name == "good-reg"
@@ -1692,3 +1904,117 @@ class TestEnsureRegistryOnHost:
         with mock.patch("sparkrun.orchestration.primitives.run_script_on_host", return_value=fake_result):
             path = mgr.ensure_registry_on_host("alt", "head-host", ssh_kwargs={})
         assert path.startswith("~/.cache/sparkrun/registries/_url_")
+
+
+class TestValidateGitUrl:
+    """Tests for validate_git_url URL allowlist enforcement (security B5)."""
+
+    def test_valid_https_url(self):
+        """https:// URLs must pass through unchanged (stripped)."""
+        from sparkrun.utils.shell import validate_git_url
+
+        result = validate_git_url("https://github.com/spark-arena/recipes.git")
+        assert result == "https://github.com/spark-arena/recipes.git"
+
+    def test_valid_git_at_url(self):
+        """git@ SSH URLs must be accepted."""
+        from sparkrun.utils.shell import validate_git_url
+
+        result = validate_git_url("git@github.com:spark-arena/recipes.git")
+        assert result == "git@github.com:spark-arena/recipes.git"
+
+    def test_valid_ssh_url(self):
+        """ssh:// URLs must be accepted."""
+        from sparkrun.utils.shell import validate_git_url
+
+        result = validate_git_url("ssh://git@github.com/spark-arena/recipes.git")
+        assert result == "ssh://git@github.com/spark-arena/recipes.git"
+
+    def test_valid_file_url(self):
+        """file:// URLs must be accepted (local dev / test use-case)."""
+        from sparkrun.utils.shell import validate_git_url
+
+        result = validate_git_url("file:///tmp/local-repo")
+        assert result == "file:///tmp/local-repo"
+
+    def test_dash_leading_url_raises(self):
+        """A URL starting with '-' must be rejected (option injection risk)."""
+        from sparkrun.utils.shell import validate_git_url
+
+        with pytest.raises(ValueError, match="must not start with"):
+            validate_git_url("-c protocol.ext.allow=always /tmp/evil")
+
+    def test_http_scheme_raises(self):
+        """http:// is not in the allowlist and must be rejected."""
+        from sparkrun.utils.shell import validate_git_url
+
+        with pytest.raises(ValueError, match="disallowed scheme"):
+            validate_git_url("http://insecure.example.com/repo.git")
+
+    def test_empty_url_raises(self):
+        """Empty string must be rejected."""
+        from sparkrun.utils.shell import validate_git_url
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            validate_git_url("")
+
+    def test_whitespace_only_url_raises(self):
+        """Whitespace-only string must be rejected."""
+        from sparkrun.utils.shell import validate_git_url
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            validate_git_url("   ")
+
+    def test_leading_whitespace_stripped(self):
+        """Leading/trailing whitespace is stripped before validation."""
+        from sparkrun.utils.shell import validate_git_url
+
+        result = validate_git_url("  https://github.com/example/repo.git  ")
+        assert result == "https://github.com/example/repo.git"
+
+    def test_double_dash_injection_via_upload_pack_raises(self):
+        """--upload-pack=... style injection must be rejected (starts with dash)."""
+        from sparkrun.utils.shell import validate_git_url
+
+        with pytest.raises(ValueError, match="must not start with"):
+            validate_git_url("--upload-pack=evil /tmp/target")
+
+    def test_clone_subprocess_args_contain_double_dash(self, mgr, sample_entry):
+        """Confirm that git clone subprocess calls include '--' before the URL."""
+        mgr._save_registries([sample_entry])
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stderr="", stdout="")
+            mgr.update(sample_entry.name)
+        # Only match calls whose args list contains both "git" and "clone" as elements
+        clone_calls = [c for c in mock_run.call_args_list if c.args and "clone" in c.args[0] and "git" in c.args[0]]
+        assert clone_calls, "Expected at least one git clone subprocess call"
+        for call in clone_calls:
+            args = call.args[0]  # first positional arg is the command list
+            assert "--" in args, "Expected '--' in git clone args: %r" % args
+            url_index = args.index("--") + 1
+            assert args[url_index] == sample_entry.url
+
+    def test_add_registry_rejects_http_url(self, mgr):
+        """add_registry must raise RegistryError for http:// URLs."""
+        bad_entry = RegistryEntry(
+            name="bad-registry",
+            url="http://insecure.example.com/repo.git",
+            subpath="recipes",
+        )
+        with pytest.raises(RegistryError, match="Invalid registry URL"):
+            mgr.add_registry(bad_entry)
+
+    def test_add_registry_rejects_dash_url(self, mgr):
+        """add_registry must raise RegistryError for dash-leading URLs."""
+        bad_entry = RegistryEntry(
+            name="bad-registry",
+            url="-c protocol.ext.allow=always /tmp/evil",
+            subpath="recipes",
+        )
+        with pytest.raises(RegistryError, match="Invalid registry URL"):
+            mgr.add_registry(bad_entry)
+
+    def test_add_registry_from_url_rejects_http(self, mgr):
+        """add_registry_from_url must raise RegistryError for http:// URLs."""
+        with pytest.raises(RegistryError, match="Invalid registry URL"):
+            mgr.add_registry_from_url("http://insecure.example.com/repo.git")

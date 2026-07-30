@@ -11,10 +11,10 @@ from ._common import (
     RECIPE_NAME,
     _get_context,
     _load_recipe,
-    _resolve_hosts_or_exit,
     dry_run_option,
     host_options,
     resolve_cluster_config,
+    with_host_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ def tune(ctx):
 @click.option("--parallel", "-j", type=int, default=1, help="Run N tuning jobs concurrently (default: 1 = sequential)")
 @dry_run_option
 @click.pass_context
+@with_host_context
 def tune_sglang(
     ctx,
     recipe_name,
@@ -50,6 +51,8 @@ def tune_sglang(
     parallel,
     dry_run,
     config_path=None,
+    host_list=None,
+    cluster_mgr=None,
 ):
     """Tune SGLang fused MoE Triton kernels for DGX Spark.
 
@@ -87,8 +90,7 @@ def tune_sglang(
     runtime = get_runtime(recipe.runtime, v)
     container_image = image or runtime.resolve_container(recipe)
 
-    # Resolve hosts — only use the first host
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
+    # host_list injected by @with_host_context; only use the first host
     target_host = host_list[0]
     if len(host_list) > 1:
         logger.info("Tuning runs on a single host; using first host: %s", target_host)
@@ -99,7 +101,7 @@ def tune_sglang(
     from sparkrun.core.launcher import resolve_effective_cache_dir
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-    cluster_cfg = resolve_cluster_config(cluster_name, hosts, hosts_file, _cluster_mgr)
+    cluster_cfg = resolve_cluster_config(cluster_name, hosts, hosts_file, cluster_mgr)
     remote_cache_dir = resolve_effective_cache_dir(
         cluster_cfg.cache_dir,
         host_list,
@@ -135,10 +137,22 @@ VLLM_RUNTIMES = {"vllm-ray", "vllm-distributed", "eugr-vllm"}
 @click.option("--tp", "tp_sizes", type=int, multiple=True, help="TP size(s) to tune (repeatable; default: 1,2,4,8)")
 @click.option("--image", default=None, help="Override container image")
 @click.option("--output-dir", default=None, help="Override tuning config output directory")
-@click.option("--skip-clone", is_flag=True, help="Skip cloning vLLM repo (scripts already in image)")
+@click.option(
+    "--mode",
+    type=click.Choice(["moe", "fp8", "all"]),
+    default="all",
+    show_default=True,
+    help="Kernels to tune: moe (fused MoE), fp8 (dense GEMM), or all",
+)
+@click.option(
+    "--vllm-tune-ref",
+    default=None,
+    help="Override the vllm-tune git ref (tag/branch/SHA) pinned in config",
+)
 @click.option("--parallel", "-j", type=int, default=1, help="Run N tuning jobs concurrently (default: 1 = sequential)")
 @dry_run_option
 @click.pass_context
+@with_host_context
 def tune_vllm(
     ctx,
     recipe_name,
@@ -148,23 +162,33 @@ def tune_vllm(
     tp_sizes,
     image,
     output_dir,
-    skip_clone,
+    mode,
+    vllm_tune_ref,
     parallel,
     dry_run,
     config_path=None,
+    host_list=None,
+    cluster_mgr=None,
 ):
-    """Tune vLLM fused MoE Triton kernels for DGX Spark.
+    """Tune vLLM Triton kernels for DGX Spark via the vllm-tune backend.
 
-    Runs Triton kernel autotuning inside the recipe's container on a single
-    host.  Generates optimal tile configs (BLOCK_M/N/K, warps, stages) for
-    each TP size and saves them for automatic use in future inference runs.
+    Shells out to https://github.com/SeraphimSerapis/vllm-tune on the target
+    host.  Tunes both fused MoE kernels and FP8 dense GEMM kernels by default
+    (override with ``--mode``).  Produced configs land in the same flat cache
+    directory that vLLM runtimes auto-mount, so subsequent ``sparkrun run``
+    invocations pick them up without further action.
 
-    RECIPE_NAME provides the model name and container image.
+    RECIPE_NAME provides the model name and container image.  vllm-tune
+    launches its own standalone tuning container per TP size, so a running
+    inference workload is not required.
+
+    Prerequisites on the remote host: ``jq``, ``docker``, ``git``.
 
     \b
     Examples:
       sparkrun tune vllm qwen3-moe-vllm -H 192.168.11.13
-      sparkrun tune vllm qwen3-moe-vllm --cluster mylab --tp 4
+      sparkrun tune vllm qwen3-moe-vllm --cluster mylab --tp 4 --mode moe
+      sparkrun tune vllm qwen3-4b-fp8 -H myhost --mode fp8 --tp 1
       sparkrun tune vllm qwen3-moe-vllm -H myhost --tp 1 --tp 2 --tp 4
       sparkrun tune vllm qwen3-moe-vllm -H myhost --parallel 2
     """
@@ -189,8 +213,7 @@ def tune_vllm(
     runtime = get_runtime(recipe.runtime, v)
     container_image = image or runtime.resolve_container(recipe)
 
-    # Resolve hosts — only use the first host
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
+    # host_list injected by @with_host_context; only use the first host
     target_host = host_list[0]
     if len(host_list) > 1:
         logger.info("Tuning runs on a single host; using first host: %s", target_host)
@@ -201,7 +224,7 @@ def tune_vllm(
     from sparkrun.core.launcher import resolve_effective_cache_dir
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-    cluster_cfg = resolve_cluster_config(cluster_name, hosts, hosts_file, _cluster_mgr)
+    cluster_cfg = resolve_cluster_config(cluster_name, hosts, hosts_file, cluster_mgr)
     remote_cache_dir = resolve_effective_cache_dir(
         cluster_cfg.cache_dir,
         host_list,
@@ -220,7 +243,8 @@ def tune_vllm(
         config=config,
         cache_dir=remote_cache_dir,
         output_dir=output_dir,
-        skip_clone=skip_clone,
+        mode=mode,
+        vllm_tune_ref=vllm_tune_ref,
         dry_run=dry_run,
     )
 

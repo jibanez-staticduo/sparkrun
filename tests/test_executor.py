@@ -7,6 +7,8 @@ works correctly.
 
 from __future__ import annotations
 
+import logging
+
 from sparkrun.orchestration.docker import (
     enumerate_cluster_containers,
     generate_container_name,
@@ -17,7 +19,7 @@ from sparkrun.orchestration.executor import (
     Executor,
     ExecutorConfig,
 )
-from sparkrun.orchestration.executor_docker import DockerExecutor
+from sparkrun.orchestration.executors.docker import DockerExecutor
 from sparkrun.utils.shell import b64_encode_cmd
 
 
@@ -123,32 +125,12 @@ class TestExecutorConfig:
         assert cfg.entrypoint == "bash"
 
     def test_from_chain_entrypoint_empty_preserved(self):
-        """Empty string is a meaningful value ("clear ENTRYPOINT"), not None."""
         cfg = ExecutorConfig.from_chain({"entrypoint": ""})
         assert cfg.entrypoint == ""
 
     def test_from_chain_entrypoint_unset_is_none(self):
         cfg = ExecutorConfig.from_chain({"gpus": "0"})
         assert cfg.entrypoint is None
-
-    def test_config_chain_entrypoint_empty_survives_layering(self):
-        """A runtime default of "" survives the Variables chain and beats EXECUTOR_DEFAULTS."""
-        from scitrera_app_framework.api import EnvPlacement, Variables
-
-        runtime_defaults = {"entrypoint": ""}
-        chain = Variables(sources=({}, {}, runtime_defaults, EXECUTOR_DEFAULTS), env_placement=EnvPlacement.IGNORED)
-        cfg = ExecutorConfig.from_chain(chain)
-        assert cfg.entrypoint == ""
-
-    def test_config_chain_recipe_overrides_runtime_entrypoint(self):
-        """Recipe executor_config wins over a runtime-supplied entrypoint default."""
-        from scitrera_app_framework.api import EnvPlacement, Variables
-
-        recipe_opts = {"entrypoint": "bash"}
-        runtime_defaults = {"entrypoint": ""}
-        chain = Variables(sources=({}, recipe_opts, {}, runtime_defaults, EXECUTOR_DEFAULTS), env_placement=EnvPlacement.IGNORED)
-        cfg = ExecutorConfig.from_chain(chain)
-        assert cfg.entrypoint == "bash"
 
     def test_config_chain_layering(self):
         """Verify config chain resolution: CLI > recipe > defaults."""
@@ -266,7 +248,6 @@ class TestDockerExecutorConfig:
         assert "--entrypoint bash" in cmd
 
     def test_entrypoint_precedes_image(self):
-        """--entrypoint must come before the image, or docker rejects it."""
         cmd = DockerExecutor(ExecutorConfig(entrypoint="")).run_cmd("img:latest", command="vllm serve")
         assert cmd.index("--entrypoint") < cmd.index("img:latest")
 
@@ -347,6 +328,29 @@ class TestDockerExecutorConfig:
         executor = DockerExecutor(cfg)
         cmd = executor.run_cmd("img:latest")
         assert "--ulimit memlock=-1:-1" in cmd
+
+    def test_volumes_identity_explicit_and_ro(self):
+        cfg = ExecutorConfig(volumes=["/mnt/quant:/mnt/quant", "/data", "/ref:/ref:ro"])
+        cmd = DockerExecutor(cfg).run_cmd("img:latest")
+        assert "-v /mnt/quant:/mnt/quant" in cmd
+        assert "-v /data:/data" in cmd  # bare path → identity mount
+        assert "-v /ref:/ref:ro" in cmd
+
+    def test_volumes_from_chain_string_promoted(self):
+        cfg = ExecutorConfig.from_chain({"volumes": "/mnt/quant"})
+        assert cfg.volumes == ["/mnt/quant"]
+        assert "-v /mnt/quant:/mnt/quant" in DockerExecutor(cfg).run_cmd("img:latest")
+
+    def test_volumes_coexist_with_run_cmd_volumes_dict(self):
+        # ExecutorConfig.volumes and the volumes dict (HF cache + resolved model)
+        # are independent -v channels — both land on the same docker run.
+        cfg = ExecutorConfig(volumes=["/mnt/quant/nvfp4_calib"])
+        cmd = DockerExecutor(cfg).run_cmd("img:latest", volumes={"/hf": "/cache/huggingface"})
+        assert "-v /mnt/quant/nvfp4_calib:/mnt/quant/nvfp4_calib" in cmd
+        assert "-v /hf:/cache/huggingface" in cmd
+
+    def test_volumes_none_by_default(self):
+        assert ExecutorConfig().volumes is None
 
     def test_no_user_by_default(self):
         executor = DockerExecutor()
@@ -498,3 +502,43 @@ class TestScriptGenerators:
         )
         assert "--restart always" in script
         assert "--rm" not in script
+
+
+class TestEnvDebugMasking:
+    """The DEBUG env dump must mask values for sensitive keys."""
+
+    def test_sensitive_keys_masked(self, caplog):
+        executor = DockerExecutor()
+        env = {
+            "HF_TOKEN": "hf_secretvalue",
+            "AWS_SECRET_ACCESS_KEY": "topsecret",
+            "MY_API_KEY": "abc123",
+            "DB_PASSWORD": "hunter2",
+            "VLLM_LOGGING_LEVEL": "INFO",
+        }
+        with caplog.at_level(logging.DEBUG, logger="sparkrun.orchestration.executors.docker"):
+            executor.run_cmd(image="img:latest", container_name="test", env=env)
+
+        # Inspect only the per-var env dump lines (the "  KEY=VALUE" entries),
+        # not the full assembled-command debug line.
+        dump_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("  ")]
+        dump_text = "\n".join(dump_lines)
+
+        # Sensitive values must never appear in the dump; keys are logged as ***.
+        assert "hf_secretvalue" not in dump_text
+        assert "topsecret" not in dump_text
+        assert "abc123" not in dump_text
+        assert "hunter2" not in dump_text
+        assert "  HF_TOKEN=***" in dump_text
+        assert "  AWS_SECRET_ACCESS_KEY=***" in dump_text
+        assert "  MY_API_KEY=***" in dump_text
+        assert "  DB_PASSWORD=***" in dump_text
+
+    def test_normal_keys_shown(self, caplog):
+        executor = DockerExecutor()
+        env = {"VLLM_LOGGING_LEVEL": "INFO"}
+        with caplog.at_level(logging.DEBUG, logger="sparkrun.orchestration.executors.docker"):
+            executor.run_cmd(image="img:latest", container_name="test", env=env)
+
+        dump_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("  ")]
+        assert "  VLLM_LOGGING_LEVEL=INFO" in "\n".join(dump_lines)

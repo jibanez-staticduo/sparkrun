@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field, asdict as dataclass_asdict
 from json import dumps as json_dumps
-from os import path as osp
 from pathlib import Path
 from typing import Any, TYPE_CHECKING, Optional
 
@@ -15,6 +15,8 @@ import yaml
 from vpd.next.util import read_yaml
 from vpd.legacy.arguments import arg_substitute
 from scitrera_app_framework.api import Variables, EnvPlacement
+
+from sparkrun.core.layout import RecipeLayout
 
 if TYPE_CHECKING:
     from sparkrun.core.registry import RegistryManager
@@ -62,8 +64,12 @@ _KNOWN_KEYS = {
     "stop_after_post",
     "builder",
     "builder_config",
+    "executor",
     "executor_config",
+    "scheduler",
     "distribution_config",
+    "layout",
+    "cluster_config",
 }
 
 
@@ -215,54 +221,64 @@ def _default_distribution_config(model: str = "{model}", container: str = "{cont
 
 
 def _parse_distribution_config(data: dict[str, Any]) -> DistributionConfig:
-    """Parse ``distribution_config`` from raw recipe YAML data."""
+    """Parse ``distribution_config`` from raw recipe YAML data.
+
+    An *omitted* ``models`` or ``containers`` subkey falls back to the
+    auto-default single entry (``{model}`` / ``{container}``) so a recipe can,
+    e.g., add a second model to distribute without having to re-list the
+    container it never customized.  A subkey that IS present is honored
+    literally — an explicit ``entries: []`` or ``enabled: false`` still means
+    "distribute nothing", not "use the default".
+    """
     raw = data.get("distribution_config")
     # fallback if not provided (expected to be the default case)
     if not raw or not isinstance(raw, dict):
         return _default_distribution_config()
 
-    models_raw = raw.get("models", {})
-    if not isinstance(models_raw, dict):
-        models_raw = {}
-    models_enabled = models_raw.get("enabled", True)
-    models_entries_raw = models_raw.get("entries", [])
-    if not isinstance(models_entries_raw, list):
-        models_entries_raw = []
-    model_entries = []
-    for e in models_entries_raw:
-        if isinstance(e, dict):
-            model_entries.append(
-                DistributionModelEntry(
-                    name=e.get("name", ""),
-                    target=e.get("target", [-1]),
-                    revision=e.get("revision"),
-                )
-            )
-        elif isinstance(e, str):
-            model_entries.append(DistributionModelEntry(name=e))
+    default = _default_distribution_config()
 
-    containers_raw = raw.get("containers", {})
-    if not isinstance(containers_raw, dict):
-        containers_raw = {}
-    containers_enabled = containers_raw.get("enabled", True)
-    containers_entries_raw = containers_raw.get("entries", [])
-    if not isinstance(containers_entries_raw, list):
-        containers_entries_raw = []
-    container_entries = []
-    for e in containers_entries_raw:
-        if isinstance(e, dict):
-            container_entries.append(
-                DistributionContainerEntry(
-                    name=e.get("name", ""),
-                    target=e.get("target", [-1]),
+    def _parse_models(models_raw: Any) -> DistributionResourceConfig:
+        if not isinstance(models_raw, dict):
+            models_raw = {}
+        entries_raw = models_raw.get("entries", [])
+        if not isinstance(entries_raw, list):
+            entries_raw = []
+        entries: list[DistributionModelEntry | DistributionContainerEntry] = []
+        for e in entries_raw:
+            if isinstance(e, dict):
+                entries.append(
+                    DistributionModelEntry(
+                        name=e.get("name", ""),
+                        target=e.get("target", [-1]),
+                        revision=e.get("revision"),
+                    )
                 )
-            )
-        elif isinstance(e, str):
-            container_entries.append(DistributionContainerEntry(name=e))
+            elif isinstance(e, str):
+                entries.append(DistributionModelEntry(name=e))
+        return DistributionResourceConfig(enabled=models_raw.get("enabled", True), entries=entries)
+
+    def _parse_containers(containers_raw: Any) -> DistributionResourceConfig:
+        if not isinstance(containers_raw, dict):
+            containers_raw = {}
+        entries_raw = containers_raw.get("entries", [])
+        if not isinstance(entries_raw, list):
+            entries_raw = []
+        entries: list[DistributionModelEntry | DistributionContainerEntry] = []
+        for e in entries_raw:
+            if isinstance(e, dict):
+                entries.append(
+                    DistributionContainerEntry(
+                        name=e.get("name", ""),
+                        target=e.get("target", [-1]),
+                    )
+                )
+            elif isinstance(e, str):
+                entries.append(DistributionContainerEntry(name=e))
+        return DistributionResourceConfig(enabled=containers_raw.get("enabled", True), entries=entries)
 
     return DistributionConfig(
-        models=DistributionResourceConfig(enabled=models_enabled, entries=model_entries),
-        containers=DistributionResourceConfig(enabled=containers_enabled, entries=container_entries),
+        models=_parse_models(raw["models"]) if "models" in raw else default.models,
+        containers=_parse_containers(raw["containers"]) if "containers" in raw else default.containers,
     )
 
 
@@ -320,6 +336,18 @@ def _resolve_runtime_from_command_hint(recipe: Recipe) -> None:
         recipe.runtime = "trtllm"
 
 
+def _collapse_brace_escapes(value: str) -> str:
+    """Collapse vpd-style brace escapes (``{{`` -> ``{``, ``}}`` -> ``}``).
+
+    v1 (eugr) recipes double their braces so a literal ``{`` survives vpd
+    ``{placeholder}`` substitution — e.g. a JSON-valued flag written as
+    ``--diffusion-config '{{"canvas_length": 256}}'``.  Once substitution has
+    run, the doubled braces are collapsed back to single braces, matching
+    eugr's own ``run-recipe.sh``.
+    """
+    return value.replace("{{", "{").replace("}}", "}")
+
+
 def _resolve_v1_migration(recipe: Recipe) -> None:
     """v1 format recipes -> eugr builder (runtime left for vllm variant resolution)."""
     if recipe.recipe_version != "1":
@@ -327,6 +355,11 @@ def _resolve_v1_migration(recipe: Recipe) -> None:
     if recipe.runtime in ("vllm", ""):
         if not recipe.builder:
             recipe.builder = "eugr"
+        # v1 recipes may escape literal braces as '{{'/'}}' in defaults values
+        # (e.g. a JSON-valued flag default).  Collapse them for string values
+        # only; non-string defaults (numeric port, max_num_seqs,
+        # gpu_memory_utilization, ...) are passed through untouched.
+        recipe.defaults = {k: (_collapse_brace_escapes(v) if isinstance(v, str) else v) for k, v in recipe.defaults.items()}
 
 
 def _resolve_eugr_signals(recipe: Recipe) -> None:
@@ -334,7 +367,7 @@ def _resolve_eugr_signals(recipe: Recipe) -> None:
     if recipe.runtime not in ("vllm", ""):
         return
     rc = recipe.runtime_config
-    if rc.get("build_args") or recipe.mods or recipe.container.strip().startswith("ghcr.io/spark-arena/dgx-vllm-eugr-nightly"):
+    if rc.get("build_args") or recipe.container.strip().startswith("ghcr.io/spark-arena/dgx-vllm-eugr-nightly"):
         if not recipe.builder:
             recipe.builder = "eugr"
 
@@ -343,8 +376,15 @@ def _resolve_vllm_variant(recipe: Recipe) -> None:
     """Bare 'vllm' (or empty) -> 'vllm-distributed' (default) or 'vllm-ray' (Ray hints)."""
     if recipe.runtime not in ("vllm", ""):
         return
+    # An explicit CLI override wins over everything, including a literal
+    # `--distributed-executor-backend ray` baked into the command template —
+    # so `-o distributed_executor_backend=mp` can flip a legacy recipe off Ray.
     # noinspection PyProtectedMember
-    if str(recipe._effective_default("distributed_executor_backend", "")).lower() == "ray":
+    override = recipe._applied_overrides.get("distributed_executor_backend")
+    if override is not None:
+        recipe.runtime = "vllm-ray" if str(override).lower() == "ray" else "vllm-distributed"
+        return
+    if str(recipe.defaults.get("distributed_executor_backend", "")).lower() == "ray":
         recipe.runtime = "vllm-ray"
         return
     if recipe.command and _RAY_BACKEND_RE.search(recipe.command):
@@ -398,9 +438,13 @@ def resolve_runtime(data: dict[str, Any], overrides: dict[str, Any] | None = Non
         if defaults is not None and not isinstance(defaults, dict):
             raise RecipeError("Recipe 'defaults' field must be a mapping, got %s" % type(defaults).__name__)
         defaults = defaults or {}
-        # Overrides take precedence over defaults
-        deb = effective.get("distributed_executor_backend") or defaults.get("distributed_executor_backend", "")
-        if str(deb).lower() == "ray":
+        # An explicit override wins over the literal-command hint (mirrors
+        # _resolve_vllm_variant): -o distributed_executor_backend=mp flips a
+        # legacy ray-in-command recipe to vllm-distributed.
+        override = effective.get("distributed_executor_backend")
+        if override is not None:
+            return "vllm-ray" if str(override).lower() == "ray" else "vllm-distributed"
+        if str(defaults.get("distributed_executor_backend", "")).lower() == "ray":
             return "vllm-ray"
         if _RAY_BACKEND_RE.search(cmd):
             return "vllm-ray"
@@ -500,6 +544,44 @@ def is_recipe_url(name: str) -> bool:
     return name.startswith(("http://", "https://"))
 
 
+# Hosts allowed to serve recipes without an explicit confirmation. Any
+# other https host requires the caller to pass ``allow_untrusted_host=True``
+# (the CLI prompts / honours --trust). http:// is never allowed (MITM).
+RECIPE_URL_ALLOWED_HOSTS: tuple[str, ...] = ("spark-arena.com",)
+
+# Cap fetched recipe size to avoid a hostile/buggy endpoint streaming
+# unbounded data onto the control machine. Recipes are small YAML files.
+_RECIPE_FETCH_MAX_BYTES = 5 * 1024 * 1024
+_RECIPE_FETCH_MAX_REDIRECTS = 3
+
+
+def _recipe_url_host(url: str) -> str:
+    from urllib.parse import urlparse
+
+    return (urlparse(url).hostname or "").lower()
+
+
+def _validate_recipe_url(url: str, *, allow_untrusted_host: bool) -> None:
+    """Raise RecipeError if *url* is not a safe recipe source.
+
+    Enforces https-only (no MITM) and an allowlist of known hosts unless
+    the caller explicitly opts in to an untrusted host.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise RecipeError(
+            "Refusing to fetch recipe over %r: only https:// recipe URLs are allowed "
+            "(plaintext http is vulnerable to tampering)." % (parsed.scheme or url)
+        )
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise RecipeError("Refusing to fetch recipe: URL has no host: %s" % url)
+    if host not in RECIPE_URL_ALLOWED_HOSTS and not allow_untrusted_host:
+        raise RecipeUntrustedHostError(url, host)
+
+
 def _url_cache_path(url: str) -> Path:
     """Return the local cache path for a remote recipe URL."""
     import hashlib
@@ -510,22 +592,43 @@ def _url_cache_path(url: str) -> Path:
     return DEFAULT_CACHE_DIR / "remote-recipes" / ("%s.yaml" % url_hash)
 
 
-def fetch_and_cache_recipe(url: str) -> Path:
+def fetch_and_cache_recipe(url: str, *, allow_untrusted_host: bool = False) -> Path:
     """Fetch a recipe from URL and cache it locally.
+
+    Only ``https://`` URLs are accepted, and only from
+    :data:`RECIPE_URL_ALLOWED_HOSTS` unless *allow_untrusted_host* is set
+    (the CLI prompts / honours ``--trust`` before passing it). Redirects
+    are re-validated against the same rules and the chain is capped; the
+    response body is size-capped.
 
     On success, writes/updates the cache file and returns its path.
     On network failure, falls back to cached copy if available.
     Raises RecipeError if fetch fails and no cache exists.
     """
     from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+    _validate_recipe_url(url, allow_untrusted_host=allow_untrusted_host)
 
     cache_path = _url_cache_path(url)
 
+    class _ValidatingRedirectHandler(HTTPRedirectHandler):
+        max_redirections = _RECIPE_FETCH_MAX_REDIRECTS
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            # Re-apply the same scheme/host policy to every redirect hop so
+            # an allowed host cannot bounce us to http:// or an arbitrary host.
+            _validate_recipe_url(newurl, allow_untrusted_host=allow_untrusted_host)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
     try:
+        opener = build_opener(_ValidatingRedirectHandler())
         req = Request(url, headers={"User-Agent": "sparkrun"})
-        with urlopen(req, timeout=30) as resp:
-            content = resp.read()
+        with opener.open(req, timeout=30) as resp:
+            # Read one byte past the cap so we can detect oversize bodies.
+            content = resp.read(_RECIPE_FETCH_MAX_BYTES + 1)
+        if len(content) > _RECIPE_FETCH_MAX_BYTES:
+            raise RecipeError("Refusing to fetch recipe from %s: response exceeds %d bytes." % (url, _RECIPE_FETCH_MAX_BYTES))
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_bytes(content)
         return cache_path
@@ -549,18 +652,128 @@ def fetch_and_cache_recipe(url: str) -> Path:
 # _fetch_and_cache_recipe = fetch_and_cache_recipe
 
 
+@dataclass
+class LaunchOverrides:
+    """Internal, undocumented launch/infra overrides from a recipe's
+    ``cluster_config:`` block.
+
+    Despite the YAML key (kept for back-compat), these are **per-recipe launch
+    overrides**, not a cluster definition — distinct from
+    :class:`sparkrun.core.cluster_manager.ClusterDistributionConfig` (a named
+    cluster's distribution settings) and ``ResolvedClusterConfig`` (resolved
+    transfer config).  They are intentionally *not* part of the documented
+    recipe schema — an escape hatch for temporary / environment-specific work
+    that doesn't belong in the cluster config (e.g. pointing at pre-placed
+    model weights on a shared NFS path).  Applied at the single
+    ``launch_inference`` choke point so both the CLI and ``api.run`` honour
+    them, and only for *trusted* recipes (they can expose host paths to the
+    container — see ``launcher._enforce_recipe_mount_trust``).
+
+    Fields:
+        remote_cache_dir: Overrides the remote HuggingFace cache dir on target
+            hosts (where models are mounted into the container, and where
+            distribution would land). Takes precedence over the cluster config.
+        local_cache_dir: Overrides the control-machine download cache dir.
+        resolved_model_path: Absolute path to a directory of model weights that
+            is already present on every node (e.g. a shared NFS mount). When
+            set, sparkrun skips model download + distribution entirely,
+            identity-mounts the path into the container, and points the serving
+            runtime's model argument at it.
+    """
+
+    remote_cache_dir: str | None = None
+    local_cache_dir: str | None = None
+    resolved_model_path: str | None = None
+
+    def is_empty(self) -> bool:
+        return not (self.remote_cache_dir or self.local_cache_dir or self.resolved_model_path)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {}
+        if self.remote_cache_dir:
+            d["remote_cache_dir"] = self.remote_cache_dir
+        if self.local_cache_dir:
+            d["local_cache_dir"] = self.local_cache_dir
+        if self.resolved_model_path:
+            d["resolved_model_path"] = self.resolved_model_path
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "LaunchOverrides | None":
+        if not isinstance(data, dict):
+            return None
+        cc = cls(
+            remote_cache_dir=(str(data["remote_cache_dir"]) if data.get("remote_cache_dir") else None),
+            local_cache_dir=(str(data["local_cache_dir"]) if data.get("local_cache_dir") else None),
+            resolved_model_path=(str(data["resolved_model_path"]) if data.get("resolved_model_path") else None),
+        )
+        return None if cc.is_empty() else cc
+
+
+# Back-compat alias: this type was previously named ``ClusterConfig``, which
+# collided with the cluster-side config types.  Keep the old name importable.
+ClusterConfig = LaunchOverrides
+
+
+def is_local_model_path(model: str | None) -> bool:
+    """True when a recipe's ``model:`` value is an absolute host path.
+
+    An absolute path in ``model:`` is user-facing sugar for
+    :attr:`LaunchOverrides.resolved_model_path`: the weights are already present
+    on every node (e.g. a shared mount), so sparkrun skips model download +
+    distribution, identity-mounts the directory into the container, and serves
+    the runtime directly from it.  See :func:`sparkrun.core.launcher.launch_inference`.
+
+    Only *absolute* paths are treated this way — no ``file://`` scheme, no ``~``
+    expansion, no relative paths — so an ordinary HuggingFace repo id
+    (``org/name``) or GGUF spec (``org/name-GGUF:Q4_K_M``) is never mistaken for
+    a local path.  Because this identity-mounts a host directory, it is gated to
+    trusted recipes at the launch choke point (see
+    ``launcher._enforce_recipe_mount_trust``).
+    """
+    return isinstance(model, str) and os.path.isabs(model)
+
+
 class RecipeError(Exception):
     """Raised when a recipe is invalid or cannot be loaded."""
 
 
-class RecipeAmbiguousError(RecipeError):
-    """Raised when a recipe name matches multiple registries."""
+class RecipeUntrustedHostError(RecipeError):
+    """Raised when a recipe URL points at a host not on the allowlist.
 
-    def __init__(self, name: str, matches: list[tuple[str, Path]]):
+    The caller (CLI) may catch this, confirm with the user, and retry
+    ``fetch_and_cache_recipe(url, allow_untrusted_host=True)``.
+    """
+
+    def __init__(self, url: str, host: str):
+        self.url = url
+        self.host = host
+        super().__init__(
+            "Recipe URL host %r is not in the trusted allowlist (%s). "
+            "Re-run with --trust to fetch from this host." % (host, ", ".join(RECIPE_URL_ALLOWED_HOSTS))
+        )
+
+
+class RecipeAmbiguousError(RecipeError):
+    """Raised when a recipe name matches more than one registry recipe.
+
+    Ambiguity is not only *across* registries: a registry's recipe dir is
+    scanned recursively, so ``a/foo.yaml`` and ``b/foo.yaml`` in the same
+    registry are two different recipes matching the stem ``foo``.
+
+    ``labels`` holds one user-typeable ``@registry/...`` name per entry in
+    ``matches`` (see :meth:`RegistryManager.qualified_recipe_name`), so
+    callers can present options that are actually distinguishable.  When
+    omitted it degrades to ``@registry/<stem>``.
+    """
+
+    def __init__(self, name: str, matches: list[tuple[str, Path]], labels: list[str] | None = None):
         self.name = name
         self.matches = matches
-        registries = ", ".join(reg for reg, _ in matches)
-        super().__init__("Recipe '%s' found in multiple registries: %s. Use @registry/%s to specify." % (name, registries, name))
+        self.labels = labels if labels is not None else ["@%s/%s" % (reg, Path(p).stem) for reg, p in matches]
+        from sparkrun.core.registry import format_ambiguity
+
+        super().__init__(format_ambiguity("Recipe", name, matches, self.labels))
 
 
 class Recipe:
@@ -571,6 +784,11 @@ class Recipe:
         self.source_path = source_path
         self.source_registry: str | None = None  # set by _load_recipe after resolution
         self.source_registry_url: str | None = None  # set by _load_recipe after resolution
+        # True when the recipe was fetched from a remote URL (e.g. a
+        # spark-arena link). URL-sourced recipes are never auto-trusted —
+        # their hooks require --trust / interactive confirmation. Set by
+        # _load_recipe; see core.launcher.resolve_recipe_trust.
+        self.is_url_sourced: bool = False
 
         self._qualified_name_override: str | None = None  # optional override for qualified_name
 
@@ -610,7 +828,10 @@ class Recipe:
 
         # Configuration
         self.defaults: dict[str, Any] = dict(data.get("defaults") or {})
-        self.env: dict[str, str] = {str(k): osp.expandvars(str(v)) for k, v in (data.get("env") or {}).items()}
+        # Use recipe-provided env values literally.  Do NOT expand control-machine
+        # variables (e.g. ``$AWS_SECRET_ACCESS_KEY``): a third-party recipe could
+        # otherwise exfiltrate host secrets by injecting them into the container.
+        self.env: dict[str, str] = {str(k): str(v) for k, v in (data.get("env") or {}).items()}
         self.command: str | None = data.get("command")
 
         # Metadata section (v2 extension for VRAM estimation, model info)
@@ -659,8 +880,28 @@ class Recipe:
         raw_exec = data.get("executor_config", {})
         self.executor_config: dict[str, Any] = dict(raw_exec) if isinstance(raw_exec, dict) else {}
 
+        # Experimental executor selector.  ``""`` (default) → DockerExecutor.
+        # ``"local"`` → native-subprocess LocalExecutor (no container).
+        # No CLI surface; recipe-only.
+        self.executor: str = str(data.get("executor", "") or "")
+
+        # Optional scheduler selector.  ``""`` (default) → GreedyScheduler.
+        # ``"occupancy-sparse"`` / ``"occupancy-dense"`` opt in to
+        # occupancy-sparse / occupancy-dense placement + fractional GPU sharing.
+        # Overridden by ``--scheduler`` on the CLI / ``RunOptions.scheduler``.
+        self.scheduler: str = str(data.get("scheduler", "") or "")
+
         # Distribution config (auto-generated default, mutable by runtimes)
         self.distribution_config: DistributionConfig = _parse_distribution_config(data)
+
+        # Explicit placement layout for heterogeneous clusters (optional).
+        # Parsed permissively here; the placement engine in
+        # :mod:`sparkrun.schedulers.greedy` validates at apply time.
+        raw_layout = data.get("layout")
+        self.layout: RecipeLayout | None = RecipeLayout.from_dict(raw_layout) if isinstance(raw_layout, dict) else None
+
+        # Internal, undocumented launch overrides (see :class:`LaunchOverrides`).
+        self.cluster_config: LaunchOverrides | None = LaunchOverrides.from_dict(data.get("cluster_config"))
 
         # Applied overrides (populated by resolve())
         self._applied_overrides: dict[str, Any] = {}
@@ -732,13 +973,30 @@ class Recipe:
         """Get a value from defaults with optional fallback."""
         return self.defaults.get(key, fallback)
 
+    @property
+    def effective_served_model_name(self) -> str:
+        """Resolved served-model name: CLI override → recipe default → model id.
+
+        Mirrors the runtime serve-argument resolution (``--served-model-name``
+        falls back to the model id when unset) so observers can read the name a
+        workload is actually served under off the container labels.
+        """
+        return self._effective_default("served_model_name") or self.model
+
     def build_config_chain(self, cli_overrides: dict[str, Any] | None = None, user_config: dict[str, Any] | None = None) -> Variables:
         """Build cascading config: CLI overrides -> user config -> recipe defaults.
 
-        Also injects 'model' into the chain for template substitution.
+        Also injects ``model`` and ``resolved_model_path`` into the chain for
+        ``{...}`` template substitution.  ``resolved_model_path`` resolves to the
+        recipe's ``cluster_config.resolved_model_path`` when set (pre-placed
+        on-disk weights), otherwise falls back to ``model`` so the same template
+        — e.g. ``--chat-template {resolved_model_path}/chat_template.jinja`` —
+        works for both the override and normal cases.
         """
         base = dict(self.defaults)
         base.setdefault("model", self.model)
+        _rmp = getattr(getattr(self, "cluster_config", None), "resolved_model_path", None)
+        base.setdefault("resolved_model_path", _rmp or self.model)
         return Variables(sources=(cli_overrides or {}, user_config or {}, base), env_placement=EnvPlacement.IGNORED)
 
     def render_command(self, config_chain: Variables) -> str | None:
@@ -757,6 +1015,14 @@ class Recipe:
         while last != rendered:
             last = rendered
             rendered = arg_substitute(rendered, config_chain)
+
+        # v1 (eugr) recipes escape literal braces as '{{'/'}}' so they survive
+        # the {placeholder} substitution above (e.g. JSON-valued flags like
+        # --diffusion-config '{{...}}').  Collapse them back now that
+        # substitution is done, so the runtime receives valid JSON rather than
+        # doubled braces.  Done post-substitution to preserve the escaping.
+        if self.recipe_version == "1":
+            rendered = _collapse_brace_escapes(rendered)
 
         # Fix trailing spaces after backslash line-continuations.
         # ``\<space><newline>`` → ``\<newline>``
@@ -853,6 +1119,7 @@ class Recipe:
         cli_overrides: dict[str, Any] | None = None,
         auto_detect: bool = True,
         cache_dir: str | None = None,
+        total_gpu_memory_gb: float | None = None,
     ) -> VRAMEstimate:
         """Estimate VRAM usage for this recipe.
 
@@ -924,10 +1191,9 @@ class Recipe:
                 if hf_config:
                     hf_info = extract_model_info(hf_config)
 
-                    # Capture the raw storage dtype (torch_dtype) before
-                    # quantization override — needed later when deriving
-                    # model_params from on-disk total_size.
-                    _storage_dtype = hf_info.get("model_dtype")
+                    # use quant_config to capture on disk storage as quantized if it exists
+                    # but otherwise fall back to the model dtype
+                    _storage_dtype = hf_info.get("quant_dtype") or hf_info.get("model_dtype")
 
                     # Fill in missing fields (metadata takes precedence)
                     if not model_dtype:
@@ -1031,6 +1297,7 @@ class Recipe:
             model_vram=float(model_vram) if model_vram is not None else None,
             kv_vram_per_token=float(kv_vram_per_token) if kv_vram_per_token is not None else None,
             gpu_memory_utilization=gpu_memory_utilization,
+            total_gpu_memory_gb=total_gpu_memory_gb,
         )
 
         # Write back auto-detected values so downstream consumers
@@ -1073,6 +1340,7 @@ class Recipe:
             "source_path": self.source_path,
             "source_registry": self.source_registry,
             "source_registry_url": self.source_registry_url,
+            "is_url_sourced": self.is_url_sourced,
             "_qualified_name_override": self._qualified_name_override,
             "recipe_version": self.recipe_version,
             "description": self.description,
@@ -1097,8 +1365,12 @@ class Recipe:
             "mods": list(self.mods),
             "builder": self.builder,
             "builder_config": dict(self.builder_config),
+            "executor": self.executor,
             "executor_config": dict(self.executor_config),
+            "scheduler": self.scheduler,
             "distribution_config": dataclass_asdict(self.distribution_config),
+            "layout": self.layout.to_dict() if self.layout else None,
+            "cluster_config": self.cluster_config.to_dict() if self.cluster_config else None,
             "_applied_overrides": dict(self._applied_overrides),
             "_raw": dict(self._raw),
         }
@@ -1109,6 +1381,7 @@ class Recipe:
         self.source_path = state.get("source_path")
         self.source_registry = state.get("source_registry")
         self.source_registry_url = state.get("source_registry_url")
+        self.is_url_sourced = state.get("is_url_sourced", False)
         self._qualified_name_override = state.get("_qualified_name_override")
         self.recipe_version = state.get("recipe_version", "2")
         self.name = state.get("name", "unnamed")
@@ -1134,10 +1407,15 @@ class Recipe:
         self.mods = list(state.get("mods") or [])
         self.builder = state.get("builder", "")
         self.builder_config = dict(state.get("builder_config") or {})
+        self.executor = str(state.get("executor", "") or "")
         self.executor_config = dict(state.get("executor_config") or {})
+        self.scheduler = str(state.get("scheduler", "") or "")
         self._applied_overrides = dict(state.get("_applied_overrides") or {})
         dist_cfg: dict | None = state.get("distribution_config", None)
         self.distribution_config = _parse_distribution_config(self._raw) if dist_cfg is None else DistributionConfig.from_dict(dist_cfg)
+        layout_state = state.get("layout")
+        self.layout = RecipeLayout.from_dict(layout_state) if isinstance(layout_state, dict) else None
+        self.cluster_config = LaunchOverrides.from_dict(state.get("cluster_config"))
 
     @classmethod
     def _deserialize(cls, data: dict[str, Any]) -> Recipe:
@@ -1182,6 +1460,8 @@ class Recipe:
         "container",
         "solo_only",
         "cluster_only",
+        "layout",
+        "cluster_config",
         "metadata",
         "build_args",
         "mods",
@@ -1216,7 +1496,7 @@ class Recipe:
         if self.runtime_version:
             d["runtime_version"] = self.runtime_version
 
-        # -- Topology --
+        # -- Topology -- (accounts for v1 solo_only/cluster_only flags as well)
         if self.min_nodes != 1:
             d["min_nodes"] = self.min_nodes
         if self.max_nodes is not None:
@@ -1226,11 +1506,23 @@ class Recipe:
         if self.container:
             d["container"] = self.container
 
-        # -- Preserve Raw Topology flags from v1 --
-        if self._raw.get("solo_only"):
-            d["solo_only"] = True
-        if self._raw.get("cluster_only"):
-            d["cluster_only"] = True
+        # # -- Preserve Raw Topology flags from v1 --
+        # if self._raw.get("solo_only"):
+        #     d["solo_only"] = True
+        # if self._raw.get("cluster_only"):
+        #     d["cluster_only"] = True
+
+        # -- Explicit placement layout (optional) --
+        if self.layout is not None:
+            layout_dict = self.layout.to_dict()
+            if layout_dict:
+                d["layout"] = layout_dict
+
+        # -- Cluster config (internal launch overrides; undocumented) --
+        if self.cluster_config is not None:
+            cc_dict = self.cluster_config.to_dict()
+            if cc_dict:
+                d["cluster_config"] = cc_dict
 
         # -- Metadata (absorb promoted keys) --
         d["metadata"] = meta = dict(self.metadata)
@@ -1256,6 +1548,10 @@ class Recipe:
             d["builder"] = self.builder
         if self.builder_config:
             d["builder_config"] = dict(self.builder_config)
+
+        # -- Scheduler --
+        if self.scheduler:
+            d["scheduler"] = self.scheduler
 
         # -- Configuration --
         if self.defaults:
@@ -1369,6 +1665,17 @@ class Recipe:
         return dest
 
 
+def _ambiguous(name: str, matches: list[tuple[str, Path]], registry_manager: RegistryManager) -> RecipeAmbiguousError:
+    """Build a :class:`RecipeAmbiguousError` with path-qualified labels.
+
+    Labels come from :meth:`RegistryManager.qualified_recipe_name`, so two
+    nested matches in one registry render as distinct, re-typeable names
+    rather than the same ``@registry/stem`` twice.
+    """
+    labels = [registry_manager.qualified_recipe_name(reg, path) for reg, path in matches]
+    return RecipeAmbiguousError(name, matches, labels=labels)
+
+
 def find_recipe(
     name: str,
     search_paths: list[Path] | None = None,
@@ -1387,7 +1694,8 @@ def find_recipe(
     5. Registry file-stem matching (if registry_manager provided)
 
     Raises:
-        RecipeAmbiguousError: If name matches multiple registries without @scope.
+        RecipeAmbiguousError: If name matches multiple recipes — either across
+            registries (no @scope) or at multiple paths within the scoped one.
         RecipeError: If recipe not found.
     """
     # Parse @registry/name prefix
@@ -1402,8 +1710,14 @@ def find_recipe(
             include_hidden=True,
         )
         scoped_matches = [(reg, path) for reg, path in matches if reg == scoped_registry]
-        if scoped_matches:
+        if len(scoped_matches) == 1:
             return scoped_matches[0][1]
+        # A registry's recipe dir is scanned recursively, so one stem can match
+        # several files in the *same* registry. Silently taking the first sorted
+        # hit would pick a recipe the user never named (e.g. the 3x-cluster
+        # variant when they meant the 4x one) — surface it instead.
+        if scoped_matches:
+            raise _ambiguous(lookup_name, scoped_matches, registry_manager)
         raise RecipeError("Recipe '%s' not found in registry '%s'" % (lookup_name, scoped_registry))
 
     # 1. Check if it's a direct path
@@ -1449,7 +1763,7 @@ def find_recipe(
             _registry_name, recipe_path = matches[0]
             return recipe_path
         elif len(matches) > 1:
-            raise RecipeAmbiguousError(lookup_name, matches)
+            raise _ambiguous(lookup_name, matches, registry_manager)
 
     search_desc = [str(p) for p in (search_paths or [])]
     if registry_manager:
@@ -1469,12 +1783,17 @@ def find_recipe_in_registry(name: str, registry_name: str, registry_manager: Reg
         Path to the recipe file.
 
     Raises:
+        RecipeAmbiguousError: If the name matches several paths in that registry.
         RecipeError: If recipe not found in that registry.
     """
     matches = registry_manager.find_recipe_in_registries(name, include_hidden=True)
-    for reg, path in matches:
-        if reg == registry_name:
-            return path
+    scoped = [(reg, path) for reg, path in matches if reg == registry_name]
+    if len(scoped) == 1:
+        return scoped[0][1]
+    if scoped:
+        # Recursive scan means one stem can match several files in a single
+        # registry; don't guess which one the caller meant.
+        raise _ambiguous(name, scoped, registry_manager)
     raise RecipeError("Recipe '%s' not found in registry '%s'" % (name, registry_name))
 
 
@@ -1522,6 +1841,8 @@ def list_recipes(
     local_files: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
     """List all available recipes with name and path."""
+    from sparkrun.core.registry import RECIPE_ASSET, iter_asset_files
+
     recipes: list[dict[str, Any]] = []
     seen_names: set[str] = set()
 
@@ -1554,7 +1875,7 @@ def list_recipes(
                         registry_name = reg.name
                         break
 
-        for f in sorted(search_dir.rglob("*.yaml")):
+        for f in iter_asset_files(search_dir, RECIPE_ASSET):
             if f.stem not in seen_names:
                 seen_names.add(f.stem)
                 entry = recipe_summary(f, registry_name=registry_name)
@@ -1562,6 +1883,27 @@ def list_recipes(
                     recipes.append(entry)
 
     return recipes
+
+
+#: Recipe summary fields a free-text query is matched against.
+RECIPE_QUERY_FIELDS: tuple[str, ...] = ("name", "file", "model", "description")
+
+
+def recipe_matches_query(entry: dict[str, Any], query: str | None) -> bool:
+    """Return True when a recipe summary matches a free-text *query*.
+
+    Case-insensitive substring match over :data:`RECIPE_QUERY_FIELDS`. An
+    empty/None query matches everything.
+
+    This is the single matching predicate shared by
+    ``RegistryManager.search_recipes`` and the local (CWD) recipe search, so
+    a recipe sitting in the working directory is found on the same terms as
+    one from a registry.
+    """
+    if not query:
+        return True
+    needle = query.lower()
+    return any(needle in str(entry.get(f, "")).lower() for f in RECIPE_QUERY_FIELDS)
 
 
 def filter_recipes(

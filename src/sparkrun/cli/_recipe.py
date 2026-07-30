@@ -8,6 +8,7 @@ import click
 
 from ._common import (
     RECIPE_NAME,
+    RECIPE_QUERY,
     REGISTRY_NAME,
     RUNTIME_NAME,
     _display_recipe_detail,
@@ -27,34 +28,56 @@ def recipe(ctx):
     pass
 
 
+def _search_recipes(ctx, query, *, registry, runtime, show_all, unique_names=False):
+    """CLI adapter around :func:`sparkrun.api.search_recipes`.
+
+    Renders the api's typed filter error as a Click usage error, and hands
+    back the recipe-summary mappings the formatters and ``--json`` consume
+    alongside the resolved ``(registry, query)`` so callers can phrase an
+    empty-result message.
+    """
+    from sparkrun import api
+
+    sctx = _get_context(ctx)
+    try:
+        # Resolved separately so the command can name *which* registry came
+        # back empty; search_recipes resolves again internally, which keeps it
+        # safe to call without any pre-resolution.
+        scoped_registry, remaining_query = api.resolve_recipe_filter(query, registry=registry, sctx=sctx)
+        recipes = api.search_recipes(
+            query,
+            registry=registry,
+            runtime=runtime,
+            include_hidden=show_all,
+            unique_names=unique_names,
+            sctx=sctx,
+        )
+    except api.InvalidRegistryFilter as e:
+        raise click.UsageError(str(e)) from e
+
+    return [r.to_dict() for r in recipes], scoped_registry, remaining_query
+
+
 @recipe.command("list")
 @click.option("--registry", type=REGISTRY_NAME, default=None, help="Filter by registry name")
 @click.option("--runtime", type=RUNTIME_NAME, default=None, help="Filter by runtime (e.g. vllm, sglang, llama-cpp)")
 @click.option("--all", "-a", "show_all", is_flag=True, help="Include hidden registry recipes")
 @json_option()
-@click.argument("query", required=False)
+@click.argument("query", type=RECIPE_QUERY, required=False)
 # @click.option("--config", "config_path", default=None, help="Path to config file")
 @click.pass_context
 def recipe_list(ctx, registry, runtime, show_all, output_json, query, config_path=None):
-    """List available recipes from all registries."""
-    from sparkrun.core.recipe import list_recipes, filter_recipes
+    """List available recipes from all registries.
+
+    QUERY may be scoped to a registry with the ``@registry`` shorthand:
+    ``@community`` (equivalent to ``--registry community``) or
+    ``@community/qwen`` (that registry, searching for ``qwen``).
+    """
     from sparkrun.utils.cli_formatters import format_recipe_table
 
-    config, registry_mgr = _get_config_and_registry(config_path)
-    registry_mgr.ensure_initialized()
-
-    # When a specific registry is requested, include hidden registries so the
-    # user can list recipes from a non-visible registry without needing --all.
-    include_hidden = show_all or (registry is not None)
-
-    if query:
-        recipes = registry_mgr.search_recipes(query, include_hidden=include_hidden)
-    else:
-        from sparkrun.core.recipe import discover_cwd_recipes
-
-        recipes = list_recipes(registry_manager=registry_mgr, include_hidden=include_hidden, local_files=discover_cwd_recipes())
-
-    recipes = filter_recipes(recipes, runtime=runtime, registry=registry)
+    # unique_names: `list` is the "what can I type?" view, so a name resolves
+    # to exactly one row.  `search` shows every registry's copy instead.
+    recipes, _registry, _query = _search_recipes(ctx, query, registry=registry, runtime=runtime, show_all=show_all, unique_names=True)
 
     if output_json:
         print_json(recipes)
@@ -68,27 +91,31 @@ def recipe_list(ctx, registry, runtime, show_all, output_json, query, config_pat
 @click.option("--runtime", type=RUNTIME_NAME, default=None, help="Filter by runtime (e.g. vllm, sglang, llama-cpp)")
 @click.option("--all", "-a", "show_all", is_flag=True, help="Include hidden registry recipes")
 @json_option()
-@click.argument("query")
+@click.argument("query", type=RECIPE_QUERY)
 # @click.option("--config", "config_path", default=None, help="Path to config file")
 @click.pass_context
 def recipe_search(ctx, registry, runtime, show_all, output_json, query, config_path=None):
-    """Search for recipes by name, model, or description."""
-    from sparkrun.core.recipe import filter_recipes
+    """Search for recipes by name, model, or description.
+
+    QUERY may be scoped to a registry with the ``@registry`` shorthand:
+    ``@community`` (every recipe in that registry) or ``@community/qwen``
+    (that registry, searching for ``qwen``).
+    """
     from sparkrun.utils.cli_formatters import format_recipe_table
 
-    config, registry_mgr = _get_config_and_registry(config_path)
-    registry_mgr.ensure_initialized()
-
-    include_hidden = show_all or (registry is not None)
-    recipes = registry_mgr.search_recipes(query, include_hidden=include_hidden)
-    recipes = filter_recipes(recipes, runtime=runtime, registry=registry)
+    recipes, scoped_registry, remaining_query = _search_recipes(ctx, query, registry=registry, runtime=runtime, show_all=show_all)
 
     if output_json:
         print_json(recipes)
         return
 
     if not recipes:
-        click.echo(f"No recipes found matching '{query}'.")
+        # A bare "@registry" scope consumes the whole query, leaving nothing
+        # to quote back — name the registry instead.
+        if remaining_query:
+            click.echo(f"No recipes found matching '{remaining_query}'.")
+        else:
+            click.echo(f"No recipes found in registry '{scoped_registry}'.")
         return
 
     click.echo(format_recipe_table(recipes, show_model=True))

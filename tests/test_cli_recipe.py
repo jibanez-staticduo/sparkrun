@@ -142,6 +142,200 @@ class TestRecipeSearch:
         assert "No recipes found" in result.output
 
 
+@pytest.fixture
+def scoped_registry_setup(tmp_path: Path, monkeypatch):
+    """Two enabled registries plus a disabled one, for @registry scope tests."""
+    config_root = tmp_path / "config"
+    cache_root = tmp_path / "cache" / "registries"
+    config_root.mkdir(parents=True)
+    cache_root.mkdir(parents=True)
+
+    import sparkrun.core.config
+
+    monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+    monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CACHE_DIR", tmp_path / "cache")
+
+    registry_data = {
+        "registries": [
+            {"name": "community", "url": "https://github.com/example/community", "subpath": "recipes", "enabled": True},
+            {"name": "official", "url": "https://github.com/example/official", "subpath": "recipes", "enabled": True},
+            {"name": "retired", "url": "https://github.com/example/retired", "subpath": "recipes", "enabled": False},
+        ]
+    }
+    with open(config_root / "registries.yaml", "w") as f:
+        yaml.dump(registry_data, f)
+
+    def _write(registry_name, file_stem, model, runtime):
+        recipe_dir = cache_root / registry_name / "recipes"
+        recipe_dir.mkdir(parents=True, exist_ok=True)
+        (cache_root / registry_name / ".git").mkdir(exist_ok=True)
+        with open(recipe_dir / f"{file_stem}.yaml", "w") as fh:
+            yaml.dump(
+                {
+                    "sparkrun_version": "2",
+                    "name": file_stem,
+                    "description": f"{file_stem} recipe",
+                    "model": model,
+                    "runtime": runtime,
+                    "container": "scitrera/dgx-spark-vllm:latest",
+                },
+                fh,
+            )
+
+    _write("community", "community-qwen", "Qwen/Qwen3-1.7B", "vllm")
+    _write("community", "community-mistral", "mistralai/Mistral-7B-v0.1", "sglang")
+    _write("official", "official-qwen", "Qwen/Qwen3-8B", "vllm")
+
+    return config_root, cache_root
+
+
+class TestRegistryScopeQuery:
+    """Test the implicit ``@registry`` scope in list/search queries."""
+
+    @pytest.mark.parametrize("cmd", (["recipe", "list"], ["list"], ["recipe", "search"], ["search"]))
+    def test_scope_without_slash(self, runner, scoped_registry_setup, cmd):
+        """@community is equivalent to --registry community."""
+        result = runner.invoke(main, [*cmd, "@community"])
+        assert result.exit_code == 0, result.output
+        assert "community-qwen" in result.output
+        assert "community-mistral" in result.output
+        assert "official-qwen" not in result.output
+
+    @pytest.mark.parametrize("cmd", (["recipe", "list"], ["recipe", "search"]))
+    def test_scope_with_trailing_slash(self, runner, scoped_registry_setup, cmd):
+        """@community/ behaves the same as @community."""
+        result = runner.invoke(main, [*cmd, "@community/"])
+        assert result.exit_code == 0, result.output
+        assert "community-qwen" in result.output
+        assert "community-mistral" in result.output
+        assert "official-qwen" not in result.output
+
+    @pytest.mark.parametrize("cmd", (["recipe", "list"], ["recipe", "search"]))
+    def test_scope_with_query(self, runner, scoped_registry_setup, cmd):
+        """Text after the slash is the query, applied within the registry."""
+        result = runner.invoke(main, [*cmd, "@community/qwen"])
+        assert result.exit_code == 0, result.output
+        assert "community-qwen" in result.output
+        assert "community-mistral" not in result.output
+        assert "official-qwen" not in result.output
+
+    def test_scope_json_output(self, runner, scoped_registry_setup):
+        """JSON output honours the scope too."""
+        import json
+
+        result = runner.invoke(main, ["recipe", "list", "--json", "@community"])
+        assert result.exit_code == 0, result.output
+        names = {r["file"] for r in json.loads(result.output)}
+        assert names == {"community-qwen", "community-mistral"}
+
+    def test_scope_combines_with_runtime_filter(self, runner, scoped_registry_setup):
+        """--runtime still applies on top of the scope."""
+        result = runner.invoke(main, ["recipe", "list", "--runtime", "sglang", "@community"])
+        assert result.exit_code == 0, result.output
+        assert "community-mistral" in result.output
+        assert "community-qwen" not in result.output
+
+    def test_scope_matching_explicit_registry_is_allowed(self, runner, scoped_registry_setup):
+        """Redundant but agreeing --registry is not an error."""
+        result = runner.invoke(main, ["recipe", "list", "--registry", "community", "@community/qwen"])
+        assert result.exit_code == 0, result.output
+        assert "community-qwen" in result.output
+
+    def test_scope_conflicting_with_explicit_registry(self, runner, scoped_registry_setup):
+        """A scope that disagrees with --registry is a usage error."""
+        result = runner.invoke(main, ["recipe", "list", "--registry", "official", "@community"])
+        assert result.exit_code != 0
+        assert "Conflicting registry" in result.output
+
+    @pytest.mark.parametrize("cmd", (["recipe", "list"], ["list"], ["recipe", "search"], ["search"]))
+    def test_scope_unknown_registry(self, runner, scoped_registry_setup, cmd):
+        """An unknown registry reports the available ones instead of 'no recipes'."""
+        result = runner.invoke(main, [*cmd, "@comunity"])
+        assert result.exit_code != 0
+        assert "Unknown registry 'comunity'" in result.output
+        assert "community" in result.output
+
+    @pytest.mark.parametrize("cmd", (["recipe", "list"], ["recipe", "search"]))
+    def test_scope_disabled_registry(self, runner, scoped_registry_setup, cmd):
+        """A disabled registry says so rather than silently listing nothing."""
+        result = runner.invoke(main, [*cmd, "@retired"])
+        assert result.exit_code != 0
+        assert "disabled" in result.output
+
+    @pytest.mark.parametrize("cmd", (["recipe", "list"], ["list"], ["recipe", "search", "qwen"], ["search", "qwen"]))
+    def test_explicit_unknown_registry_matches_scope(self, runner, scoped_registry_setup, cmd):
+        """--registry is validated exactly like the @registry shorthand."""
+        result = runner.invoke(main, [*cmd, "--registry", "comunity"])
+        assert result.exit_code != 0
+        assert "Unknown registry 'comunity'" in result.output
+        assert "community" in result.output
+
+    @pytest.mark.parametrize("cmd", (["recipe", "list"], ["recipe", "search", "qwen"]))
+    def test_explicit_disabled_registry_matches_scope(self, runner, scoped_registry_setup, cmd):
+        """--registry on a disabled registry errors like the shorthand does."""
+        result = runner.invoke(main, [*cmd, "--registry", "retired"])
+        assert result.exit_code != 0
+        assert "disabled" in result.output
+
+    def test_bare_at_is_treated_as_plain_query(self, runner, scoped_registry_setup):
+        """A lone '@' names no registry, so it stays an unscoped plain query."""
+        result = runner.invoke(main, ["recipe", "list", "@"])
+        assert result.exit_code == 0, result.output
+        # Every qualified name contains '@', so nothing is filtered out.
+        assert "community-qwen" in result.output
+        assert "official-qwen" in result.output
+
+    def test_search_scope_with_no_matches(self, runner, scoped_registry_setup):
+        """Empty scoped search results name the registry."""
+        result = runner.invoke(main, ["recipe", "search", "@community/nonexistent-xyz"])
+        assert result.exit_code == 0, result.output
+        assert "No recipes found matching 'nonexistent-xyz'" in result.output
+
+    def test_scope_includes_hidden_registry(self, runner, tmp_path, monkeypatch):
+        """An invisible registry is listable via its scope without --all."""
+        config_root = tmp_path / "config"
+        cache_root = tmp_path / "cache" / "registries"
+        config_root.mkdir(parents=True)
+        (cache_root / "hidden" / "recipes").mkdir(parents=True)
+        (cache_root / "hidden" / ".git").mkdir()
+
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CACHE_DIR", tmp_path / "cache")
+
+        with open(config_root / "registries.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "registries": [
+                        {
+                            "name": "hidden",
+                            "url": "https://github.com/example/hidden",
+                            "subpath": "recipes",
+                            "enabled": True,
+                            "visible": False,
+                        }
+                    ]
+                },
+                f,
+            )
+        with open(cache_root / "hidden" / "recipes" / "hidden-recipe.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "sparkrun_version": "2",
+                    "name": "hidden-recipe",
+                    "model": "Qwen/Qwen3-1.7B",
+                    "runtime": "vllm",
+                    "container": "scitrera/dgx-spark-vllm:latest",
+                },
+                f,
+            )
+
+        result = runner.invoke(main, ["recipe", "list", "@hidden"])
+        assert result.exit_code == 0, result.output
+        assert "hidden-recipe" in result.output
+
+
 class TestRecipeShow:
     """Test recipe show command."""
 

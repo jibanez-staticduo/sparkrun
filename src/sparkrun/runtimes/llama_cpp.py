@@ -6,7 +6,7 @@ import logging
 from typing import Any, TYPE_CHECKING
 
 from sparkrun.core.config import SparkrunConfig
-from sparkrun.runtimes._util import parse_api_key_from_command
+from sparkrun.runtimes._util import resolve_api_key
 from sparkrun.runtimes.base import RuntimePlugin
 
 if TYPE_CHECKING:
@@ -28,6 +28,16 @@ _LLAMA_CPP_FLAG_MAP = {
     "split_mode": "--split-mode",
     "served_model_name": "--alias",
     "api_key": "--api-key",
+    # Sampling controls — let command-less recipes specify them via defaults.
+    "top_p": "--top-p",
+    "top_k": "--top-k",
+    "temperature": "--temp",
+    "min_p": "--min-p",
+    "presence_penalty": "--presence-penalty",
+    # ``flash_attn`` is valued in modern llama.cpp (``on``/``off``/``auto``).
+    # Listed here so flag-stripping treats it as valued; emission is handled
+    # by ``_special_flags`` to normalise bool/string values.
+    "flash_attn": "--flash-attn",
 }
 
 # Defaults injected when not set in recipe config
@@ -37,11 +47,17 @@ _LLAMA_CPP_DEFAULTS = {
 
 # Boolean flags (present when truthy, absent when falsy)
 _LLAMA_CPP_BOOL_FLAGS = {
-    "flash_attn": "--flash-attn",
     "cont_batching": "--cont-batching",
     "no_webui": "--no-webui",
     "jinja": "--jinja",
 }
+
+# Keys with bespoke emission logic (handled by ``_special_flags``), excluded
+# from the generic ``build_flags_from_map`` pass to avoid double emission.
+#   * ``flash_attn`` — valued, with bool compatibility (True→on, False→off).
+#   * ``webui`` / ``mmap`` — inverted booleans (emit ``--no-webui`` /
+#     ``--no-mmap`` only when explicitly disabled; default-on emits nothing).
+_LLAMA_CPP_SPECIAL_KEYS = frozenset({"flash_attn", "webui", "mmap"})
 
 # Short-form flag aliases recognised when stripping flags from rendered
 # command templates (e.g. ``-a`` is the short form of ``--alias``).
@@ -93,26 +109,10 @@ class LlamaCppRuntime(RuntimePlugin):
     ) -> str | None:
         """Resolve the llama-server ``--api-key`` value for proxy/discovery use.
 
-        Checks, in order: CLI override, ``defaults.api_key`` (also
-        emitted as ``--api-key`` via :data:`_LLAMA_CPP_FLAG_MAP` for
-        structured commands), ``env.LLAMA_API_KEY``, and finally a
-        literal ``--api-key`` flag parsed from the recipe's ``command``
-        field.  Returns ``None`` when none are set.
+        Delegates to :func:`sparkrun.runtimes._util.resolve_api_key` with
+        ``env_var="LLAMA_API_KEY"`` and ``flag_name="--api-key"``.
         """
-        if overrides:
-            val = overrides.get("api_key")
-            if val:
-                return str(val)
-        val = recipe.defaults.get("api_key")
-        if val:
-            return str(val)
-        val = recipe.env.get("LLAMA_API_KEY")
-        if val:
-            return str(val)
-        parsed = parse_api_key_from_command(recipe.command)
-        if parsed:
-            return parsed
-        return None
+        return resolve_api_key(recipe, overrides, "LLAMA_API_KEY", "--api-key")
 
     # --- Parallelism helpers ---
 
@@ -159,45 +159,6 @@ class LlamaCppRuntime(RuntimePlugin):
             return "layer" if int(pp) > 1 else None
         return None
 
-    def compute_required_nodes(self, recipe, overrides=None):
-        """Compute required nodes from TP or PP (mutually exclusive).
-
-        In llama.cpp, ``--split-mode row`` (TP) and ``--split-mode layer``
-        (PP) both distribute across N nodes but cannot be combined.
-
-        Returns ``None`` when neither is configured.
-
-        Raises:
-            ValueError: If both tensor_parallel and pipeline_parallel
-                are set, or if data_parallel > 1 (llama.cpp has no native
-                multi-replica DP coordination).
-        """
-        config = recipe.build_config_chain(overrides or {})
-        # _resolve_split_mode validates mutual exclusivity
-        self._resolve_split_mode(config)
-
-        dp = config.get("data_parallel")
-        if dp is not None and int(dp) > 1:
-            raise ValueError("llama.cpp runtime does not support data_parallel > 1 (got %d)" % int(dp))
-
-        tp = config.get("tensor_parallel")
-        pp = config.get("pipeline_parallel")
-
-        if tp is not None and pp is not None:
-            # Both set — use whichever is > 1; if both are 1, return 1
-            tp_val, pp_val = int(tp), int(pp)
-            if tp_val > 1:
-                return tp_val
-            if pp_val > 1:
-                return pp_val
-            return 1
-
-        if tp is not None:
-            return int(tp)
-        if pp is not None:
-            return int(pp)
-        return None
-
     @staticmethod
     def _inject_split_mode_in_command(command: str, split_mode: str) -> str:
         """Strip existing ``--split-mode`` from *command* and append the correct one."""
@@ -205,6 +166,52 @@ class LlamaCppRuntime(RuntimePlugin):
 
         command = re.sub(r"--split-mode\s+\S+", "", command).strip()
         return "%s --split-mode %s" % (command, split_mode)
+
+    @staticmethod
+    def _special_flags(config, skip_keys: set[str] | frozenset[str] = frozenset()) -> list[str]:
+        """Emit flags with bespoke value handling (see ``_LLAMA_CPP_SPECIAL_KEYS``).
+
+        ``flash_attn`` is valued in modern llama.cpp; booleans are normalised
+        (``True`` → ``on``, ``False`` → ``off``) while strings pass through.
+        ``webui`` and ``mmap`` are inverted toggles — ``--no-webui`` /
+        ``--no-mmap`` are emitted only when the value is explicitly falsy.
+        """
+        from scitrera_app_framework import ext_parse_bool
+
+        parts: list[str] = []
+
+        if "flash_attn" not in skip_keys:
+            fa = config.get("flash_attn")
+            if fa is not None:
+                if isinstance(fa, bool):
+                    parts.extend(["--flash-attn", "on" if fa else "off"])
+                else:
+                    parts.extend(["--flash-attn", str(fa)])
+
+        if "webui" not in skip_keys:
+            webui = config.get("webui")
+            if webui is not None and not ext_parse_bool(webui):
+                parts.append("--no-webui")
+
+        if "mmap" not in skip_keys:
+            mmap = config.get("mmap")
+            if mmap is not None and not ext_parse_bool(mmap):
+                parts.append("--no-mmap")
+
+        return parts
+
+    @staticmethod
+    def _inject_mmproj(command: str, mmproj_path: str | None) -> str:
+        """Append ``--mmproj <path>`` to *command* when not already present.
+
+        The projector path is resolved by the launcher and exposed via
+        ``config["_mmproj_path"]``.  Recipes that already reference it
+        explicitly (literal ``--mmproj`` or via the ``{mmproj}`` placeholder)
+        are left untouched, so this only fills in the auto case.
+        """
+        if not mmproj_path or "--mmproj" in command:
+            return command
+        return "%s --mmproj %s" % (command.rstrip().rstrip("\\").rstrip(), mmproj_path)
 
     def prepare(
         self,
@@ -289,6 +296,9 @@ class LlamaCppRuntime(RuntimePlugin):
                     set(_LLAMA_CPP_BOOL_FLAGS),
                     flag_aliases=_LLAMA_CPP_FLAG_ALIASES,
                 )
+            # Auto-inject the multimodal projector when the recipe didn't
+            # reference it explicitly (literal --mmproj or {mmproj}).
+            rendered = self._inject_mmproj(rendered, config.get("_mmproj_path"))
             return rendered
 
         # Otherwise, build command from structured defaults
@@ -326,16 +336,24 @@ class LlamaCppRuntime(RuntimePlugin):
         else:
             parts = ["llama-server", "-m", model or ""]
 
-        # Add valued and boolean flags from config
+        # Multimodal projector for vision GGUF models (resolved by the launcher).
+        mmproj_path = config.get("_mmproj_path")
+        if mmproj_path and "mmproj" not in skip_keys:
+            parts.extend(["--mmproj", str(mmproj_path)])
+
+        # Add valued and boolean flags from config.  Keys with bespoke emission
+        # (flash_attn / webui / mmap) are skipped here and handled separately.
         all_flags = {**_LLAMA_CPP_FLAG_MAP, **_LLAMA_CPP_BOOL_FLAGS}
+        generic_skip = set(skip_keys) | _LLAMA_CPP_SPECIAL_KEYS
         parts.extend(
             self.build_flags_from_map(
                 config,
                 all_flags,
                 bool_keys=set(_LLAMA_CPP_BOOL_FLAGS),
-                skip_keys=skip_keys,
+                skip_keys=generic_skip,
             )
         )
+        parts.extend(self._special_flags(config, skip_keys=skip_keys))
 
         return " ".join(parts)
 
@@ -358,7 +376,12 @@ class LlamaCppRuntime(RuntimePlugin):
         return cmds
 
     def validate_recipe(self, recipe: Recipe) -> list[str]:
-        """Validate llama.cpp-specific recipe fields."""
+        """Validate llama.cpp-specific recipe fields.
+
+        llama.cpp distributes across nodes via ``--split-mode row`` (TP)
+        or ``--split-mode layer`` (PP) but cannot combine the two on the
+        same job, and has no native multi-replica DP coordination.
+        """
         issues = super().validate_recipe(recipe)
         defaults = recipe.defaults or {}
         tp = defaults.get("tensor_parallel")
@@ -367,6 +390,11 @@ class LlamaCppRuntime(RuntimePlugin):
             issues.append(
                 "[llama-cpp] tensor_parallel and pipeline_parallel are mutually "
                 "exclusive; use one for --split-mode row (TP) or layer (PP), not both"
+            )
+        dp = defaults.get("data_parallel")
+        if dp is not None and int(dp) > 1:
+            issues.append(
+                "[llama-cpp] data_parallel > 1 is not supported (got %d); llama.cpp has no native multi-replica DP coordination" % int(dp)
             )
         return issues
 
@@ -395,7 +423,7 @@ class LlamaCppRuntime(RuntimePlugin):
         head_container = self._container_name(cluster_id, "head")
         run_remote_command(
             hosts[0],
-            self.executor.stop_cmd(head_container),
+            self._resolve_executor().stop_cmd(head_container),
             timeout=30,
             dry_run=dry_run,
             **ssh_kwargs,
@@ -406,7 +434,7 @@ class LlamaCppRuntime(RuntimePlugin):
             worker_container = self._container_name(cluster_id, "worker")
             run_remote_command(
                 host,
-                self.executor.stop_cmd(worker_container),
+                self._resolve_executor().stop_cmd(worker_container),
                 timeout=30,
                 dry_run=dry_run,
                 **ssh_kwargs,
@@ -462,8 +490,10 @@ class LlamaCppRuntime(RuntimePlugin):
         import time
         from sparkrun.runtimes._cluster_ops import (
             ClusterContext,
+            cleanup_after_failure,
             cleanup_named_containers,
             detect_ib_with_ips,
+            dump_serve_log,
             launch_containers_parallel,
             run_pre_serve_hooks,
             exec_serve_on_container,
@@ -474,8 +504,24 @@ class LlamaCppRuntime(RuntimePlugin):
         logger.warning("llama.cpp RPC clustering is EXPERIMENTAL. Behavior may change in future versions.")
 
         progress = kwargs.pop("progress", None)
+        cluster = kwargs.pop("cluster", None)
+        backends = kwargs.pop("backends", None)
+        trust = kwargs.pop("trust", False)
+        placement = kwargs.pop("placement", None)
 
-        ctx = ClusterContext.build(self, hosts, image, cluster_id, env, cache_dir, config, dry_run)
+        ctx = ClusterContext.build(
+            self,
+            hosts,
+            image,
+            cluster_id,
+            env,
+            cache_dir,
+            config,
+            dry_run,
+            cluster=cluster,
+            recipe=recipe,
+            placement=placement,
+        )
         head_container = self._container_name(cluster_id, "head")
         worker_container_name = self._container_name(cluster_id, "worker")
 
@@ -506,7 +552,7 @@ class LlamaCppRuntime(RuntimePlugin):
             progress.step("Detecting InfiniBand")
         else:
             logger.info("Step 2/6: InfiniBand detection...")
-        comm_env, ib_ip_map = detect_ib_with_ips(ctx, comm_env, ib_ip_map)
+        comm_env, ib_ip_map, _ib_iface_map = detect_ib_with_ips(ctx, comm_env, ib_ip_map, backends=backends)
         logger.info("Step 2/6: IB step done (%.1fs)", time.monotonic() - t0)
 
         # Resolve worker RPC addresses: prefer IB IPs for high-speed fabric
@@ -532,7 +578,18 @@ class LlamaCppRuntime(RuntimePlugin):
             all_containers.append((host, worker_container_name))
 
         combined_docker_opts = (self.get_extra_docker_opts() or []) + (extra_docker_opts or [])
-        rc = launch_containers_parallel(ctx, all_containers, self.executor, comm_env, extra_docker_opts=combined_docker_opts or None)
+        # llama.cpp uses role-based container names (head, worker) rather
+        # than ranked ones, so we don't emit per-container rank labels —
+        # workload_labels_for_cluster picks up cluster_id + recipe + runtime.
+        rc = launch_containers_parallel(
+            ctx,
+            all_containers,
+            self.executor,
+            comm_env,
+            extra_docker_opts=combined_docker_opts or None,
+            runtime=self,
+            recipe=recipe,
+        )
         if rc != 0:
             return rc
         logger.info("Step 3/6: All containers launched (%.1fs)", time.monotonic() - t0)
@@ -543,7 +600,7 @@ class LlamaCppRuntime(RuntimePlugin):
             progress.step("Running pre-serve hooks")
         else:
             logger.info("Step 4/6: Running pre-serve hooks...")
-        run_pre_serve_hooks(self, ctx, all_containers, recipe, overrides)
+        run_pre_serve_hooks(self, ctx, all_containers, recipe, overrides, trust=trust, cache_dir=cache_dir)
         logger.info("Step 4/6: Pre-serve hooks done (%.1fs)", time.monotonic() - t0)
 
         # Step 5: Exec RPC workers and wait for RPC ports
@@ -561,11 +618,13 @@ class LlamaCppRuntime(RuntimePlugin):
             rpc_worker_command = self._build_rpc_worker_command(rpc_port)
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
+            from sparkrun.orchestration.ssh import resolve_parallel_cap
+            from sparkrun.runtimes._cluster_ops import _config_ssh_cap
 
-            with ThreadPoolExecutor(max_workers=len(ctx.worker_hosts)) as pool:
+            with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(ctx.worker_hosts), _config_ssh_cap(ctx.config))) as pool:
                 futures = {}
                 for host in ctx.worker_hosts:
-                    exec_script = self.executor.generate_exec_serve_script(
+                    exec_script = self._resolve_executor().generate_exec_serve_script(
                         container_name=worker_container_name,
                         serve_command=rpc_worker_command,
                         env=ctx.all_env,
@@ -581,15 +640,29 @@ class LlamaCppRuntime(RuntimePlugin):
                     )
                     futures[future] = host
 
+                worker_failures = []
                 for future in as_completed(futures):
                     host = futures[future]
                     result = future.result()
                     if not result.success and not dry_run:
-                        logger.warning(
-                            "  RPC worker on %s may have failed: %s",
+                        worker_failures.append((host, result))
+
+                if worker_failures:
+                    for host, result in worker_failures:
+                        logger.error(
+                            "RPC worker on %s failed to exec (rc=%d):",
                             host,
-                            result.stderr[:100],
+                            result.returncode,
                         )
+                        for line in (result.stderr or "").rstrip().splitlines():
+                            logger.error("  %s", line)
+                    cleanup_after_failure(
+                        ctx,
+                        self.executor,
+                        container_names=[head_container, worker_container_name],
+                        reason=f"{len(worker_failures)} RPC worker(s) failed exec",
+                    )
+                    return 1
 
             # Wait for RPC ports (probe via management IPs -- SSH
             # connectivity is guaranteed there; the IB IPs are used for the
@@ -608,10 +681,16 @@ class LlamaCppRuntime(RuntimePlugin):
                     )
                     if not ready:
                         logger.error(
-                            "RPC worker on %s failed to become ready. Check logs: ssh %s 'docker logs %s'",
+                            "RPC worker on %s failed to become ready (port %d).",
                             host,
-                            host,
-                            worker_container_name,
+                            rpc_port,
+                        )
+                        dump_serve_log(host, worker_container_name, ctx.ssh_kwargs, dry_run=dry_run)
+                        cleanup_after_failure(
+                            ctx,
+                            self.executor,
+                            container_names=[head_container, worker_container_name],
+                            reason=f"RPC worker on {host} did not open port",
                         )
                         return 1
 
@@ -641,6 +720,13 @@ class LlamaCppRuntime(RuntimePlugin):
 
         rc = exec_serve_on_container(ctx, self.executor, ctx.head_host, head_container, head_command)
         if rc != 0:
+            dump_serve_log(ctx.head_host, head_container, ctx.ssh_kwargs, dry_run=dry_run)
+            cleanup_after_failure(
+                ctx,
+                self.executor,
+                container_names=[head_container, worker_container_name],
+                reason="llama-server head exec failed",
+            )
             return rc
         logger.info("Step 6/6: Head launched (%.1fs)", time.monotonic() - t0)
 

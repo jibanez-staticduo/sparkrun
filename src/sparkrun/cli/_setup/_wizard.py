@@ -31,7 +31,6 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
       sparkrun setup wizard --dry-run --hosts 10.0.0.1 --cluster test
       sparkrun setup wizard --yes --hosts 10.0.0.1,10.0.0.2
     """
-    import os
     import shutil
     import subprocess
 
@@ -54,9 +53,10 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         apply_cx7_plan,
         distribute_cx7_host_keys,
     )
-    from sparkrun.orchestration.primitives import build_ssh_kwargs, local_ip_for
+    from sparkrun.orchestration.primitives import build_ssh_kwargs
     from sparkrun.orchestration.sudo import dispatch_sudo_script, run_with_sudo_fallback, run_sudo_script_on_host
     from sparkrun.scripts import read_script
+    from sparkrun.utils.net import local_ip_for
 
     from .._common import _get_cluster_manager
     from ._commands import setup_install
@@ -64,17 +64,19 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         EARLYOOM_PREFER_PATTERNS,
         EARLYOOM_AVOID_PATTERNS,
         _build_earlyoom_regex,
+        _cdi_summary,
         _DOCKER_GROUP_SCRIPT,
         _DOCKER_GROUP_FALLBACK_SCRIPT,
         _docker_group_summary,
     )
-    from ._ssh import _run_ssh_mesh, _detect_and_update_mgmt_ips
+    from ._ssh import _default_ssh_user, _ensure_ssh_access, _run_ssh_mesh, _detect_and_update_mgmt_ips
 
     # Manifest tracking
     from sparkrun.core.setup_manifest import ManifestManager
 
     # Track results for summary
     results = {}
+    wizard_run_kind = "initial_setup"
     sudo_password = None
     host_list = []
     cx7_detected_any = False
@@ -87,8 +89,9 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         click.echo("=" * 48)
         click.echo()
 
-        # Default user (may be overridden by interactive prompt below)
-        default_user = os.environ.get("USER", "root")
+        # Default user (may be overridden by interactive prompt below).
+        # Never fabricate "root" — see _default_ssh_user.
+        default_user = _default_ssh_user()
         if user is None:
             user = default_user
 
@@ -123,9 +126,34 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         cluster_mgr = _get_cluster_manager()
         manifest_mgr = ManifestManager(cluster_mgr.clusters_dir)
 
+        # Control→host SSH access is a precondition for every probe the wizard
+        # runs (CX7 detection, shared-cache detection, the mesh itself).  Gate
+        # on it once, as the *first* network action and only after the SSH
+        # username is known — otherwise a cluster that has never seen our key
+        # produces a wall of "Permission denied" from each probe in turn, with
+        # the username prompt arriving after the damage is done.
+        ssh_access_hosts: list[str] | None = None
+
+        def _gate_ssh_access(current_user):
+            """Run the access gate once; return the (possibly corrected) user."""
+            nonlocal ssh_access_hosts
+            if ssh_access_hosts is not None or not host_list:
+                return current_user
+            outcome = _ensure_ssh_access(host_list, current_user, config, dry_run=dry_run, yes=yes)
+            ssh_access_hosts = outcome.ok_hosts
+            if outcome.blocked:
+                results["ssh_access"] = "%d/%d hosts" % (len(outcome.ok_hosts), len(host_list))
+            elif outcome.bootstrapped:
+                results["ssh_access"] = "OK (key installed)"
+            else:
+                results["ssh_access"] = "OK"
+            click.echo()
+            return outcome.user
+
         # Check for existing clusters
         existing = cluster_mgr.list_clusters()
         default_name = cluster_mgr.get_default() if existing else None
+        wizard_run_kind = "config_revision" if existing or default_name else "initial_setup"
         if existing and not cluster_name and not hosts:
             if default_name and not yes:
                 # Default cluster exists — offer to continue with it (low friction)
@@ -294,22 +322,9 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                 click.echo("Error: No hosts specified.", err=True)
                 return
 
-            # Detect CX7 on remote hosts if not already known
-            if not local_is_spark and not dry_run:
-                click.echo("Detecting CX7 on remote hosts...")
-                ssh_kwargs = build_ssh_kwargs(config)
-                if user:
-                    ssh_kwargs["ssh_user"] = user
-                try:
-                    remote_detections = detect_cx7_for_hosts(
-                        host_list,
-                        ssh_kwargs=ssh_kwargs,
-                    )
-                    cx7_detected_any = any(d.detected for d in remote_detections.values())
-                except Exception as e:
-                    logger.debug("Remote CX7 detection failed: %s", e)
-
-            # Step 1d: Create cluster
+            # Step 1d: Name the cluster and settle on an SSH user.  Both
+            # prompts come *before* any SSH so the first connection is made
+            # with the credentials the operator actually intends to use.
             if not cluster_name:
                 if yes:
                     cluster_name = "default"
@@ -318,13 +333,74 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
 
             # Prompt for SSH username (--user flag takes precedence)
             if not yes and user == default_user:
-                user = click.prompt("SSH username", default=default_user)
+                user = click.prompt("SSH username", default=default_user or None)
+
+            click.echo()
+
+            # Step 1e: SSH access gate — the first network action of the run.
+            user = _gate_ssh_access(user)
+
+            # Detect CX7 on remote hosts if not already known
+            if not local_is_spark and not dry_run and ssh_access_hosts:
+                click.echo("Detecting CX7 on remote hosts...")
+                ssh_kwargs = build_ssh_kwargs(config)
+                if user:
+                    ssh_kwargs["ssh_user"] = user
+                try:
+                    remote_detections = detect_cx7_for_hosts(
+                        ssh_access_hosts,
+                        ssh_kwargs=ssh_kwargs,
+                    )
+                    cx7_detected_any = any(d.detected for d in remote_detections.values())
+                except Exception as e:
+                    logger.debug("Remote CX7 detection failed: %s", e)
+
+            # Detect a shared/NFS HF cache and offer to enable the matching
+            # distribution preferences (skip the redundant per-host rsync,
+            # drop perm preservation that fails under root_squash).
+            dist_cfg = None
+            if ssh_access_hosts and not dry_run:
+                from sparkrun.core.cluster_manager import (
+                    ClusterDistributionConfig,
+                    ModelDistributionPrefs,
+                )
+                from sparkrun.models.distribute import detect_shared_cache
+
+                ssh_kwargs_cache = build_ssh_kwargs(config)
+                if user and user != default_user:
+                    ssh_kwargs_cache["ssh_user"] = user
+                try:
+                    shared = detect_shared_cache(None, ssh_access_hosts, **ssh_kwargs_cache)
+                except Exception as e:
+                    logger.debug("Shared-cache detection failed: %s", e)
+                    shared = False
+
+                if shared:
+                    click.echo("Detected a shared/NFS HuggingFace cache across the cluster hosts.")
+                    skip_fan_out = yes or click.confirm(
+                        "Skip per-host model sync (the cache is already visible everywhere)?",
+                        default=True,
+                    )
+                    disable_perms = yes or click.confirm(
+                        "Disable file-permission preservation during sync (recommended on NFS)?",
+                        default=True,
+                    )
+                    dist_cfg = ClusterDistributionConfig(
+                        model=ModelDistributionPrefs(
+                            preserve_perms=not disable_perms,
+                            skip_fan_out=bool(skip_fan_out),
+                        )
+                    )
+
+            from sparkrun.core.scheduler import NEW_CLUSTER_DEFAULT_SCHEDULER, new_cluster_scheduler_notice
 
             try:
                 cluster_mgr.create(
                     name=cluster_name,
                     hosts=host_list,
                     user=user if user != default_user else None,
+                    distribution=dist_cfg,
+                    scheduler=NEW_CLUSTER_DEFAULT_SCHEDULER,
                 )
                 cluster_mgr.set_default(cluster_name)
                 results["cluster"] = "%s (%d hosts, set as default)" % (cluster_name, len(host_list))
@@ -335,16 +411,24 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                         len(host_list),
                     )
                 )
+                click.echo(new_cluster_scheduler_notice())
             except ClusterError as e:
                 if "already exists" in str(e):
                     if yes or click.confirm(
                         "Cluster '%s' already exists. Update it?" % cluster_name,
                         default=True,
                     ):
+                        # Only override distribution prefs when we actually
+                        # detected a shared cache; otherwise leave the existing
+                        # cluster's prefs untouched (update() defaults to _UNSET).
+                        _update_kw = {}
+                        if dist_cfg is not None:
+                            _update_kw["distribution"] = dist_cfg
                         cluster_mgr.update(
                             name=cluster_name,
                             hosts=host_list,
                             user=user if user != default_user else None,
+                            **_update_kw,
                         )
                         cluster_mgr.set_default(cluster_name)
                         results["cluster"] = "%s (%d hosts, updated)" % (cluster_name, len(host_list))
@@ -355,8 +439,11 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                             name=cluster_name,
                             hosts=host_list,
                             user=user if user != default_user else None,
+                            distribution=dist_cfg,
+                            scheduler=NEW_CLUSTER_DEFAULT_SCHEDULER,
                         )
                         cluster_mgr.set_default(cluster_name)
+                        click.echo(new_cluster_scheduler_notice())
                         results["cluster"] = "%s (%d hosts, set as default)" % (
                             cluster_name,
                             len(host_list),
@@ -366,14 +453,18 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
 
         click.echo()
 
+        # Reusing an existing cluster skips the discovery path above, so the
+        # access gate has not run yet — run it here before probing.
+        user = _gate_ssh_access(user)
+
         # Detect CX7 on cluster hosts if not already known (e.g. reusing
         # an existing cluster skips the host-discovery path above).
-        if host_list and not cx7_detected_any and len(host_list) >= 2 and not dry_run:
+        if ssh_access_hosts and not cx7_detected_any and len(ssh_access_hosts) >= 2 and not dry_run:
             ssh_kwargs_probe = build_ssh_kwargs(config)
             if user:
                 ssh_kwargs_probe["ssh_user"] = user
             try:
-                probe = detect_cx7_for_hosts(host_list, ssh_kwargs=ssh_kwargs_probe)
+                probe = detect_cx7_for_hosts(ssh_access_hosts, ssh_kwargs=ssh_kwargs_probe)
                 cx7_detected_any = any(d.detected for d in probe.values())
             except Exception as e:
                 logger.debug("CX7 probe on existing cluster failed: %s", e)
@@ -396,7 +487,7 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                     mesh_hosts = list(host_list)
                     seen = set(mesh_hosts)
                     self_ip = local_ip_for(host_list[0]) if host_list else None
-                    local_user = os.environ.get("USER", "root")
+                    local_user = _default_ssh_user()
                     cross_user = user != local_user
                     if self_ip and self_ip in seen and cross_user:
                         # Control machine was explicitly listed — keep it.
@@ -540,6 +631,12 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                 alt_default = default_user if sudo_user != default_user else ""
                 click.echo("  Sudo failed for '%s'. Specify a user with sudo access." % sudo_user)
                 alt_user = click.prompt("Sudo user", default=alt_default)
+                try:
+                    from sparkrun.utils.shell import validate_unix_username
+
+                    validate_unix_username(alt_user)
+                except ValueError as exc:
+                    raise click.BadParameter(str(exc), param_hint="'Sudo user'") from exc
                 sudo_password = click.prompt("[sudo] password for %s" % alt_user, hide_input=True)
 
                 # Use indirect sudo: SSH as cluster user, su to alt_user
@@ -620,16 +717,28 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
 
                     click.echo("  Topology: %s" % effective_topology.value)
 
+                    # Reuse any interface filter saved on the cluster (e.g. set
+                    # via `setup cx7 --interfaces '*np1'`) so the wizard pins the
+                    # same port pair.  See issue #203.
+                    cx7_interfaces: list[str] | None = None
+                    if cluster_name:
+                        try:
+                            cx7_interfaces = cluster_mgr.get(cluster_name).fabric_interfaces or None
+                        except Exception:
+                            cx7_interfaces = None
+                    if cx7_interfaces:
+                        click.echo("  Interface filter: %s" % ", ".join(cx7_interfaces))
+
                     # Select subnets and plan based on topology
                     if effective_topology == CX7Topology.RING:
                         all_subnets = select_subnets_for_topology(detections, effective_topology)
                         click.echo("  Subnets: %s" % ", ".join(str(s) for s in all_subnets))
-                        plan = plan_ring_cx7(detections, topology_result, all_subnets)
+                        plan = plan_ring_cx7(detections, topology_result, all_subnets, interfaces=cx7_interfaces)
                     else:
                         s1, s2 = select_subnets(detections)
                         all_subnets = [s1, s2]
                         click.echo("  Subnets: %s, %s" % (s1, s2))
-                        plan = plan_cluster_cx7(detections, s1, s2)
+                        plan = plan_cluster_cx7(detections, s1, s2, interfaces=cx7_interfaces)
 
                     # Check for plan-level errors (e.g. insufficient ports)
                     if plan.errors and not plan.host_plans:
@@ -713,7 +822,7 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                 mesh_hosts = list(host_list)
                 seen_mesh = set(mesh_hosts)
                 self_ip = local_ip_for(host_list[0]) if host_list else None
-                local_user_remesh = os.environ.get("USER", "root")
+                local_user_remesh = _default_ssh_user()
                 cross_user_remesh = user != local_user_remesh
                 if self_ip and self_ip not in seen_mesh and not cross_user_remesh:
                     mesh_hosts.append(self_ip)
@@ -818,6 +927,65 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
                         return
             else:
                 results["docker"] = "skipped"
+            click.echo()
+
+        # ── Phase 4b: NVIDIA CDI Spec ────────────────────────────────
+        # Generate /etc/cdi/nvidia.yaml so Docker can resolve the
+        # `--device nvidia.com/gpu=...` flags the docker executor emits.
+        # Some DGX Spark hosts need this generated explicitly for full CDI
+        # support; the script self-skips where nvidia-ctk is absent.
+        if host_list:
+            click.echo("Phase 4b: NVIDIA CDI (Container Device Interface)")
+            click.echo("-" * 30)
+            click.echo("Generates /etc/cdi/nvidia.yaml so Docker can access the GPU(s).")
+
+            run_cdi = yes or click.confirm(
+                "Generate the NVIDIA CDI spec on all hosts?",
+                default=True,
+            )
+
+            if run_cdi:
+                try:
+                    cdi_script = read_script("nvidia_cdi_generate.sh")
+                    cdi_fallback = read_script("nvidia_cdi_generate_fallback.sh")
+
+                    if dry_run:
+                        click.echo("  [dry-run] Would generate CDI spec on %d host(s)." % len(host_list))
+                        results["cdi"] = "dry-run"
+                    else:
+                        pw = _ensure_sudo_password()
+                        if _indirect_sudo_user:
+                            cdi_result_map = {}
+                            for h in host_list:
+                                cdi_result_map[h] = _run_sudo_on_host(h, cdi_fallback, pw, timeout=120)
+                        else:
+                            cdi_result_map, cdi_still_failed = run_with_sudo_fallback(
+                                host_list,
+                                cdi_script,
+                                cdi_fallback,
+                                sudo_ssh_kwargs,
+                                dry_run=dry_run,
+                                sudo_password=pw,
+                            )
+                            if cdi_still_failed and pw:
+                                for h in cdi_still_failed:
+                                    cdi_result_map[h] = _run_sudo_on_host(h, cdi_fallback, pw, timeout=120)
+
+                        cdi_ok = sum(1 for h in host_list if cdi_result_map.get(h) and cdi_result_map[h].success)
+                        results["cdi"] = "OK (%d/%d)" % (cdi_ok, len(host_list)) if cdi_ok else "failed"
+                        for h in host_list:
+                            r = cdi_result_map.get(h)
+                            if r and r.success:
+                                click.echo("  %s: %s" % (h, _cdi_summary(r.stdout)))
+                        if cdi_ok and cluster_name:
+                            manifest_mgr.record_phase(cluster_name, user, host_list, "nvidia_cdi")
+                except Exception as e:
+                    results["cdi"] = "failed"
+                    click.echo("CDI error: %s" % e, err=True)
+                    if not yes and not click.confirm("Continue?", default=True):
+                        return
+            else:
+                results["cdi"] = "skipped"
             click.echo()
 
         # ── Phase 5: Sudoers Entries ─────────────────────────────────
@@ -999,6 +1167,8 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
         click.echo("  SSH remesh: %s" % results["ssh_remesh"])
     if results.get("docker"):
         click.echo("  Docker:     %s" % results["docker"])
+    if results.get("cdi"):
+        click.echo("  CDI:        %s" % results["cdi"])
     if results.get("sudoers"):
         click.echo("  Sudoers:    %s" % results["sudoers"])
     if results.get("earlyoom"):
@@ -1009,4 +1179,15 @@ def setup_wizard(ctx, hosts, cluster_name, user, dry_run, yes):
     click.echo("  sparkrun show qwen3-1.7b-vllm           # Recipe details + VRAM estimate")
     click.echo("  sparkrun run qwen3-1.7b-vllm --dry-run  # Preview a launch")
     click.echo("  sparkrun run qwen3-1.7b-vllm            # Launch inference")
+
+    from sparkrun.telemetry import emit_setup_wizard_event
+
+    emit_setup_wizard_event(
+        config,
+        wizard_run_kind=wizard_run_kind,
+        results=results,
+        cluster_node_count=len(host_list),
+        dry_run=dry_run,
+        cx7_detected=cx7_detected_any,
+    )
     click.echo()

@@ -417,6 +417,56 @@ def test_wizard_nopasswd(runner, v, patched_cluster_mgr):
     assert "[sudo] password" not in result.output
 
 
+def test_wizard_generates_cdi(runner, v, patched_cluster_mgr):
+    """Wizard runs the NVIDIA CDI phase and reports the generated spec."""
+    with (
+        mock.patch("subprocess.run") as mock_sub,
+        mock.patch("sparkrun.orchestration.networking.detect_cx7_for_hosts") as mock_cx7,
+        mock.patch("sparkrun.cli._setup._ssh._run_ssh_mesh", return_value=True),
+        mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel") as mock_rsp,
+        mock.patch("sparkrun.orchestration.sudo.run_with_sudo_fallback") as mock_sudo,
+        mock.patch("sparkrun.orchestration.sudo.run_sudo_script_on_host") as mock_sudo_host,
+    ):
+        mock_sub.return_value = mock.Mock(returncode=0, stdout="CX7_DETECTED=0\n", stderr="")
+        mock_cx7.return_value = {"10.0.0.1": mock.Mock(detected=False)}
+        mock_rsp.return_value = [RemoteResult("10.0.0.1", 0, "", "")]
+        mock_sudo.return_value = (
+            {"10.0.0.1": RemoteResult("10.0.0.1", 0, "GENERATED: /etc/cdi/nvidia.yaml (1 device(s))", "")},
+            [],
+        )
+        mock_sudo_host.return_value = RemoteResult("10.0.0.1", 0, "OK", "")
+
+        result = runner.invoke(
+            main,
+            ["setup", "wizard", "--hosts", "10.0.0.1", "--cluster", "cditest", "--yes"],
+        )
+
+    assert result.exit_code == 0
+    assert "Phase 4b: NVIDIA CDI" in result.output
+    assert "GENERATED: /etc/cdi/nvidia.yaml" in result.output
+    assert "CDI:" in result.output
+
+    # The phase is recorded in the setup manifest.
+    from sparkrun.core.setup_manifest import ManifestManager
+
+    manifest = ManifestManager(patched_cluster_mgr.clusters_dir).load("cditest")
+    assert manifest is not None
+    assert "nvidia_cdi" in manifest.phases
+
+
+def test_wizard_cdi_dry_run(runner, v, patched_cluster_mgr):
+    """Wizard --dry-run previews the CDI phase without running sudo."""
+    with mock.patch("subprocess.run") as mock_sub:
+        mock_sub.return_value = mock.Mock(returncode=0, stdout="CX7_DETECTED=0\n", stderr="")
+        result = runner.invoke(
+            main,
+            ["setup", "wizard", "--hosts", "10.0.0.1", "--cluster", "cdidry", "--dry-run", "--yes"],
+        )
+
+    assert result.exit_code == 0
+    assert "Would generate CDI spec" in result.output
+
+
 def test_wizard_sudo_password_reuse(runner, v, patched_cluster_mgr):
     """Password collected once is reused across phases."""
     with (

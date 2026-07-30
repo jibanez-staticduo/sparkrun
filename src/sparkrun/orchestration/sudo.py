@@ -7,7 +7,7 @@ import subprocess
 
 from sparkrun.orchestration import ssh as _ssh
 from sparkrun.orchestration.ssh import RemoteResult
-from sparkrun.utils.shell import b64_encode_cmd, b64_wrap_python
+from sparkrun.utils.shell import b64_encode_cmd, b64_wrap_python, validate_unix_username
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,8 @@ def run_indirect_sudo_script(
     Returns:
         RemoteResult with returncode, stdout, stderr.
     """
+    validate_unix_username(sudo_user)
+
     if dry_run:
         logger.info("[dry-run] Would execute indirect sudo on %s (via su %s)", host, sudo_user)
         return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
@@ -316,9 +318,12 @@ def run_with_sudo_fallback(
         r = _run_local_sudo_script(script, password=None, timeout=timeout, dry_run=dry_run)
         # Preserve original host label in the result
         r = RemoteResult(host=h, returncode=r.returncode, stdout=r.stdout, stderr=r.stderr)
-        if r.success:
-            result_map[h] = r
-        else:
+        # Always record the result (even on failure) so callers keep the script's
+        # output for diagnostics; a failure that isn't a sudo issue (and so has no
+        # password retry) would otherwise vanish. Success/failure is read via
+        # ``.success``; ``still_failed`` is derived from ``failed_hosts`` below.
+        result_map[h] = r
+        if not r.success:
             failed_hosts.append(h)
 
     # Step 1b: Try non-interactive sudo on remote hosts in parallel.
@@ -335,9 +340,10 @@ def run_with_sudo_fallback(
             **ssh_kwargs,
         )
         for r in parallel_results:
-            if r.success:
-                result_map[r.host] = r
-            else:
+            # Record every result (see Step 1a) so a non-sudo failure's output
+            # survives even when there's no password to trigger a fallback.
+            result_map[r.host] = r
+            if not r.success:
                 failed_hosts.append(r.host)
 
     if failed_hosts and not dry_run:

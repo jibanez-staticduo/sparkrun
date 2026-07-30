@@ -304,6 +304,9 @@ def test_resolve_auto_cross_user_returns_delegated(mock_in_cluster):
     assert isinstance(result, TransferModeResult)
     assert result.mode == "delegated"
     assert result.ib_result is None
+    # auto-inferred delegated must arm the push fallback (e.g. private image the
+    # cross-user head can't pull but the control machine has locally).
+    assert result.auto_delegated is True
 
 
 @patch("sparkrun.orchestration.distribution.is_control_in_cluster", return_value=True)
@@ -316,10 +319,60 @@ def test_resolve_auto_same_user_returns_local(mock_in_cluster):
 
 
 def test_resolve_explicit_mode_passthrough():
-    """Explicit modes are returned unchanged."""
-    assert resolve_auto_transfer_mode("local", ["10.0.0.5"]).mode == "local"
-    assert resolve_auto_transfer_mode("delegated", ["10.0.0.5"]).mode == "delegated"
-    assert resolve_auto_transfer_mode("push", ["10.0.0.5"]).mode == "push"
+    """Explicit modes are returned unchanged and never arm the push fallback."""
+    for mode in ("local", "delegated", "push"):
+        res = resolve_auto_transfer_mode(mode, ["10.0.0.5"])
+        assert res.mode == mode
+        # Explicitly-chosen delegated must NOT silently fall back to push.
+        assert res.auto_delegated is False
+
+
+def test_single_image_delegated_falls_back_to_push_single_host():
+    """auto_delegated + single-host delegated pull failure → push from local succeeds."""
+    from sparkrun.orchestration.distribution import _distribute_single_image
+
+    with (
+        patch("sparkrun.containers.distribute.distribute_image_from_head", return_value=["h1"]),
+        patch("sparkrun.containers.distribute.distribute_image_from_local", return_value=[]) as m_local,
+    ):
+        failed = _distribute_single_image("img", ["h1"], ["h1"], "delegated", None, None, {}, dry_run=False, auto_delegated=True)
+    assert failed == []  # push to head succeeded → overall success (was the single-host bug)
+    m_local.assert_called_once()
+
+
+def test_single_image_delegated_no_fallback_when_not_auto():
+    """Explicit delegated (auto_delegated=False) does not fall back to push."""
+    from sparkrun.orchestration.distribution import _distribute_single_image
+
+    with (
+        patch("sparkrun.containers.distribute.distribute_image_from_head", return_value=["h1"]),
+        patch("sparkrun.containers.distribute.distribute_image_from_local", return_value=[]) as m_local,
+    ):
+        failed = _distribute_single_image("img", ["h1"], ["h1"], "delegated", None, None, {}, dry_run=False, auto_delegated=False)
+    assert failed == ["h1"]
+    m_local.assert_not_called()
+
+
+def test_single_image_delegated_fallback_multi_host_fans_out():
+    """auto_delegated fallback: push to head, then head→worker fan-out."""
+    from sparkrun.orchestration.distribution import _distribute_single_image
+
+    calls = {"head": 0}
+
+    def head_side(image, targets, **k):
+        calls["head"] += 1
+        return list(targets) if calls["head"] == 1 else []  # 1st call (pull) fails, 2nd (fan-out) ok
+
+    with (
+        patch("sparkrun.containers.distribute.distribute_image_from_head", side_effect=head_side),
+        patch("sparkrun.containers.distribute.distribute_image_from_local", return_value=[]) as m_local,
+    ):
+        failed = _distribute_single_image(
+            "img", ["h1", "h2"], ["h1", "h2"], "delegated", None, None, {}, dry_run=False, auto_delegated=True
+        )
+    assert failed == []
+    m_local.assert_called_once()  # pushed to head
+    assert calls["head"] == 2  # pull attempt + fan-out
 
 
 @patch("sparkrun.orchestration.distribution.is_control_in_cluster", return_value=False)
@@ -330,6 +383,7 @@ def test_resolve_auto_external_no_local_ib_returns_delegated(mock_ib, mock_in_cl
     result = resolve_auto_transfer_mode("auto", ["10.0.0.5"], ssh_kwargs={"ssh_user": "drew"})
     assert result.mode == "delegated"
     assert result.ib_result is None
+    assert result.auto_delegated is True
 
 
 @patch("sparkrun.orchestration.distribution.is_control_in_cluster", return_value=False)
@@ -590,24 +644,23 @@ def test_explicit_local_cross_user_warns(mock_pop, mock_dist_local, mock_ssh_kw,
 
 @patch.dict("os.environ", {"USER": "drew"})
 def test_stop_by_cluster_id_cross_user_uses_ssh():
-    """_stop_by_cluster_id: localhost + different ssh_user → SSH cleanup path."""
-    from sparkrun.cli._stop_logs import _stop_by_cluster_id
+    """api.stop: localhost + different ssh_user → SSH cleanup path.
 
-    config_mock = MagicMock()
-    config_mock.cache_dir = "/tmp/cache"
-    config_mock.ssh_user = "dgxuser"
-    config_mock.ssh_key = None
-    config_mock.ssh_options = None
+    After Task 9, stop-by-cluster_id flows through ``sparkrun.api.stop``;
+    the CLI no longer owns the dispatch helper.  The cleanup is dispatched
+    via ``sparkrun.orchestration.primitives.cleanup_containers`` for the
+    cross-user case (i.e. localhost addressed via SSH because the SSH
+    login user differs from the local ``$USER``).
+    """
+    import sparkrun.api as api
 
     with (
         patch("sparkrun.orchestration.job_metadata.load_job_metadata", return_value={"hosts": ["127.0.0.1"]}),
         patch("sparkrun.orchestration.job_metadata.remove_job_metadata"),
-        patch("sparkrun.cli._stop_logs.resolve_hosts_with_metadata_fallback", return_value=["127.0.0.1"]),
-        patch("sparkrun.orchestration.docker.enumerate_cluster_containers", return_value=["c1_solo"]),
-        patch("sparkrun.orchestration.primitives.cleanup_containers") as mock_remote,
+        patch("sparkrun.orchestration.primitives.cleanup_containers_by_host") as mock_remote,
         patch("sparkrun.orchestration.primitives.cleanup_containers_local") as mock_local,
     ):
-        _stop_by_cluster_id("abc12345", None, None, None, config_mock, dry_run=True)
+        api.stop(cluster_id="sparkrun_abc12345", hosts=("127.0.0.1",), cache_dir="/tmp/cache")
 
         mock_local.assert_not_called()
         mock_remote.assert_called_once()
@@ -778,3 +831,67 @@ class TestResolveEffectiveCacheDir:
 
         assert result == "/home/other/.cache/huggingface"
         mock_probe.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# C4: parallel cleanup_containers with per-host reporting
+# ---------------------------------------------------------------------------
+
+
+@patch("sparkrun.orchestration.primitives.run_command_on_host")
+def test_cleanup_containers_reports_failed_hosts(mock_run):
+    """cleanup_containers returns the hosts whose stop did not confirm."""
+    from sparkrun.orchestration.primitives import cleanup_containers
+
+    def _side(host, cmds, **kw):
+        # h2 fails to confirm cleanup; the rest succeed.
+        return RemoteResult(host=host, returncode=1 if host == "h2" else 0, stdout="", stderr="boom")
+
+    mock_run.side_effect = _side
+
+    failed = cleanup_containers(["h1", "h2", "h3"], ["c0", "c1"])
+    assert failed == ["h2"]
+    # One call per host (parallel, order-independent).
+    assert mock_run.call_count == 3
+
+
+@patch("sparkrun.orchestration.primitives.run_command_on_host")
+def test_cleanup_containers_all_ok_returns_empty(mock_run):
+    from sparkrun.orchestration.primitives import cleanup_containers
+
+    mock_run.return_value = RemoteResult(host="x", returncode=0, stdout="", stderr="")
+    failed = cleanup_containers(["h1", "h2"], ["c0"])
+    assert failed == []
+
+
+@patch("sparkrun.orchestration.primitives.run_command_on_host")
+def test_cleanup_containers_unreachable_host_does_not_block_others(mock_run):
+    """An exception on one host is reported, not raised, and others proceed."""
+    from sparkrun.orchestration.primitives import cleanup_containers
+
+    def _side(host, cmds, **kw):
+        if host == "h1":
+            raise RuntimeError("ssh down")
+        return RemoteResult(host=host, returncode=0, stdout="", stderr="")
+
+    mock_run.side_effect = _side
+
+    failed = cleanup_containers(["h1", "h2"], ["c0"])
+    assert failed == ["h1"]
+
+
+@patch("sparkrun.orchestration.primitives.run_command_on_host")
+def test_cleanup_containers_dry_run_reports_no_failures(mock_run):
+    from sparkrun.orchestration.primitives import cleanup_containers
+
+    mock_run.return_value = RemoteResult(host="x", returncode=1, stdout="", stderr="")
+    failed = cleanup_containers(["h1", "h2"], ["c0"], dry_run=True)
+    assert failed == []
+
+
+@patch("sparkrun.orchestration.primitives.run_command_on_host")
+def test_cleanup_containers_empty_hosts_noop(mock_run):
+    from sparkrun.orchestration.primitives import cleanup_containers
+
+    assert cleanup_containers([], ["c0"]) == []
+    mock_run.assert_not_called()

@@ -6,32 +6,13 @@ Resolves hosts from CLI args, files, cluster manager, or config defaults.
 from __future__ import annotations
 
 import logging
-import re
 import socket
-import subprocess
 from pathlib import Path
 
 from sparkrun.core.cluster_manager import ClusterError, ClusterManager
-from sparkrun.utils import is_local_host  # noqa: F401 re-exported for backward compat
+from sparkrun.utils import get_local_ips, is_local_host  # noqa: F401 is_local_host re-exported for backward compat
 
 logger = logging.getLogger(__name__)
-
-_IP_ADDR_RE = re.compile(r"\binet6?\s+([0-9a-fA-F.:]+)")
-
-
-def _collect_interface_ips() -> set[str]:
-    """Enumerate IPs bound to local interfaces via ``ip -o addr show``.
-
-    Why: socket.getaddrinfo(gethostname()) misses interface IPs that aren't in
-    DNS/hosts (common on DGX Spark, where the LAN IP isn't mapped to the host).
-    """
-    try:
-        result = subprocess.run(["ip", "-o", "addr", "show"], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return set()
-    if result.returncode != 0:
-        return set()
-    return {m.group(1).split("%")[0] for m in _IP_ADDR_RE.finditer(result.stdout)}
 
 
 def _get_local_identifiers() -> set[str]:
@@ -61,7 +42,8 @@ def _get_local_identifiers() -> set[str]:
         except (OSError, socket.gaierror):
             pass
 
-    identifiers.update(_collect_interface_ips())
+    # Add interface-bound IPs (LAN IPs absent from DNS/hosts, e.g. DGX Spark).
+    identifiers.update(get_local_ips())
 
     return identifiers
 

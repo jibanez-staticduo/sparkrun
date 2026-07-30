@@ -33,6 +33,9 @@ EUGR_BUILD_INDEX_CACHE_NAME = "eugr-vllm-build-index.json"
 GHCR_EUGR_NIGHTLY = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly"
 GHCR_EUGR_NIGHTLY_TF5 = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5"
 
+DOCKER_EUGR_NIGHTLY_SHORT = "eugr/spark-vllm:latest"
+DOCKER_EUGR_NIGHTLY = f"docker.io/{DOCKER_EUGR_NIGHTLY_SHORT}"
+
 # GHCR package paths (without registry prefix) for API calls
 GHCR_EUGR_PKG = "spark-arena/dgx-vllm-eugr-nightly"
 GHCR_EUGR_PKG_TF5 = "spark-arena/dgx-vllm-eugr-nightly-tf5"
@@ -40,6 +43,48 @@ GHCR_EUGR_PKG_TF5 = "spark-arena/dgx-vllm-eugr-nightly-tf5"
 # Local image names produced by prepare_image() for nightly builds
 LOCAL_EUGR_NIGHTLY = "sparkrun-eugr-vllm"
 LOCAL_EUGR_NIGHTLY_TF5 = "sparkrun-eugr-vllm-tf5"
+
+# Fully-qualified ":latest" refs for the GHCR nightly variants.
+GHCR_EUGR_NIGHTLY_LATEST = GHCR_EUGR_NIGHTLY + ":latest"
+GHCR_EUGR_NIGHTLY_TF5_LATEST = GHCR_EUGR_NIGHTLY_TF5 + ":latest"
+
+# ":latest" image refs recognized as eugr nightly sentinels. Following eugr's
+# pull-first switch, sparkrun PULLS our authoritative GHCR nightly
+# (``GHCR_EUGR_NIGHTLY_LATEST``) for these by default and only builds locally from
+# upstream wheels when the recipe opts in with ``--use-wheels`` (see
+# ``prepare_image``). All four forms — GHCR nightly, GHCR nightly-tf5, and the
+# Docker Hub ``eugr/spark-vllm`` image in short and fully-qualified form — resolve
+# to the single non-tf5 build (tf5 and non-tf5 now build identically). The
+# official Docker Hub images are sentinels too, so we always substitute our own
+# nightly as the authoritative ":latest".
+EUGR_NIGHTLY_LATEST_SENTINELS = (
+    GHCR_EUGR_NIGHTLY_LATEST,
+    GHCR_EUGR_NIGHTLY_TF5_LATEST,
+    DOCKER_EUGR_NIGHTLY_SHORT,
+    DOCKER_EUGR_NIGHTLY,
+)
+
+USE_WHEELS_BUILD_ARG = "--use-wheels"
+
+# build_args that do NOT trigger a build. These mirror the flags that leave
+# build-and-copy.sh's CUSTOM_BUILD_REQUESTED false, so the script still pulls the
+# prebuilt runner. Only the deprecated ``--tf5`` family qualifies — every other
+# flag (``--use-wheels``, ``--rebuild-vllm``, ``--rebuild-flashinfer``,
+# ``--vllm-ref``, ``--exp-mxfp4``, ``--force-*-download``, ``--apply-*-pr`` …)
+# requests a wheels/custom build and is forwarded verbatim to the script.
+_PULL_COMPATIBLE_BUILD_ARGS = frozenset({"--tf5", "--pre-tf", "--pre-transformers"})
+
+
+def _wants_build(build_args: list[str]) -> bool:
+    """Return True when *build_args* request a wheels/custom build (vs a pull).
+
+    Mirrors build-and-copy.sh: any token that isn't a known pull-compatible no-op
+    (see :data:`_PULL_COMPATIBLE_BUILD_ARGS`) implies a build. Flag *values* (e.g.
+    the ``main`` in ``--vllm-ref main``) also count as non-pull-compatible, which is
+    fine — the presence of the flag itself already forces the build.
+    """
+    return any(a not in _PULL_COMPATIBLE_BUILD_ARGS for a in build_args)
+
 
 # Build cache file name (stored under cache_dir)
 EUGR_BUILD_CACHE_NAME = "eugr-build-cache.json"
@@ -53,8 +98,27 @@ _FLASHINFER_RELEASE_TAG = "prebuilt-flashinfer-current"
 _RE_VLLM_COMMIT = re.compile(r"\+g([0-9a-f]{6,})\.")
 _RE_FLASHINFER_COMMIT = re.compile(r"\([\d.]+\w*-([0-9a-f]{6,})-d\d{8}\)")
 
-# build_args values that are eligible for cache skip checks
-_CACHEABLE_BUILD_ARGS: list[list[str]] = [[], ["--tf5"]]
+# Normalized build_args values eligible for cache skip checks. ``["--use-wheels"]``
+# is the standard nightly wheels build; ``[]`` / ``["--tf5"]`` cover the legacy
+# escape-hatch path (``use_sentinel_image=false``). Custom wheel-build flags
+# (``--vllm-ref`` etc.) are intentionally absent so they always rebuild.
+_CACHEABLE_BUILD_ARGS: list[list[str]] = [[], ["--tf5"], [USE_WHEELS_BUILD_ARG]]
+
+# Flags dropped when computing a build's cache identity: ``--cleanup`` is
+# unconditional hygiene and ``--tf5`` is a deprecated no-op (the tag it would set
+# is always overridden by ``-t``), so neither changes the produced image.
+_CACHE_IGNORED_BUILD_ARGS = frozenset({"--cleanup", "--tf5"})
+
+
+def _cache_build_args(build_args: list[str]) -> list[str]:
+    """Return the canonical build_args used as build-cache identity.
+
+    Drops hygiene/no-op flags (see :data:`_CACHE_IGNORED_BUILD_ARGS`) so a build
+    and a later cache check resolve to the same key regardless of ``--cleanup`` /
+    ``--tf5`` noise.
+    """
+    return [a for a in build_args if a not in _CACHE_IGNORED_BUILD_ARGS]
+
 
 # Subdirectory under the sparkrun cache dir where per-build log files are written
 EUGR_BUILD_LOG_DIR = "eugr-builds"
@@ -299,11 +363,19 @@ class EugrBuilder(BuilderPlugin):
         build_args = recipe.runtime_config.get("build_args", [])
         needs_build = False  # assume False at first
 
+        # `builder_config.rebuild` (set directly in a recipe or via `sparkrun run
+        # --rebuild`) requests the freshest possible image: a from-scratch rebuild
+        # for locally-built images, and a fresh `docker pull` for pullable registry
+        # images. Applied identically for local/push (non-delegated, on the control
+        # machine) and delegated (on the head) transfer modes.
+        force_rebuild = bool(recipe.builder_config.get("rebuild")) if recipe.builder_config else False
+
         # Builder-level user defaults from `defaults.builders.eugr` in the user config.
-        # `use_sentinel_image` (default True) controls whether ":latest" tags on the
-        # eugr nightly GHCR images are interpreted as "build locally from upstream
-        # wheels" (the historical behavior) — power users can set this to False to
-        # treat ":latest" as a regular pullable image instead.
+        # `use_sentinel_image` (default True) enables eugr's pull-first substitution:
+        # nightly ":latest" sentinels and other non-pullable eugr images resolve to
+        # our authoritative GHCR nightly and are pulled unless `--use-wheels` opts
+        # into a local wheels build. Power users can set it False to opt out — images
+        # are then used verbatim and a missing one is built via build-and-copy.sh.
         # `save_build_logs` (default False) controls whether build-and-copy.sh output
         # is persisted to a log file under <cache_dir>/eugr-builds/.  When False the
         # output is still captured in memory so failure-mode error context is intact;
@@ -313,51 +385,81 @@ class EugrBuilder(BuilderPlugin):
         use_sentinel_image = bool(builder_defaults.get("use_sentinel_image", True))
         save_build_logs = bool(builder_defaults.get("save_build_logs", False))
 
-        # ~~ SPECIAL CASES: map pullable eugr nightly images to use direct build ~~~
-        if not use_sentinel_image:
-            logger.debug(
-                "eugr sentinel image handling disabled (defaults.builders.eugr.use_sentinel_image=false); "
-                "':latest' will be treated as a regular pullable image"
-            )
-        elif image.strip() == GHCR_EUGR_NIGHTLY_TF5 + ":latest" and (build_args == ["--tf5"] or not build_args):
-            # use sparkrun prefixed names to avoid collisions with other user images
-            image = LOCAL_EUGR_NIGHTLY_TF5
-            build_args = ["--tf5"]
-            needs_build = True
-            logger.info("Mapped eugr nightly tf5 image to use direct build via container name '%s' (build_args managed)", image)
-        elif image.strip() == GHCR_EUGR_NIGHTLY + ":latest" and not build_args:
-            # use sparkrun prefixed names to avoid collisions with other user images
-            image = LOCAL_EUGR_NIGHTLY
-            needs_build = True
-            logger.info("Mapped eugr nightly image to container name '%s'", image)
-        # NOTE: if not :latest, then we do want to use the given container image
+        # eugr is pull-first. `build-and-copy.sh` only builds the runner from wheels
+        # when `--use-wheels` or a custom-build flag (`--rebuild-vllm`, `--vllm-ref`,
+        # `--exp-mxfp4`, …) is passed; otherwise it (and we) pull a prebuilt image.
+        # sparkrun mirrors this exactly via `_wants_build()`. A pull resolves the
+        # recipe's image to a pullable ref, falling back to OUR authoritative GHCR
+        # nightly when it's neither pullable nor already present.
+        #
+        # `use_sentinel_image` (default True) gates this pull-first substitution.
+        # Set it False to opt out: images are used verbatim and a missing one is
+        # built via `build-and-copy.sh` the legacy way.
+        wants_build = _wants_build(build_args)
 
-        # TODO: review semantics here for build/no-build when image names are standarized
-        # # if we have "unusual build_args then we need to pursue the build path
-        # elif build_args:
-        #     needs_build = True
-
-        # Determine if we need to build the image.
-        # If the image references a known public registry, it's pullable — never build it.
-        is_pullable = any(image.startswith(prefix) for prefix in PULLABLE_REGISTRY_PREFIXES)
-        if is_pullable and not needs_build:
-            logger.info("image '%s' is from a known registry; skipping build (will be pulled at runtime)", image)
-            needs_build = False
-        elif not needs_build:
-            # Check if image already exists — skip build if specifically named and already present
+        def _image_present(img: str) -> bool:
             if delegated:
-                image_found = self._image_exists_on_host(image, head, ssh_kwargs)
+                return self._image_exists_on_host(img, head, ssh_kwargs)
+            from sparkrun.containers.registry import image_exists_locally
+
+            return image_exists_locally(img)
+
+        # Recognized nightly ":latest" sentinels map to our canonical names — the
+        # sparkrun-prefixed local tag when building, our GHCR nightly when pulling.
+        # tf5 and non-tf5 nightlies are identical now, so both map the same way.
+        if use_sentinel_image and image.strip() in EUGR_NIGHTLY_LATEST_SENTINELS:
+            if wants_build:
+                logger.info("Mapped eugr nightly image '%s' to local build '%s'", image.strip(), LOCAL_EUGR_NIGHTLY)
+                image = LOCAL_EUGR_NIGHTLY
             else:
-                from sparkrun.containers.registry import image_exists_locally
+                logger.info(
+                    "Mapped eugr nightly image '%s' to pullable '%s' (add --use-wheels to build_args to build from wheels)",
+                    image.strip(),
+                    GHCR_EUGR_NIGHTLY_LATEST,
+                )
+                image = GHCR_EUGR_NIGHTLY_LATEST
 
-                image_found = image_exists_locally(image)
+        is_pullable = any(image.startswith(prefix) for prefix in PULLABLE_REGISTRY_PREFIXES)
 
-            if not image_found:
+        if is_pullable:
+            # Pull path — covers sentinel→canonical and any external pullable ref.
+            # build_args don't apply to a pull, so they're ignored here.
+            if force_rebuild:
+                # Registry images can't be rebuilt, so honor `rebuild` by pulling a
+                # fresh copy (bypassing any stale local/head image of the same tag).
+                self._force_pull_image(image, head if delegated else None, ssh_kwargs if delegated else None, dry_run=dry_run)
+            else:
+                logger.info("image '%s' is pullable; skipping build (will be pulled at runtime)", image)
+            needs_build = False
+        elif wants_build or not use_sentinel_image:
+            # Build path: `--use-wheels`/custom-build flags, or the legacy escape hatch.
+            if force_rebuild:
+                # Rebuild forces a from-scratch build regardless of a present image.
                 needs_build = True
-                if delegated:
-                    logger.info("image '%s' not found on head '%s'; will build remotely", image, head)
-                else:
-                    logger.info("image '%s' not found locally; will build", image)
+                logger.info("rebuild requested; will rebuild image '%s' from wheels", image)
+            elif not _image_present(image):
+                needs_build = True
+                logger.info(
+                    "image '%s' not found%s; will build from wheels",
+                    image,
+                    " on head '%s'" % head if delegated else " locally",
+                )
+        else:
+            # Pull-first default for a non-pullable eugr image with no build flags.
+            # Reuse it if already present; otherwise substitute OUR nightly and pull —
+            # eugr won't build without `--use-wheels` (or a custom-build flag).
+            if _image_present(image) and not force_rebuild:
+                logger.info("image '%s' found; using it (add --use-wheels to build_args to rebuild from wheels)", image)
+            else:
+                logger.info(
+                    "image '%s' not available; substituting our nightly '%s' (add --use-wheels to build_args to build from wheels)",
+                    image,
+                    GHCR_EUGR_NIGHTLY_LATEST,
+                )
+                image = GHCR_EUGR_NIGHTLY_LATEST
+                if force_rebuild:
+                    self._force_pull_image(image, head if delegated else None, ssh_kwargs if delegated else None, dry_run=dry_run)
+            needs_build = False
 
         # nothing eugr-specific to prepare -- no build
         if not needs_build:
@@ -376,11 +478,12 @@ class EugrBuilder(BuilderPlugin):
                 registry_cache_root = Path(config.cache_dir) / "registries"
             self._repo_dir = self.ensure_repo(registry_cache_root=registry_cache_root, branch=branch)
 
-        # Check build cache — skip rebuild if upstream wheels haven't changed
-        if needs_build and not dry_run:
+        # Check build cache — skip rebuild if upstream wheels haven't changed.
+        # An explicit `rebuild` request bypasses the cache and always rebuilds.
+        if needs_build and not dry_run and not force_rebuild:
             skip_host = head if delegated else None
             skip_ssh = ssh_kwargs if delegated else None
-            if self._can_skip_build(image, build_args, config, host=skip_host, ssh_kwargs=skip_ssh):
+            if self._can_skip_build(image, _cache_build_args(build_args), config, host=skip_host, ssh_kwargs=skip_ssh):
                 logger.info(
                     "Build cache hit — skipping rebuild of '%s' (upstream wheels unchanged)",
                     image,
@@ -389,12 +492,14 @@ class EugrBuilder(BuilderPlugin):
 
         # Build image if needed
         if needs_build:
-            # `--cleanup` is an unconditional builder-hygiene flag — keep it out of the
-            # cached build_args so cache identity remains tied to the recipe's canonical
-            # build_args (otherwise every subsequent cache check would miss).
+            # Forward the recipe's build_args verbatim (so `--use-wheels` actually
+            # reaches build-and-copy.sh) plus the `--cleanup` hygiene flag. The cache
+            # identity uses the normalized args (`_cache_build_args`) so `--cleanup`
+            # and the deprecated `--tf5` don't cause spurious cache misses.
             effective_build_args = list(build_args)
             if "--cleanup" not in effective_build_args:
                 effective_build_args.append("--cleanup")
+            cache_args = _cache_build_args(build_args)
 
             if delegated:
                 self._build_image_remote(image, effective_build_args, head, ssh_kwargs, dry_run, config=config, save_logs=save_build_logs)
@@ -403,12 +508,12 @@ class EugrBuilder(BuilderPlugin):
                 # corruption mode the rebuild path produces (see issue #164).
                 if not dry_run:
                     self._verify_image_imports(image, host=head, ssh_kwargs=ssh_kwargs)
-                    self._save_build_metadata(image, build_args, config, host=head, ssh_kwargs=ssh_kwargs)
+                    self._save_build_metadata(image, cache_args, config, host=head, ssh_kwargs=ssh_kwargs)
             else:
                 self._build_image(image, effective_build_args, dry_run, config=config, save_logs=save_build_logs)
                 if not dry_run:
                     self._verify_image_imports(image)
-                    self._save_build_metadata(image, build_args, config)
+                    self._save_build_metadata(image, cache_args, config)
 
         # TODO: potentially inject metadata flags as needed into recipe?
         return image
@@ -1026,6 +1131,36 @@ class EugrBuilder(BuilderPlugin):
         script = "docker image inspect %s >/dev/null 2>&1" % quote(image)
         result = run_script_on_host(host, script, ssh_kwargs=ssh_kwargs, timeout=30)
         return result.success
+
+    @staticmethod
+    def _force_pull_image(image: str, host: str | None = None, ssh_kwargs: dict | None = None, dry_run: bool = False) -> None:
+        """Force a fresh ``docker pull`` of *image*.
+
+        When *host* is ``None`` (local/push transfer modes) the pull runs on the
+        control machine; otherwise it runs on the head node over SSH (delegated
+        mode). A failed pull is logged as a warning rather than raised — a stale
+        local copy of the tag, if any, remains usable as a fallback.
+        """
+        if host:
+            from sparkrun.orchestration.primitives import run_script_on_host
+
+            if dry_run:
+                logger.info("[dry-run] Would force-pull fresh image '%s' on host '%s'", image, host)
+                return
+            logger.info("rebuild requested; pulling fresh registry image '%s' on host '%s'", image, host)
+            script = "docker pull %s" % quote(image)
+            result = run_script_on_host(host, script, ssh_kwargs=ssh_kwargs, timeout=1800)
+            if not result.success:
+                logger.warning("Force pull of '%s' on host '%s' failed", image, host)
+        else:
+            from sparkrun.containers.registry import ensure_image
+
+            if dry_run:
+                logger.info("[dry-run] Would force-pull fresh image '%s'", image)
+                return
+            logger.info("rebuild requested; pulling fresh registry image '%s'", image)
+            if ensure_image(image, dry_run=dry_run, force_pull=True) != 0:
+                logger.warning("Force pull of '%s' failed", image)
 
     def _ensure_repo_remote(
         self,

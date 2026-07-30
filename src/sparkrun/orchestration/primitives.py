@@ -8,15 +8,18 @@ their particular launch and teardown flows.
 from __future__ import annotations
 
 import logging
-import subprocess
 
 from sparkrun.core.config import SparkrunConfig, resolve_hf_cache_home
 from sparkrun.utils import is_valid_ip
 from sparkrun.orchestration.ssh import (
+    DEFAULT_MAX_PARALLEL_SSH,
     RemoteResult,
+    resolve_parallel_cap,
+    run_local_script,
     run_remote_command,
     run_remote_script,
     run_remote_scripts_parallel,
+    should_run_locally,
 )
 from sparkrun.orchestration.comm_env import ClusterCommEnv
 from sparkrun.orchestration.infiniband import (
@@ -28,8 +31,11 @@ from sparkrun.orchestration.docker import docker_stop_cmd
 
 logger = logging.getLogger(__name__)
 
-# Orchestration constants
-MAX_PARALLEL_SSH = 20
+# Orchestration constants.
+# ``MAX_PARALLEL_SSH`` is retained here for backward-compatible imports;
+# the canonical default now lives in ``orchestration.ssh`` so the fan-out
+# helpers and ``SparkrunConfig.max_parallel_ssh`` share one source of truth.
+MAX_PARALLEL_SSH = DEFAULT_MAX_PARALLEL_SSH
 PORT_SCAN_MAX_ATTEMPTS = 24
 
 
@@ -72,6 +78,32 @@ def build_volumes(
     if extra:
         volumes.update(extra)
     return volumes
+
+
+def resolved_model_volume(recipe) -> dict[str, str]:
+    """Identity bind-mount for a recipe's pre-placed on-disk model weights.
+
+    Two surfaces feed this: the ``cluster_config.resolved_model_path`` escape
+    hatch, and — as user-facing sugar — an absolute path in the recipe's
+    ``model:`` field (:func:`sparkrun.core.recipe.is_local_model_path`).  Either
+    way the weights directory is already present on every node (e.g. a shared
+    NFS mount) and is mounted into the container at the *same* path so the
+    serving runtime can read it directly (the serve argument points at this path
+    already).  Returns an empty dict when neither is configured.
+    """
+    path = getattr(getattr(recipe, "cluster_config", None), "resolved_model_path", None)
+    if not path:
+        from sparkrun.core.recipe import is_local_model_path
+
+        model = getattr(recipe, "model", None)
+        if is_local_model_path(model):
+            path = model
+    if not path or not isinstance(path, str):
+        return {}
+    from sparkrun.utils.shell import assert_safe_mount_source
+
+    assert_safe_mount_source(path)
+    return {path: path}
 
 
 def probe_remote_hf_cache(
@@ -358,25 +390,114 @@ def check_tcp_reachability(
     return results
 
 
+def cleanup_containers_by_host(
+    host_containers: dict[str, list[str]],
+    ssh_kwargs: dict | None = None,
+    dry_run: bool = False,
+    max_workers: int | None = None,
+) -> dict[str, RemoteResult]:
+    """Tear down a *different* container set per host, in parallel.
+
+    The shared teardown primitive: one dispatching, verifying removal per
+    host.  Unlike a bare ``docker rm -f ... || true`` chain, the script
+    (:func:`~sparkrun.orchestration.docker.docker_teardown_script`)
+    confirms the containers are actually gone and reports how many it
+    removed, so callers can report a truthful count instead of assuming
+    the command that returned 0 did anything.
+
+    Best-effort per host: an exception or a failed teardown on one host
+    is recorded, never raised, so it can't block or mask cleanup of the
+    rest.
+
+    Args:
+        host_containers: Mapping of host → container names on that host.
+        ssh_kwargs: SSH connection parameters.
+        dry_run: Log without executing.
+        max_workers: Cap on concurrent cleanup workers (defaults to the
+            shared SSH fan-out cap).
+
+    Returns:
+        Mapping of host → :class:`RemoteResult`.  ``result.success`` is
+        the per-host verdict; the removed count is recoverable via
+        :func:`~sparkrun.orchestration.docker.parse_teardown_removed`.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from sparkrun.orchestration.docker import docker_teardown_script
+
+    if not host_containers:
+        return {}
+
+    results: dict[str, RemoteResult] = {}
+    with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(host_containers), max_workers)) as pool:
+        futures = {
+            pool.submit(
+                run_command_on_host,
+                host,
+                docker_teardown_script(names),
+                ssh_kwargs=ssh_kwargs,
+                timeout=30,
+                dry_run=dry_run,
+                quiet=True,
+            ): host
+            for host, names in host_containers.items()
+        }
+        for future in as_completed(futures):
+            host = futures[future]
+            try:
+                results[host] = future.result()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("Cleanup raised on %s: %s", host, e)
+                results[host] = RemoteResult(host=host, returncode=255, stdout="", stderr=str(e))
+
+    failed = [h for h, r in results.items() if not r.success] if not dry_run else []
+    if failed:
+        logger.warning(
+            "Container cleanup did not confirm on %d host(s): %s — these may still hold VRAM; check with 'sparkrun stop' or 'docker ps'.",
+            len(failed),
+            ", ".join(sorted(failed)),
+        )
+    return results
+
+
 def cleanup_containers(
     hosts: list[str],
     container_names: list[str],
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
-) -> None:
-    """Stop and remove named containers on every host.
+    max_workers: int | None = None,
+) -> list[str]:
+    """Stop and remove the same named containers on every host, in parallel.
 
-    Uses local execution when a host is localhost, SSH otherwise.
+    Thin wrapper over :func:`cleanup_containers_by_host` for the common
+    "same candidate names everywhere" case (see it for the dispatch and
+    verification semantics).
 
     Args:
         hosts: Target hosts.
         container_names: Container names to remove on each host.
         ssh_kwargs: SSH connection parameters.
         dry_run: Log without executing.
+        max_workers: Cap on concurrent cleanup workers (defaults to the
+            shared SSH fan-out cap).
+
+    Returns:
+        List of hosts where the teardown did not confirm (empty on full
+        success).  Always empty in dry-run mode.
     """
-    cmds = "; ".join(docker_stop_cmd(name) for name in container_names)
-    for host in hosts:
-        run_command_on_host(host, cmds, ssh_kwargs=ssh_kwargs, timeout=30, dry_run=dry_run)
+    if not hosts:
+        return []
+
+    results = cleanup_containers_by_host(
+        {host: list(container_names) for host in hosts},
+        ssh_kwargs=ssh_kwargs,
+        dry_run=dry_run,
+        max_workers=max_workers,
+    )
+    if dry_run:
+        return []
+    # Preserve the caller's host order in the failure report.
+    return [host for host in hosts if not results[host].success]
 
 
 def cleanup_containers_local(
@@ -391,24 +512,6 @@ def cleanup_containers_local(
 # ---------------------------------------------------------------------------
 # IP detection
 # ---------------------------------------------------------------------------
-
-
-def local_ip_for(target_host: str) -> str | None:
-    """Return the local IP address on the interface that routes to *target_host*.
-
-    Uses a UDP connect (no packets sent) to let the OS pick the right
-    source address.  Falls back to ``socket.gethostname()`` on failure.
-    """
-    import socket
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect((target_host, 1))  # port is arbitrary; no traffic sent
-            return s.getsockname()[0]
-    except Exception:
-        # Fall back to hostname if routing lookup fails (e.g. target
-        # is not resolvable from the control machine itself).
-        return socket.gethostname() or None
 
 
 def detect_host_ip(
@@ -499,68 +602,13 @@ def find_available_port(
 
 
 # ---------------------------------------------------------------------------
-# Execution dispatch predicate
-# ---------------------------------------------------------------------------
-
-
-def should_run_locally(host: str, ssh_user: str | None = None) -> bool:
-    """True if *host* is local AND no cross-user SSH is needed.
-
-    Use this instead of :func:`~sparkrun.utils.is_local_host` at
-    execution dispatch points (where the code decides "run locally via
-    subprocess" vs "run via SSH").  Keep ``is_local_host`` for pure
-    address-identity checks (e.g. "is this IP me?").
-
-    Returns ``True`` when the host is local and *ssh_user* is ``None``
-    or matches the current OS user.
-    """
-    import os
-    from sparkrun.utils import is_local_host
-
-    if not is_local_host(host):
-        return False
-    if ssh_user is None:
-        return True
-    return ssh_user == os.environ.get("USER", "root")
-
-
-# ---------------------------------------------------------------------------
-# Local execution
-# ---------------------------------------------------------------------------
-
-
-def run_local_script(script: str, dry_run: bool = False) -> RemoteResult:
-    """Execute a script locally via subprocess.
-
-    Args:
-        script: Bash script content to execute.
-        dry_run: If True, log the script but don't execute.
-
-    Returns:
-        RemoteResult with host set to ``"localhost"``.
-    """
-    if dry_run:
-        script_lines = script.count("\n")
-        logger.info("[dry-run] Would execute locally (%d lines, %d bytes)", script_lines, len(script))
-        return RemoteResult(host="localhost", returncode=0, stdout="[dry-run]", stderr="")
-
-    proc = subprocess.run(
-        ["bash", "-s"],
-        input=script,
-        capture_output=True,
-        text=True,
-    )
-    return RemoteResult(
-        host="localhost",
-        returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Execution helpers (local-or-remote dispatch)
 # ---------------------------------------------------------------------------
+#
+# ``should_run_locally`` / ``run_local_script`` are defined in
+# ``orchestration.ssh`` (alongside ``RemoteResult``, and so the fan-out
+# helpers there can honour ``allow_local``); they are re-exported above
+# for the many callers that import them from here.
 
 
 def run_script_on_host(
@@ -577,7 +625,7 @@ def run_script_on_host(
     """
     kw = ssh_kwargs or {}
     if should_run_locally(host, kw.get("ssh_user")):
-        return run_local_script(script, dry_run=dry_run)
+        return run_local_script(script, dry_run=dry_run, timeout=timeout)
     return run_remote_script(host, script, timeout=timeout, dry_run=dry_run, **kw)
 
 
@@ -592,5 +640,41 @@ def run_command_on_host(
     """Run a command on a host — dispatches to local or remote execution."""
     kw = ssh_kwargs or {}
     if should_run_locally(host, kw.get("ssh_user")):
-        return run_local_script("#!/bin/bash\n" + command, dry_run=dry_run)
+        return run_local_script("#!/bin/bash\n" + command, dry_run=dry_run, timeout=timeout)
     return run_remote_command(host, command, timeout=timeout, dry_run=dry_run, quiet=quiet, **kw)
+
+
+def resolve_image_sha(
+    image_ref: str,
+    hosts: list[str] | tuple[str, ...],
+    ssh_kwargs: dict | None = None,
+    dry_run: bool = False,
+) -> str | None:
+    """Resolve a container image reference to its content-addressable image ID.
+
+    Runs ``docker image inspect --format '{{.Id}}' <ref>`` on each host in
+    *hosts* until one succeeds; returns the ``sha256:...`` ID string. Returns
+    ``None`` when no host can resolve it (image not pulled, docker unavailable,
+    network error). Returns ``None`` on ``dry_run`` to avoid live calls.
+
+    Used by benchmark resume to lock the exact image bits across invocations
+    so a re-pushed tag or rebuilt local image cannot silently change the
+    workload between sessions.
+    """
+    if dry_run or not hosts:
+        return None
+    from sparkrun.utils.shell import quote as _q
+
+    cmd = "docker image inspect --format '{{.Id}}' %s" % _q(image_ref)
+    for host in hosts:
+        try:
+            result = run_command_on_host(host, cmd, ssh_kwargs=ssh_kwargs, dry_run=False, quiet=True)
+        except Exception:
+            logger.debug("resolve_image_sha: exception on %s", host, exc_info=True)
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            sha = result.stdout.strip().splitlines()[0].strip()
+            if sha.startswith("sha256:"):
+                return sha
+            logger.debug("resolve_image_sha: unexpected output on %s: %r", host, sha)
+    return None
