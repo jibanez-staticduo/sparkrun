@@ -6,7 +6,7 @@ follows semantic versioning.
 
 For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md).
 
-## [0.3.0] — unreleased
+## [0.3.0] — 2026-07-30
 
 The largest release since 0.1: multiplatform foundations, a console-free
 library API, pluggable placement, and a security pass across recipe trust.
@@ -270,3 +270,5 @@ the post-launch lifecycle are unchanged for existing recipes.
 - `_validate_git_url` allowlists `https://`, `git@`, `ssh://`, `file://`.
 - `utils/shell.py:quote()` wraps `shlex.quote()`; in-tree shell construction
   routes through it.
+
+[0.3.0]: https://github.com/spark-arena/sparkrun/releases/tag/v0.3.0
