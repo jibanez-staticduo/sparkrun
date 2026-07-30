@@ -94,7 +94,14 @@ class TestSaveOmitsDefaultTrust:
 
 
 class TestFallbackDefaultsTrustAlignment:
-    """Defaults whose URL is in BOOTSTRAP_REGISTRY_URLS are trusted; others are not."""
+    """Which built-in registries ship trusted.
+
+    Trust is declared per entry on ``FALLBACK_DEFAULT_REGISTRIES`` — it is NOT
+    derived from ``BOOTSTRAP_REGISTRY_URLS``, which exists only for
+    bootstrap-time manifest discovery. The two lists deliberately differ:
+    ``eugr`` and ``atlas`` are first-party recipe sources that ship trusted
+    without participating in manifest discovery.
+    """
 
     def test_bootstrap_url_entries_are_trusted(self):
         for entry in FALLBACK_DEFAULT_REGISTRIES:
@@ -104,19 +111,16 @@ class TestFallbackDefaultsTrustAlignment:
                     entry.url,
                 )
 
-    def test_non_bootstrap_entries_are_not_trusted(self):
+    def test_all_builtin_defaults_ship_trusted(self):
+        """Every registry sparkrun ships by default is first-party and trusted."""
         for entry in FALLBACK_DEFAULT_REGISTRIES:
-            if entry.url not in BOOTSTRAP_REGISTRY_URLS:
-                assert entry.trusted is False, "Expected %s (url=%s) to be untrusted because its URL is NOT in BOOTSTRAP_REGISTRY_URLS" % (
-                    entry.name,
-                    entry.url,
-                )
+            assert entry.trusted is True, "Expected built-in default %s (url=%s) to ship trusted" % (entry.name, entry.url)
 
-    def test_eugr_and_atlas_not_trusted(self):
-        """Concrete sanity check: eugr and atlas ship untrusted."""
+    def test_eugr_and_atlas_trusted(self):
+        """eugr and atlas ship trusted despite not being manifest-discovery URLs."""
         by_name = {e.name: e for e in FALLBACK_DEFAULT_REGISTRIES}
-        assert by_name["eugr"].trusted is False
-        assert by_name["atlas"].trusted is False
+        assert by_name["eugr"].trusted is True
+        assert by_name["atlas"].trusted is True
 
     def test_official_and_sparkrun_testing_trusted(self):
         """Concrete sanity check: official + sparkrun-testing ship trusted."""
@@ -303,6 +307,37 @@ class TestTrustMigration:
         assert post_first == post_second
         # And _needs_trust_migration returns False post-migration.
         assert mgr._needs_trust_migration() is False
+
+    def test_migration_trusts_defaults_outside_bootstrap_urls(self, mgr):
+        """A trusted default that isn't a bootstrap-discovery URL still migrates trusted.
+
+        Regression guard: the migration derives trust from
+        FALLBACK_DEFAULT_REGISTRIES, not BOOTSTRAP_REGISTRY_URLS. Deriving it
+        from the latter meant marking a new registry trusted only reached fresh
+        installs — anyone upgrading from a pre-trust registries.yaml silently
+        kept it untrusted.
+        """
+        by_name = {e.name: e for e in FALLBACK_DEFAULT_REGISTRIES}
+        eugr_url = by_name["eugr"].url
+        atlas_url = by_name["atlas"].url
+        assert eugr_url not in BOOTSTRAP_REGISTRY_URLS
+        assert atlas_url not in BOOTSTRAP_REGISTRY_URLS
+
+        self._write_legacy(mgr, [("eugr", eugr_url), ("atlas", atlas_url), ("third-party", "https://example.com/third")])
+        entries = {e.name: e for e in mgr._load_registries()}
+        assert entries["eugr"].trusted is True
+        assert entries["atlas"].trusted is True
+        assert entries["third-party"].trusted is False
+
+    def test_migration_matches_urls_modulo_dot_git(self, mgr):
+        """``…/repo`` and ``…/repo.git`` are the same registry for trust purposes."""
+        by_name = {e.name: e for e in FALLBACK_DEFAULT_REGISTRIES}
+        official_url = by_name["official"].url
+        variant = official_url[:-4] if official_url.endswith(".git") else official_url + ".git"
+
+        self._write_legacy(mgr, [("official-variant", variant)])
+        entries = {e.name: e for e in mgr._load_registries()}
+        assert entries["official-variant"].trusted is True
 
     def test_no_migration_when_field_present(self, mgr):
         """If every entry already has 'trusted', migration must NOT fire."""

@@ -324,7 +324,7 @@ FALLBACK_DEFAULT_REGISTRIES = [
         description="Official eugr/spark-vllm-docker repo recipes",
         mods_subpath="mods",
         visible=True,
-        # Not in BOOTSTRAP_REGISTRY_URLS — ships untrusted.
+        trusted=True,
     ),
     RegistryEntry(
         name="sparkrun-transitional",
@@ -357,9 +357,28 @@ FALLBACK_DEFAULT_REGISTRIES = [
         subpath="recipes",
         description="Atlas recipes",
         visible=False,
-        # Not in BOOTSTRAP_REGISTRY_URLS — ships untrusted.
+        trusted=True,
     ),
 ]
+
+
+def _normalize_registry_url(url: str) -> str:
+    """Canonicalize a git URL for comparison (drop trailing ``/`` and ``.git``)."""
+    normalized = (url or "").rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized
+
+
+def _default_trusted_urls() -> set[str]:
+    """Normalized URLs of every registry that ships ``trusted=True``.
+
+    The single source of truth for "which registries are trusted out of the
+    box", consumed by the legacy-config trust migration so a newly-trusted
+    default reaches upgrading users and not just fresh installs.
+    """
+    return {_normalize_registry_url(e.url) for e in FALLBACK_DEFAULT_REGISTRIES if e.trusted}
+
 
 # List of git URLs for registries that have been superseded and should be cleaned up.
 # Comparison strips trailing .git from entry URLs before matching.
@@ -869,14 +888,21 @@ class RegistryManager:
     def _migrate_trust_field(self, entries: list[RegistryEntry]) -> list[RegistryEntry]:
         """Backfill the ``trusted`` field for legacy registries.yaml files.
 
-        Any entry whose URL is in :data:`BOOTSTRAP_REGISTRY_URLS` is marked
-        as ``trusted=True``; all others retain ``trusted=False``.  The
-        migrated list is then persisted via :meth:`_save_registries` so
-        the next load sees an explicit ``trusted`` field on every entry
-        and the migration does not repeat.
+        An entry is marked ``trusted=True`` when it matches a registry that
+        :data:`FALLBACK_DEFAULT_REGISTRIES` ships as trusted; everything else
+        retains ``trusted=False``.  The migrated list is then persisted via
+        :meth:`_save_registries` so the next load sees an explicit ``trusted``
+        field on every entry and the migration does not repeat.
+
+        Deriving this from the default registry list (rather than from
+        :data:`BOOTSTRAP_REGISTRY_URLS`, which exists for manifest discovery)
+        keeps a single source of truth for "which registries ship trusted" —
+        otherwise adding a trusted default silently fails to reach users
+        upgrading from a pre-trust ``registries.yaml``.
         """
+        trusted_urls = _default_trusted_urls()
         for entry in entries:
-            entry.trusted = entry.url in BOOTSTRAP_REGISTRY_URLS
+            entry.trusted = _normalize_registry_url(entry.url) in trusted_urls
         self._save_registries(entries)
         logger.info("Migrated registries.yaml to per-registry trust model")
         return entries
