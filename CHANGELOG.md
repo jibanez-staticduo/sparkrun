@@ -101,14 +101,13 @@ the post-launch lifecycle are unchanged for existing recipes.
 - `orchestration/telemetry/` — `TelemetryProvider` per status scope, powering
   `api.live_monitor`.
 
-#### Feature flags, updates, telemetry
+#### Feature flags and telemetry
 
 - `core/features.py` — `FeatureFlag` registry with per-channel defaults;
   resolution order env → config → channel → baseline → fail-closed.
   `SPARKRUN_FEATURE_<NAME>` env override.
 - `sparkrun setup features list|enable|disable|reset`.
 - Plugin self-gating via `required_feature_flag`.
-- Release channels: `sparkrun update --stable|--beta|--alpha` (`--yolo` alias).
 - Anonymous, opt-out telemetry (`telemetry/`), `sparkrun setup telemetry`,
   `SPARKRUN_NO_TELEMETRY` per-process override.
 
@@ -120,13 +119,12 @@ the post-launch lifecycle are unchanged for existing recipes.
   inference endpoint, via JIT-minted tagged OAuth keys.
 - `sparkrun setup k8s` (gated) — kubectl acquisition, cluster info, least-priv
   service account, Kueue install, JobSet launch.
-- `sparkrun cluster inspect`, `sparkrun cluster import svd|eugr`.
+- `sparkrun cluster import svd|eugr`.
 - `sparkrun registry trust|untrust`, `registry add --trust`.
 - `sparkrun recipe update`; `--json` on recipe list/search and status.
 - `@registry` scope accepted in `list` / `search` queries.
 - `logs`: `-f/--follow`, `-a/--all-sources`, `-n/--lines` (default: all).
-- `run`: `--memory-limit`, `--label`, plus hidden `--scheduler`, `--rebuild`,
-  `--executor-args`, `--dp`.
+- `run`: hidden `--scheduler`, `--rebuild`, `--executor-args`, `--dp`.
 - `benchmark` categories (`performance` / `perf`, `tools`), `--resume`,
   `--arena`, `--api-key-env`.
 - `run-recipe.sh` compatibility shim for the spark-vllm-docker workflow.
@@ -135,8 +133,8 @@ the post-launch lifecycle are unchanged for existing recipes.
 
 - `tokenary` runtime — native multi-node TP over its own NCCL bootstrap;
   embedding-only and NER workloads.
-- `modular-max` runtime — single-node; `tensor_parallel` → local `--devices`.
-- `atlas` runtime — pure-Rust engine, native NCCL, TP × EP mesh.
+- `modular-max` runtime — single-node; `tensor_parallel` maps to local
+  `--devices` rather than to host count.
 - Recipe-settable `command_binary` for self-dispatching images.
 - `--rebuild` / `builder_config.rebuild`.
 

@@ -47,9 +47,9 @@ Repository: <https://github.com/spark-arena/sparkrun>
 - **Out-of-tree plugins**: runtimes, executors, transports, and CLI commands
   can ship outside the repo, loaded from `plugins.paths`. The Thunder Compute
   transport moved out of core to become the first consumer.
-- **Update channels and telemetry**: `sparkrun update --stable|--beta|--alpha`,
-  plus anonymous opt-out usage telemetry
-  (`sparkrun setup telemetry`, `SPARKRUN_NO_TELEMETRY`).
+- **Anonymous, opt-out telemetry**: coarse usage signal to guide what gets
+  built next (`sparkrun setup telemetry`, `SPARKRUN_NO_TELEMETRY`). Model
+  identifiers are sent only for confirmed-public HuggingFace repos.
 
 ## New
 
