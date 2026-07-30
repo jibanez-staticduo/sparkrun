@@ -22,7 +22,7 @@ ci:
   # Pinned, not floating: a bare `scitrera-repo-tools` picks up the newest
   # release, so an unrelated generator change would surface as CI drift on
   # whatever PR happened to run next. Bump deliberately.
-  repo_tools_source: "scitrera-repo-tools==0.1.20"
+  repo_tools_source: "scitrera-repo-tools==0.1.21"
   test_branches: [ main, develop ]
   python:
     # requires-python is >=3.12; 3.11 would not install.
