@@ -2,11 +2,11 @@
 
 How sparkrun selects and configures an executor for a launch. Three are shipped:
 
-| Selector | Class            | Status         | Notes                                                                   |
-|----------|------------------|----------------|-------------------------------------------------------------------------|
-| `docker` | `DockerExecutor` | Stable         | Default. Used by every previously-released launch path.                 |
-| `local`  | `LocalExecutor`  | Experimental   | Native subprocess (no container). Hand-coded process-group lifecycle.    |
-| `k8s`    | `K8sExecutor`    | Experimental   | `kubectl run`-driven. Drops Docker-specific options.                    |
+| Selector | Class            | Status       | Notes                                                                   |
+|----------|------------------|--------------|-------------------------------------------------------------------------|
+| `docker` | `DockerExecutor` | Stable       | Default. Used by every previously-released launch path.                 |
+| `local`  | `LocalExecutor`  | Alpha        | Native subprocess (no container). Hand-coded process-group lifecycle.    |
+| `k8s`    | `K8sExecutor`    | Experimental | `kubectl run`-driven. Drops Docker-specific options.                    |
 
 ## Resolution chain
 
