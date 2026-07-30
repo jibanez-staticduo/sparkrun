@@ -1257,6 +1257,9 @@ class RuntimePlugin(Plugin):
             logger.error("Failed to launch container on %s (rc=%d):", host, result.returncode)
             for line in (result.stderr or "").rstrip().splitlines():
                 logger.error("  %s", line)
+            from sparkrun.orchestration.launch_diagnostics import log_launch_failure_hint
+
+            log_launch_failure_hint(logger, result.stderr)
             from sparkrun.runtimes._cluster_ops import cleanup_solo_after_failure
 
             cleanup_solo_after_failure(

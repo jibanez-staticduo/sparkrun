@@ -656,6 +656,12 @@ def launch_containers_parallel(
             result = future.result()
             if not result.success and not ctx.dry_run:
                 logger.error("Failed to launch container %s on %s: %s", cname, host, result.stderr[:200])
+                from sparkrun.orchestration.launch_diagnostics import log_launch_failure_hint
+
+                # Passed the full stderr, not the truncated copy above: a CDI
+                # error can arrive past 200 characters, and a hint that depends
+                # on where the message happened to be cut is worse than none.
+                log_launch_failure_hint(logger, result.stderr)
                 return 1
 
     return 0
