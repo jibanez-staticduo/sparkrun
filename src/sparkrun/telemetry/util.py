@@ -30,6 +30,77 @@ def string_value(value) -> str | None:
     return text or None
 
 
+# --------------------------------------------------------------------------
+# Model identifiers
+# --------------------------------------------------------------------------
+
+#: Placeholders substituted for a model identifier that must not be sent.
+#: They are deliberately distinct so the collected data can tell "this was a
+#: local path" from "this was a private repo" from "we could not establish
+#: visibility" — all three are useful signal, none of them names the model.
+MODEL_LOCAL_PATH = "<local-path>"
+MODEL_PRIVATE = "<hf-private>"
+MODEL_UNKNOWN = "<unknown-visibility>"
+
+
+def _looks_like_local_path(model: str) -> bool:
+    """True when *model* refers to weights on disk rather than a Hub repo id.
+
+    A Hub repo id is ``org/name`` — at most one slash, no leading separator,
+    no drive letter, no ``~``.  Anything absolute, relative-with-dots, or
+    Windows-drive-prefixed is a filesystem path.
+    """
+    if model.startswith(("/", "~", "./", "../", "\\")):
+        return True
+    # Windows drive letter, e.g. C:\models\foo
+    if len(model) >= 2 and model[1] == ":" and model[0].isalpha():
+        return True
+    return model.count("/") > 1
+
+
+def model_identifier(model, *, revision=None, probe: bool = True) -> str | None:
+    """Return the model identifier safe to send, or a coarse placeholder.
+
+    The raw value is emitted **only** for a repo confirmed publicly readable
+    on the Hub.  Everything else collapses to one of :data:`MODEL_LOCAL_PATH`,
+    :data:`MODEL_PRIVATE`, or :data:`MODEL_UNKNOWN`.
+
+    This fails closed: an unresolvable lookup yields ``MODEL_UNKNOWN`` rather
+    than the model name, so being offline or rate-limited can never turn into
+    disclosure.
+
+    Args:
+        model: The recipe's ``model`` value.
+        revision: Optional pinned revision, forwarded to the visibility probe.
+        probe: When False, skip the network lookup entirely and report
+            ``MODEL_UNKNOWN`` for anything not obviously a local path.  Used
+            when telemetry is disabled, so an opted-out user never pays for a
+            lookup that exists only to serve telemetry.
+    """
+    text = string_value(model)
+    if text is None:
+        return None
+
+    if _looks_like_local_path(text):
+        return MODEL_LOCAL_PATH
+
+    if not probe:
+        return MODEL_UNKNOWN
+
+    from sparkrun.models.vram import (
+        MODEL_VISIBILITY_PRIVATE,
+        MODEL_VISIBILITY_PUBLIC,
+        fetch_model_visibility,
+    )
+
+    visibility = fetch_model_visibility(text, string_value(revision))
+    if visibility == MODEL_VISIBILITY_PUBLIC:
+        return text
+    if visibility == MODEL_VISIBILITY_PRIVATE:
+        return MODEL_PRIVATE
+    return MODEL_UNKNOWN
+
+
 def attr_string(source, name: str) -> str | None:
     """Read one optional string-like attribute from a loosely typed domain object."""
     return string_value(getattr(source, name, None))

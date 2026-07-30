@@ -9,6 +9,7 @@ from sparkrun.core.config import SparkrunConfig
 
 from .benchmark import build_benchmark_event
 from .client import send_event
+from .config import telemetry_enabled
 from .events import build_run_event, build_setup_wizard_event, build_update_event
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,12 @@ def emit_run_telemetry(
     cluster,
     options,
 ) -> None:
+    # Checked here, not just inside send_event: building a run event resolves
+    # the model identifier, which may probe the Hub for repo visibility.  An
+    # opted-out user must not pay for a lookup that exists only to serve
+    # telemetry.
+    if not telemetry_enabled(config):
+        return
     try:
         send_event(config, build_run_event(result=result, recipe=recipe, cluster=cluster, options=options))
     except Exception:  # noqa: BLE001  # noqa: BROAD_EXCEPT_OK
@@ -91,6 +98,9 @@ def emit_benchmark_telemetry(
     options,
     recipe=None,
 ) -> None:
+    # See emit_run_telemetry: event construction can probe the Hub.
+    if not telemetry_enabled(config):
+        return
     try:
         send_event(config, build_benchmark_event(result=result, options=options, recipe=recipe))
     except Exception:  # noqa: BLE001  # noqa: BROAD_EXCEPT_OK

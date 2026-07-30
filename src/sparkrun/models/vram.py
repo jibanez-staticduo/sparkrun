@@ -231,6 +231,58 @@ def fetch_model_config(
         return None
 
 
+#: Resolved visibility of a HuggingFace repo, as reported by ``model_info``.
+MODEL_VISIBILITY_PUBLIC = "public"
+MODEL_VISIBILITY_PRIVATE = "private"
+MODEL_VISIBILITY_UNKNOWN = "unknown"
+
+#: Per-process memo for :func:`fetch_model_visibility` so a single command
+#: never asks the Hub about the same repo twice.
+_VISIBILITY_MEMO: dict[tuple[str, str | None], str] = {}
+
+
+def fetch_model_visibility(model_id: str, revision: str | None = None) -> str:
+    """Return whether *model_id* is a publicly readable HuggingFace repo.
+
+    One of :data:`MODEL_VISIBILITY_PUBLIC`, :data:`MODEL_VISIBILITY_PRIVATE`
+    (also covers *gated* repos), or :data:`MODEL_VISIBILITY_UNKNOWN`.
+
+    This reads ``ModelInfo.private`` / ``.gated`` rather than inferring from
+    whether a fetch succeeded.  The distinction matters: ``huggingface_hub``
+    picks up an ambient ``HF_TOKEN`` or stored login, so a *successful* lookup
+    says nothing about visibility — a user with a token resolves their own
+    private repos perfectly well.
+
+    Every failure mode — offline, rate-limited, typo'd id, no such repo —
+    collapses to ``unknown``, so callers must treat ``unknown`` as "not
+    established" rather than "not public".
+    """
+    key = (model_id, revision)
+    memo = _VISIBILITY_MEMO.get(key)
+    if memo is not None:
+        return memo
+
+    verdict = MODEL_VISIBILITY_UNKNOWN
+    try:
+        from huggingface_hub import model_info as _model_info
+
+        kwargs: dict[str, Any] = {"repo_id": model_id}
+        if revision:
+            kwargs["revision"] = revision
+        mi = _model_info(**kwargs)
+        # `gated` is False, "auto", or "manual" — anything truthy means the
+        # repo id is not freely readable and is treated as non-public.
+        if bool(getattr(mi, "private", False)) or bool(getattr(mi, "gated", False)):
+            verdict = MODEL_VISIBILITY_PRIVATE
+        else:
+            verdict = MODEL_VISIBILITY_PUBLIC
+    except Exception as e:
+        logger.debug("Could not resolve HF visibility for %s: %s", model_id, e)
+
+    _VISIBILITY_MEMO[key] = verdict
+    return verdict
+
+
 def fetch_safetensors_size(
     model_id: str,
     revision: str | None = None,

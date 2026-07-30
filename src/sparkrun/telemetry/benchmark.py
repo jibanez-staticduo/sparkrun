@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from .types import TelemetryEvent
 from .events import model_quantization_summary
-from .util import parallelism_summary, recipe_source, string_value, system_info
+from .util import model_identifier, parallelism_summary, recipe_source, string_value, system_info
 
 if TYPE_CHECKING:
     from sparkrun.api._benchmark_models import BenchmarkOptions, BenchmarkResult
@@ -36,7 +36,10 @@ def build_benchmark_event(*, result: BenchmarkResult, options: BenchmarkOptions,
         "container_image_longterm_pinned": bool(result.container_image_longterm_pinned),
         "system": system_info(),
     }
-    model = string_value(getattr(event_recipe, "model", None))
+    model = model_identifier(
+        getattr(event_recipe, "model", None),
+        revision=getattr(event_recipe, "model_revision", None),
+    )
     if model is not None:
         event["model"] = model
     parallelism = parallelism_summary(event_recipe, options.overrides, fallback_to_overrides=True)

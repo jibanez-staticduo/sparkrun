@@ -134,7 +134,8 @@ def test_run_event_has_anonymous_source_hardware_and_parallelism():
     )
     options = api.RunOptions(recipe=recipe, hosts=("h1", "h2"), overrides={})
 
-    event = build_run_event(result=result, recipe=recipe, cluster=cluster, options=options)
+    with patch("sparkrun.models.vram.fetch_model_visibility", return_value="public"):
+        event = build_run_event(result=result, recipe=recipe, cluster=cluster, options=options)
 
     assert event["event_type"] == "run"
     assert event["model"] == "org/model"

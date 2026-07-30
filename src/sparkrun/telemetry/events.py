@@ -10,6 +10,7 @@ from .types import TelemetryEvent
 from .util import (
     attr_string,
     int_value,
+    model_identifier,
     parallelism_summary,
     recipe_source,
     registry_summary,
@@ -106,7 +107,7 @@ def build_run_event(*, result, recipe, cluster, options) -> TelemetryEvent:
         "executor": attr_string(result, "executor"),
         "scheduler": attr_string(result, "scheduler"),
         "is_solo": bool(getattr(result, "is_solo", False)),
-        "model": attr_string(recipe, "model"),
+        "model": model_identifier(getattr(recipe, "model", None), revision=getattr(recipe, "model_revision", None)),
         "recipe_source": recipe_source(recipe, _metadata(result)),
         "parallelism": _parallelism(recipe, options),
         "cluster": _cluster_summary(cluster, host_list),

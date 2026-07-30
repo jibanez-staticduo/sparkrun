@@ -246,6 +246,16 @@ the post-launch lifecycle are unchanged for existing recipes.
   pseudo-filesystems regardless of trust.
 - **Recipe `env` is no longer expanded**, preventing a third-party recipe from
   exfiltrating control-machine secrets into a container it controls.
+- **Telemetry sends a model identifier only for a confirmed-public HF repo.**
+  Everything else becomes a coarse placeholder that records why it was
+  withheld — `<hf-private>`, `<local-path>`, `<unknown-visibility>` — so a
+  private repo id or a path to local weights never leaves the machine. The
+  verdict reads the Hub's `private` / `gated` flags rather than inferring from
+  whether a fetch succeeded, since an ambient `HF_TOKEN` resolves a user's own
+  private repos. It fails closed: offline, rate-limited, and skipped-detection
+  all yield `<unknown-visibility>`. Opted-out users never trigger the lookup —
+  the enablement check moved ahead of event construction in
+  `emit_run_telemetry` / `emit_benchmark_telemetry`.
 - **Trust is a per-registry local decision** stored in the user's
   `registries.yaml`; a repository manifest cannot grant itself trust.
 - Proxy bind host is explicit and persisted; an unconfigured proxy still binds
