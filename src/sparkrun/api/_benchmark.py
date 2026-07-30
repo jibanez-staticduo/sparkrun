@@ -382,11 +382,16 @@ def _execute_benchmark(
     # -----------------------------------------------------------------------
     # 3. Check prerequisites
     # -----------------------------------------------------------------------
-    missing = fw.check_prerequisites()
-    if missing:
-        for msg in missing:
-            emitter.error("Error: %s" % msg)
-        raise BenchmarkFailed("Benchmark prerequisites not met", exit_code=1)
+    # Skipped for a dry run: --dry-run exists to show what *would* happen
+    # without executing anything, so requiring the execution toolchain to be
+    # installed defeats it — you could not preview a benchmark from a machine
+    # that isn't set up to run one.  A real run still fails closed below.
+    if not dry_run:
+        missing = fw.check_prerequisites()
+        if missing:
+            for msg in missing:
+                emitter.error("Error: %s" % msg)
+            raise BenchmarkFailed("Benchmark prerequisites not met", exit_code=1)
 
     # -----------------------------------------------------------------------
     # 4. Build overrides and resolve runtime/hosts

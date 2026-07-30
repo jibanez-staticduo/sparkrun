@@ -191,6 +191,39 @@ def test_benchmark_run_uses_api_run_and_threads_scheduler_flag(fake_recipe_env, 
     mock_stop.assert_not_called()
 
 
+def test_benchmark_dry_run_does_not_require_the_execution_toolchain(fake_recipe_env):
+    """``--dry-run`` must work without ``uvx`` on PATH.
+
+    A dry run exists to show what *would* happen without executing anything,
+    so demanding the benchmark framework's toolchain defeats it — you could
+    not preview a benchmark from a machine that isn't set up to run one.
+
+    This regressed invisibly because every dev machine has ``uvx``; only CI,
+    which does not, caught it. Simulating the missing binary keeps the
+    guarantee testable everywhere.
+    """
+    captured_options: list[Any] = []
+
+    def _fake_run(options, *, sctx=None):
+        captured_options.append(options)
+        return _make_fake_run_result()
+
+    with (
+        patch("shutil.which", return_value=None),
+        patch("sparkrun.api.run", side_effect=_fake_run),
+        patch("sparkrun.api.stop"),
+    ):
+        result = CliRunner().invoke(
+            cli_main,
+            ["benchmark", "run", "--solo", "--dry-run", "--hosts", "h1", "test-recipe"],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0, "dry run must not need uvx: %s\n%s" % (result.exit_code, result.output)
+    assert "uvx not found" not in result.output
+    assert len(captured_options) == 1
+
+
 def test_benchmark_run_scheduler_flag_defaults_to_none(fake_recipe_env):
     """Without --scheduler, ``RunOptions.scheduler`` must be ``None`` (let
     the registry default kick in).
