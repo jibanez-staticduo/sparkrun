@@ -2,11 +2,13 @@
 
 from unittest.mock import patch
 
+from sparkrun.orchestration.comm_env import ClusterCommEnv
 from sparkrun.orchestration.infiniband import (
     generate_ib_detect_script,
     parse_ib_detect_output,
     generate_nccl_env,
     generate_ring_nccl_overrides,
+    pin_comm_env_to_ib,
     validate_ib_connectivity,
 )
 from sparkrun.orchestration.ssh import RemoteResult
@@ -618,3 +620,92 @@ def test_cross_port_cabling_produces_per_host_nccl_vars():
     # Verify each host gets its own values back
     assert cce.get_env("head")["NCCL_IB_HCA"] == "rocep1s0f0,roceP2p1s0f0"
     assert cce.get_env("worker")["NCCL_IB_HCA"] == "rocep1s0f1,roceP2p1s0f1"
+
+
+# ---------------------------------------------------------------------------
+# pin_comm_env_to_ib: re-pin per-host comm env onto the fabric
+# ---------------------------------------------------------------------------
+
+
+def _mgmt_first_env(mgmt_if: str, ib_nets: str, mgmt_ip: str) -> dict:
+    """A per-host env shaped like generate_nccl_env's mgmt-first output."""
+    return {
+        "NCCL_NET": "IB",
+        "MN_IF_NAME": mgmt_if,
+        "OMPI_MCA_btl_tcp_if_include": mgmt_if,
+        "GLOO_SOCKET_IFNAME": mgmt_if,
+        "TP_SOCKET_IFNAME": mgmt_if,
+        "NCCL_SOCKET_IFNAME": ",".join([mgmt_if] + ib_nets.split(",")),
+        "NODE_IP": mgmt_ip,
+    }
+
+
+def test_pin_comm_env_to_ib_flips_mgmt_first_env_onto_fabric():
+    """The fabric verdict re-pins NODE_IP and socket ifaces to IB (not VLLM_HOST_IP)."""
+    per_host = {
+        "h1": _mgmt_first_env("wlP9s9", "enp1s0f1np1,enP2p1s0f1np1", "192.168.1.155"),
+        "h2": _mgmt_first_env("wlP9s9", "enp1s0f1np1,enP2p1s0f1np1", "192.168.1.126"),
+    }
+    comm_env = ClusterCommEnv.from_per_host(per_host)
+
+    pinned = pin_comm_env_to_ib(
+        comm_env,
+        ["h1", "h2"],
+        ib_ip_map={"h1": "192.168.0.155", "h2": "192.168.0.126"},
+        ib_iface_map={"h1": "enp1s0f1np1", "h2": "enp1s0f1np1"},
+    )
+
+    for host, ib_ip in (("h1", "192.168.0.155"), ("h2", "192.168.0.126")):
+        env = pinned.get_env(host)
+        assert env["GLOO_SOCKET_IFNAME"] == "enp1s0f1np1"
+        assert env["TP_SOCKET_IFNAME"] == "enp1s0f1np1"
+        assert env["MN_IF_NAME"] == "enp1s0f1np1"
+        assert env["OMPI_MCA_btl_tcp_if_include"] == "enp1s0f1np1"
+        # Management interface is dropped from the NCCL list (it is the dead link).
+        assert env["NCCL_SOCKET_IFNAME"] == "enp1s0f1np1"
+        assert env["NODE_IP"] == ib_ip
+        # VLLM_HOST_IP is a runtime concern (see VllmMixin), not set here.
+        assert "VLLM_HOST_IP" not in env
+        # Shared, non-interface keys are preserved.
+        assert env["NCCL_NET"] == "IB"
+
+
+def test_pin_comm_env_to_ib_skips_hosts_missing_fabric_data():
+    """A host without both an IB IP and interface keeps its management env."""
+    per_host = {
+        "h1": _mgmt_first_env("wlP9s9", "enp1s0f1np1", "192.168.1.155"),
+        "h2": _mgmt_first_env("wlP9s9", "enp1s0f1np1", "192.168.1.126"),
+    }
+    comm_env = ClusterCommEnv.from_per_host(per_host)
+
+    pinned = pin_comm_env_to_ib(
+        comm_env,
+        ["h1", "h2"],
+        ib_ip_map={"h1": "192.168.0.155"},  # h2 absent (e.g. validated non-first IP)
+        ib_iface_map={"h1": "enp1s0f1np1"},
+    )
+
+    h1 = pinned.get_env("h1")
+    assert h1["GLOO_SOCKET_IFNAME"] == "enp1s0f1np1"
+    assert h1["NODE_IP"] == "192.168.0.155"
+
+    # h2 is untouched: still management-pinned.
+    h2 = pinned.get_env("h2")
+    assert h2["GLOO_SOCKET_IFNAME"] == "wlP9s9"
+    assert h2["NODE_IP"] == "192.168.1.126"
+
+
+def test_pin_comm_env_to_ib_does_not_mutate_input():
+    """The input comm env is left unchanged; a fresh env is returned."""
+    per_host = {"h1": _mgmt_first_env("wlP9s9", "enp1s0f1np1", "192.168.1.155")}
+    comm_env = ClusterCommEnv.from_per_host(per_host)
+    before = comm_env.get_env("h1")
+
+    pin_comm_env_to_ib(
+        comm_env,
+        ["h1"],
+        ib_ip_map={"h1": "192.168.0.155"},
+        ib_iface_map={"h1": "enp1s0f1np1"},
+    )
+
+    assert comm_env.get_env("h1") == before

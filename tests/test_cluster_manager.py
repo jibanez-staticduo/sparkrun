@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from sparkrun.core.cluster_manager import ClusterManager, ClusterError, ResolvedClusterConfig
+from sparkrun.core.hardware import AcceleratorSpec, HostHardware
 
 
 def test_create_cluster(tmp_path: Path):
@@ -28,6 +29,161 @@ def test_create_cluster_already_exists(tmp_path: Path):
 
     with pytest.raises(ClusterError):
         manager.create("duplicate", ["host2"])
+
+
+def test_max_gpu_memory_utilization_round_trips(tmp_path: Path):
+    """Cluster-wide cap persists via create → write → read; omitted when unset."""
+    from sparkrun.core.cluster_manager import ClusterDefinition
+
+    manager = ClusterManager(tmp_path)
+
+    # Unset by default — neither field appears in the serialized dict.
+    manager.create("plain", ["host1"])
+    plain = manager.get("plain")
+    assert plain.max_gpu_memory_utilization is None
+    assert plain.accelerator_memory_limits == {}
+    assert "max_gpu_memory_utilization" not in plain.to_dict()
+    assert "accelerator_memory_limits" not in plain.to_dict()
+
+    # Cluster-wide cap via create() survives a round-trip.
+    manager.create("capped", ["host1"], max_gpu_memory_utilization=0.8)
+    assert manager.get("capped").max_gpu_memory_utilization == 0.8
+
+    # Per-accelerator-type map (set via the dataclass / YAML) survives too.
+    manager._write_cluster(ClusterDefinition(name="typed", hosts=["host1"], accelerator_memory_limits={"gb10": 0.85, "h200": 0.95}))
+    assert manager.get("typed").accelerator_memory_limits == {"gb10": 0.85, "h200": 0.95}
+
+
+def test_distribution_model_enabled_round_trips(tmp_path: Path):
+    """``distribution.model.enabled: false`` survives write → read; True is the omitted default."""
+    from sparkrun.core.cluster_manager import ClusterDefinition, ClusterDistributionConfig, ModelDistributionPrefs
+
+    manager = ClusterManager(tmp_path)
+
+    # Default (enabled=True) is omitted from the serialized dict.
+    prefs = ModelDistributionPrefs()
+    assert prefs.enabled is True
+    assert prefs.is_default() is True
+    assert "enabled" not in prefs.to_dict()
+
+    manager._write_cluster(
+        ClusterDefinition(
+            name="nodist",
+            hosts=["host1"],
+            distribution=ClusterDistributionConfig(model=ModelDistributionPrefs(enabled=False)),
+        )
+    )
+    reloaded = manager.get("nodist")
+    assert reloaded.distribution.model.enabled is False
+    assert reloaded.distribution.model.to_dict() == {"enabled": False}
+
+
+def test_update_max_gpu_memory_utilization(tmp_path: Path):
+    """update() sets and clears the cluster-wide cap."""
+    manager = ClusterManager(tmp_path)
+    manager.create("c", ["host1"], max_gpu_memory_utilization=0.8)
+
+    manager.update("c", max_gpu_memory_utilization=0.7)
+    assert manager.get("c").max_gpu_memory_utilization == 0.7
+
+    manager.update("c", max_gpu_memory_utilization=None)
+    assert manager.get("c").max_gpu_memory_utilization is None
+
+
+def test_fabric_interfaces_round_trips(tmp_path: Path):
+    """fabric_interfaces (issue #203) survives create/update/load; empty is omitted."""
+    manager = ClusterManager(tmp_path)
+
+    # Default is an empty list, omitted from the serialized dict.
+    manager.create("plain", ["host1"])
+    plain = manager.get("plain")
+    assert plain.fabric_interfaces == []
+    assert "fabric_interfaces" not in plain.to_dict()
+
+    # Set via create() and survive a round-trip.
+    manager.create("two", ["a", "b"], fabric_interfaces=["*np1"])
+    assert manager.get("two").fabric_interfaces == ["*np1"]
+    assert manager.get("two").to_dict()["fabric_interfaces"] == ["*np1"]
+
+    # An unrelated update leaves the saved selection intact (_UNSET sentinel).
+    manager.update("two", topology="switch")
+    assert manager.get("two").fabric_interfaces == ["*np1"]
+
+    # update() replaces and clears the selection.
+    manager.update("two", fabric_interfaces=["*np0"])
+    assert manager.get("two").fabric_interfaces == ["*np0"]
+    manager.update("two", fabric_interfaces=[])
+    assert manager.get("two").fabric_interfaces == []
+    assert "fabric_interfaces" not in manager.get("two").to_dict()
+
+
+def test_env_envfile_syncsource_round_trip(tmp_path: Path):
+    """env / env_file / sync_source survive create/update/load; empty omitted."""
+    manager = ClusterManager(tmp_path)
+
+    manager.create("plain", ["h1"])
+    plain = manager.get("plain")
+    assert plain.env == {} and plain.env_file is None and plain.sync_source is None
+    for key in ("env", "env_file", "sync_source"):
+        assert key not in plain.to_dict()
+
+    manager.create(
+        "svd",
+        ["a", "b"],
+        env={"HF_TOKEN": "${CONTAINER_HF_TOKEN}"},
+        env_file="/path/.env",
+        sync_source="spark_vllm_docker:/path/.env",
+    )
+    c = manager.get("svd")
+    assert c.env == {"HF_TOKEN": "${CONTAINER_HF_TOKEN}"}
+    assert c.env_file == "/path/.env"
+    assert c.sync_source == "spark_vllm_docker:/path/.env"
+
+    # Unrelated update preserves the import-owned fields (_UNSET sentinel).
+    manager.update("svd", description="hi")
+    assert manager.get("svd").env == {"HF_TOKEN": "${CONTAINER_HF_TOKEN}"}
+
+    # update replaces / clears.
+    manager.update("svd", env={}, env_file=None, sync_source=None)
+    cleared = manager.get("svd")
+    assert cleared.env == {} and cleared.env_file is None and cleared.sync_source is None
+
+
+def test_resolve_env_substitutes_from_env_file(tmp_path: Path):
+    """${VAR} resolves from env_file; literals pass through."""
+    envf = tmp_path / "svd.env"
+    envf.write_text('# c\nCONTAINER_HF_TOKEN="secret123"\nPLAINSRC=nope\n')
+    manager = ClusterManager(tmp_path)
+    manager.create(
+        "svd",
+        ["a"],
+        env={"HF_TOKEN": "${CONTAINER_HF_TOKEN}", "LIT": "literal"},
+        env_file=str(envf),
+    )
+    assert manager.get("svd").resolve_env() == {"HF_TOKEN": "secret123", "LIT": "literal"}
+
+
+def test_resolve_env_missing_var_is_hard_error(tmp_path: Path):
+    envf = tmp_path / "svd.env"
+    envf.write_text("OTHER=1\n")
+    manager = ClusterManager(tmp_path)
+    manager.create("svd", ["a"], env={"X": "${NOPE}"}, env_file=str(envf))
+    with pytest.raises(ClusterError, match=r"\$\{NOPE\}"):
+        manager.get("svd").resolve_env()
+
+
+def test_resolve_env_reference_without_env_file_errors(tmp_path: Path):
+    manager = ClusterManager(tmp_path)
+    manager.create("svd", ["a"], env={"X": "${Y}"})
+    with pytest.raises(ClusterError, match="no env_file"):
+        manager.get("svd").resolve_env()
+
+
+def test_resolve_env_no_refs_needs_no_file(tmp_path: Path):
+    """All-literal env resolves without reading any file."""
+    manager = ClusterManager(tmp_path)
+    manager.create("svd", ["a"], env={"A": "1", "B": "two"})
+    assert manager.get("svd").resolve_env() == {"A": "1", "B": "two"}
 
 
 def test_get_cluster_not_found(tmp_path: Path):
@@ -781,3 +937,347 @@ class TestParseMonitorLine:
         assert sample is not None
         assert sample.timestamp == "2026-03-02T10:00:00Z"
         assert sample.hostname == "val"
+
+
+# ---------------------------------------------------------------------------
+# Per-host hardware metadata (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def test_create_cluster_without_hosts_hardware_defaults_dgx_spark(tmp_path: Path):
+    """A cluster created without hosts_hardware returns DGX Spark default per host."""
+    manager = ClusterManager(tmp_path)
+    manager.create("legacy", ["host1", "host2"])
+
+    cluster = manager.get("legacy")
+    assert cluster.hosts_hardware == {}
+
+    hw = cluster.hardware_for("host1")
+    assert len(hw.accelerators) == 1
+    assert hw.accelerators[0].vendor == "nvidia"
+    assert hw.accelerators[0].model == "gb10"
+    assert hw.accelerators[0].memory_gb == 121.0
+
+
+def test_create_cluster_with_hosts_hardware_round_trips(tmp_path: Path):
+    """A cluster with explicit per-host hardware round-trips through YAML."""
+    manager = ClusterManager(tmp_path)
+    hw_spark = HostHardware(
+        accelerators=[
+            AcceleratorSpec(
+                vendor="nvidia",
+                model="gb10",
+                memory_gb=121.0,
+                capabilities=frozenset({"cuda"}),
+            )
+        ]
+    )
+    hw_rtx = HostHardware(
+        accelerators=[
+            AcceleratorSpec(
+                vendor="nvidia",
+                model="rtx-pro-6000",
+                count=2,
+                memory_gb=96.0,
+                capabilities=frozenset({"cuda"}),
+            )
+        ],
+        notes="workstation",
+    )
+    manager.create(
+        "mixed",
+        ["spark-01", "rtx-box"],
+        hosts_hardware={"spark-01": hw_spark, "rtx-box": hw_rtx},
+    )
+
+    restored = manager.get("mixed")
+    assert restored.hardware_for("spark-01") == hw_spark
+    assert restored.hardware_for("rtx-box") == hw_rtx
+
+
+def test_hardware_for_unknown_host_returns_default(tmp_path: Path):
+    """Hosts absent from hosts_hardware still get a DGX Spark default."""
+    manager = ClusterManager(tmp_path)
+    hw = HostHardware(accelerators=[AcceleratorSpec(vendor="amd", model="mi300x", memory_gb=192.0)])
+    manager.create("partial", ["amd-box", "mystery-host"], hosts_hardware={"amd-box": hw})
+
+    restored = manager.get("partial")
+    assert restored.hardware_for("amd-box").accelerators[0].vendor == "amd"
+    # Unknown host -> DGX Spark default
+    default_hw = restored.hardware_for("mystery-host")
+    assert default_hw.accelerators[0].model == "gb10"
+
+
+def test_update_hosts_hardware(tmp_path: Path):
+    """update() with hosts_hardware overwrites the field."""
+    manager = ClusterManager(tmp_path)
+    manager.create("c", ["h1"])
+    hw = HostHardware(accelerators=[AcceleratorSpec(vendor="intel", model="gaudi3", memory_gb=128.0)])
+    manager.update("c", hosts_hardware={"h1": hw})
+
+    restored = manager.get("c")
+    assert restored.hardware_for("h1") == hw
+
+
+def test_to_dict_includes_hosts_hardware_only_when_set(tmp_path: Path):
+    """to_dict omits hosts_hardware when empty (back-compat with old consumers)."""
+    manager = ClusterManager(tmp_path)
+    manager.create("legacy", ["h1"])
+    assert "hosts_hardware" not in manager.get("legacy").to_dict()
+
+    hw = HostHardware(accelerators=[AcceleratorSpec(vendor="nvidia", model="h200", count=8, memory_gb=141.0)])
+    manager.update("legacy", hosts_hardware={"h1": hw})
+    assert "hosts_hardware" in manager.get("legacy").to_dict()
+
+
+# --------------------------------------------------------------------------
+# classify_cluster_status — snapshot → ClusterStatusResult classification
+# --------------------------------------------------------------------------
+
+
+class TestQueryClusterStatusParsing:
+    """Regression coverage for cluster_id extraction in classify_cluster_status.
+
+    Container names follow ``sparkrun_<intent>_<placement>[_<role>]``.  The
+    cluster_id is the full ``sparkrun_<intent>_<placement>`` — workloads
+    with the same intent but different placement tokens (the same recipe
+    replayed back to back) are distinct jobs and must not collapse on the
+    intent prefix.
+    """
+
+    @staticmethod
+    def _cd(name, role, status="Up 1 minute", image="img"):
+        from sparkrun.core.cluster_status import ContainerDetail
+
+        return ContainerDetail(name=name, role=role, status=status, image=image)
+
+    @classmethod
+    def _wl(cls, cluster_id, containers):
+        from sparkrun.core.cluster_status import RunningWorkload
+
+        return RunningWorkload(cluster_id=cluster_id, containers=tuple(containers))
+
+    @staticmethod
+    def _status(host_workloads, errors=None):
+        """Build a canned merged :class:`ClusterStatus` snapshot.
+
+        ``host_workloads`` maps host → list of RunningWorkloads (each host
+        present is *reachable*).  ``errors`` maps unreachable host → message
+        (those hosts are absent from ``hosts``).
+        """
+        from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy
+
+        hosts = tuple(HostOccupancy(host=h, workloads=tuple(ws)) for h, ws in host_workloads.items())
+        return ClusterStatus(hosts=hosts, executor="docker", errors=dict(errors or {}))
+
+    def test_two_workloads_same_intent_distinct_placements_are_separate_clusters(self, tmp_path):
+        """Same recipe launched twice → same intent_id, different placement_tokens
+        → must report as two distinct cluster_ids."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
+
+        intent = "221f3a3a45d7fa4d"
+        place_a = "aabbccddeeff"
+        place_b = "112233445566"
+        cid_a = "sparkrun_%s_%s" % (intent, place_a)
+        cid_b = "sparkrun_%s_%s" % (intent, place_b)
+        # Workload A on h1+h2, workload B on h3+h4 — both share the same intent prefix.
+        status = self._status(
+            {
+                "h1": [self._wl(cid_a, [self._cd("%s_head" % cid_a, "head")])],
+                "h2": [self._wl(cid_a, [self._cd("%s_node_1" % cid_a, "node_1")])],
+                "h3": [self._wl(cid_b, [self._cd("%s_head" % cid_b, "head", "Up 30 seconds")])],
+                "h4": [self._wl(cid_b, [self._cd("%s_node_1" % cid_b, "node_1", "Up 30 seconds")])],
+            }
+        )
+
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1", "h2", "h3", "h4"])
+
+        assert set(result.groups.keys()) == {cid_a, cid_b}
+        # Each cluster has exactly two members (one per host).
+        assert len(result.groups[cid_a].members) == 2
+        assert len(result.groups[cid_b].members) == 2
+        # Roles come straight from ContainerDetail.role (head + node_1).
+        assert sorted(m[1] for m in result.groups[cid_a].members) == ["head", "node_1"]
+        assert sorted(m[1] for m in result.groups[cid_b].members) == ["head", "node_1"]
+        assert result.total_containers == 4
+
+    def test_single_workload_parses_full_cluster_id(self, tmp_path):
+        """A single 2-node workload must surface as exactly one cluster_id with full placement token."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
+
+        intent = "deadbeefcafe1234"
+        place = "0123456789ab"
+        cid = "sparkrun_%s_%s" % (intent, place)
+        status = self._status(
+            {
+                "h1": [self._wl(cid, [self._cd("%s_head" % cid, "head", "Up 5 minutes")])],
+                "h2": [self._wl(cid, [self._cd("%s_node_1" % cid, "node_1", "Up 5 minutes")])],
+            }
+        )
+
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1", "h2"])
+
+        assert list(result.groups.keys()) == [cid]
+        assert len(result.groups[cid].members) == 2
+
+    def test_solo_container_uses_full_cluster_id(self, tmp_path):
+        """Solo containers (`..._solo`) must yield the full cluster_id, not the intent prefix."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
+
+        intent = "feedfacef00d4242"
+        place = "abcdef012345"
+        cid = "sparkrun_%s_%s" % (intent, place)
+        status = self._status({"h1": [self._wl(cid, [self._cd("%s_solo" % cid, "solo", "Up 10 seconds")])]})
+
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1"])
+
+        assert result.groups == {}
+        assert len(result.solo_entries) == 1
+        assert result.solo_entries[0].cluster_id == cid
+
+    def test_local_executor_pidfile_workload_is_surfaced(self, tmp_path):
+        """A docker container + a native local process for DIFFERENT cluster_ids both
+        surface as solo entries (the local one carries the ``(local process)`` image)."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
+
+        intent, place = "0123456789abcdef", "fedcba987654"
+        cid_docker = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+        cid_local = "sparkrun_%s_%s" % (intent, place)
+        status = self._status(
+            {
+                "h1": [
+                    self._wl(cid_docker, [self._cd("%s_solo" % cid_docker, "solo", "Up 5 seconds", "some/img")]),
+                    self._wl(cid_local, [self._cd("%s_solo" % cid_local, "solo", "Up (pid 4242)", "(local process)")]),
+                ]
+            }
+        )
+
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1"])
+
+        cids = {e.cluster_id for e in result.solo_entries}
+        assert cid_docker in cids and cid_local in cids  # both distinct jobs visible
+        local = next(e for e in result.solo_entries if e.cluster_id == cid_local)
+        assert "pid 4242" in local.status and local.image == "(local process)"
+        assert result.total_containers == 2
+
+    def test_unreachable_host_is_errored_not_idle(self, tmp_path):
+        """A host the executor could not reach (recorded in ``ClusterStatus.errors``,
+        absent from ``hosts``) surfaces as an error and NOT as idle."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
+
+        status = self._status({}, errors={"h1": "connection refused"})
+
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1"])
+
+        assert result.errors.get("h1") == "connection refused"  # surfaced as an error
+        assert "h1" not in result.idle_hosts  # NOT misreported as idle
+        assert result.total_containers == 0
+
+    def test_reachable_host_with_no_workloads_is_idle(self, tmp_path):
+        """A reachable host (present in the snapshot) with zero containers
+        is idle — not an error."""
+        from sparkrun.core.cluster_manager import classify_cluster_status
+
+        status = self._status({"h1": []})
+
+        result = classify_cluster_status(status, cache_dir=str(tmp_path), host_list=["h1"])
+
+        assert result.idle_hosts == ["h1"]
+        assert "h1" not in result.errors
+        assert result.total_containers == 0
+
+
+class TestClusterDistributionPrefs:
+    """Round-trip + resolution for cluster ``distribution.model`` prefs."""
+
+    def test_defaults_omitted_from_yaml(self, tmp_path: Path):
+        """A cluster with default prefs writes no ``distribution`` block."""
+        manager = ClusterManager(tmp_path)
+        manager.create("c", ["h1"])
+        text = (tmp_path / "clusters" / "c.yaml").read_text()
+        assert "distribution" not in text
+        # Defaults still materialize on read.
+        cluster = manager.get("c")
+        assert cluster.distribution.model.preserve_perms is True
+        assert cluster.distribution.model.skip_fan_out is False
+
+    def test_create_persists_non_default_prefs(self, tmp_path: Path):
+        from sparkrun.core.cluster_manager import (
+            ClusterDistributionConfig,
+            ModelDistributionPrefs,
+        )
+
+        manager = ClusterManager(tmp_path)
+        manager.create(
+            "shared",
+            ["h1", "h2"],
+            distribution=ClusterDistributionConfig(model=ModelDistributionPrefs(preserve_perms=False, skip_fan_out=True)),
+        )
+        text = (tmp_path / "clusters" / "shared.yaml").read_text()
+        assert "distribution" in text
+
+        cluster = manager.get("shared")
+        assert cluster.distribution.model.preserve_perms is False
+        assert cluster.distribution.model.skip_fan_out is True
+
+    def test_update_prefs(self, tmp_path: Path):
+        from sparkrun.core.cluster_manager import (
+            ClusterDistributionConfig,
+            ModelDistributionPrefs,
+        )
+
+        manager = ClusterManager(tmp_path)
+        manager.create("c", ["h1"])
+        manager.update(
+            "c",
+            distribution=ClusterDistributionConfig(model=ModelDistributionPrefs(skip_fan_out=True)),
+        )
+        cluster = manager.get("c")
+        assert cluster.distribution.model.skip_fan_out is True
+        assert cluster.distribution.model.preserve_perms is True
+
+    def test_legacy_yaml_without_distribution_loads(self, tmp_path: Path):
+        """A cluster file with no ``distribution`` key loads with defaults."""
+        clusters_dir = tmp_path / "clusters"
+        clusters_dir.mkdir(parents=True, exist_ok=True)
+        (clusters_dir / "old.yaml").write_text("name: old\nhosts:\n- h1\ndescription: legacy\n")
+        manager = ClusterManager(tmp_path)
+        cluster = manager.get("old")
+        assert cluster.distribution.model.preserve_perms is True
+        assert cluster.distribution.model.skip_fan_out is False
+
+    def test_resolved_config_carries_prefs_from_cluster(self, tmp_path: Path):
+        from sparkrun.core.cluster_manager import (
+            ClusterDistributionConfig,
+            ModelDistributionPrefs,
+            resolve_cluster_config,
+        )
+
+        manager = ClusterManager(tmp_path)
+        manager.create(
+            "shared",
+            ["h1", "h2"],
+            distribution=ClusterDistributionConfig(model=ModelDistributionPrefs(preserve_perms=False, skip_fan_out=True)),
+        )
+        # Hosts sourced from the cluster → prefs apply.
+        cfg = resolve_cluster_config("shared", None, None, manager)
+        assert cfg.preserve_model_perms is False
+        assert cfg.skip_model_fan_out is True
+
+    def test_resolved_config_ignores_prefs_with_explicit_hosts(self, tmp_path: Path):
+        """Explicit --hosts bypasses cluster transfer prefs (matches cache_dir)."""
+        from sparkrun.core.cluster_manager import (
+            ClusterDistributionConfig,
+            ModelDistributionPrefs,
+            resolve_cluster_config,
+        )
+
+        manager = ClusterManager(tmp_path)
+        manager.create(
+            "shared",
+            ["h1", "h2"],
+            distribution=ClusterDistributionConfig(model=ModelDistributionPrefs(preserve_perms=False, skip_fan_out=True)),
+        )
+        cfg = resolve_cluster_config("shared", "h9,h10", None, manager)
+        assert cfg.preserve_model_perms is True
+        assert cfg.skip_model_fan_out is False

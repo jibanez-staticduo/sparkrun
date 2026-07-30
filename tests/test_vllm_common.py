@@ -56,3 +56,36 @@ def test_estimate_vram_handles_auto_max_model_len():
     # auto_detect=False keeps this offline; the max_model_len guard still runs.
     est = _recipe().estimate_vram(auto_detect=False)
     assert est is not None
+
+
+# ---------------------------------------------------------------------------
+# finalize_host_comm_env: vLLM mirrors NODE_IP into VLLM_HOST_IP
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_host_comm_env_mirrors_node_ip_into_vllm_host_ip():
+    """Both vLLM runtimes advertise VLLM_HOST_IP equal to the host's NODE_IP."""
+    for runtime in (VllmDistributedRuntime(), VllmRayRuntime()):
+        host_env = {"NODE_IP": "192.168.0.155", "GLOO_SOCKET_IFNAME": "cx0"}
+        out = runtime.finalize_host_comm_env(host_env)
+        assert out["VLLM_HOST_IP"] == "192.168.0.155"
+        # NODE_IP and the rest are preserved; input is not mutated.
+        assert out["NODE_IP"] == "192.168.0.155"
+        assert out["GLOO_SOCKET_IFNAME"] == "cx0"
+        assert "VLLM_HOST_IP" not in host_env
+
+
+def test_finalize_host_comm_env_no_node_ip_leaves_env_alone():
+    """Without a NODE_IP there is nothing to advertise, so VLLM_HOST_IP is unset."""
+    out = VllmDistributedRuntime().finalize_host_comm_env({"NCCL_NET": "IB"})
+    assert "VLLM_HOST_IP" not in out
+
+
+def test_finalize_host_comm_env_base_runtime_is_noop():
+    """Non-vLLM runtimes do not invent VLLM_HOST_IP from NODE_IP."""
+    from sparkrun.runtimes.sglang import SglangRuntime
+
+    host_env = {"NODE_IP": "192.168.0.155"}
+    out = SglangRuntime().finalize_host_comm_env(host_env)
+    assert "VLLM_HOST_IP" not in out
+    assert out == host_env

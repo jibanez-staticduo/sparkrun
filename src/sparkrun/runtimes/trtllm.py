@@ -153,6 +153,7 @@ class TrtllmRuntime(RuntimePlugin):
         host_ips: list[str],
         nccl_env: dict[str, str] | None = None,
         extra_env_keys: list[str] | None = None,
+        ranks_per_node: int = 1,
     ) -> str:
         """Wrap a trtllm-serve command with mpirun for multi-node execution.
 
@@ -161,6 +162,8 @@ class TrtllmRuntime(RuntimePlugin):
             host_ips: Management IPs for all hosts (order = rank order).
             nccl_env: NCCL environment variables to propagate via ``-x``.
             extra_env_keys: Additional env var names to propagate.
+            ranks_per_node: MPI ranks per host (1 on DGX Spark / 1-GPU
+                hosts; derived from placement on multi-GPU hosts).
 
         Returns:
             Complete ``mpirun`` command string.
@@ -173,7 +176,7 @@ class TrtllmRuntime(RuntimePlugin):
             "/tmp/sparkrun-rsh-wrapper.sh",
             "--mca",
             "rmaps_ppr_n_pernode",
-            "1",
+            str(ranks_per_node),
             "-H",
             ",".join(host_ips),
         ]
@@ -237,7 +240,7 @@ class TrtllmRuntime(RuntimePlugin):
             [
                 '    *) echo "Unknown host: $HOST" >&2; exit 1 ;;',
                 "esac",
-                "exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\",
+                "exec ssh -o StrictHostKeyChecking=accept-new \\",  # TOFU: matches codebase convention, provides MITM protection after first connection
                 '  -i %s "$HOST" docker exec "$CONTAINER" "$@"' % ssh_key_path,
             ]
         )
@@ -331,6 +334,8 @@ class TrtllmRuntime(RuntimePlugin):
         dry_run: bool,
         recipe: Recipe | None = None,
         config_chain=None,
+        trust: bool = False,
+        cache_dir: str | None = None,
     ) -> None:
         """Write extra-llm-api-config.yml into containers before serve.
 
@@ -339,7 +344,15 @@ class TrtllmRuntime(RuntimePlugin):
         every container.  This is the solo-mode counterpart of the config
         injection that ``_run_cluster`` performs in step 6.
         """
-        super()._pre_serve(hosts_containers, ssh_kwargs, dry_run, recipe=recipe, config_chain=config_chain)
+        super()._pre_serve(
+            hosts_containers,
+            ssh_kwargs,
+            dry_run,
+            recipe=recipe,
+            config_chain=config_chain,
+            trust=trust,
+            cache_dir=cache_dir,
+        )
 
         if recipe is None:
             return
@@ -352,7 +365,7 @@ class TrtllmRuntime(RuntimePlugin):
         write_cmd = ("cat > %s << 'SPARKRUN_EOF'\n%sSPARKRUN_EOF") % (_EXTRA_CONFIG_PATH, extra_yaml)
 
         for host, container_name in hosts_containers:
-            exec_cmd = self.executor.exec_cmd(container_name, write_cmd)
+            exec_cmd = self._resolve_executor().exec_cmd(container_name, write_cmd)
             result = run_remote_command(
                 host,
                 exec_cmd,
@@ -440,14 +453,30 @@ class TrtllmRuntime(RuntimePlugin):
         from sparkrun.orchestration.ssh import run_remote_command
         from sparkrun.runtimes._cluster_ops import (
             ClusterContext,
+            cleanup_after_failure,
             cleanup_ranked_containers,
             launch_containers_parallel,
-            resolve_ib_env,
+            resolve_comm_env,
         )
 
         progress = kwargs.pop("progress", None)
+        cluster = kwargs.pop("cluster", None)
+        backends = kwargs.pop("backends", None)
+        placement = kwargs.pop("placement", None)
 
-        ctx = ClusterContext.build(self, hosts, image, cluster_id, env, cache_dir, config, dry_run)
+        ctx = ClusterContext.build(
+            self,
+            hosts,
+            image,
+            cluster_id,
+            env,
+            cache_dir,
+            config,
+            dry_run,
+            cluster=cluster,
+            recipe=recipe,
+            placement=placement,
+        )
         extra_docker_opts = self.get_extra_docker_opts()
 
         self._print_cluster_banner(
@@ -477,7 +506,12 @@ class TrtllmRuntime(RuntimePlugin):
             progress.step("Detecting InfiniBand")
         else:
             logger.info("Step 2/7: InfiniBand detection...")
-        comm_env = resolve_ib_env(ctx, comm_env)
+        # New path uses CollectiveBackend.env_for_host via backends;
+        # backends must be threaded through by the launcher (the legacy
+        # backend-free IB env resolution has been removed).
+        if backends is None:
+            raise RuntimeError("backends is None; legacy IB env resolution is deprecated and no backends were provided.")
+        comm_env = resolve_comm_env(ctx, comm_env, backends=backends)
         logger.info("Step 2/7: IB step done (%.1fs)", time.monotonic() - t0)
 
         # Step 3: Detect management IPs on all hosts
@@ -494,7 +528,7 @@ class TrtllmRuntime(RuntimePlugin):
             except RuntimeError as e:
                 logger.error("%s", e)
                 return 1
-            container_name = self.executor.node_container_name(cluster_id, rank)
+            container_name = self._resolve_executor().node_container_name(cluster_id, rank)
             host_ip_map[ip] = container_name
             host_ips.append(ip)
             logger.info("  Rank %d: %s -> %s (IP: %s)", rank, host, container_name, ip)
@@ -506,7 +540,8 @@ class TrtllmRuntime(RuntimePlugin):
             progress.step("Launching containers")
         else:
             logger.info("Step 4/7: Launching %d container(s) with sleep infinity...", ctx.num_nodes)
-        containers = [(host, self.executor.node_container_name(cluster_id, rank)) for rank, host in enumerate(hosts)]
+        containers = [(host, self._resolve_executor().node_container_name(cluster_id, rank)) for rank, host in enumerate(hosts)]
+        container_ranks = {self._resolve_executor().node_container_name(cluster_id, rank): rank for rank, _ in enumerate(hosts)}
         combined_docker_opts = (self.get_extra_docker_opts() or []) + (extra_docker_opts or [])
         rc = launch_containers_parallel(
             ctx,
@@ -514,6 +549,9 @@ class TrtllmRuntime(RuntimePlugin):
             self.executor,
             comm_env,
             extra_docker_opts=combined_docker_opts or None,
+            runtime=self,
+            recipe=recipe,
+            container_ranks=container_ranks,
         )
         if rc != 0:
             return rc
@@ -527,13 +565,18 @@ class TrtllmRuntime(RuntimePlugin):
             logger.info("Step 5/7: Verifying containers are running...")
         if not dry_run:
             for rank, host in enumerate(hosts):
-                container_name = self.executor.node_container_name(cluster_id, rank)
+                container_name = self._resolve_executor().node_container_name(cluster_id, rank)
                 if not is_container_running(host, container_name, ssh_kwargs=ctx.ssh_kwargs):
                     logger.error(
                         "Container %s not running on %s (rank %d)",
                         container_name,
                         host,
                         rank,
+                    )
+                    cleanup_after_failure(
+                        ctx,
+                        self.executor,
+                        reason=f"container {container_name} not running on {host}",
                     )
                     return 1
             logger.info("Step 5/7: All containers verified (%.1fs)", time.monotonic() - t0)
@@ -543,7 +586,7 @@ class TrtllmRuntime(RuntimePlugin):
         # Step 6: Write rsh wrapper + extra config into head container
         t0 = time.monotonic()
         head_host = hosts[0]
-        head_container = self.executor.node_container_name(cluster_id, 0)
+        head_container = self._resolve_executor().node_container_name(cluster_id, 0)
         if progress:
             progress.step("Writing rsh wrapper")
         else:
@@ -564,7 +607,7 @@ class TrtllmRuntime(RuntimePlugin):
             "cat > /tmp/sparkrun-rsh-wrapper.sh << 'SPARKRUN_EOF'\n%sSPARKRUN_EOF\nchmod +x /tmp/sparkrun-rsh-wrapper.sh"
         ) % rsh_wrapper
 
-        exec_write = self.executor.exec_cmd(head_container, write_wrapper_cmd)
+        exec_write = self._resolve_executor().exec_cmd(head_container, write_wrapper_cmd)
         result = run_remote_command(
             head_host,
             exec_write,
@@ -573,7 +616,10 @@ class TrtllmRuntime(RuntimePlugin):
             **ctx.ssh_kwargs,
         )
         if not result.success and not dry_run:
-            logger.error("Failed to write rsh wrapper: %s", result.stderr[:200])
+            logger.error("Failed to write rsh wrapper (rc=%d):", result.returncode)
+            for line in (result.stderr or "").rstrip().splitlines():
+                logger.error("  %s", line)
+            cleanup_after_failure(ctx, self.executor, reason="rsh wrapper write failed")
             return 1
 
         # Write extra-llm-api-config.yml if needed
@@ -581,7 +627,7 @@ class TrtllmRuntime(RuntimePlugin):
             extra_config_yaml = self._build_extra_config(recipe, overrides)
             if extra_config_yaml:
                 write_config_cmd = ("cat > %s << 'SPARKRUN_EOF'\n%sSPARKRUN_EOF") % (_EXTRA_CONFIG_PATH, extra_config_yaml)
-                exec_config = self.executor.exec_cmd(head_container, write_config_cmd)
+                exec_config = self._resolve_executor().exec_cmd(head_container, write_config_cmd)
                 result = run_remote_command(
                     head_host,
                     exec_config,
@@ -590,7 +636,10 @@ class TrtllmRuntime(RuntimePlugin):
                     **ctx.ssh_kwargs,
                 )
                 if not result.success and not dry_run:
-                    logger.error("Failed to write extra config: %s", result.stderr[:200])
+                    logger.error("Failed to write extra config (rc=%d):", result.returncode)
+                    for line in (result.stderr or "").rstrip().splitlines():
+                        logger.error("  %s", line)
+                    cleanup_after_failure(ctx, self.executor, reason="extra LLM config write failed")
                     return 1
                 logger.info("  Extra LLM API config written to %s", _EXTRA_CONFIG_PATH)
 
@@ -620,12 +669,16 @@ class TrtllmRuntime(RuntimePlugin):
             logger.error("No serve command or recipe provided")
             return 1
 
-        # Build mpirun command (head-host env since mpirun runs in head container)
+        # Build mpirun command (head-host env since mpirun runs in head container).
+        # When placement carries multi-GPU hosts, derive slot count from
+        # the heaviest host so MPI doesn't cap every host to 1 rank.
         head_env = comm_env.get_env(ctx.head_host) if comm_env else None
+        ranks_per_node = ctx.placement.max_ranks_per_host if ctx.placement else 1
         mpirun_cmd = self._build_mpirun_command(
             trtllm_cmd,
             host_ips,
             nccl_env=head_env,
+            ranks_per_node=ranks_per_node or 1,
         )
 
         logger.info("mpirun command:")
@@ -633,7 +686,7 @@ class TrtllmRuntime(RuntimePlugin):
             logger.info("  %s", line)
 
         # Exec mpirun on head container
-        exec_mpirun = self.executor.exec_cmd(
+        exec_mpirun = self._resolve_executor().exec_cmd(
             container_name=head_container,
             command=mpirun_cmd,
             detach=detached,
@@ -648,7 +701,14 @@ class TrtllmRuntime(RuntimePlugin):
         logger.info("Step 7/7: mpirun dispatched (%.1fs)", time.monotonic() - t0)
 
         if not dry_run and not result.success:
-            logger.error("mpirun exec failed: %s", result.stderr[:200])
+            logger.error("mpirun exec failed on %s (rc=%d):", head_host, result.returncode)
+            for line in (result.stderr or "").rstrip().splitlines():
+                logger.error("  %s", line)
+            if result.stdout:
+                logger.error("mpirun stdout:")
+                for line in result.stdout.rstrip().splitlines():
+                    logger.error("  %s", line)
+            cleanup_after_failure(ctx, self.executor, reason="mpirun exec failed")
             return 1
 
         self._print_connection_info(hosts, cluster_id, per_node_logs=True)

@@ -81,6 +81,45 @@ class BuilderPlugin(Plugin):
     def initialize(self, v: Variables, logger: Logger) -> BuilderPlugin:
         return self
 
+    def prepare(
+        self,
+        image: str,
+        recipe: Recipe,
+        hosts: list[str],
+        config: SparkrunConfig | None = None,
+        dry_run: bool = False,
+        transfer_mode: str = "local",
+        ssh_kwargs: dict | None = None,
+    ) -> str:
+        """Prepare the execution environment. Returns the final image name.
+
+        This is the canonical hook the launcher calls in its builder
+        phase. The default implementation delegates to
+        :meth:`prepare_image`, so image builders keep overriding
+        ``prepare_image`` unchanged (back-compat). Environment builders
+        (e.g. a host-side python venv) override ``prepare`` directly to do
+        their host-side setup and return the image ref (usually unchanged).
+        """
+        return self.prepare_image(
+            image,
+            recipe,
+            hosts,
+            config=config,
+            dry_run=dry_run,
+            transfer_mode=transfer_mode,
+            ssh_kwargs=ssh_kwargs,
+        )
+
+    def default_env_file(self, recipe: Recipe) -> str | None:
+        """Return a shell env_file this builder produces, or ``None``.
+
+        Environment builders that produce a shell env_file (sourced before
+        the serve command, e.g. a venv activation script) return its path;
+        the local executor auto-populates its ``env_file`` from this when the
+        recipe doesn't set one explicitly.
+        """
+        return None
+
     def prepare_image(
         self,
         image: str,

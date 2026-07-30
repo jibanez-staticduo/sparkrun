@@ -20,11 +20,13 @@ _DTYPE_BYTES: dict[str, float] = {
     "fp8": 1.0,
     "fp8_e5m2": 1.0,
     "fp8_e4m3": 1.0,
+    "mxfp8": 1.0,
     "int4": 0.5,
     "awq": 0.5,
     "nvfp4": 0.5,
     "awq4": 0.5,
     "w4a16_awq": 0.5,
+    "w4a16_nvfp4": 0.5,
     "awq8": 1.0,
     "gptq": 0.5,
     "mxfp4": 0.5,
@@ -81,7 +83,14 @@ _PARAM_SUFFIXES = {
 # Total system memory is ~128 GB (127601452 KiB ≈ 121.7 GiB).
 # Usable GPU memory depends on gpu_memory_utilization and OS overhead.
 # We use 121 GiB as an "available for inference" figure.
-DGX_SPARK_VRAM_GB = 121.0
+#
+# Used as the default per-host VRAM budget by the single-platform fit
+# path (:attr:`VRAMEstimate.fits_dgx_spark`).  Heterogeneous-cluster
+# fits should call :func:`sparkrun.models.fit.check_fit` instead, which
+# reads ``memory_gb`` from each host's
+# :class:`~sparkrun.core.hardware.HostHardware`.
+DEFAULT_VRAM_GB = 121.0
+DGX_SPARK_VRAM_GB = DEFAULT_VRAM_GB  # alias retained for callers that pre-date DEFAULT_VRAM_GB
 
 
 @dataclass
@@ -107,6 +116,7 @@ class VRAMEstimate:
 
     # GPU memory budget fields
     gpu_memory_utilization: float | None = None
+    total_gpu_memory_gb: float | None = None
     usable_gpu_memory_gb: float | None = None
     available_kv_gb: float | None = None
     max_context_tokens: int | None = None
@@ -114,7 +124,13 @@ class VRAMEstimate:
 
     @property
     def fits_dgx_spark(self) -> bool:
-        """Whether the estimated VRAM fits within DGX Spark GPU memory."""
+        """Whether the estimated per-GPU VRAM fits within DGX Spark memory.
+
+        Legacy single-platform helper.  For heterogeneous-cluster fit checks
+        use :func:`sparkrun.models.fit.check_fit`, which inspects each
+        host's actual accelerator memory from
+        :class:`~sparkrun.core.hardware.HostHardware`.
+        """
         return self.total_per_gpu_gb <= DGX_SPARK_VRAM_GB
 
     def to_dict(self) -> dict[str, Any]:
@@ -213,6 +229,58 @@ def fetch_model_config(
     except Exception as e:
         logger.debug("Could not fetch HF config for %s: %s", model_id, e)
         return None
+
+
+#: Resolved visibility of a HuggingFace repo, as reported by ``model_info``.
+MODEL_VISIBILITY_PUBLIC = "public"
+MODEL_VISIBILITY_PRIVATE = "private"
+MODEL_VISIBILITY_UNKNOWN = "unknown"
+
+#: Per-process memo for :func:`fetch_model_visibility` so a single command
+#: never asks the Hub about the same repo twice.
+_VISIBILITY_MEMO: dict[tuple[str, str | None], str] = {}
+
+
+def fetch_model_visibility(model_id: str, revision: str | None = None) -> str:
+    """Return whether *model_id* is a publicly readable HuggingFace repo.
+
+    One of :data:`MODEL_VISIBILITY_PUBLIC`, :data:`MODEL_VISIBILITY_PRIVATE`
+    (also covers *gated* repos), or :data:`MODEL_VISIBILITY_UNKNOWN`.
+
+    This reads ``ModelInfo.private`` / ``.gated`` rather than inferring from
+    whether a fetch succeeded.  The distinction matters: ``huggingface_hub``
+    picks up an ambient ``HF_TOKEN`` or stored login, so a *successful* lookup
+    says nothing about visibility — a user with a token resolves their own
+    private repos perfectly well.
+
+    Every failure mode — offline, rate-limited, typo'd id, no such repo —
+    collapses to ``unknown``, so callers must treat ``unknown`` as "not
+    established" rather than "not public".
+    """
+    key = (model_id, revision)
+    memo = _VISIBILITY_MEMO.get(key)
+    if memo is not None:
+        return memo
+
+    verdict = MODEL_VISIBILITY_UNKNOWN
+    try:
+        from huggingface_hub import model_info as _model_info
+
+        kwargs: dict[str, Any] = {"repo_id": model_id}
+        if revision:
+            kwargs["revision"] = revision
+        mi = _model_info(**kwargs)
+        # `gated` is False, "auto", or "manual" — anything truthy means the
+        # repo id is not freely readable and is treated as non-public.
+        if bool(getattr(mi, "private", False)) or bool(getattr(mi, "gated", False)):
+            verdict = MODEL_VISIBILITY_PRIVATE
+        else:
+            verdict = MODEL_VISIBILITY_PUBLIC
+    except Exception as e:
+        logger.debug("Could not resolve HF visibility for %s: %s", model_id, e)
+
+    _VISIBILITY_MEMO[key] = verdict
+    return verdict
 
 
 def fetch_safetensors_size(
@@ -525,6 +593,7 @@ def estimate_vram(
     model_vram: float | None = None,
     kv_vram_per_token: float | None = None,
     gpu_memory_utilization: float | None = None,
+    total_gpu_memory_gb: float | None = None,
 ) -> VRAMEstimate:
     """Estimate VRAM usage for an inference workload.
 
@@ -541,6 +610,9 @@ def estimate_vram(
         model_vram: Direct override for model weight VRAM in GB (not scaled by TP/PP).
         kv_vram_per_token: Direct override for KV cache in GB per token (scaled by max_model_len and TP*PP).
         gpu_memory_utilization: Fraction of GPU memory the runtime is allowed to use (e.g. 0.9).
+        total_gpu_memory_gb: Per-GPU memory of the *target* accelerator (e.g. 48 for an
+            RTX A6000). Defaults to the DGX Spark figure when unset, preserving the
+            legacy single-platform estimate.
 
     Returns:
         VRAMEstimate with per-GPU totals and any warnings.
@@ -612,8 +684,12 @@ def estimate_vram(
     max_context_tokens: int | None = None
     context_multiplier: float | None = None
 
+    # Target accelerator memory: caller-supplied (e.g. 48 GB A6000) or the
+    # DGX Spark default. Keeps the budget honest on non-DGX clusters.
+    _total_gpu_gb = total_gpu_memory_gb if (total_gpu_memory_gb and total_gpu_memory_gb > 0) else DGX_SPARK_VRAM_GB
+
     if gpu_memory_utilization is not None and gpu_memory_utilization > 0:
-        usable_gpu_memory_gb = DGX_SPARK_VRAM_GB * gpu_memory_utilization
+        usable_gpu_memory_gb = _total_gpu_gb * gpu_memory_utilization
         available_kv_gb = usable_gpu_memory_gb - per_gpu_weights_gb
 
         if available_kv_gb < 0:
@@ -648,6 +724,7 @@ def estimate_vram(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         gpu_memory_utilization=gpu_memory_utilization,
+        total_gpu_memory_gb=_total_gpu_gb,
         usable_gpu_memory_gb=usable_gpu_memory_gb,
         available_kv_gb=available_kv_gb,
         max_context_tokens=max_context_tokens,

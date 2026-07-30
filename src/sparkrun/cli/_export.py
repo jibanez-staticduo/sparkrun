@@ -13,9 +13,9 @@ import yaml
 from ._common import (
     RECIPE_NAME,
     TARGET,
-    _apply_node_trimming,
     _apply_recipe_overrides,
     _get_config_and_registry,
+    _get_context,
     _is_cluster_id,
     _load_recipe,
     _resolve_hosts_or_exit,
@@ -26,6 +26,10 @@ from ._common import (
     json_option,
     print_json,
 )
+
+# NOTE: _resolve_hosts_or_exit is retained in _export.py because the internal
+# helpers (_resolve_recipe_for_systemd, export_running) use it conditionally
+# and do not map cleanly to the @with_host_context decorator pattern.
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +106,7 @@ def export_running(ctx, target, hosts, hosts_file, cluster_name, output_json, sa
       sparkrun export running-recipe e5f6a7b8 --save effective-recipe.yaml
     """
     from sparkrun.core.recipe import Recipe
-    from sparkrun.orchestration.job_metadata import load_job_metadata, generate_cluster_id
+    from sparkrun.orchestration.job_metadata import load_job_metadata, derive_cluster_id
 
     config, _ = _get_config_and_registry()
 
@@ -113,7 +117,7 @@ def export_running(ctx, target, hosts, hosts_file, cluster_name, output_json, sa
         # Target is a recipe name — need hosts to generate cluster_id
         recipe, _recipe_path, _registry_mgr = _load_recipe(config, target)
         host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
-        cluster_id = generate_cluster_id(recipe, host_list)
+        cluster_id = derive_cluster_id(recipe, host_list)
 
     # Load job metadata
     meta = load_job_metadata(cluster_id, cache_dir=str(config.cache_dir))
@@ -406,6 +410,8 @@ def _resolve_recipe_for_systemd(
     image,
     port,
     served_model_name,
+    *,
+    sctx=None,
 ):
     """Resolve recipe, hosts, and overrides for the systemd command.
 
@@ -470,9 +476,38 @@ def _resolve_recipe_for_systemd(
     )
 
     host_list, _ = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
-    host_list = _apply_node_trimming(host_list, recipe, overrides=overrides)
+    host_list = _trim_hosts_via_api(host_list, recipe, overrides, sctx=sctx)
 
     return recipe, overrides, host_list
+
+
+def _trim_hosts_via_api(host_list, recipe, overrides, *, sctx=None):
+    """Resolve ``host_list`` to the scheduler's effective hosts via ``api.schedule``.
+
+    Mirrors the placement-driven host selection ``api.run`` performs so
+    the systemd export targets the same hosts the launcher would have
+    used.  Returns the original list when there is no multi-host
+    parallelism to schedule.
+    """
+    if len(host_list) <= 1:
+        return host_list
+
+    import sparkrun.api as api
+    from sparkrun.core.parallelism import extract_parallelism
+    from sparkrun.core.scheduler import SchedulingRequest
+
+    parallelism = extract_parallelism(recipe.build_config_chain(overrides))
+    if not any(getattr(parallelism, k) > 1 for k in ("tensor_parallel", "pipeline_parallel", "data_parallel")):
+        return host_list
+    request = SchedulingRequest(
+        parallelism=parallelism,
+        hosts=tuple(host_list),
+        host_hardware=None,
+        layout=getattr(recipe, "layout", None),
+        resources=None,
+    )
+    result = api.schedule(request, sctx=sctx)
+    return list(result.assignment.hosts_used)
 
 
 def _build_cluster_yaml(cluster_name, hosts, ssh_user=None):
@@ -542,6 +577,7 @@ def export_systemd(
         do_install = True
 
     config, _ = _get_config_and_registry()
+    sctx = _get_context(ctx)
 
     # Resolve recipe, overrides, and hosts
     recipe, overrides, host_list = _resolve_recipe_for_systemd(
@@ -559,6 +595,7 @@ def export_systemd(
         image,
         port,
         served_model_name,
+        sctx=sctx,
     )
 
     head_host = host_list[0]

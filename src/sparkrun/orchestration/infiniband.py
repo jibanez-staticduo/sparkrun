@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from sparkrun.orchestration.comm_env import ClusterCommEnv
 from sparkrun.scripts import read_script
 from sparkrun.utils import parse_kv_output
+
+if TYPE_CHECKING:
+    from sparkrun.core.backend_select import BackendBundle
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,15 @@ class IBDetectionResult:
 
     Useful when clusters are defined by IB IPs: lets callers
     display the management IP alongside the IB address.
+    """
+    ib_iface_map: dict[str, str] = field(default_factory=dict)
+    """Mapping of queried host → the IB/CX7 network interface for its first IB IP.
+
+    Parallel to :attr:`ib_ip_map`: ``ib_ip_map[host]`` is the first detected
+    IB IP and ``ib_iface_map[host]`` is the matching interface from
+    ``DETECTED_NET_LIST``.  Consumed by :func:`pin_comm_env_to_ib` when the
+    distributed-init verdict falls back to the fabric, so socket-interface
+    env vars follow the same network as ``NODE_IP`` / master address.
     """
 
 
@@ -210,6 +223,69 @@ def extract_ib_ips(ib_info: dict[str, str]) -> list[str]:
     return [ip.strip() for ip in raw.split(",") if ip.strip()]
 
 
+# Env vars that name a single control-socket interface.  When the
+# distributed-init verdict falls back to the fabric these must follow the IB
+# interface, not the management/default-route interface.
+_SINGLE_IFACE_ENV_KEYS = (
+    "MN_IF_NAME",
+    "OMPI_MCA_btl_tcp_if_include",
+    "GLOO_SOCKET_IFNAME",
+    "TP_SOCKET_IFNAME",
+)
+
+
+def pin_comm_env_to_ib(
+    comm_env: ClusterCommEnv,
+    hosts: list[str],
+    ib_ip_map: dict[str, str],
+    ib_iface_map: dict[str, str],
+) -> ClusterCommEnv:
+    """Re-pin the per-host comm env to the IB/CX7 fabric.
+
+    Called only when :func:`select_init_network` chooses the ``"ib"`` network
+    (management head unreachable from the workers).  ``generate_nccl_env``
+    builds the comm env management-first — ``NODE_IP`` is the management IP,
+    the socket-interface vars name the management interface, and
+    ``NCCL_SOCKET_IFNAME`` lists the management interface ahead of the IB
+    adapters.  When the init verdict is the fabric, that management interface
+    is the one that is down, so keeping it selected would strand NCCL bootstrap
+    and vLLM's message queue on a dead link.
+
+    For every host that has both a fabric IP (*ib_ip_map*) and a fabric
+    interface (*ib_iface_map*), this rewrites that host's env so control
+    traffic uses the fabric:
+
+    * ``NODE_IP`` → the host's IB IP (so Ray's ``--node-ip-address`` and any
+      runtime advertising ``NODE_IP`` use the fabric address, not the default
+      route).  Runtimes that need a runtime-specific advertise var mirror
+      ``NODE_IP`` themselves — e.g. vLLM sets ``VLLM_HOST_IP = NODE_IP`` via
+      :meth:`RuntimePlugin.finalize_host_comm_env`.
+    * single-interface vars (``GLOO_SOCKET_IFNAME``, ``TP_SOCKET_IFNAME``,
+      ``MN_IF_NAME``, ``OMPI_MCA_btl_tcp_if_include``) → the fabric interface.
+    * ``NCCL_SOCKET_IFNAME`` → the fabric interface only (drops the leading
+      management entry so NCCL can't pick the dead interface first).
+
+    Hosts missing either the IP or the interface are left untouched — a
+    partial map cannot produce a mismatched binding.  Returns a fresh
+    :class:`ClusterCommEnv`; the input is not mutated.
+    """
+    per_host: dict[str, dict[str, str]] = {}
+    for host in hosts:
+        host_env = comm_env.get_env(host)
+        ib_ip = ib_ip_map.get(host)
+        ib_iface = ib_iface_map.get(host)
+        if ib_ip and ib_iface:
+            for key in _SINGLE_IFACE_ENV_KEYS:
+                if key in host_env:
+                    host_env[key] = ib_iface
+            if "NCCL_SOCKET_IFNAME" in host_env:
+                host_env["NCCL_SOCKET_IFNAME"] = ib_iface
+            host_env["NODE_IP"] = ib_ip
+        per_host[host] = host_env
+
+    return ClusterCommEnv.from_per_host(per_host)
+
+
 def validate_ib_connectivity(
     ib_candidates: dict[str, str] | dict[str, list[str]],
     ssh_kwargs: dict | None = None,
@@ -281,8 +357,9 @@ def validate_ib_connectivity(
             result = run_remote_command(_ip, "true", connect_timeout=5, timeout=10, **kw)
             return host_ip, result.success
 
-        # TODO: review parallelism limits!
-        with ThreadPoolExecutor(max_workers=len(work)) as pool:
+        from sparkrun.orchestration.ssh import resolve_parallel_cap
+
+        with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(work))) as pool:
             for host_ip, ok in pool.map(_probe, work):
                 probe_results[host_ip] = ok
 
@@ -334,6 +411,7 @@ def detect_ib_for_hosts(
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
     topology: str | None = None,
+    backends: "dict[str, BackendBundle] | None" = None,
 ) -> IBDetectionResult:
     """Run IB detection on all hosts and return aggregated results.
 
@@ -345,6 +423,13 @@ def detect_ib_for_hosts(
         hosts: Management hostnames/IPs.
         ssh_kwargs: SSH connection parameters.
         dry_run: Log without executing.
+        topology: Optional cluster topology hint (e.g. ``"ring"``).
+        backends: Optional per-host :class:`BackendBundle`.  When
+            provided, each host's env block is produced by
+            ``backends[host].collective.env_for_host(ib_info, topology=...)``.
+            Hosts missing from *backends* fall back to the legacy
+            :func:`generate_nccl_env` (NCCL) path.  When *backends* is
+            ``None`` every host uses the legacy path.
 
     Returns:
         :class:`IBDetectionResult` with NCCL env and IB IP mapping.
@@ -369,6 +454,7 @@ def detect_ib_for_hosts(
 
     per_host_env: dict[str, dict[str, str]] = {}
     ib_ip_map: dict[str, str] = {}
+    ib_iface_map: dict[str, str] = {}
     ib_candidates: dict[str, list[str]] = {}
     mgmt_ip_map: dict[str, str] = {}
 
@@ -377,8 +463,14 @@ def detect_ib_for_hosts(
             continue
         ib_info = parse_ib_detect_output(result.stdout)
 
-        # Per-host comm env (so heterogeneous socket interfaces work)
-        host_env = generate_nccl_env(ib_info, topology=topology)
+        # Per-host comm env: route through backend when provided so
+        # NCCL/RCCL/HCCL hosts emit the right env block.  Hosts missing
+        # from *backends* (or all hosts when *backends* is None) use the
+        # legacy NCCL generator — byte-identical to NcclBackend on NVIDIA.
+        if backends is not None and result.host in backends:
+            host_env = backends[result.host].collective.env_for_host(ib_info, topology=topology)
+        else:
+            host_env = generate_nccl_env(ib_info, topology=topology)
         if host_env:
             per_host_env[result.host] = host_env
             if result.host == head_host:
@@ -396,6 +488,12 @@ def detect_ib_for_hosts(
                 logger.debug("  %s IB transfer IP candidates: %s", result.host, ib_ips)
             else:
                 logger.debug("  %s IB transfer IP: %s", result.host, ib_ips[0])
+
+            # Interface backing the first IB IP (parallel to DETECTED_IB_IPS),
+            # used to re-pin socket-interface env when init falls back to fabric.
+            net_ifaces = [name.strip() for name in ib_info.get("DETECTED_NET_LIST", "").split(",") if name.strip()]
+            if net_ifaces:
+                ib_iface_map[result.host] = net_ifaces[0]
 
         # Management IP (from default route interface)
         mgmt_ip = ib_info.get("DETECTED_MGMT_IP", "").strip()
@@ -417,4 +515,5 @@ def detect_ib_for_hosts(
         ib_ip_map=ib_ip_map,
         ib_candidates=ib_candidates,
         mgmt_ip_map=mgmt_ip_map,
+        ib_iface_map=ib_iface_map,
     )

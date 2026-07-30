@@ -6,6 +6,9 @@ import sys
 
 import click
 
+import sparkrun.api as api
+from sparkrun.core.scheduler import NEW_CLUSTER_DEFAULT_SCHEDULER, new_cluster_scheduler_notice
+
 from ._common import (
     CLUSTER_NAME,
     TARGET,
@@ -20,6 +23,30 @@ from ._common import (
     print_json,
     HIDE_ADVANCED_OPTIONS,
 )
+
+
+def _parse_executor_opts(opts: tuple[str, ...]) -> dict:
+    """Parse repeated -o/--executor-opt key=value pairs into a dict.
+
+    Values are auto-coerced to int/float/bool where possible via
+    :func:`sparkrun.utils.coerce_value`.  Exits with an error message
+    on malformed entries.
+    """
+    from sparkrun.utils import coerce_value
+
+    result: dict = {}
+    for opt in opts:
+        if "=" not in opt:
+            click.echo("Error: --executor-opt must be key=value, got: %s" % opt, err=True)
+            sys.exit(1)
+        key, _, value = opt.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            click.echo("Error: --executor-opt has empty key: %s" % opt, err=True)
+            sys.exit(1)
+        result[key] = coerce_value(value)
+    return result
 
 
 @click.group()
@@ -48,12 +75,60 @@ def cluster(ctx):
     type=click.Choice(["auto", "cx7", "mgmt"], case_sensitive=False),
     help="Network interface for transfers (auto=default, cx7=InfiniBand, mgmt=management)",
 )
+@click.option(
+    "--executor",
+    "executor_name",
+    default=None,
+    help="Default executor selector for workloads on this cluster (e.g. docker, local, k8s)",
+)
+@click.option(
+    "--executor-opt",
+    "-o",
+    "executor_opts",
+    multiple=True,
+    help="Executor option (repeatable): -o key=value (e.g. -o privileged=false -o shm_size=16g)",
+)
+@click.option(
+    "--scheduler",
+    "scheduler_name",
+    default=NEW_CLUSTER_DEFAULT_SCHEDULER,
+    show_default=True,
+    help="Default scheduler selector for workloads on this cluster (e.g. greedy, occupancy-sparse, occupancy-dense). "
+    "New clusters default to occupancy-sparse; pass '--scheduler greedy' (or an empty string) for 0.2.x behavior.",
+)
+@click.option(
+    "--max-gpu-mem-util",
+    "max_gpu_mem_util",
+    type=float,
+    default=None,
+    help="Cluster-wide cap (0.0 < x <= 1.0) on the fraction of GPU memory usable for "
+    "scheduling/fit (e.g. 0.85). Overrides platform defaults. Per-type/per-host caps via cluster YAML.",
+)
 @click.option("--default", "set_default", is_flag=True, default=False, help="Set as the default cluster")
 @click.pass_context
-def cluster_create(ctx, name, hosts, hosts_file, description, user, cache_dir, transfer_mode, transfer_interface, set_default):
+def cluster_create(
+    ctx,
+    name,
+    hosts,
+    hosts_file,
+    description,
+    user,
+    cache_dir,
+    transfer_mode,
+    transfer_interface,
+    executor_name,
+    executor_opts,
+    scheduler_name,
+    max_gpu_mem_util,
+    set_default,
+):
     """Create a new named cluster."""
     from sparkrun.core.cluster_manager import ClusterError
     from sparkrun.core.hosts import parse_hosts_file
+
+    if max_gpu_mem_util is not None and not (0.0 < max_gpu_mem_util <= 1.0):
+        click.echo("Error: --max-gpu-mem-util must be > 0.0 and <= 1.0.", err=True)
+        sys.exit(1)
 
     # "auto" means unset (use default behavior)
     if transfer_interface == "auto":
@@ -67,18 +142,190 @@ def cluster_create(ctx, name, hosts, hosts_file, description, user, cache_dir, t
         click.echo("Error: No hosts provided.", err=True)
         sys.exit(1)
 
-    mgr = _get_cluster_manager()
+    executor_config = _parse_executor_opts(executor_opts) if executor_opts else None
+
+    sctx = _get_context(ctx)
+    mgr = _get_cluster_manager(sctx=sctx)
     try:
         mgr.create(
-            name, host_list, description, user=user, cache_dir=cache_dir, transfer_mode=transfer_mode, transfer_interface=transfer_interface
+            name,
+            host_list,
+            description,
+            user=user,
+            cache_dir=cache_dir,
+            transfer_mode=transfer_mode,
+            transfer_interface=transfer_interface,
+            executor=executor_name,
+            executor_config=executor_config,
+            scheduler=scheduler_name,
+            max_gpu_memory_utilization=max_gpu_mem_util,
         )
         click.echo(f"Cluster '{name}' created with {len(host_list)} host(s).")
+        if scheduler_name and scheduler_name != "greedy":
+            click.echo(new_cluster_scheduler_notice(scheduler_name))
         if set_default:
             mgr.set_default(name)
             click.echo(f"Default cluster set to '{name}'.")
     except ClusterError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+@cluster.group("import", invoke_without_command=True)
+@click.option(
+    "--from-spark-vllm-docker-env",
+    "svd_env",
+    default=None,
+    metavar="PATH",
+    help="[deprecated] Import a legacy spark-vllm-docker .env; use `cluster import svd PATH`.",
+)
+@click.option("--name", "name", type=CLUSTER_NAME, default=None, help="Cluster name (default: derived from the source)")
+@click.option("--default", "set_default", is_flag=True, default=False, help="Set as the default cluster")
+@dry_run_option
+@click.pass_context
+def cluster_import(ctx, svd_env, name, set_default, dry_run):
+    """Import an external cluster config into a sparkrun cluster.
+
+    Subcommands:
+
+    \b
+      svd | eugr PATH   import a spark-vllm-docker .env file
+
+    Additional providers may be contributed by plugins (e.g. ``cluster import
+    thunder`` from the sparkrun_thunder plugin).
+
+    The legacy ``--from-spark-vllm-docker-env PATH`` flag is still accepted
+    (deprecated) and forwards to ``import svd``.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    if svd_env:
+        click.echo(
+            "Warning: --from-spark-vllm-docker-env is deprecated; use `sparkrun cluster import svd PATH`.",
+            err=True,
+        )
+        _do_svd_import(ctx, svd_env, name, set_default, dry_run)
+        return
+    click.echo(ctx.get_help(), err=True)
+    ctx.exit(0)
+
+
+def _do_svd_import(ctx, svd_env, name, set_default, dry_run):
+    """Import a spark-vllm-docker ``.env`` into a cluster (svd/eugr subcommand body).
+
+    Re-running on the same file **syncs in place** — matched by the stored
+    ``sync_source`` (even if the cluster was renamed) — and only ever rewrites
+    the import-owned fields.  The resolved cluster name is printed to stdout.
+    """
+    from sparkrun.core.cluster_manager import ClusterError
+    from sparkrun.core.svd_import import build_svd_import
+
+    if not svd_env:
+        click.echo("Error: a source PATH is required.", err=True)
+        sys.exit(1)
+
+    try:
+        imp = build_svd_import(svd_env)
+    except ClusterError as e:
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+
+    sctx = _get_context(ctx)
+    mgr = _get_cluster_manager(sctx=sctx)
+
+    # Re-sync identity is the sync_source, not the name — so a renamed
+    # cluster still updates in place on re-import.
+    existing = next((c for c in mgr.list_clusters() if c.sync_source == imp.sync_source), None)
+    if existing is not None:
+        target = existing.name
+    else:
+        target = name or imp.default_name
+        clash = None
+        try:
+            clash = mgr.get(target)
+        except ClusterError:
+            clash = None
+        if clash is not None and clash.sync_source != imp.sync_source:
+            click.echo(
+                "Error: cluster '%s' already exists from a different source; pass --name to choose another." % target,
+                err=True,
+            )
+            sys.exit(1)
+
+    # Human report goes to stderr; only the resolved name lands on stdout.
+    for line in imp.carried:
+        click.echo("  carried: %s" % line, err=True)
+    for line in imp.dropped:
+        click.echo("  dropped: %s" % line, err=True)
+    click.echo("  env_file: %s" % imp.env_file, err=True)
+
+    if dry_run:
+        click.echo("[dry-run] would %s cluster '%s'." % ("sync" if existing else "create", target), err=True)
+        click.echo(target)
+        return
+
+    try:
+        if existing is not None:
+            changes = [
+                f
+                for f, old, new in (
+                    ("hosts", existing.hosts, imp.hosts),
+                    ("fabric_interfaces", existing.fabric_interfaces, imp.fabric_interfaces),
+                    ("env", existing.env, imp.env),
+                    ("env_file", existing.env_file, imp.env_file),
+                )
+                if old != new
+            ]
+            mgr.update(
+                target,
+                hosts=imp.hosts,
+                fabric_interfaces=imp.fabric_interfaces,
+                env=imp.env,
+                env_file=imp.env_file,
+                sync_source=imp.sync_source,
+            )
+            if changes:
+                click.echo("Synced cluster '%s' (updated: %s)." % (target, ", ".join(changes)), err=True)
+            else:
+                click.echo("Cluster '%s' already in sync; no changes." % target, err=True)
+        else:
+            mgr.create(
+                target,
+                imp.hosts,
+                fabric_interfaces=imp.fabric_interfaces,
+                env=imp.env,
+                env_file=imp.env_file,
+                sync_source=imp.sync_source,
+            )
+            click.echo("Imported cluster '%s' with %d host(s)." % (target, len(imp.hosts)), err=True)
+        if set_default:
+            mgr.set_default(target)
+            click.echo("Default cluster set to '%s'." % target, err=True)
+    except ClusterError as e:
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+
+    click.echo(target)
+
+
+@cluster_import.command("svd")
+@click.argument("path", metavar="PATH")
+@click.option("--name", "name", type=CLUSTER_NAME, default=None, help="Cluster name (default: derived from the env file path)")
+@click.option("--default", "set_default", is_flag=True, default=False, help="Set as the default cluster")
+@dry_run_option
+@click.pass_context
+def cluster_import_svd(ctx, path, name, set_default, dry_run):
+    """Import a spark-vllm-docker ``.env`` file into a cluster.
+
+    Maps ``CLUSTER_NODES`` -> hosts, ``ETH_IF`` -> fabric_interfaces, and
+    ``CONTAINER_*`` -> env references (resolved from the env file at launch, so
+    secrets stay out of YAML).  Re-running syncs in place.  Aliased as ``eugr``.
+    """
+    _do_svd_import(ctx, path, name, set_default, dry_run)
+
+
+# ``eugr`` is an alias for ``svd`` (same spark-vllm-docker .env format).
+cluster_import.add_command(cluster_import_svd, "eugr")
 
 
 @cluster.command("update")
@@ -108,9 +355,64 @@ def cluster_create(ctx, name, hosts, hosts_file, description, user, cache_dir, t
     type=click.Choice(["none", "direct", "switch", "ring"], case_sensitive=False),
     help="CX7 topology (none=remove, direct/switch=switched fabric, ring=3-node mesh/ring)",
 )
+@click.option(
+    "--infer-hardware",
+    is_flag=True,
+    help="SSH into each cluster host, detect accelerators (NVIDIA/AMD/Intel/Apple) + IB, and persist per-host hardware metadata",
+)
+@click.option(
+    "--executor",
+    "executor_name",
+    default=None,
+    help="Default executor selector for workloads on this cluster (e.g. docker, local, k8s). Pass empty string to clear.",
+)
+@click.option(
+    "--executor-opt",
+    "-o",
+    "executor_opts",
+    multiple=True,
+    help="Executor option (repeatable): -o key=value. Pass once with no value to clear.",
+)
+@click.option(
+    "--clear-executor-config",
+    is_flag=True,
+    default=False,
+    help="Remove all executor config options from the cluster",
+)
+@click.option(
+    "--scheduler",
+    "scheduler_name",
+    default=None,
+    help="Default scheduler selector for workloads on this cluster (e.g. greedy, occupancy-sparse, occupancy-dense). Pass empty string to clear.",
+)
+@click.option(
+    "--max-gpu-mem-util",
+    "max_gpu_mem_util",
+    type=float,
+    default=None,
+    help="Cluster-wide cap (0.0 < x <= 1.0) on the fraction of GPU memory usable for "
+    "scheduling/fit (e.g. 0.85). Pass 0 to clear. Per-type/per-host caps via cluster YAML.",
+)
 @click.pass_context
 def cluster_update(
-    ctx, name, hosts, hosts_file, add_host, remove_host, description, user, cache_dir, transfer_mode, transfer_interface, topology
+    ctx,
+    name,
+    hosts,
+    hosts_file,
+    add_host,
+    remove_host,
+    description,
+    user,
+    cache_dir,
+    transfer_mode,
+    transfer_interface,
+    topology,
+    infer_hardware,
+    executor_name,
+    executor_opts,
+    clear_executor_config,
+    scheduler_name,
+    max_gpu_mem_util,
 ):
     """Update an existing cluster.
 
@@ -147,6 +449,10 @@ def cluster_update(
     transfer_mode_provided = ctx.get_parameter_source("transfer_mode") == ParameterSource.COMMANDLINE
     transfer_interface_provided = ctx.get_parameter_source("transfer_interface") == ParameterSource.COMMANDLINE
     topology_provided = ctx.get_parameter_source("topology") == ParameterSource.COMMANDLINE
+    executor_provided = ctx.get_parameter_source("executor_name") == ParameterSource.COMMANDLINE
+    executor_opts_provided = bool(executor_opts) or clear_executor_config
+    scheduler_provided = ctx.get_parameter_source("scheduler_name") == ParameterSource.COMMANDLINE
+    max_gpu_mem_util_provided = ctx.get_parameter_source("max_gpu_mem_util") == ParameterSource.COMMANDLINE
 
     has_host_change = host_list is not None or add_host or remove_host
     if (
@@ -157,16 +463,27 @@ def cluster_update(
         and not transfer_mode_provided
         and not transfer_interface_provided
         and not topology_provided
+        and not infer_hardware
+        and not executor_provided
+        and not executor_opts_provided
+        and not scheduler_provided
+        and not max_gpu_mem_util_provided
     ):
         click.echo(
             "Error: Nothing to update. Provide --hosts, --hosts-file, --add-host, "
             "--remove-host, -d, --user, --cache-dir, --transfer-mode, "
-            "--transfer-interface, or --topology.",
+            "--transfer-interface, --topology, --infer-hardware, --executor, "
+            "--executor-opt, --clear-executor-config, --scheduler, or --max-gpu-mem-util.",
             err=True,
         )
         sys.exit(1)
 
-    mgr = _get_cluster_manager()
+    if max_gpu_mem_util_provided and max_gpu_mem_util != 0 and not (0.0 < max_gpu_mem_util <= 1.0):
+        click.echo("Error: --max-gpu-mem-util must be > 0.0 and <= 1.0 (or 0 to clear).", err=True)
+        sys.exit(1)
+
+    sctx = _get_context(ctx)
+    mgr = _get_cluster_manager(sctx=sctx)
 
     # Handle --add-host / --remove-host by modifying the current host list
     if add_host or remove_host:
@@ -219,6 +536,54 @@ def cluster_update(
             update_kwargs["topology"] = "switch"
         else:
             update_kwargs["topology"] = topology
+    if executor_provided:
+        # Empty string clears the executor selector
+        update_kwargs["executor"] = executor_name if executor_name else None
+    if clear_executor_config:
+        update_kwargs["executor_config"] = None
+    elif executor_opts:
+        update_kwargs["executor_config"] = _parse_executor_opts(executor_opts)
+    if scheduler_provided:
+        # Empty string clears the scheduler selector
+        update_kwargs["scheduler"] = scheduler_name if scheduler_name else None
+    if max_gpu_mem_util_provided:
+        # 0 clears the cluster-wide cap (defer to platform default / 1.0 fallback)
+        update_kwargs["max_gpu_memory_utilization"] = max_gpu_mem_util if max_gpu_mem_util else None
+
+    if infer_hardware:
+        from sparkrun.core.fingerprint import fingerprint_host
+        from sparkrun.orchestration.primitives import build_ssh_kwargs
+
+        # Resolve hosts list to probe: prefer the (possibly updated) host_list
+        # for this invocation, else read the persisted cluster.
+        probe_hosts: list[str]
+        if host_list is not None:
+            probe_hosts = host_list
+        else:
+            try:
+                probe_hosts = list(mgr.get(name).hosts)
+            except ClusterError as e:
+                click.echo(f"Error: {e}", err=True)
+                sys.exit(1)
+
+        ssh_kwargs = build_ssh_kwargs(sctx.config)
+        click.echo("Fingerprinting %d host(s)..." % len(probe_hosts))
+        hosts_hardware: dict = {}
+        for host in probe_hosts:
+            click.echo("  %s ..." % host, nl=False)
+            try:
+                hw = fingerprint_host(host, ssh_kwargs)
+            except Exception as e:
+                click.echo(" FAILED (%s)" % e)
+                continue
+            hosts_hardware[host] = hw
+            if hw.accelerators:
+                summary = ", ".join("%dx %s/%s" % (a.count, a.vendor, a.model) for a in hw.accelerators)
+                click.echo(" %s" % summary)
+            else:
+                click.echo(" no accelerators detected (%s)" % (hw.notes or "?"))
+        if hosts_hardware:
+            update_kwargs["hosts_hardware"] = hosts_hardware
 
     try:
         mgr.update(name, hosts=host_list, description=description, **update_kwargs)
@@ -296,6 +661,10 @@ def cluster_show(ctx, name, output_json):
 
     click.echo(f"Name:        {c.name}")
     click.echo(f"Description: {c.description or '(none)'}")
+    if c.transport and c.transport != "ssh":
+        click.echo(f"Transport:   {c.transport}")
+    if c.provider_ref:
+        click.echo(f"Provider:    {c.provider_ref}")
     if c.user:
         click.echo(f"User:        {c.user}")
     if c.cache_dir:
@@ -306,6 +675,14 @@ def cluster_show(ctx, name, output_json):
         click.echo(f"Xfer iface:  {c.transfer_interface}")
     if c.topology:
         click.echo(f"Topology:    {c.topology}")
+    if c.executor:
+        click.echo(f"Executor:    {c.executor}")
+    if c.executor_config:
+        click.echo("Executor config:")
+        for k, v in sorted(c.executor_config.items()):
+            click.echo(f"  {k}: {v}")
+    if c.scheduler:
+        click.echo(f"Scheduler:   {c.scheduler}")
     click.echo(f"Default:     {'yes' if c.name == default_name else 'no'}")
     click.echo(f"Hosts ({len(c.hosts)}):")
     for h in c.hosts:
@@ -325,12 +702,25 @@ def cluster_delete(ctx, name, force):
     if not force:
         click.confirm(f"Delete cluster '{name}'?", abort=True)
 
+    # Capture the definition before deletion so a provider transport can tear
+    # down out-of-band state (e.g. the managed ssh alias) after it's gone.
+    _cd = None
+    try:
+        _cd = mgr.get(name)
+    except ClusterError:
+        pass
+
     try:
         mgr.delete(name)
         click.echo(f"Cluster '{name}' deleted.")
     except ClusterError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+    if _cd is not None:
+        from sparkrun.transports import cleanup_cluster_transport
+
+        cleanup_cluster_transport(_cd)
 
 
 @cluster.command("set-default")
@@ -423,7 +813,7 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
 
       sparkrun cluster monitor --cluster mylab --json
     """
-    from sparkrun.core.monitoring import ClusterMonitor, stream_cluster_monitor
+    from sparkrun.core.monitoring import stream_cluster_monitor
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
     config = _get_context(ctx).config
@@ -446,39 +836,23 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
 
     # ---- JSON streaming mode ----
     if output_json:
-        import time
+        # Stream MonitorFrames (telemetry + occupancy) as newline-delimited JSON.
+        # ``hosts`` is a list of per-host rows (the canonical MonitorFrame shape,
+        # shared with the desktop SSE): {host, error, sample, workloads, ...}.
+        from sparkrun.core.monitoring import serialize_frame
 
-        def _render_json(states):
-            """Emit one JSON object per update tick with all host data."""
-            snapshot = {"timestamp": time.time(), "hosts": {}}
-            for host in host_list:
-                state = states.get(host)
-                if state is None or state.latest is None:
-                    snapshot["hosts"][host] = {"error": state.error} if (state and state.error) else {"connecting": True}
-                    continue
-                snapshot["hosts"][host] = state.latest
-            print_json(snapshot)
-
-        if backend == "nv-monitor":
-            from sparkrun.core.monitoring import NvMonitorClusterMonitor
-
-            monitor = NvMonitorClusterMonitor(host_list, ssh_kwargs, interval)
-            monitor.start()
-            try:
-                while True:
-                    time.sleep(1)
-                    _render_json(monitor.states)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                monitor.stop()
-        else:
-            stream_cluster_monitor(
+        try:
+            for frame in api.live_monitor(
                 host_list,
-                ssh_kwargs,
+                cluster=cluster_name or None,
+                ssh_kwargs=ssh_kwargs,
                 interval=interval,
-                on_update=_render_json,
-            )
+                backend=backend,
+                sctx=_get_context(ctx),
+            ):
+                print_json({"timestamp": frame.queried_at, "hosts": serialize_frame(frame)})
+        except KeyboardInterrupt:
+            pass
         return
 
     # Try the Textual TUI unless --simple was requested.
@@ -486,59 +860,49 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
         try:
             from sparkrun.cli._monitor_tui import ClusterMonitorApp
 
-            if backend == "nv-monitor":
-                from sparkrun.core.monitoring import NvMonitorClusterMonitor
-
-                monitor = NvMonitorClusterMonitor(host_list, ssh_kwargs, interval)
-            else:
-                monitor = ClusterMonitor(host_list, ssh_kwargs, interval)
-            app = ClusterMonitorApp(monitor, cache_dir=str(config.cache_dir))
-            app.run()
+            # Single source: a LiveMonitorSession combines the substrate's
+            # telemetry stream with a background api.status occupancy poll, so
+            # the TUI shows local/provider workloads (not just docker).
+            session = api.open_live_monitor(
+                host_list,
+                cluster=cluster_name or None,
+                ssh_kwargs=ssh_kwargs,
+                interval=interval,
+                backend=backend,
+                sctx=_get_context(ctx),
+            )
+            try:
+                app = ClusterMonitorApp(session, host_list, interval=interval, cache_dir=str(config.cache_dir))
+                app.run()
+            finally:
+                session.close()
             return
         except ImportError:
             click.echo("Textual not installed — falling back to simple mode.\n", err=True)
 
     # ---- simple plain-text fallback ----
-    import time
-
-    from sparkrun.utils.cli_formatters import format_monitor_table
+    # Also flows from api.live_monitor (telemetry + occupancy), so the Jobs
+    # column reflects all executors' workloads, not the docker-only count.
+    from sparkrun.utils.cli_formatters import format_activity_table
 
     click.echo("Monitoring %d host(s) every %ds (Ctrl-C to stop)...\n" % (len(host_list), interval))
 
     # Number of lines the table occupies: header + separator + one row per host
     table_lines = len(host_list) + 2
-
-    def _render(states):
-        """Move cursor back to table start and redraw."""
-        table = format_monitor_table(states, host_list)
-        click.echo("\033[%dA\033[J" % table_lines, nl=False)
-        click.echo(table)
-
-    if backend == "nv-monitor":
-        from sparkrun.core.monitoring import NvMonitorClusterMonitor
-
-        monitor = NvMonitorClusterMonitor(host_list, ssh_kwargs, interval)
-        monitor.start()
-        click.echo(format_monitor_table({}, host_list))
-        try:
-            while True:
-                time.sleep(1)
-                table = format_monitor_table(monitor.states, host_list)
-                click.echo("\033[%dA\033[J" % table_lines, nl=False)
-                click.echo(table)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            monitor.stop()
-    else:
-        click.echo(format_monitor_table({}, host_list))
-
-        stream_cluster_monitor(
+    click.echo(format_activity_table(None, host_list))  # initial (connecting)
+    try:
+        for frame in api.live_monitor(
             host_list,
-            ssh_kwargs,
+            cluster=cluster_name or None,
+            ssh_kwargs=ssh_kwargs,
             interval=interval,
-            on_update=_render,
-        )
+            backend=backend,
+            sctx=_get_context(ctx),
+        ):
+            click.echo("\033[%dA\033[J" % table_lines, nl=False)
+            click.echo(format_activity_table(frame, host_list))
+    except KeyboardInterrupt:
+        pass
 
     click.echo("\nMonitoring stopped.")
 
@@ -561,12 +925,12 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
 
       sparkrun cluster status --cluster mylab
     """
-    from sparkrun.core.cluster_manager import query_cluster_status
     from sparkrun.utils.cli_formatters import format_job_label, format_job_commands, format_host_display
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-    config = _get_context(ctx).config
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
+    sctx = _get_context(ctx)
+    config = sctx.config
+    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
 
     ssh_kwargs = build_ssh_kwargs(config)
 
@@ -575,12 +939,13 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
         click.echo("[dry-run] Would run on %d host(s): %s" % (len(host_list), docker_cmd))
         return
 
-    # Query and classify — business logic lives in cluster_manager
-    result = query_cluster_status(
-        host_list,
-        ssh_kwargs=ssh_kwargs,
-        cache_dir=str(config.cache_dir),
-    )
+    # All status flows from the single source, ``api.status_report`` — the
+    # display tier over ``api.status``.  It owns executor resolution
+    # (cluster-aware, so a cluster's ``executor_config`` incl. ``pid_dir`` is
+    # honored), the cross-executor merge, and classification into the
+    # display-oriented ``ClusterStatusResult`` (per-container role/status/image,
+    # idle hosts, pending ops).
+    result = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
 
     if output_json:
         out = result.to_dict()
@@ -704,14 +1069,28 @@ def cluster_check_job(ctx, target, hosts, hosts_file, cluster_name, tp_override,
     if _is_cluster_id(target) is not None:
         # --- Cluster ID path ---
         cid = _is_cluster_id(target)
-        from sparkrun.orchestration.job_metadata import load_job_metadata
+        # Look up persisted metadata via the API (purely on-disk job
+        # cache enumeration — no executor needed).  We still fall back
+        # to ``load_job_metadata`` when the API enumeration misses
+        # (older job files without started_at, etc.).
+        meta: dict | None = None
+        try:
+            jobs = api.list_jobs(sctx=sctx)
+        except Exception:
+            jobs = []
+        for j in jobs:
+            if j.cluster_id == cid:
+                meta = dict(j.metadata)
+                break
+        if meta is None:
+            from sparkrun.orchestration.job_metadata import load_job_metadata
 
-        meta = load_job_metadata(cid, cache_dir=str(config.cache_dir))
+            meta = load_job_metadata(cid, cache_dir=str(config.cache_dir))
 
         # Resolve hosts: CLI flags > metadata > default cluster (None means "let check_job_running decide")
         host_list = None
         if hosts or hosts_file or cluster_name:
-            host_list, _ = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
+            host_list, _ = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
         elif meta and meta.get("hosts"):
             host_list = meta["hosts"]
 
@@ -725,34 +1104,39 @@ def cluster_check_job(ctx, target, hosts, hosts_file, cluster_name, tp_override,
         )
     else:
         # --- Recipe path ---
-        from sparkrun.cli._common import _apply_node_trimming, _load_recipe
-        from sparkrun.core.bootstrap import get_runtime
-        from sparkrun.orchestration.job_metadata import generate_cluster_id
+        from sparkrun.cli._common import _load_recipe
+        from sparkrun.core.parallelism import extract_parallelism
+        from sparkrun.core.scheduler import SchedulingRequest
+        from sparkrun.orchestration.job_metadata import derive_cluster_id
 
-        v = sctx.variables
         recipe, _recipe_path, _registry_mgr = _load_recipe(config, target)
         host_list, _ = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
 
-        # Resolve runtime for node trimming
-        try:
-            runtime = get_runtime(recipe.runtime, v)
-        except ValueError:
-            runtime = None
-
-        try:
-            host_list = _apply_node_trimming(
-                host_list,
-                recipe,
-                tp_override=tp_override,
-                runtime=runtime,
-                quiet=True,
-            )
-        except ValueError as e:
-            click.echo("Error: %s" % e, err=True)
-            sys.exit(1)
+        # Derive the effective host list via the scheduler so the
+        # cluster_id matches what ``api.run`` would have produced.
+        # ``hosts_used`` IS the effective list — no separate trimming step.
+        trim_overrides: dict = {}
+        if tp_override is not None:
+            trim_overrides["tensor_parallel"] = tp_override
+        if len(host_list) > 1:
+            parallelism = extract_parallelism(recipe.build_config_chain(trim_overrides))
+            if any(getattr(parallelism, k) > 1 for k in ("tensor_parallel", "pipeline_parallel", "data_parallel")):
+                request = SchedulingRequest(
+                    parallelism=parallelism,
+                    hosts=tuple(host_list),
+                    host_hardware=None,
+                    layout=getattr(recipe, "layout", None),
+                    resources=None,
+                )
+                try:
+                    sched_result = api.schedule(request, sctx=sctx)
+                except api.SparkrunError as e:
+                    click.echo("Error: %s" % e, err=True)
+                    sys.exit(1)
+                host_list = list(sched_result.assignment.hosts_used)
 
         # Build overrides for cluster_id generation
-        cid = generate_cluster_id(
+        cid = derive_cluster_id(
             recipe, host_list, overrides=build_cluster_id_overrides(port=port, served_model_name=served_model_name, tp_override=tp_override)
         )
         status = check_job_running(
@@ -891,6 +1275,8 @@ def cluster_inspect(ctx, name, hosts, hosts_file, cluster_name, dry_run, output_
     effective_config = {
         "cluster": cluster_cfg.name,
         "ssh_user": config.ssh_user,
+        "transport": cluster_cfg.transport,
+        "provider_ref": cluster_cfg.provider_ref,
         "transfer_mode": xfer_mode,
         "transfer_mode_resolved": resolved_mode,
         "transfer_interface": xfer_iface or "auto",
@@ -939,6 +1325,9 @@ def cluster_inspect(ctx, name, hosts, hosts_file, cluster_name, dry_run, output_
     else:
         click.echo("  cluster:            (none — using explicit hosts)")
     click.echo("  ssh_user:           %s" % (config.ssh_user or "(default)"))
+    click.echo("  transport:          %s" % cluster_cfg.transport)
+    if cluster_cfg.provider_ref:
+        click.echo("  provider_ref:       %s" % cluster_cfg.provider_ref)
 
     def _fmt_resolved(configured: str, resolved: str | None) -> str:
         if resolved and configured != resolved:

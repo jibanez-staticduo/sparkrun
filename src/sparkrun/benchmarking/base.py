@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging import Logger
 from pathlib import Path
-from typing import Any, Callable, TYPE_CHECKING, Optional
+from typing import Any, Callable, ClassVar, TYPE_CHECKING, Optional
 
 import yaml
 from scitrera_app_framework import Plugin, Variables
@@ -70,6 +70,23 @@ class BenchmarkingPlugin(Plugin):
     framework_name: str = ""
     default_args: dict[str, Any] = {}
     passthrough_args: set[str] = set()
+
+    # Benchmark category taxonomy: the kind of question this framework answers
+    # ("performance", "tools", "hallucinations", ...). A plugin may belong to
+    # more than one category, but ``primary_category`` is the one used when a
+    # spec/profile does not pin a category explicitly.
+    categories: ClassVar[tuple[str, ...]] = ("performance",)
+    primary_category: ClassVar[str] = "performance"
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # If the subclass declared ``categories`` but not ``primary_category``,
+        # default the primary to the first declared category. Without this,
+        # tools-only plugins would inherit ``primary_category = "performance"``.
+        if "categories" in cls.__dict__ and "primary_category" not in cls.__dict__:
+            cats = cls.__dict__["categories"]
+            if cats:
+                cls.primary_category = cats[0]
 
     # --- SAF Plugin interface ---
 
@@ -149,20 +166,46 @@ class BenchmarkingPlugin(Plugin):
         """Return default benchmark args when no profile is provided."""
         return dict(self.default_args)
 
+    def prepare_benchmark_args(
+        self,
+        recipe: "Recipe",
+        config_chain: dict[str, Any],
+        overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Framework-specific args derived from the recipe/config chain.
+
+        Called by the common benchmark path after profile + CLI overrides
+        have been resolved, before ``build_benchmark_command``.  Each
+        framework returns a dict of extra args it wants injected; the
+        common code merges this in *without overwriting* keys already
+        present in ``bench_args``.
+
+        Default: nothing extra.  Frameworks override to opt in to recipe
+        fields they care about (e.g. ``llama-benchy`` consumes
+        ``served_model_name``).
+        """
+        return {}
+
     def detect_version(self) -> str | None:
         """Resolve the framework tool version that will be used for execution.
 
-        Frameworks that pin via ``uvx <pkg>@<version>`` (or similar) should
-        implement this so the version can be captured up-front and reused for
-        all subsequent calls within the same benchmark run — including
-        resumes after a crash.  The scheduler stashes the result in
-        ``state.extras["framework_version"]`` and threads it back into every
-        per-task ``run_args`` via the ``_pinned_version`` sentinel key, which
-        the framework's ``build_benchmark_command`` is expected to consume.
+        Frameworks that pin a tool version for reproducibility (e.g. via
+        ``uvx pkg@version``, or ``--from git+url@ref``) should implement this
+        so the version is captured once and threaded back into every task's
+        ``run_args`` via the ``framework_pinned_version`` sentinel.
 
         Default: framework does not support pinning.  Returns ``None``.
         """
         return None
+
+    def apply_session_warmup_state(self, run_args: dict[str, Any], *, is_first_task: bool) -> dict[str, Any]:
+        """Return a possibly-mutated copy of ``run_args`` reflecting the framework's
+        one-time-per-session vs per-task split for warmup / coherence checks.
+        Default: no change.  Frameworks that do warmup once per session at the
+        start should set their warmup/coherence-disabling args on tasks beyond
+        the first.
+        """
+        return dict(run_args)
 
     def estimate_test_count(self, args: dict[str, Any]) -> int | None:
         """Estimate the number of test combinations from the args.
@@ -272,6 +315,13 @@ class BenchmarkResult:
     profile: Optional[str] = None
     benchmark_args: Optional[dict[str, Any]] = None
 
+    # Pre-resolved long-term archival reference. When set (e.g. from a
+    # persisted resume state), generate_metadata uses these instead of calling
+    # builder.resolve_long_term_image again — keeps result-yaml provenance
+    # identical across sessions of the same resumable run.
+    longterm_image_ref: Optional[str] = None
+    longterm_image_pinned: bool = False
+
     @property
     def output_csv(self):
         return self.outputs.get("csv") if self.outputs else None
@@ -330,7 +380,11 @@ class BenchmarkResult:
         # Resolve container image to a pinned long-term reference when possible
         container_pinned = False
         recipe_container = container_image or recipe.container
-        if launch_result and launch_result.builder:
+        if self.longterm_image_ref:
+            # Pre-resolved (and persisted) on first launch of this resumable run.
+            recipe_container = self.longterm_image_ref
+            container_pinned = self.longterm_image_pinned
+        elif launch_result and launch_result.builder:
             try:
                 resolved_image, pinned = launch_result.builder.resolve_long_term_image(
                     container_image=launch_result.container_image,

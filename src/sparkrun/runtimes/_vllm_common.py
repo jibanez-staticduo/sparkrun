@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING
-from sparkrun.runtimes._util import default_env_hf_offline, parse_api_key_from_command
+from sparkrun.runtimes._util import default_env_hf_offline, resolve_api_key
 
 if TYPE_CHECKING:
     from sparkrun.core.recipe import Recipe
@@ -34,10 +34,43 @@ class VllmMixin:
         env.update(get_vllm_tuning_env() or {})
         return env
 
+    def finalize_host_comm_env(self, host_env: dict[str, str]) -> dict[str, str]:
+        """Advertise vLLM on the host's resolved ``NODE_IP``.
+
+        vLLM infers its message-queue / distributed host address from the
+        default route unless ``VLLM_HOST_IP`` is set.  Mirror the finalized
+        per-host ``NODE_IP`` (which the init-network selection may have pinned
+        to the IB/CX7 fabric) so vLLM binds the same network as the rendezvous
+        address instead of the default-route interface.
+        """
+        host_env = super().finalize_host_comm_env(host_env)
+        node_ip = host_env.get("NODE_IP")
+        if node_ip:
+            host_env = {**host_env, "VLLM_HOST_IP": node_ip}
+        return host_env
+
     def version_commands(self) -> dict[str, str]:
         cmds = super().version_commands()
         cmds["vllm"] = "python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo unknown"
         return cmds
+
+    def _apply_distributed_backend(self, command: str, config, skip_keys: set[str] | frozenset[str] = frozenset()) -> str:
+        """Sync a rendered command's ``--distributed-executor-backend`` value.
+
+        ``render_command`` leaves a literal ``--distributed-executor-backend
+        ray`` in a recipe ``command`` untouched, so a CLI override
+        (``-o distributed_executor_backend=mp``) would otherwise be ignored.
+        When the config chain resolves a value for the key — i.e. it was set
+        in ``defaults`` or via ``-o`` — force the command to that value;
+        when it resolves nothing (the value lives only in the literal
+        command), leave the command as-is.
+        """
+        if "distributed_executor_backend" in skip_keys:
+            return command
+        value = config.get("distributed_executor_backend")
+        if value is None:
+            return command
+        return self.reconcile_flag_in_command(command, "--distributed-executor-backend", value, override=True)
 
     def resolve_api_key(
         self,
@@ -46,26 +79,94 @@ class VllmMixin:
     ) -> str | None:
         """Resolve the vLLM ``--api-key`` value for proxy/discovery use.
 
-        Checks, in order: CLI override, ``defaults.api_key`` (also
-        emitted as ``--api-key`` via :data:`VLLM_FLAG_MAP` for structured
-        commands), ``env.VLLM_API_KEY``, and finally a literal
-        ``--api-key`` flag parsed from the recipe's ``command`` field.
-        Returns ``None`` when none are set.
+        Delegates to :func:`sparkrun.runtimes._util.resolve_api_key` with
+        ``env_var="VLLM_API_KEY"`` and ``flag_name="--api-key"``.
         """
-        if overrides:
-            val = overrides.get("api_key")
-            if val:
-                return str(val)
-        val = recipe.defaults.get("api_key")
-        if val:
-            return str(val)
-        val = recipe.env.get("VLLM_API_KEY")
-        if val:
-            return str(val)
-        parsed = parse_api_key_from_command(recipe.command)
-        if parsed:
-            return parsed
-        return None
+        return resolve_api_key(recipe, overrides, "VLLM_API_KEY", "--api-key")
+
+    def _build_base_command(
+        self,
+        recipe: "Recipe",
+        config,
+        skip_keys: set[str] | frozenset[str] = frozenset(),
+    ) -> str:
+        """Build the ``vllm serve`` command without cluster-specific arguments.
+
+        Emits ``vllm serve <model> [-tp N] [--flag value ...]`` from the
+        config chain.  ``tensor_parallel`` and ``distributed_executor_backend``
+        are always added to the skip set since callers append them
+        explicitly (or omit them) based on the clustering strategy.
+        """
+        parts = ["vllm", "serve", recipe.model]
+
+        tp = config.get("tensor_parallel")
+        if tp:
+            parts.extend(["-tp", str(tp)])
+
+        skip = {"tensor_parallel", "distributed_executor_backend"}
+        skip.update(skip_keys)
+        parts.extend(
+            self.build_flags_from_map(
+                config,
+                VLLM_FLAG_MAP,
+                bool_keys=VLLM_BOOL_FLAGS,
+                skip_keys=skip,
+            )
+        )
+
+        return " ".join(parts)
+
+    def _build_command(
+        self,
+        recipe: "Recipe",
+        config,
+        is_cluster: bool,
+        num_nodes: int,
+        head_ip: str | None = None,
+        skip_keys: set[str] | frozenset[str] = frozenset(),
+        *,
+        cluster_backend: str | None = None,
+        master_port: int = 25000,
+    ) -> str:
+        """Build the ``vllm serve`` command from structured config.
+
+        The non-cluster path produces the bare ``vllm serve`` invocation.
+        Cluster mode appends either:
+
+        * ``--distributed-executor-backend <backend>`` when
+          *cluster_backend* is set (Ray runtime), or
+        * ``--nnodes <num_nodes> --master-addr <head_ip> --master-port
+          <master_port>`` when *head_ip* is supplied (native distributed).
+
+        For native distributed, ``--node-rank`` is intentionally omitted —
+        that is the responsibility of :meth:`generate_node_command`.
+
+        Args:
+            recipe: The loaded recipe.
+            config: Resolved config chain (``recipe.build_config_chain(...)``).
+            is_cluster: Whether the workload is multi-node.
+            num_nodes: Total node count (used for ``--nnodes``).
+            head_ip: Head IP for native distributed cluster.  Ignored when
+                *cluster_backend* is set.
+            skip_keys: Config keys to omit from flag emission.
+            cluster_backend: Optional distributed-executor backend
+                (e.g. ``"ray"``); when set, appends
+                ``--distributed-executor-backend`` instead of native
+                ``--nnodes``/``--master-addr`` flags.
+            master_port: Master coordination port for native distributed.
+        """
+        base = self._build_base_command(recipe, config, skip_keys=skip_keys)
+
+        if not is_cluster:
+            return base
+
+        if cluster_backend:
+            return base + " --distributed-executor-backend %s" % cluster_backend
+
+        if head_ip:
+            return base + " --nnodes %d --master-addr %s --master-port %d" % (num_nodes, head_ip, master_port)
+
+        return base
 
     def detect_spec_config_draft_model(self, recipe: "Recipe") -> str | None:
         try:

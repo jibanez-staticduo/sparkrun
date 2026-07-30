@@ -111,6 +111,34 @@ def _cli_test_recipes(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(sparkrun.core.recipe, "discover_cwd_recipes", _patched_discover)
 
 
+@pytest.fixture(autouse=True)
+def _stub_cluster_status_in_cli_tests(monkeypatch):
+    """Default cluster-status acquisition to a no-op so CLI tests don't SSH out.
+
+    The v0.3 launch flow populates ``SchedulingRequest.status`` from a
+    single call site: ``api.status``, invoked by the shared placement
+    authority :func:`sparkrun.api._hosts.resolve_effective_hosts`
+    (consumed by ``api.run``, the benchmark flow, and
+    :func:`sparkrun.cli._common.resolve_effective_hosts_for_recipe`).
+    It dispatches to ``executor.query_status`` → SSH against the
+    supplied hosts.  In unit tests the hosts are unreachable mock IPs
+    — without these stubs each test waits the full SSH connect
+    timeout (~10s/host) before the best-effort wrappers swallow the
+    failure.
+
+    Tests that need a real (or richer) status snapshot should re-patch
+    the relevant call site directly.
+    """
+    from sparkrun.core.cluster_status import empty_status
+
+    _stub = lambda hosts, **kwargs: empty_status(list(hosts))  # noqa: E731
+    monkeypatch.setattr("sparkrun.api._status.status", _stub)
+    # ``api/__init__`` re-binds ``status`` into the public namespace;
+    # CLI helpers call ``api.status(...)`` against that binding, so
+    # patch it directly too.
+    monkeypatch.setattr("sparkrun.api.status", _stub)
+
+
 class TestVersionAndHelp:
     """Test version and help output."""
 
@@ -963,6 +991,115 @@ class TestRunCommand:
         assert "max_nodes=1" in result.output
         assert "requires 2 nodes" in result.output
 
+    def test_run_platform_homogeneous_dgx_spark(self, runner, reset_bootstrap):
+        """Platform line shows homogeneous DGX Spark when all hosts have GB10 hardware."""
+        with mock.patch.object(SglangRuntime, "run", return_value=0):
+            with mock.patch("sparkrun.cli._run._summarize_platforms") as mock_sp:
+                mock_sp.return_value = ("DGX Spark (NVIDIA GB10, NCCL)", None)
+                result = runner.invoke(
+                    main,
+                    [
+                        "run",
+                        _TEST_RECIPE_NAME,
+                        "--dry-run",
+                        "--hosts",
+                        "10.0.0.1,10.0.0.2",
+                    ],
+                )
+
+        assert result.exit_code == 0
+        assert "Platform:  DGX Spark (NVIDIA GB10, NCCL)" in result.output
+
+    def test_run_platform_heterogeneous(self, runner, reset_bootstrap):
+        """Platform line shows 'mixed' with per-host details for heterogeneous clusters."""
+        with mock.patch.object(SglangRuntime, "run", return_value=0):
+            with mock.patch("sparkrun.cli._run._summarize_platforms") as mock_sp:
+                mock_sp.return_value = (
+                    "mixed",
+                    [
+                        ("10.0.0.1", "DGX Spark (NVIDIA GB10, NCCL)"),
+                        ("10.0.0.2", "Generic NVIDIA (NVIDIA H100, NCCL)"),
+                    ],
+                )
+                result = runner.invoke(
+                    main,
+                    [
+                        "run",
+                        _TEST_RECIPE_NAME,
+                        "--dry-run",
+                        "--hosts",
+                        "10.0.0.1,10.0.0.2",
+                    ],
+                )
+
+        assert result.exit_code == 0
+        assert "Platform:  mixed" in result.output
+        assert "10.0.0.1:" in result.output
+        assert "DGX Spark (NVIDIA GB10, NCCL)" in result.output
+        assert "10.0.0.2:" in result.output
+        assert "Generic NVIDIA (NVIDIA H100, NCCL)" in result.output
+
+    def test_run_platform_no_cluster_defaults_to_dgx_spark(self, runner, reset_bootstrap):
+        """Platform line falls back to DGX Spark hardware when no cluster is specified."""
+        with mock.patch.object(SglangRuntime, "run", return_value=0):
+            result = runner.invoke(
+                main,
+                [
+                    "run",
+                    _TEST_RECIPE_NAME,
+                    "--dry-run",
+                    "--hosts",
+                    "10.0.0.1,10.0.0.2",
+                ],
+            )
+
+        assert result.exit_code == 0
+        # No cluster => default_dgx_spark_hardware() => DGX Spark platform
+        assert "Platform:" in result.output
+        assert "DGX Spark" in result.output
+
+    def test_run_banner_shows_scheduler_line(self, runner, reset_bootstrap):
+        """The pre-launch banner shows the effective scheduler name so users
+        can see which scheduler is making placement decisions."""
+        with mock.patch.object(SglangRuntime, "run", return_value=0):
+            result = runner.invoke(
+                main,
+                [
+                    "run",
+                    _TEST_RECIPE_NAME,
+                    "--dry-run",
+                    "--hosts",
+                    "10.0.0.1,10.0.0.2",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        # Banner advertises the resolved scheduler name — defaults to
+        # FALLBACK_DEFAULT_SCHEDULER when neither CLI nor recipe override.
+        from sparkrun.core.scheduler import FALLBACK_DEFAULT_SCHEDULER
+
+        assert "Scheduler:" in result.output
+        assert FALLBACK_DEFAULT_SCHEDULER in result.output
+
+    def test_run_banner_scheduler_honors_cli_override(self, runner, reset_bootstrap):
+        """--scheduler flag is reflected in the banner line."""
+        with mock.patch.object(SglangRuntime, "run", return_value=0):
+            result = runner.invoke(
+                main,
+                [
+                    "run",
+                    _TEST_RECIPE_NAME,
+                    "--dry-run",
+                    "--hosts",
+                    "10.0.0.1,10.0.0.2",
+                    "--scheduler",
+                    "greedy",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Scheduler: greedy" in result.output
+
 
 class TestStopCommand:
     """Test the stop command."""
@@ -1022,31 +1159,46 @@ class TestClusterCommands:
         assert "update" in result.output
         assert "status" in result.output
 
+    @staticmethod
+    def _solo_snapshot():
+        """A one-solo-workload ``ClusterStatus`` (the single-source shape the CLI
+        classifies)."""
+        from sparkrun.core.cluster_status import ClusterStatus, ContainerDetail, HostOccupancy, RunningWorkload
+
+        return ClusterStatus(
+            hosts=(
+                HostOccupancy(
+                    host="10.0.0.1",
+                    workloads=(RunningWorkload(cluster_id="cid1", containers=(ContainerDetail("cid1_solo", "solo", "running", "img"),)),),
+                ),
+            ),
+            executor="docker",
+        )
+
     def test_cluster_status_json(self, runner, cluster_setup):
         """Test cluster status --json outputs valid JSON."""
         import json
-        from sparkrun.core.cluster_manager import ClusterStatusResult, ClusterSoloEntry
 
-        with (
-            mock.patch(
-                "sparkrun.core.cluster_manager.query_cluster_status",
-                return_value=ClusterStatusResult(
-                    groups={},
-                    solo_entries=[ClusterSoloEntry("cid1", "10.0.0.1", "name", "running", "img", {"recipe": "test"})],
-                    errors={},
-                    idle_hosts=[],
-                    pending_ops=[],
-                    total_containers=1,
-                    host_count=1,
-                ),
-            ),
-        ):
+        # CLI calls api.status_report; patch the ClusterStatus source it
+        # composes over so the real status_report + classify run end-to-end.
+        with mock.patch("sparkrun.api._status.status", return_value=self._solo_snapshot()):
             result = runner.invoke(main, ["cluster", "status", "--cluster", "test-cluster", "--json"])
 
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert "solo_entries" in data
         assert "groups" in data
+        assert data["solo_entries"][0]["cluster_id"] == "cid1"
+
+    def test_top_level_status_json(self, runner, cluster_setup):
+        """The top-level `status` alias forwards --json to cluster status."""
+        import json
+
+        with mock.patch("sparkrun.api._status.status", return_value=self._solo_snapshot()):
+            result = runner.invoke(main, ["status", "--cluster", "test-cluster", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
         assert data["solo_entries"][0]["cluster_id"] == "cid1"
 
     def test_cluster_create(self, runner, tmp_path, monkeypatch):
@@ -1595,6 +1747,230 @@ class TestClusterCommands:
         assert data["name"] == "test-cluster"
         assert data["default"] is True
 
+    def test_cluster_create_with_executor(self, runner, tmp_path, monkeypatch):
+        """Test creating a cluster with --executor and -o option."""
+        config_root = tmp_path / "config"
+        config_root.mkdir()
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+
+        result = runner.invoke(
+            main,
+            [
+                "cluster",
+                "create",
+                "exec-cluster",
+                "--hosts",
+                "h1,h2",
+                "--executor",
+                "docker",
+                "-o",
+                "privileged=false",
+                "-o",
+                "shm_size=16g",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        # Verify persisted state
+        from sparkrun.core.cluster_manager import ClusterManager
+
+        mgr = ClusterManager(config_root)
+        c = mgr.get("exec-cluster")
+        assert c.executor == "docker"
+        assert c.executor_config == {"privileged": False, "shm_size": "16g"}
+
+    def test_cluster_create_executor_show(self, runner, tmp_path, monkeypatch):
+        """Test that cluster show renders executor + executor_config."""
+        config_root = tmp_path / "config"
+        config_root.mkdir()
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+
+        runner.invoke(
+            main,
+            [
+                "cluster",
+                "create",
+                "show-exec",
+                "--hosts",
+                "h1",
+                "--executor",
+                "k8s",
+                "-o",
+                "namespace=ml",
+            ],
+        )
+        result = runner.invoke(main, ["cluster", "show", "show-exec"])
+        assert result.exit_code == 0
+        assert "Executor:    k8s" in result.output
+        assert "namespace: ml" in result.output
+
+    def test_cluster_update_executor(self, runner, cluster_setup):
+        """Test updating cluster executor selector + opts."""
+        result = runner.invoke(
+            main,
+            [
+                "cluster",
+                "update",
+                "test-cluster",
+                "--executor",
+                "local",
+                "-o",
+                "user=ubuntu",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(main, ["cluster", "show", "test-cluster"])
+        assert "Executor:    local" in result.output
+        assert "user: ubuntu" in result.output
+
+    def test_cluster_update_clear_executor(self, runner, cluster_setup):
+        """Test clearing executor selector with empty string."""
+        runner.invoke(main, ["cluster", "update", "test-cluster", "--executor", "docker"])
+        result = runner.invoke(main, ["cluster", "update", "test-cluster", "--executor", ""])
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(main, ["cluster", "show", "test-cluster"])
+        assert "Executor:" not in result.output
+
+    def test_cluster_update_clear_executor_config(self, runner, cluster_setup):
+        """Test clearing executor_config with --clear-executor-config."""
+        runner.invoke(
+            main,
+            ["cluster", "update", "test-cluster", "--executor", "docker", "-o", "shm_size=8g"],
+        )
+        result = runner.invoke(main, ["cluster", "update", "test-cluster", "--clear-executor-config"])
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(main, ["cluster", "show", "test-cluster"])
+        assert "Executor:    docker" in result.output
+        assert "Executor config:" not in result.output
+
+    def test_cluster_create_invalid_executor_opt(self, runner, tmp_path, monkeypatch):
+        """Test that -o without = is rejected."""
+        config_root = tmp_path / "config"
+        config_root.mkdir()
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+
+        result = runner.invoke(
+            main,
+            [
+                "cluster",
+                "create",
+                "bad-opt",
+                "--hosts",
+                "h1",
+                "-o",
+                "privileged",  # missing =
+            ],
+        )
+        assert result.exit_code != 0
+        assert "key=value" in result.output
+
+    def test_cluster_create_with_scheduler(self, runner, tmp_path, monkeypatch):
+        """Test creating a cluster with --scheduler persists the field."""
+        config_root = tmp_path / "config"
+        config_root.mkdir()
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+
+        result = runner.invoke(
+            main,
+            [
+                "cluster",
+                "create",
+                "sched-cluster",
+                "--hosts",
+                "h1,h2",
+                "--scheduler",
+                "occupancy-sparse",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        from sparkrun.core.cluster_manager import ClusterManager
+
+        mgr = ClusterManager(config_root)
+        c = mgr.get("sched-cluster")
+        assert c.scheduler == "occupancy-sparse"
+
+    def test_cluster_create_defaults_to_occupancy_sparse(self, runner, tmp_path, monkeypatch):
+        """A new cluster created without --scheduler opts into occupancy-sparse
+        and surfaces the migration notice contrasting it with 0.2.x greedy."""
+        config_root = tmp_path / "config"
+        config_root.mkdir()
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+
+        result = runner.invoke(main, ["cluster", "create", "new-default", "--hosts", "h1,h2"])
+        assert result.exit_code == 0, result.output
+        assert "occupancy-sparse" in result.output  # migration notice shown
+
+        from sparkrun.core.cluster_manager import ClusterManager
+
+        mgr = ClusterManager(config_root)
+        assert mgr.get("new-default").scheduler == "occupancy-sparse"
+
+    def test_cluster_create_greedy_skips_migration_notice(self, runner, tmp_path, monkeypatch):
+        """Opting back into greedy persists greedy and suppresses the notice."""
+        config_root = tmp_path / "config"
+        config_root.mkdir()
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+
+        result = runner.invoke(main, ["cluster", "create", "legacy", "--hosts", "h1", "--scheduler", "greedy"])
+        assert result.exit_code == 0, result.output
+        assert "spreads each workload" not in result.output  # no occupancy notice
+
+        from sparkrun.core.cluster_manager import ClusterManager
+
+        assert ClusterManager(config_root).get("legacy").scheduler == "greedy"
+
+    def test_cluster_show_renders_scheduler(self, runner, tmp_path, monkeypatch):
+        """``cluster show`` renders the Scheduler line when set."""
+        config_root = tmp_path / "config"
+        config_root.mkdir()
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
+
+        runner.invoke(
+            main,
+            ["cluster", "create", "show-sched", "--hosts", "h1", "--scheduler", "greedy"],
+        )
+        result = runner.invoke(main, ["cluster", "show", "show-sched"])
+        assert result.exit_code == 0
+        assert "Scheduler:   greedy" in result.output
+
+    def test_cluster_update_scheduler(self, runner, cluster_setup):
+        """Test updating cluster scheduler selector."""
+        result = runner.invoke(
+            main,
+            ["cluster", "update", "test-cluster", "--scheduler", "greedy"],
+        )
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(main, ["cluster", "show", "test-cluster"])
+        assert "Scheduler:   greedy" in result.output
+
+    def test_cluster_update_clear_scheduler(self, runner, cluster_setup):
+        """Test clearing scheduler selector with empty string."""
+        runner.invoke(main, ["cluster", "update", "test-cluster", "--scheduler", "greedy"])
+        result = runner.invoke(main, ["cluster", "update", "test-cluster", "--scheduler", ""])
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(main, ["cluster", "show", "test-cluster"])
+        assert "Scheduler:" not in result.output
+
 
 class TestClusterMonitor:
     """Test cluster monitor subcommand."""
@@ -1697,8 +2073,8 @@ class TestClusterMonitor:
             assert call_kwargs.kwargs.get("interval") == 5 or call_kwargs[1].get("interval") == 5
 
     def test_cluster_monitor_simple_flag(self, runner, cluster_setup):
-        """--simple bypasses TUI and uses plain-text fallback."""
-        with mock.patch("sparkrun.core.monitoring.stream_cluster_monitor") as mock_stream:
+        """--simple bypasses TUI and uses the plain-text fallback (via api.live_monitor)."""
+        with mock.patch("sparkrun.api.live_monitor", return_value=iter([])):
             result = runner.invoke(
                 main,
                 [
@@ -1711,34 +2087,35 @@ class TestClusterMonitor:
             )
             assert result.exit_code == 0
             assert "Monitoring" in result.output
-            mock_stream.assert_called_once()
 
     def test_cluster_monitor_json_flag(self, runner, cluster_setup):
-        """--json streams newline-delimited JSON via on_update callback."""
+        """--json streams newline-delimited JSON MonitorFrames (telemetry + occupancy)."""
         import json
 
-        from sparkrun.core.monitoring import HostMonitorState, MonitorSample
+        from sparkrun.core.cluster_status import ContainerDetail, RunningWorkload
+        from sparkrun.core.monitoring import HostActivity, MonitorFrame, MonitorSample
 
-        sample = MonitorSample(
-            timestamp="2025-01-01T00:00:00",
-            hostname="host1",
-            cpu_usage_pct="12.3",
-            mem_used_pct="45.6",
-            gpu_util_pct="78.9",
-            gpu_temp_c="55",
-            gpu_power_w="120",
+        frame = MonitorFrame(
+            hosts=(
+                HostActivity(
+                    host="10.0.0.1",
+                    telemetry=MonitorSample(hostname="host1", cpu_usage_pct="12.3", gpu_util_pct="78.9"),
+                    workloads=(
+                        RunningWorkload(
+                            cluster_id="sparkrun_x",
+                            recipe_name="qwen",
+                            containers=(ContainerDetail("sparkrun_x_solo", "solo", "Up", "(local process)"),),
+                        ),
+                    ),
+                    used_slots=1,
+                    free_slots=3,
+                ),
+                HostActivity(host="10.0.0.2", telemetry_error="connection refused"),
+            ),
+            queried_at=1.0,
         )
 
-        def fake_stream(hosts, ssh_kwargs, interval=2, on_update=None, dry_run=False):
-            """Simulate one update tick with sample data."""
-            if on_update:
-                states = {
-                    "10.0.0.1": HostMonitorState(latest=sample),
-                    "10.0.0.2": HostMonitorState(error="connection refused"),
-                }
-                on_update(states)
-
-        with mock.patch("sparkrun.core.monitoring.stream_cluster_monitor", side_effect=fake_stream):
+        with mock.patch("sparkrun.api.live_monitor", return_value=iter([frame])):
             result = runner.invoke(
                 main,
                 [
@@ -1751,13 +2128,16 @@ class TestClusterMonitor:
             )
             assert result.exit_code == 0
             obj = json.loads(result.output.strip())
-            assert "timestamp" in obj
-            assert "hosts" in obj
-            # Host with sample data should have monitor fields
-            assert obj["hosts"]["10.0.0.1"]["hostname"] == "host1"
-            assert obj["hosts"]["10.0.0.1"]["cpu_usage_pct"] == "12.3"
-            # Host with error and no sample should report error
-            assert obj["hosts"]["10.0.0.2"]["error"] == "connection refused"
+            assert "timestamp" in obj and "hosts" in obj
+            rows = {r["host"]: r for r in obj["hosts"]}  # hosts is a list of per-host rows
+            assert rows["10.0.0.1"]["sample"]["hostname"] == "host1"
+            assert rows["10.0.0.1"]["sample"]["cpu_usage_pct"] == "12.3"
+            # Occupancy (all executors) now surfaces in --json.
+            assert rows["10.0.0.1"]["workloads"][0]["cluster_id"] == "sparkrun_x"
+            assert rows["10.0.0.1"]["used_slots"] == 1
+            # Host with an error and no telemetry.
+            assert rows["10.0.0.2"]["error"] == "connection refused"
+            assert rows["10.0.0.2"]["sample"] is None
 
     def test_cluster_monitor_tui_fallback_on_import_error(self, runner, cluster_setup, monkeypatch):
         """Falls back to simple mode when Textual is not importable."""
@@ -1771,7 +2151,7 @@ class TestClusterMonitor:
             return real_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", mock_import)
-        with mock.patch("sparkrun.core.monitoring.stream_cluster_monitor") as mock_stream:
+        with mock.patch("sparkrun.api.live_monitor", return_value=iter([])):
             result = runner.invoke(
                 main,
                 [
@@ -1783,7 +2163,6 @@ class TestClusterMonitor:
             )
             assert result.exit_code == 0
             assert "falling back" in result.output.lower() or "Monitoring" in result.output
-            mock_stream.assert_called_once()
 
 
 class TestRunWithCluster:
@@ -1978,85 +2357,87 @@ class TestTensorParallelValidation:
             assert call_kwargs["hosts"] == ["10.0.0.1"]
 
 
-class TestApplyNodeTrimming:
-    """Test _apply_node_trimming helper function."""
+class TestResolveEffectiveHostsForRecipe:
+    """Test :func:`sparkrun.cli._common.resolve_effective_hosts_for_recipe`.
 
-    def _make_recipe(self, defaults=None):
+    Replaces the legacy ``_apply_node_trimming`` tests; placement is now a
+    structural property derived from ``api.schedule``.
+    """
+
+    def _make_recipe(self, defaults=None, mode="auto", max_nodes=None):
         from sparkrun.core.recipe import Recipe
 
         data = {
             "name": "test",
             "runtime": "sglang",
             "model": "meta-llama/Llama-2-7b-hf",
+            "mode": mode,
         }
         if defaults:
             data["defaults"] = defaults
+        if max_nodes is not None:
+            data["max_nodes"] = max_nodes
         return Recipe.from_dict(data)
 
-    def test_with_runtime_trims_to_tp_times_pp(self):
-        """Runtime-aware trimming: tp=2, pp=2 → 4 nodes."""
-        from sparkrun.cli._common import _apply_node_trimming
+    def test_multi_host_trims_to_scheduler_hosts_used(self, reset_bootstrap):
+        """tp=2, pp=2, 6 hosts → scheduler picks 4."""
+        from sparkrun.cli._common import resolve_effective_hosts_for_recipe
 
-        recipe = self._make_recipe(
-            defaults={
-                "tensor_parallel": 2,
-                "pipeline_parallel": 2,
-            }
-        )
-        runtime = SglangRuntime()
+        recipe = self._make_recipe(defaults={"tensor_parallel": 2, "pipeline_parallel": 2})
         hosts = ["h1", "h2", "h3", "h4", "h5", "h6"]
-        result = _apply_node_trimming(hosts, recipe, runtime=runtime)
+        result, is_solo = resolve_effective_hosts_for_recipe(hosts, recipe, {})
         assert result == ["h1", "h2", "h3", "h4"]
+        assert is_solo is False
 
-    def test_without_runtime_trims_to_tp(self):
-        """Legacy path (no runtime): trims to TP only."""
-        from sparkrun.cli._common import _apply_node_trimming
-
-        recipe = self._make_recipe(
-            defaults={
-                "tensor_parallel": 2,
-                "pipeline_parallel": 2,
-            }
-        )
-        hosts = ["h1", "h2", "h3", "h4"]
-        # Without runtime, only TP is considered
-        result = _apply_node_trimming(hosts, recipe)
-        assert result == ["h1", "h2"]
-
-    def test_tp_override_combined_with_runtime_pp(self):
-        """tp_override is injected into overrides for runtime computation."""
-        from sparkrun.cli._common import _apply_node_trimming
-
-        recipe = self._make_recipe(defaults={"pipeline_parallel": 2})
-        runtime = SglangRuntime()
-        hosts = ["h1", "h2", "h3", "h4", "h5", "h6"]
-        # tp_override=3, pp=2 → 6 nodes
-        result = _apply_node_trimming(
-            hosts,
-            recipe,
-            runtime=runtime,
-            tp_override=3,
-        )
-        assert result == hosts  # 6 == 6, no trimming
-
-    def test_single_host_no_trimming(self):
-        """Single host is never trimmed."""
-        from sparkrun.cli._common import _apply_node_trimming
-
-        recipe = self._make_recipe(defaults={"tensor_parallel": 4})
-        runtime = SglangRuntime()
-        hosts = ["h1"]
-        result = _apply_node_trimming(hosts, recipe, runtime=runtime)
-        assert result == ["h1"]
-
-    def test_backward_compat_alias(self):
-        """_apply_tp_trimming still works as backward-compat alias."""
-        from sparkrun.cli._common import _apply_tp_trimming
+    def test_tp_only_trims_to_tp(self, reset_bootstrap):
+        """tp=2, 4 hosts → scheduler picks 2."""
+        from sparkrun.cli._common import resolve_effective_hosts_for_recipe
 
         recipe = self._make_recipe(defaults={"tensor_parallel": 2})
         hosts = ["h1", "h2", "h3", "h4"]
-        result = _apply_tp_trimming(hosts, recipe)
+        result, is_solo = resolve_effective_hosts_for_recipe(hosts, recipe, {})
         assert result == ["h1", "h2"]
+        assert is_solo is False
+
+    def test_tp_override_combined_with_recipe_pp(self, reset_bootstrap):
+        """tp override + recipe pp=2 → 6 nodes (no trim because exact fit)."""
+        from sparkrun.cli._common import resolve_effective_hosts_for_recipe
+
+        recipe = self._make_recipe(defaults={"pipeline_parallel": 2})
+        hosts = ["h1", "h2", "h3", "h4", "h5", "h6"]
+        result, is_solo = resolve_effective_hosts_for_recipe(hosts, recipe, {"tensor_parallel": 3})
+        assert result == hosts  # 6 == 6, no trimming
+        assert is_solo is False
+
+    def test_single_host_no_scheduler_call(self, reset_bootstrap):
+        """Single host short-circuits the scheduler and is reported as solo."""
+        from sparkrun.cli._common import resolve_effective_hosts_for_recipe
+
+        recipe = self._make_recipe(defaults={"tensor_parallel": 4})
+        hosts = ["h1"]
+        result, is_solo = resolve_effective_hosts_for_recipe(hosts, recipe, {})
+        assert result == ["h1"]
+        assert is_solo is True
+
+    def test_solo_flag_forces_one_host(self, reset_bootstrap):
+        """--solo trims to 1 host regardless of parallelism."""
+        from sparkrun.cli._common import resolve_effective_hosts_for_recipe
+
+        recipe = self._make_recipe(defaults={"tensor_parallel": 4})
+        hosts = ["h1", "h2", "h3", "h4"]
+        result, is_solo = resolve_effective_hosts_for_recipe(hosts, recipe, {}, solo=True)
+        assert result == ["h1"]
+        assert is_solo is True
+
+    def test_max_nodes_caps_host_count(self, reset_bootstrap):
+        """recipe.max_nodes enforces an upper bound after scheduling."""
+        from sparkrun.cli._common import resolve_effective_hosts_for_recipe
+
+        recipe = self._make_recipe(max_nodes=2)
+        hosts = ["h1", "h2", "h3", "h4"]
+        result, is_solo = resolve_effective_hosts_for_recipe(hosts, recipe, {})
+        assert result == ["h1", "h2"]
+        assert is_solo is False
 
 
 class TestOptionOverrides:
@@ -2302,7 +2683,7 @@ class TestFollowLogs:
     def test_follow_logs_called_after_successful_run(self, runner, reset_bootstrap):
         """follow_logs is called after a successful detached run."""
         with (
-            mock.patch("sparkrun.orchestration.distribution.distribute_from_config", return_value=(None, {}, {})),
+            mock.patch("sparkrun.orchestration.distribution.distribute_from_config", return_value=(None, {}, {}, {})),
             mock.patch.object(SglangRuntime, "run", return_value=0),
             mock.patch.object(SglangRuntime, "follow_logs") as mock_follow,
         ):
@@ -2326,7 +2707,7 @@ class TestFollowLogs:
     def test_no_follow_flag_skips_follow_logs(self, runner, reset_bootstrap):
         """--no-follow prevents follow_logs from being called."""
         with (
-            mock.patch("sparkrun.orchestration.distribution.distribute_from_config", return_value=(None, {}, {})),
+            mock.patch("sparkrun.orchestration.distribution.distribute_from_config", return_value=(None, {}, {}, {})),
             mock.patch.object(SglangRuntime, "run", return_value=0),
             mock.patch.object(SglangRuntime, "follow_logs") as mock_follow,
             mock.patch("sparkrun.orchestration.job_metadata.check_job_running") as mock_check,
@@ -2372,7 +2753,7 @@ class TestFollowLogs:
     def test_foreground_skips_follow_logs(self, runner, reset_bootstrap):
         """--foreground prevents follow_logs from being called."""
         with (
-            mock.patch("sparkrun.orchestration.distribution.distribute_from_config", return_value=(None, {}, {})),
+            mock.patch("sparkrun.orchestration.distribution.distribute_from_config", return_value=(None, {}, {}, {})),
             mock.patch.object(SglangRuntime, "run", return_value=0),
             mock.patch.object(SglangRuntime, "follow_logs") as mock_follow,
         ):
@@ -2394,7 +2775,7 @@ class TestFollowLogs:
     def test_nonzero_exit_skips_follow_logs(self, runner, reset_bootstrap):
         """Non-zero exit code from runtime.run() prevents follow_logs."""
         with (
-            mock.patch("sparkrun.orchestration.distribution.distribute_from_config", return_value=(None, {}, {})),
+            mock.patch("sparkrun.orchestration.distribution.distribute_from_config", return_value=(None, {}, {}, {})),
             mock.patch.object(SglangRuntime, "run", return_value=1),
             mock.patch.object(SglangRuntime, "follow_logs") as mock_follow,
         ):
@@ -2647,7 +3028,7 @@ class TestSetupSshCommand:
         monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
         monkeypatch.setenv("USER", "testuser")
 
-        from sparkrun.orchestration.primitives import local_ip_for
+        from sparkrun.utils.net import local_ip_for
 
         local_ip = local_ip_for("10.0.0.1")
 
@@ -2678,7 +3059,7 @@ class TestSetupSshCommand:
         monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
         monkeypatch.setenv("USER", "testuser")
 
-        from sparkrun.orchestration.primitives import local_ip_for
+        from sparkrun.utils.net import local_ip_for
 
         local_ip = local_ip_for("10.0.0.1")
 
@@ -2764,7 +3145,7 @@ class TestSetupSshCommand:
 
         monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
 
-        with mock.patch("sparkrun.orchestration.primitives.local_ip_for", return_value="192.168.1.100"):
+        with mock.patch("sparkrun.utils.net.local_ip_for", return_value="192.168.1.100"):
             result = runner.invoke(
                 main,
                 [
@@ -2937,7 +3318,7 @@ class TestSetupSshCommand:
         monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
         monkeypatch.setenv("USER", "localuser")
 
-        from sparkrun.orchestration.primitives import local_ip_for
+        from sparkrun.utils.net import local_ip_for
 
         local_ip = local_ip_for("10.0.0.1")
 
@@ -2970,7 +3351,7 @@ class TestSetupSshCommand:
         monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CONFIG_DIR", config_root)
         monkeypatch.setenv("USER", "localuser")
 
-        from sparkrun.orchestration.primitives import local_ip_for
+        from sparkrun.utils.net import local_ip_for
 
         local_ip = local_ip_for("10.0.0.1")
 
@@ -3835,9 +4216,9 @@ class TestLogCommand:
         assert "--hosts" in result.output
         assert "TARGET" in result.output
 
-    def test_log_calls_follow_logs(self, runner, reset_bootstrap):
-        """sparkrun logs calls runtime.follow_logs with correct args."""
-        with mock.patch.object(SglangRuntime, "follow_logs") as mock_follow:
+    def test_log_calls_api_logs(self, runner, reset_bootstrap):
+        """sparkrun logs renders api.logs, addressing the workload by recipe."""
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(
                 main,
                 [
@@ -3850,11 +4231,49 @@ class TestLogCommand:
                 ],
             )
 
-            assert result.exit_code == 0
-            mock_follow.assert_called_once()
-            call_kwargs = mock_follow.call_args.kwargs
-            assert call_kwargs["cluster_id"].startswith("sparkrun_")
+            assert result.exit_code == 0, result.output
+            mock_logs.assert_called_once()
+            call_kwargs = mock_logs.call_args.kwargs
+            # Recipe target: no literal cluster_id, resolved by live intent instead.
+            assert mock_logs.call_args.args[0] is None
+            assert call_kwargs["recipe"] is not None
             assert call_kwargs["tail"] == 50
+
+    def test_log_help_shows_follow_and_lines(self, runner):
+        """logs --help advertises the docker-logs-style -n/-f options."""
+        result = runner.invoke(main, ["logs", "--help"])
+        assert result.exit_code == 0
+        assert "--follow" in result.output
+        assert "-f" in result.output
+        assert "-n" in result.output
+
+    def test_log_bare_does_not_follow(self, runner, reset_bootstrap):
+        """Called bare, logs dumps (follow=False) and shows all lines (tail=None)."""
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
+            result = runner.invoke(main, ["logs", _TEST_RECIPE_NAME, "--hosts", "localhost"])
+
+            assert result.exit_code == 0, result.output
+            call_kwargs = mock_logs.call_args.kwargs
+            assert call_kwargs["follow"] is False
+            assert call_kwargs["tail"] is None
+
+    def test_log_follow_flag_attaches(self, runner, reset_bootstrap):
+        """-f/--follow sets follow=True on the runtime call."""
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
+            result = runner.invoke(main, ["logs", _TEST_RECIPE_NAME, "--hosts", "localhost", "-f"])
+
+            assert result.exit_code == 0, result.output
+            assert mock_logs.call_args.kwargs["follow"] is True
+
+    def test_log_lines_option_sets_tail(self, runner, reset_bootstrap):
+        """-n N limits the number of lines (tail=N) without following."""
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
+            result = runner.invoke(main, ["logs", _TEST_RECIPE_NAME, "--hosts", "localhost", "-n", "25"])
+
+            assert result.exit_code == 0, result.output
+            call_kwargs = mock_logs.call_args.kwargs
+            assert call_kwargs["tail"] == 25
+            assert call_kwargs["follow"] is False
 
     def test_log_no_hosts_error(self, runner, reset_bootstrap, tmp_path, monkeypatch):
         """sparkrun logs with no hosts exits with error."""
@@ -4103,6 +4522,9 @@ class TestUrlRecipe:
         p2 = _url_cache_path("https://example.com/b")
         assert p1 != p2
 
+    # An allowlisted host so fetch validation passes (see RECIPE_URL_ALLOWED_HOSTS).
+    _ALLOWED_RECIPE_URL = "https://spark-arena.com/api/recipes/abc/raw"
+
     def test_fetch_and_cache_recipe_success(self, tmp_path, monkeypatch):
         """Successful fetch writes cache file."""
         from sparkrun.core.recipe import fetch_and_cache_recipe as _fetch_and_cache_recipe
@@ -4119,8 +4541,9 @@ class TestUrlRecipe:
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
-            path = _fetch_and_cache_recipe("https://example.com/recipe")
+        # Code fetches via build_opener().open (for redirect re-validation).
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+            path = _fetch_and_cache_recipe(self._ALLOWED_RECIPE_URL)
 
         assert path.exists()
         assert path.read_bytes() == recipe_yaml
@@ -4133,7 +4556,7 @@ class TestUrlRecipe:
 
         monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CACHE_DIR", tmp_path)
 
-        url = "https://example.com/recipe"
+        url = self._ALLOWED_RECIPE_URL
         cache_path = _url_cache_path(url)
         cache_path.parent.mkdir(parents=True)
         cache_path.write_text("model: cached\nruntime: sglang\n")
@@ -4142,7 +4565,7 @@ class TestUrlRecipe:
 
         from urllib.error import URLError
 
-        with patch("urllib.request.urlopen", side_effect=URLError("offline")):
+        with patch("urllib.request.OpenerDirector.open", side_effect=URLError("offline")):
             path = _fetch_and_cache_recipe(url)
         assert path == cache_path
 
@@ -4160,9 +4583,71 @@ class TestUrlRecipe:
 
         from sparkrun.core.recipe import RecipeError
 
-        with patch("urllib.request.urlopen", side_effect=URLError("offline")):
+        with patch("urllib.request.OpenerDirector.open", side_effect=URLError("offline")):
             with pytest.raises(RecipeError, match="Failed to fetch"):
-                _fetch_and_cache_recipe("https://example.com/recipe")
+                _fetch_and_cache_recipe(self._ALLOWED_RECIPE_URL)
+
+    def test_fetch_rejects_plaintext_http(self, tmp_path, monkeypatch):
+        """http:// recipe URLs are refused (MITM protection)."""
+        from sparkrun.core.recipe import fetch_and_cache_recipe as _fetch_and_cache_recipe, RecipeError
+
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CACHE_DIR", tmp_path)
+
+        with pytest.raises(RecipeError, match="only https"):
+            _fetch_and_cache_recipe("http://spark-arena.com/api/recipes/abc/raw")
+
+    def test_fetch_rejects_offlist_host(self, tmp_path, monkeypatch):
+        """A non-allowlisted https host raises RecipeUntrustedHostError unless opted in."""
+        from sparkrun.core.recipe import fetch_and_cache_recipe as _fetch_and_cache_recipe, RecipeUntrustedHostError
+
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CACHE_DIR", tmp_path)
+
+        with pytest.raises(RecipeUntrustedHostError):
+            _fetch_and_cache_recipe("https://evil.example/recipe.yaml")
+
+    def test_fetch_offlist_host_allowed_with_flag(self, tmp_path, monkeypatch):
+        """allow_untrusted_host=True bypasses the allowlist (post-confirmation)."""
+        from sparkrun.core.recipe import fetch_and_cache_recipe as _fetch_and_cache_recipe
+
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CACHE_DIR", tmp_path)
+
+        from unittest.mock import MagicMock, patch
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"model: m\nruntime: sglang\n"
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+            path = _fetch_and_cache_recipe("https://evil.example/recipe.yaml", allow_untrusted_host=True)
+        assert path.exists()
+
+    def test_fetch_rejects_oversize_response(self, tmp_path, monkeypatch):
+        """A response exceeding the size cap is refused."""
+        from sparkrun.core.recipe import fetch_and_cache_recipe as _fetch_and_cache_recipe, RecipeError
+        from sparkrun.core import recipe as _recipe_mod
+
+        import sparkrun.core.config
+
+        monkeypatch.setattr(sparkrun.core.config, "DEFAULT_CACHE_DIR", tmp_path)
+        monkeypatch.setattr(_recipe_mod, "_RECIPE_FETCH_MAX_BYTES", 16)
+
+        from unittest.mock import MagicMock, patch
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"x" * 64
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+            with pytest.raises(RecipeError, match="exceeds"):
+                _fetch_and_cache_recipe(self._ALLOWED_RECIPE_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -4563,28 +5048,21 @@ class TestClusterUserInCLICommands:
         return config_root
 
     def test_cluster_status_uses_cluster_user(self, runner, cluster_with_user, monkeypatch):
-        """cluster status with --cluster should use the cluster's SSH user."""
+        """cluster status with --cluster should use the cluster's SSH user.
+
+        Status now flows through ``api.status_report`` → ``api.status``; the
+        cluster's SSH user is applied to ``config`` in host resolution and
+        reaches the query via the ssh_kwargs the CLI forwards.
+        """
         captured_kwargs = {}
 
-        def mock_query_status(host_list, ssh_kwargs=None, cache_dir=None):
+        def mock_status(hosts, *, executor=None, cluster=None, ssh_kwargs=None, sctx=None):
             captured_kwargs.update(ssh_kwargs or {})
-            # Return a minimal result object
-            from types import SimpleNamespace
+            from sparkrun.core.cluster_status import ClusterStatus
 
-            return SimpleNamespace(
-                groups={},
-                solo_entries=[],
-                errors={},
-                idle_hosts=host_list,
-                pending_ops=[],
-                total_containers=0,
-                host_count=len(host_list),
-            )
+            return ClusterStatus(hosts=(), executor="docker")
 
-        monkeypatch.setattr(
-            "sparkrun.core.cluster_manager.query_cluster_status",
-            mock_query_status,
-        )
+        monkeypatch.setattr("sparkrun.api._status.status", mock_status)
 
         result = runner.invoke(
             main,
@@ -4602,24 +5080,13 @@ class TestClusterUserInCLICommands:
         """stop --all with --cluster should use the cluster's SSH user."""
         captured_kwargs = {}
 
-        def mock_query_status(host_list, ssh_kwargs=None, cache_dir=None):
+        def mock_status(hosts, *, executor=None, cluster=None, ssh_kwargs=None, sctx=None):
             captured_kwargs.update(ssh_kwargs or {})
-            from types import SimpleNamespace
+            from sparkrun.core.cluster_status import ClusterStatus
 
-            return SimpleNamespace(
-                groups={},
-                solo_entries=[],
-                errors={},
-                idle_hosts=host_list,
-                pending_ops=[],
-                total_containers=0,
-                host_count=len(host_list),
-            )
+            return ClusterStatus(hosts=(), executor="docker")
 
-        monkeypatch.setattr(
-            "sparkrun.core.cluster_manager.query_cluster_status",
-            mock_query_status,
-        )
+        monkeypatch.setattr("sparkrun.api._status.status", mock_status)
 
         result = runner.invoke(
             main,
@@ -4634,18 +5101,48 @@ class TestClusterUserInCLICommands:
         assert captured_kwargs.get("ssh_user") == "labadmin"
 
     def test_stop_recipe_uses_cluster_user(self, runner, cluster_with_user, monkeypatch):
-        """stop <recipe> with --cluster should use the cluster's SSH user."""
+        """stop <recipe> with --cluster should use the cluster's SSH user.
+
+        Under the 0.3 identifier model, ``stop <recipe>`` runs
+        status-driven discovery before invoking cleanup.  We stub
+        ``query_status`` to surface one matching cluster so the path
+        reaches ``cleanup_containers`` where the SSH user assertion
+        lives.  ``generate_intent_id`` is mocked so we don't depend on
+        the specific intent value the recipe would compute (the
+        identity isn't what's under test here — the SSH user is).
+        """
+        from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+        from sparkrun.orchestration.executors.docker import DockerExecutor
+        from sparkrun.orchestration.executors.local import LocalExecutor
+
         captured_kwargs = {}
 
-        def mock_cleanup(host_list, container_names, ssh_kwargs=None, dry_run=False):
+        def mock_cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None):
+            from sparkrun.orchestration.ssh import RemoteResult
+
             captured_kwargs.update(ssh_kwargs or {})
+            return {h: RemoteResult(host=h, returncode=0, stdout="sparkrun_removed=1", stderr="") for h in host_containers}
 
         monkeypatch.setattr(
-            "sparkrun.orchestration.primitives.cleanup_containers",
+            "sparkrun.orchestration.primitives.cleanup_containers_by_host",
             mock_cleanup,
         )
+        monkeypatch.setattr("sparkrun.orchestration.job_metadata.generate_intent_id", lambda *a, **kw: "aabbccdd1122")
         # Prevent real git clones when ensure_initialized sees empty cache
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock.Mock(returncode=1, stderr="mocked"))
+
+        fake_cluster_id = "sparkrun_aabbccdd1122_0123456789abcdef"
+
+        def fake_query_status(self, hosts, **kw):
+            return ClusterStatus(
+                hosts=tuple(HostOccupancy(host=h, workloads=(RunningWorkload(cluster_id=fake_cluster_id),)) for h in hosts),
+                executor="docker",
+            )
+
+        monkeypatch.setattr(DockerExecutor, "query_status", fake_query_status)
+        # Discovery now sweeps the whole host scope (docker + local); keep the
+        # local branch hermetic (no real SSH) — it contributes nothing here.
+        monkeypatch.setattr(LocalExecutor, "query_status", lambda self, hosts, **kw: ClusterStatus(hosts=(), executor="local"))
 
         result = runner.invoke(
             main,
@@ -4656,17 +5153,24 @@ class TestClusterUserInCLICommands:
                 "userlab",
             ],
         )
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert captured_kwargs.get("ssh_user") == "labadmin"
 
     def test_logs_uses_cluster_user(self, runner, cluster_with_user, reset_bootstrap, monkeypatch):
         """logs with --cluster should use the cluster's SSH user."""
-        captured_config = {}
+        captured = {}
 
-        def mock_follow_logs(self, hosts=None, cluster_id=None, config=None, **kw):
-            captured_config["ssh_user"] = config.ssh_user if config else None
+        def _capture(executor, sources, **kwargs):
+            captured["ssh_user"] = (kwargs.get("ssh_kwargs") or {}).get("ssh_user")
+            return iter(())
 
-        monkeypatch.setattr(SglangRuntime, "follow_logs", mock_follow_logs)
+        # Assert on the SSH user the reader actually connects as — the
+        # observable end of "logs uses the cluster's user".
+        monkeypatch.setattr("sparkrun.orchestration.logs.read_log_sources", _capture)
+        monkeypatch.setattr(
+            "sparkrun.api._resolve.discover_cluster_id_by_intent",
+            lambda *a, **kw: "sparkrun_aabbccddeeff0011_aabbccddeeff",
+        )
         # Prevent real git clones when ensure_initialized sees empty cache
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock.Mock(returncode=1, stderr="mocked"))
 
@@ -4679,8 +5183,8 @@ class TestClusterUserInCLICommands:
                 "userlab",
             ],
         )
-        assert result.exit_code == 0
-        assert captured_config.get("ssh_user") == "labadmin"
+        assert result.exit_code == 0, result.output
+        assert captured.get("ssh_user") == "labadmin"
 
     def test_run_dry_run_uses_cluster_user(self, runner, cluster_with_user, reset_bootstrap, monkeypatch):
         """run --dry-run with --cluster should use the cluster's SSH user."""
@@ -4759,8 +5263,14 @@ class TestUpdateCommand:
         assert result.exit_code == 0
         assert "not installed via uv" in result.output
 
-    def test_update_uv_upgrade_succeeds(self, runner, monkeypatch):
+    def test_update_uv_upgrade_succeeds(self, runner, monkeypatch, tmp_path):
         """update performs uv upgrade and shells out for registry update."""
+        # Isolate config so the channel resolves to the default (stable) and the
+        # command never reads or writes the real ~/.config/sparkrun/config.yaml.
+        import sparkrun.core.config as config_module
+
+        monkeypatch.setattr(config_module, "DEFAULT_CONFIG_DIR", tmp_path / "config")
+        monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
         def fake_run(cmd, **kwargs):
@@ -4983,6 +5493,17 @@ class TestSetupEarlyoom:
         assert "dbus-daemon" in avoid_regex
         assert "NetworkManager" in avoid_regex
 
+    def test_cdi_summary(self):
+        """_cdi_summary extracts the status line from CDI generate output."""
+        from sparkrun.cli._setup._phases import _cdi_summary
+
+        generated = "some noise\nGENERATED: /etc/cdi/nvidia.yaml (1 device(s))\n"
+        assert _cdi_summary(generated) == "GENERATED: /etc/cdi/nvidia.yaml (1 device(s))"
+        assert _cdi_summary("SKIPPED: nvidia-ctk not found") == "SKIPPED: nvidia-ctk not found"
+        assert _cdi_summary("ERROR: nvidia-ctk cdi generate failed") == "ERROR: nvidia-ctk cdi generate failed"
+        # No recognized keyword → falls back to a truncated raw dump.
+        assert _cdi_summary("weird output") == "weird output"
+
 
 class TestStopLogsClusterIdAndOverrides:
     """Test stop/logs with cluster ID targeting and --port/--served-model-name overrides."""
@@ -5006,10 +5527,29 @@ class TestStopLogsClusterIdAndOverrides:
         return {"config_root": config_root, "cache_root": cache_root}
 
     def test_stop_with_port_override(self, runner, config_setup, reset_bootstrap):
-        """Verify --port is passed through to generate_cluster_id."""
+        """Verify --port is threaded through to ``generate_intent_id``.
+
+        Under the 0.3 identifier model, ``api.stop(recipe=...)`` derives
+        the intent_id from recipe + overrides (no hosts), then does
+        status-driven discovery to find the matching cluster_id.  We
+        mock ``generate_intent_id`` to capture the overrides passed and
+        stub ``query_status`` so the discovery completes successfully.
+        """
+        from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+        from sparkrun.orchestration.executors.docker import DockerExecutor
+
+        fake_cid = "sparkrun_aabbccdd1122_0123456789abcdef"
+
+        def fake_query_status(self, hosts, **kw):
+            return ClusterStatus(
+                hosts=tuple(HostOccupancy(host=h, workloads=(RunningWorkload(cluster_id=fake_cid),)) for h in hosts),
+                executor="docker",
+            )
+
         with (
-            mock.patch("sparkrun.orchestration.primitives.cleanup_containers"),
-            mock.patch("sparkrun.orchestration.job_metadata.generate_cluster_id", return_value="sparkrun_aabbccdd1122") as mock_gen,
+            mock.patch("sparkrun.orchestration.primitives.cleanup_containers_by_host"),
+            mock.patch("sparkrun.orchestration.job_metadata.generate_intent_id", return_value="aabbccdd1122") as mock_gen,
+            mock.patch.object(DockerExecutor, "query_status", fake_query_status),
             mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr="mocked")),
         ):
             result = runner.invoke(
@@ -5023,18 +5563,29 @@ class TestStopLogsClusterIdAndOverrides:
                     "8001",
                 ],
             )
-            assert result.exit_code == 0
-            # generate_cluster_id should have been called with overrides containing port
+            assert result.exit_code == 0, result.output
             call_kwargs = mock_gen.call_args
             overrides = call_kwargs.kwargs.get("overrides") or (call_kwargs[1].get("overrides") if len(call_kwargs) > 1 else None)
             assert overrides is not None
             assert overrides.get("port") == 8001
 
     def test_stop_with_served_model_name(self, runner, config_setup, reset_bootstrap):
-        """Verify --served-model-name is passed through to generate_cluster_id."""
+        """Verify --served-model-name is threaded through to ``generate_intent_id``."""
+        from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+        from sparkrun.orchestration.executors.docker import DockerExecutor
+
+        fake_cid = "sparkrun_aabbccdd1122_0123456789abcdef"
+
+        def fake_query_status(self, hosts, **kw):
+            return ClusterStatus(
+                hosts=tuple(HostOccupancy(host=h, workloads=(RunningWorkload(cluster_id=fake_cid),)) for h in hosts),
+                executor="docker",
+            )
+
         with (
-            mock.patch("sparkrun.orchestration.primitives.cleanup_containers"),
-            mock.patch("sparkrun.orchestration.job_metadata.generate_cluster_id", return_value="sparkrun_aabbccdd1122") as mock_gen,
+            mock.patch("sparkrun.orchestration.primitives.cleanup_containers_by_host"),
+            mock.patch("sparkrun.orchestration.job_metadata.generate_intent_id", return_value="aabbccdd1122") as mock_gen,
+            mock.patch.object(DockerExecutor, "query_status", fake_query_status),
             mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr="mocked")),
         ):
             result = runner.invoke(
@@ -5048,7 +5599,7 @@ class TestStopLogsClusterIdAndOverrides:
                     "my-model",
                 ],
             )
-            assert result.exit_code == 0
+            assert result.exit_code == 0, result.output
             call_kwargs = mock_gen.call_args
             overrides = call_kwargs.kwargs.get("overrides") or (call_kwargs[1].get("overrides") if len(call_kwargs) > 1 else None)
             assert overrides is not None
@@ -5069,7 +5620,7 @@ class TestStopLogsClusterIdAndOverrides:
         }
         (jobs_dir / "aabbccdd1122.yaml").write_text(yaml.safe_dump(meta))
 
-        with mock.patch("sparkrun.orchestration.primitives.cleanup_containers") as mock_cleanup:
+        with mock.patch("sparkrun.orchestration.primitives.cleanup_containers_by_host") as mock_cleanup:
             result = runner.invoke(main, ["stop", "aabbccdd1122"])
             assert result.exit_code == 0
             assert "stopped" in result.output.lower()
@@ -5082,34 +5633,23 @@ class TestStopLogsClusterIdAndOverrides:
         assert "No job metadata" in result.output
 
     def test_logs_with_port_override(self, runner, config_setup, reset_bootstrap):
-        """Verify --port is passed through to generate_cluster_id in logs."""
-        mock_runtime = mock.Mock()
-        mock_runtime.follow_logs = mock.Mock()
-        mock_runtime.compute_required_nodes = mock.Mock(return_value=2)
-        with (
-            mock.patch("sparkrun.core.bootstrap.get_runtime", return_value=mock_runtime),
-            mock.patch("sparkrun.orchestration.job_metadata.generate_cluster_id", return_value="sparkrun_aabbccdd1122") as mock_gen,
-            mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr="mocked")),
-        ):
+        """--port reaches api.logs as an override.
+
+        The port participates in the intent, so a workload launched on a
+        non-default port is only findable when the override is threaded
+        through to the intent computation.
+        """
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(
                 main,
-                [
-                    "logs",
-                    _TEST_RECIPE_NAME,
-                    "--cluster",
-                    "test-cluster",
-                    "--port",
-                    "8001",
-                ],
+                ["logs", _TEST_RECIPE_NAME, "--cluster", "test-cluster", "--port", "8001"],
             )
-            assert result.exit_code == 0
-            call_kwargs = mock_gen.call_args
-            overrides = call_kwargs.kwargs.get("overrides") or (call_kwargs[1].get("overrides") if len(call_kwargs) > 1 else None)
-            assert overrides is not None
+            assert result.exit_code == 0, result.output
+            overrides = mock_logs.call_args.kwargs["overrides"]
             assert overrides.get("port") == 8001
 
     def test_logs_by_cluster_id(self, runner, config_setup, reset_bootstrap):
-        """Logs by cluster ID loads metadata and calls runtime.follow_logs."""
+        """Logs by cluster ID resolves hosts from metadata and renders api.logs."""
         cache_root = config_setup["cache_root"]
         jobs_dir = cache_root / "jobs"
         jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -5122,15 +5662,46 @@ class TestStopLogsClusterIdAndOverrides:
         }
         (jobs_dir / "aabbccdd1122.yaml").write_text(yaml.safe_dump(meta))
 
-        mock_runtime = mock.Mock()
-        mock_runtime.follow_logs = mock.Mock()
-        with mock.patch("sparkrun.core.bootstrap.get_runtime", return_value=mock_runtime):
+        with mock.patch("sparkrun.api.logs", return_value=iter(())) as mock_logs:
             result = runner.invoke(main, ["logs", "aabbccdd1122"])
-            assert result.exit_code == 0
-            mock_runtime.follow_logs.assert_called_once()
-            call_kwargs = mock_runtime.follow_logs.call_args
-            assert call_kwargs.kwargs["cluster_id"] == "sparkrun_aabbccdd1122"
-            assert call_kwargs.kwargs["hosts"] == ["10.0.0.1"]
+            assert result.exit_code == 0, result.output
+            assert mock_logs.call_args.args[0] == "sparkrun_aabbccdd1122"
+            assert mock_logs.call_args.kwargs["hosts"] == ("10.0.0.1",)
+
+    def test_logs_renders_api_lines_verbatim(self, runner, config_setup, reset_bootstrap):
+        """Single-source output is echoed unprefixed, so it stays pipe-friendly."""
+        from sparkrun.core.log_source import LogLine
+
+        lines = [
+            LogLine(host="10.0.0.1", container="c_solo", text="first"),
+            LogLine(host="10.0.0.1", container="c_solo", text="second"),
+        ]
+        with mock.patch("sparkrun.api.logs", return_value=iter(lines)):
+            result = runner.invoke(main, ["logs", _TEST_RECIPE_NAME, "--cluster", "test-cluster"])
+
+        assert result.exit_code == 0, result.output
+        assert "first" in result.output
+        assert "second" in result.output
+        assert "[10.0.0.1/" not in result.output
+
+    def test_logs_all_sources_prefixes_and_requests_all_scope(self, runner, config_setup, reset_bootstrap):
+        """-a asks for every source and labels lines so interleaved output is readable."""
+        from sparkrun.core.log_source import SCOPE_ALL, LogLine
+
+        lines = [
+            LogLine(host="10.0.0.1", container="c_node_0", text="from head", role="node_0", rank=0),
+            LogLine(host="10.0.0.2", container="c_node_1", text="from worker", role="node_1", rank=1),
+        ]
+        with mock.patch("sparkrun.api.logs", return_value=iter(lines)) as mock_logs:
+            result = runner.invoke(
+                main,
+                ["logs", _TEST_RECIPE_NAME, "--hosts", "10.0.0.1,10.0.0.2", "-a"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert mock_logs.call_args.kwargs["scope"] == SCOPE_ALL
+        assert "[10.0.0.1/node_0] from head" in result.output
+        assert "[10.0.0.2/node_1] from worker" in result.output
 
 
 class TestFormatJobCommandsAndLabel:
@@ -5470,3 +6041,202 @@ class TestRegistryListJson:
             assert "name" in data[0]
             assert "url" in data[0]
             assert "enabled" in data[0]
+
+
+class TestRegistryTrustCli:
+    """CLI surface for the per-registry trust model."""
+
+    @pytest.fixture
+    def isolated_registry(self, runner, tmp_path, monkeypatch):
+        """Redirect DEFAULT_CONFIG_DIR + cache to a temp tree so CLI ops are isolated."""
+        from sparkrun.core import config as config_module
+        from sparkrun.core.registry import RegistryEntry, RegistryManager
+
+        cfg_dir = tmp_path / "cfg"
+        cache_dir = tmp_path / "cache"
+        cfg_dir.mkdir()
+        cache_dir.mkdir()
+        monkeypatch.setattr(config_module, "DEFAULT_CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(config_module, "DEFAULT_CACHE_DIR", cache_dir)
+
+        # Seed a known set of registries (avoids manifest discovery network calls).
+        mgr = RegistryManager(cfg_dir, cache_dir / "registries")
+        mgr._manifest_discovery_attempted = True
+        mgr._save_registries(
+            [
+                RegistryEntry(
+                    name="seed-trusted",
+                    url="https://example.com/trusted",
+                    subpath="recipes",
+                    description="seed trusted entry",
+                    trusted=True,
+                ),
+                RegistryEntry(
+                    name="seed-untrusted",
+                    url="https://example.com/untrusted",
+                    subpath="recipes",
+                    description="seed untrusted entry",
+                    trusted=False,
+                ),
+            ]
+        )
+        return cfg_dir, cache_dir, mgr
+
+    def test_trust_command_flips_bit(self, runner, isolated_registry):
+        """``sparkrun registry trust <name>`` marks entry trusted."""
+        _, _, mgr = isolated_registry
+        result = runner.invoke(main, ["registry", "trust", "seed-untrusted"])
+        assert result.exit_code == 0
+        assert "trusted" in result.output.lower()
+        loaded = {e.name: e for e in mgr._load_registries_from_file()}
+        assert loaded["seed-untrusted"].trusted is True
+
+    def test_untrust_command_flips_bit_back(self, runner, isolated_registry):
+        """``sparkrun registry untrust <name>`` marks entry untrusted."""
+        _, _, mgr = isolated_registry
+        result = runner.invoke(main, ["registry", "untrust", "seed-trusted"])
+        assert result.exit_code == 0
+        assert "untrusted" in result.output.lower()
+        loaded = {e.name: e for e in mgr._load_registries_from_file()}
+        assert loaded["seed-trusted"].trusted is False
+
+    def test_trust_unknown_exits_nonzero(self, runner, isolated_registry):
+        result = runner.invoke(main, ["registry", "trust", "does-not-exist"])
+        assert result.exit_code != 0
+        assert "not found" in result.output.lower() or "error" in result.output.lower()
+
+    def test_add_with_trust_flag(self, runner, isolated_registry, monkeypatch):
+        """``sparkrun registry add --trust <url>`` lands entries as trusted."""
+        _, _, mgr = isolated_registry
+        from sparkrun.core.registry import RegistryEntry
+
+        # Mock the manifest-discovery step so the CLI doesn't hit the network.
+        new_entries = [
+            RegistryEntry(name="added-via-cli", url="https://example.com/new", subpath="recipes"),
+        ]
+        monkeypatch.setattr(
+            "sparkrun.core.registry.RegistryManager._discover_manifest_entries",
+            lambda self, url: new_entries,
+        )
+
+        result = runner.invoke(main, ["registry", "add", "--trust", "--no-update", "https://example.com/new"])
+        assert result.exit_code == 0, result.output
+        loaded = {e.name: e for e in mgr._load_registries_from_file()}
+        assert loaded["added-via-cli"].trusted is True
+
+    def test_add_without_trust_lands_untrusted(self, runner, isolated_registry, monkeypatch):
+        """``sparkrun registry add <url>`` defaults to trusted=False."""
+        _, _, mgr = isolated_registry
+        from sparkrun.core.registry import RegistryEntry
+
+        new_entries = [
+            RegistryEntry(name="added-default", url="https://example.com/def", subpath="recipes"),
+        ]
+        monkeypatch.setattr(
+            "sparkrun.core.registry.RegistryManager._discover_manifest_entries",
+            lambda self, url: new_entries,
+        )
+
+        result = runner.invoke(main, ["registry", "add", "--no-update", "https://example.com/def"])
+        assert result.exit_code == 0, result.output
+        loaded = {e.name: e for e in mgr._load_registries_from_file()}
+        assert loaded["added-default"].trusted is False
+
+    def test_registry_list_displays_trust(self, runner, isolated_registry):
+        result = runner.invoke(main, ["registry", "list"])
+        assert result.exit_code == 0
+        # Header shows Trusted column.
+        assert "Trusted" in result.output
+        # Seeded entries both appear with their trust state.
+        # Each row has name + 'yes'/'no' tokens in the trusted column.
+        lines = [ln for ln in result.output.splitlines() if "seed-" in ln]
+        assert any("seed-trusted" in ln and "yes" in ln for ln in lines)
+        assert any("seed-untrusted" in ln and "no" in ln for ln in lines)
+
+    def test_registry_show_displays_trust(self, runner, isolated_registry):
+        result = runner.invoke(main, ["registry", "show", "seed-trusted"])
+        assert result.exit_code == 0, result.output
+        assert "Trusted:" in result.output
+        # "Trusted:     yes"
+        trust_line = [ln for ln in result.output.splitlines() if ln.startswith("Trusted:")][0]
+        assert "yes" in trust_line
+
+        result_un = runner.invoke(main, ["registry", "show", "seed-untrusted"])
+        assert result_un.exit_code == 0, result_un.output
+        un_line = [ln for ln in result_un.output.splitlines() if ln.startswith("Trusted:")][0]
+        assert "no" in un_line
+
+
+class TestWithHostContext:
+    """Unit tests for the @with_host_context decorator."""
+
+    def test_injects_host_list_and_cluster_mgr(self, monkeypatch):
+        """Decorated function receives host_list and cluster_mgr kwargs."""
+        from sparkrun.cli._common import with_host_context
+
+        captured = {}
+
+        @with_host_context
+        def dummy(hosts=None, hosts_file=None, cluster_name=None, host_list=None, cluster_mgr=None):
+            captured["host_list"] = host_list
+            captured["cluster_mgr"] = cluster_mgr
+
+        monkeypatch.setattr(
+            "sparkrun.cli._common._resolve_hosts_or_exit",
+            lambda *args, **kwargs: (["10.0.0.1", "10.0.0.2"], object()),
+        )
+
+        dummy(hosts="10.0.0.1,10.0.0.2", hosts_file=None, cluster_name=None)
+
+        assert captured["host_list"] == ["10.0.0.1", "10.0.0.2"]
+        assert captured["cluster_mgr"] is not None
+
+    def test_exit_on_empty_hosts(self, monkeypatch):
+        """Decorator exits with code 1 when no hosts are resolved."""
+        from sparkrun.cli._common import with_host_context
+
+        def _mock_resolve(*args, **kwargs):
+            # Simulate the exit that _resolve_hosts_or_exit does on no hosts
+            raise SystemExit(1)
+
+        monkeypatch.setattr("sparkrun.cli._common._resolve_hosts_or_exit", _mock_resolve)
+
+        @with_host_context
+        def dummy(hosts=None, hosts_file=None, cluster_name=None, host_list=None, cluster_mgr=None):
+            pass  # pragma: no cover
+
+        with pytest.raises(SystemExit) as exc_info:
+            dummy(hosts=None, hosts_file=None, cluster_name=None)
+        assert exc_info.value.code == 1
+
+    def test_preserves_function_metadata(self):
+        """functools.wraps preserves __name__ and __doc__."""
+        from sparkrun.cli._common import with_host_context
+
+        @with_host_context
+        def my_command(hosts=None, hosts_file=None, cluster_name=None, host_list=None, cluster_mgr=None):
+            """My docstring."""
+
+        assert my_command.__name__ == "my_command"
+        assert my_command.__doc__ == "My docstring."
+
+    def test_passes_through_other_kwargs(self, monkeypatch):
+        """Extra kwargs from Click options are forwarded unchanged."""
+        from sparkrun.cli._common import with_host_context
+
+        captured = {}
+
+        @with_host_context
+        def dummy(hosts=None, hosts_file=None, cluster_name=None, dry_run=False, host_list=None, cluster_mgr=None):
+            captured["dry_run"] = dry_run
+            captured["host_list"] = host_list
+
+        monkeypatch.setattr(
+            "sparkrun.cli._common._resolve_hosts_or_exit",
+            lambda *args, **kwargs: (["localhost"], None),
+        )
+
+        dummy(hosts="localhost", hosts_file=None, cluster_name=None, dry_run=True)
+
+        assert captured["dry_run"] is True
+        assert captured["host_list"] == ["localhost"]

@@ -242,12 +242,63 @@ def display_recipe_detail(recipe, show_vram=True, registry_name=None, cli_overri
         display_vram_estimate(recipe, cli_overrides=cli_overrides, cache_dir=cache_dir)
 
 
-def display_vram_estimate(recipe, cli_overrides=None, auto_detect=True, cache_dir=None):
-    """Display VRAM estimation for a recipe."""
-    from sparkrun.models.vram import DGX_SPARK_VRAM_GB
+def _resolve_target_accelerator(cluster, placement):
+    """Return ``(memory_gb, model)`` for the representative target accelerator.
+
+    Prefers the placed / solo host(s), falling back to the cluster's first host
+    with recorded hardware. Returns ``(None, None)`` when no per-host hardware is
+    known (e.g. the DGX Spark default fallback), so callers keep the legacy
+    121 GB / "DGX Spark" behavior. A recorded DGX Spark host reports
+    ``memory_gb == 121`` here, so DGX output is byte-identical either way.
+    """
+    if cluster is None:
+        return None, None
+    hw_map = getattr(cluster, "hosts_hardware", None) or {}
+    if not hw_map:
+        return None, None
+    ordered = []
+    if placement is not None and getattr(placement, "hosts_used", None):
+        ordered.extend(placement.hosts_used)
+    ordered.extend(getattr(cluster, "hosts", None) or [])
+    ordered.extend(hw_map.keys())
+    seen = set()
+    for host in ordered:
+        if host in seen:
+            continue
+        seen.add(host)
+        hw = hw_map.get(host)
+        accels = getattr(hw, "accelerators", None) if hw else None
+        if accels and getattr(accels[0], "memory_gb", None):
+            return accels[0].memory_gb, getattr(accels[0], "model", None)
+    return None, None
+
+
+def display_vram_estimate(
+    recipe,
+    cli_overrides=None,
+    auto_detect=True,
+    cache_dir=None,
+    cluster=None,
+    placement=None,
+):
+    """Display VRAM estimation for a recipe.
+
+    When *cluster* is provided, also render a per-host fit table using
+    :func:`sparkrun.models.fit.check_fit`.  When *placement* is also
+    provided, the per-host walk follows the placed rank set rather than
+    every cluster host.  Legacy DGX-Spark single-line fit remains in
+    the output for back-compat.
+    """
+    from sparkrun.models.vram import DEFAULT_VRAM_GB
+
+    # Resolve the target accelerator's memory so the budget/fit reflect the real
+    # GPU (e.g. 48 GB A6000) rather than the hardcoded DGX Spark figure.
+    target_mem, target_model = _resolve_target_accelerator(cluster, placement)
 
     try:
-        est = recipe.estimate_vram(cli_overrides=cli_overrides, auto_detect=auto_detect, cache_dir=cache_dir)
+        est = recipe.estimate_vram(
+            cli_overrides=cli_overrides, auto_detect=auto_detect, cache_dir=cache_dir, total_gpu_memory_gb=target_mem
+        )
     except Exception as e:
         click.echo(f"\nVRAM estimation failed: {e}", err=True)
         return
@@ -267,16 +318,21 @@ def display_vram_estimate(recipe, cli_overrides=None, auto_detect=True, cache_di
     if est.pipeline_parallel > 1:
         click.echo(f"  Pipeline parallel: {est.pipeline_parallel}")
     click.echo(f"  Per-GPU total:    {est.total_per_gpu_gb:.2f} GB")
-    fit_str = "YES" if est.fits_dgx_spark else "EXCEEDS %.0f GB" % DGX_SPARK_VRAM_GB
-    click.echo(f"  DGX Spark fit:    {fit_str}")
+    # Fit against the resolved target memory (DGX Spark when the target is a
+    # gb10 or unknown, preserving the legacy line).
+    total_gb = est.total_gpu_memory_gb or DEFAULT_VRAM_GB
+    fits = est.total_per_gpu_gb <= total_gb
+    fit_str = "YES" if fits else "EXCEEDS %.0f GB" % total_gb
+    if target_model and target_model != "gb10":
+        click.echo(f"  Fit ({target_model.upper()}, {total_gb:.0f} GB): {fit_str}")
+    else:
+        click.echo(f"  DGX Spark fit:    {fit_str}")
 
     # GPU memory budget analysis
     if est.gpu_memory_utilization is not None:
         click.echo("\n  GPU Memory Budget:")
         click.echo(f"    gpu_memory_utilization: {est.gpu_memory_utilization:.0%}")
-        click.echo(
-            f"    Usable GPU memory:     {est.usable_gpu_memory_gb:.1f} GB ({DGX_SPARK_VRAM_GB:.0f} GB x {est.gpu_memory_utilization:.0%})"
-        )
+        click.echo(f"    Usable GPU memory:     {est.usable_gpu_memory_gb:.1f} GB ({total_gb:.0f} GB x {est.gpu_memory_utilization:.0%})")
         click.echo(f"    Available for KV:      {est.available_kv_gb:.1f} GB")
         if est.max_context_tokens is not None:
             click.echo(f"    Max context tokens:    {est.max_context_tokens:,}")
@@ -287,6 +343,38 @@ def display_vram_estimate(recipe, cli_overrides=None, auto_detect=True, cache_di
 
     for w in est.warnings:
         click.echo(f"  Warning: {w}")
+
+    # Per-host cluster fit (Phase X.1) — only when caller threaded
+    # a cluster and a placement through.  Skipped on the legacy
+    # "loose host list" path so the existing DGX output stays intact.
+    if cluster is not None and placement is not None and placement.hosts_used:
+        from sparkrun.models.fit import check_fit
+
+        try:
+            fit = check_fit(est, cluster, placement)
+        except Exception as e:
+            click.echo(f"  Per-host fit check skipped: {e}")
+            return
+
+        click.echo("\n  Per-host fit:")
+        for host, detail in fit.per_host.items():
+            if detail.accelerator_memory_gb is None:
+                click.echo(f"    {host}: ranks={detail.ranks_assigned}, accelerator memory unknown")
+            else:
+                marker = "OK" if detail.ok else "EXCEEDS"
+                cap = detail.max_gpu_memory_utilization
+                if cap is not None and cap < 1.0 and detail.nominal_memory_gb is not None:
+                    accel_str = f"accelerator={detail.nominal_memory_gb:.1f} GB @{cap:.0%} -> usable={detail.accelerator_memory_gb:.1f} GB"
+                else:
+                    accel_str = f"accelerator={detail.accelerator_memory_gb:.1f} GB"
+                click.echo(
+                    f"    {host}: ranks={detail.ranks_assigned}, "
+                    f"per-rank={detail.vram_per_rank_gb:.1f} GB, "
+                    f"{accel_str}, "
+                    f"headroom={detail.headroom_gb:.1f} GB [{marker}]"
+                )
+        for w in fit.warnings:
+            click.echo(f"  Warning: {w}")
 
 
 def format_monitor_table(
@@ -323,6 +411,50 @@ def format_monitor_table(
         # Flag hosts with stale/reconnecting data.
         host_label = "%s (!)" % host if state.error else host
         jobs = s.sparkrun_jobs if s.sparkrun_jobs else "-"
+        cpu_pct = s.cpu_usage_pct if s.cpu_usage_pct else "-"
+        ram_pct = "%s%%" % s.mem_used_pct if s.mem_used_pct else "-"
+        gpu_util = "%s" % s.gpu_util_pct if s.gpu_util_pct else "-"
+        cpu_temp = "%s C" % s.cpu_temp_c if s.cpu_temp_c else "-"
+        gpu_temp = "%s C" % s.gpu_temp_c if s.gpu_temp_c else "-"
+        gpu_power = "%s W" % s.gpu_power_w if s.gpu_power_w else "-"
+
+        lines.append(f"{host_label:<{host_w}}{jobs:>6}{cpu_pct:>8}{ram_pct:>8}{gpu_util:>8}{cpu_temp:>10}{gpu_temp:>10}{gpu_power:>11}")
+
+    return "\n".join(lines)
+
+
+def format_activity_table(frame, hosts: list[str]) -> str:
+    """Format a :class:`~sparkrun.core.monitoring.MonitorFrame` as a text table.
+
+    Like :func:`format_monitor_table` but sourced from a live-monitor frame:
+    the ``Jobs`` column counts the workloads occupying the host from
+    ``api.status`` (docker + local + provider), not the telemetry stream's
+    docker-only count; telemetry columns come from ``activity.telemetry``.
+    """
+    host_w = max(16, *(len(h) for h in hosts)) + 2
+
+    header = f"{'HOST':<{host_w}}{'Jobs':>6}{'CPU%':>8}{'RAM%':>8}{'GPU%':>8}{'CPU Temp':>10}{'GPU Temp':>10}{'GPU Power':>11}"
+    separator = "-" * len(header)
+
+    lines = [header, separator]
+    for host in hosts:
+        activity = frame.for_host(host) if frame is not None else None
+        if activity is None:
+            lines.append(f"{host:<{host_w}}{'(connecting...)':>6}")
+            continue
+
+        # Jobs from occupancy (all executors), not the docker-only telemetry count.
+        n_jobs = sum(len(w.containers) or 1 for w in activity.workloads)
+        jobs = str(n_jobs) if activity.workloads else "-"
+
+        s = activity.telemetry
+        if s is None:
+            err = activity.telemetry_error or activity.status_error
+            host_label = "%s (!)" % host if err else host
+            lines.append(f"{host_label:<{host_w}}{jobs:>6}{'-':>8}{'-':>8}{'-':>8}{'-':>10}{'-':>10}{'-':>11}")
+            continue
+
+        host_label = "%s (!)" % host if (activity.telemetry_error or activity.status_error) else host
         cpu_pct = s.cpu_usage_pct if s.cpu_usage_pct else "-"
         ram_pct = "%s%%" % s.mem_used_pct if s.mem_used_pct else "-"
         gpu_util = "%s" % s.gpu_util_pct if s.gpu_util_pct else "-"

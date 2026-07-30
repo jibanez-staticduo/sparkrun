@@ -38,6 +38,20 @@ echo "DOCKER_GROUP=added"
 """
 
 
+def _cdi_summary(stdout: str) -> str:
+    """Extract the status line from nvidia CDI generate output.
+
+    Returns the first recognized status line (GENERATED/SKIPPED/ERROR) so the
+    wizard can show a one-line result per host instead of the raw script dump.
+    """
+    for kw in ("GENERATED:", "SKIPPED:", "ERROR:"):
+        for line in stdout.strip().splitlines():
+            line = line.strip()
+            if line.startswith(kw):
+                return line
+    return stdout.strip()[:80]
+
+
 def _docker_group_summary(stdout: str, user: str | None = None) -> str:
     """Extract status from docker-group script output."""
     label = "'%s' " % user if user else ""
@@ -161,15 +175,20 @@ def apply_sudoers(host_list, user, dry_run, sudo_password=None, sudo_dispatch_fn
         list of ``(label, ok_count)`` tuples.
     """
     from sparkrun.scripts import read_script
-    from sparkrun.utils.shell import validate_unix_username
+    from sparkrun.utils.shell import validate_sudoers_path, validate_unix_username
 
     validate_unix_username(user)
+    # Empty cache_dir means auto-detect inside the script; only non-empty
+    # values are interpolated into the sudoers rule and must be validated.
+    fix_cache_dir = ""
+    if fix_cache_dir:
+        validate_sudoers_path(fix_cache_dir)
     sudoers_scripts = [
         (
             "fix-permissions",
             read_script("fix_permissions_sudoers.sh").format(
                 user=user,
-                cache_dir="",
+                cache_dir=fix_cache_dir,
             ),
         ),
         (

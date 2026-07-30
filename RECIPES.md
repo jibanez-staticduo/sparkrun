@@ -29,7 +29,7 @@ Everything else is optional. When `command` is omitted, the runtime generates it
 
 | Field             | Type   | Required    | Default         | Description                                                       |
 |-------------------|--------|-------------|-----------------|-------------------------------------------------------------------|
-| `model`           | string | **yes**     | —               | HuggingFace model ID or GGUF spec (`Qwen/Qwen3-1.7B-GGUF:Q4_K_M`) |
+| `model`           | string | **yes**     | —               | HuggingFace model ID, GGUF spec (`Qwen/Qwen3-1.7B-GGUF:Q4_K_M`), or an absolute path to pre-placed on-disk weights |
 | `model_revision`  | string | no          | `null`          | Pin to a specific HF revision (branch, tag, or commit hash)       |
 | `runtime`         | string | no          | auto-detected   | Runtime identifier. See [Runtime Resolution](#runtime-resolution) |
 | `runtime_version` | string | no          | `""`            | Informational version tag                                         |
@@ -37,6 +37,21 @@ Everything else is optional. When `command` is omitted, the runtime generates it
 
 GGUF models use colon syntax (`repo:quant`) to download only the matching quantization files. When pre-synced, sparkrun
 rewrites `-hf` to `-m` with the resolved container cache path.
+
+**Local model weights:** an *absolute path* in `model:` (e.g. `model: /nfs/models/qwen3`) is treated as pre-placed
+on-disk weights that already exist on every node (typically a shared NFS mount). sparkrun then skips model download +
+distribution entirely, identity-mounts that directory into the container at the same path, and serves the runtime
+directly from it; the served-model name defaults to the directory basename. Only absolute paths trigger this — an
+ordinary repo id (`org/name`) or GGUF spec is never mistaken for a path, and `~`/relative paths are not expanded.
+Because this bind-mounts a host directory into the container, it is honored only for **trusted** recipes (local,
+default-registry, or `--trust`); an untrusted registry/URL recipe with an absolute-path model fails closed. This is the
+ergonomic front-end for the lower-level `cluster_config.resolved_model_path` escape hatch.
+
+Since distribution is skipped, the path must genuinely already exist on **every target node** — the control machine
+need not be a cluster member and need not see the path itself. Before launch, sparkrun verifies the path on the targets
+via the executor (host substrate → SSH `test -e`; provider executors probe their own volumes) and fails fast listing any
+node where it's missing, rather than letting the container crash. This preflight is best-effort: an unreachable or
+unverifiable node never blocks the launch.
 
 `model_revision` affects download, cache checking, VRAM auto-detection, and model sync. Pin to a commit hash for
 reproducible deployments.
@@ -61,9 +76,21 @@ On DGX Spark (1 GPU per node), `tensor_parallel: N` = N hosts.
 | Field            | Type   | Default | Description                                                                                    |
 |------------------|--------|---------|------------------------------------------------------------------------------------------------|
 | `defaults`       | map    | `{}`    | Default values for serve flags. CLI overrides take priority                                    |
-| `env`            | map    | `{}`    | Container environment variables. Supports `$VAR` / `${VAR}` expansion from control machine env |
+| `env`            | map    | `{}`    | Container environment variables. Values are passed through **literally** (see note below) |
 | `command`        | string | `null`  | Command template. `{key}` placeholders resolved from config chain                              |
 | `runtime_config` | map    | `{}`    | Runtime-specific config. Unknown top-level keys are auto-swept here                            |
+
+> **`env` values are not expanded.** Control-machine environment variables are
+> no longer substituted into recipe `env`. A `${HF_TOKEN}` in a recipe reaches
+> the container as the literal string `${HF_TOKEN}`, not the token. This closed
+> an exfiltration path: a third-party recipe could otherwise write
+> `env: {LEAK: "${AWS_SECRET_ACCESS_KEY}"}` and have the control machine's
+> secrets substituted into a container it controls.
+>
+> To forward a secret, use a **cluster-level** `env` block with an `env_file`
+> (`core/cluster_manager.py:ClusterDefinition.resolve_env`) — `${VAR}`
+> references there resolve at launch time from that file only, never from
+> `os.environ`, so secrets stay out of both the recipe and the cluster YAML.
 
 ### Metadata
 
@@ -96,7 +123,10 @@ precedence over auto-detected values.
 
 ```yaml
 benchmark:
-  framework: llama-benchy     # default framework
+  category: performance       # optional; derived from the framework's primary
+                              # category when omitted (perf for llama-benchy,
+                              # tools for tool-eval-bench, ...).
+  framework: llama-benchy     # default framework for the category
   timeout: 3600
   args: # or put args at top level (auto-swept)
     pp: [ 2048 ]
@@ -105,6 +135,53 @@ benchmark:
 ```
 
 Used by `sparkrun benchmark <recipe>`. CLI `-o` overrides apply on top.
+
+**Category subcommands.** `sparkrun benchmark` accepts a category positional
+that pins the kind of benchmark (and the default framework for it):
+
+```
+sparkrun benchmark performance <recipe>     # alias: sparkrun benchmark perf
+sparkrun benchmark tools       <recipe>
+sparkrun benchmark <recipe>                  # back-compat: == performance
+sparkrun benchmark run <recipe>              # legacy entry; no category
+```
+
+Pinning a category and an incompatible `--framework` raises
+`FrameworkCategoryMismatch`. New categories appear automatically once a
+plugin registers them (`BenchmarkingPlugin.categories`).
+
+**Resume / fresh.** Resumable runs (frameworks that implement
+`build_task_list`) write progress state to
+`~/.cache/sparkrun/benchmarks/<benchmark_id>/`. CLI flags:
+
+```
+--resume   # non-interactive: resume if compatible state exists, else fresh
+--fresh    # delete prior state and start over (mutually exclusive with --resume)
+```
+
+When neither flag is set and stdin is a TTY, the CLI prompts. Non-TTY
+defaults to resume. The library API (`sparkrun.api.benchmark`) exposes the
+full `ResumeMode` enum (`AUTO`, `IF_EXISTS`, `FRESH`, `REQUIRED`); pass
+`on_prompt_required=...` to inject a callback in lieu of the prompt.
+
+**Container image pinning.** On the first successful launch of a resumable
+run, sparkrun captures two distinct references and persists them in
+`state.extras`:
+
+- `container_image_sha` — content-addressable image ID resolved via
+  `docker image inspect` on a target host. On resume the orchestration
+  overrides `overrides["image"]` with this SHA so a re-pushed tag or rebuilt
+  local image cannot silently change the bits between sessions.
+- `container_image_longterm_ref` — output of the builder's
+  `resolve_long_term_image()`. Used only for archival provenance in the
+  result YAML; it is not used at launch time. Persisted so resumed sessions
+  emit identical archive references.
+
+**Spark Arena.** `--arena` on any category subcommand runs the opinionated
+Spark Arena flow (auth check, hardcoded profile `@official/spark-arena-v2`,
+post-run upload). `sparkrun arena benchmark` continues to work as a sibling
+entry point that calls into the same shared helpers (`preflight_arena` and
+`finalize_arena`).
 
 ### Version
 
@@ -184,6 +261,7 @@ Explicit `runtime` always wins. Command-hint detection only fires when `runtime`
 | `trtllm`           | MPI (`mpirun` + rsh wrapper)                        | `sleep infinity` containers + `mpirun` on head |
 | `eugr-vllm`        | Ray (inherits vllm-ray)                             | eugr container builds + Ray cluster            |
 | `atlas`            | Native (`--rank`, `--world-size`, `--master-addr`)  | Atlas Spark (avarok/atlas-gb10) — pure-Rust LLM inference; each rank runs `atlas serve`, rank 0 only HTTP |
+| `modular-max`      | None — single-node only                             | Modular MAX (`max serve`); tensor parallelism uses local GPUs via `--devices` (never multi-node) |
 
 ### Common Defaults Keys
 
@@ -226,7 +304,23 @@ defaults:
 
 ## Executor Config
 
-Controls container engine behavior. Layered: **CLI flags → recipe `executor_config` → built-in defaults**.
+Controls how the workload is launched. Layered:
+**CLI flags → recipe `executor` / `executor_config` → cluster `executor` / `executor_config` → executor adjustments → runtime executor-config defaults → `SparkrunConfig` → per-executor defaults → dataclass field defaults.**
+
+### Selecting an executor
+
+The `executor:` field picks which executor backend handles the launch. See
+[`docs/EXECUTORS.md`](docs/EXECUTORS.md) for the full reference.
+
+```yaml
+executor: docker      # default. Docker-driven (production path).
+# executor: local     # experimental. Native subprocess. No container.
+# executor: k8s       # experimental draft. kubectl run-driven.
+```
+
+Recipes that omit `executor:` fall back to whatever `SparkrunConfig.default_executor` is, then to `docker`.
+
+### Docker executor fields (default)
 
 ```yaml
 executor_config:
@@ -244,18 +338,81 @@ executor_config:
 | `ipc`            | string | `"host"`    | `--ipc`        | IPC namespace                                                                                                       |
 | `shm_size`       | string | `"10.24gb"` | `--shm-size`   | Shared memory size                                                                                                  |
 | `network`        | string | `"host"`    | `--network`    | Network mode                                                                                                        |
-| `entrypoint`     | string | `null`      | `--entrypoint` | Override the image `ENTRYPOINT`. `null` leaves it untouched; `""` clears it so the serve command runs directly       |
+| `entrypoint`     | string | `null`      | `--entrypoint` | Override the image `ENTRYPOINT`. `null` leaves it untouched; `""` clears it so sparkrun's serve command runs directly |
+| `user`           | string | `null`      | `--user`       | UID:GID or `$SHELL_USER` (auto: `$(id -u):$(id -g)` + mount passwd/group)                                           |
+| `security_opt`   | list   | `null`      | `--security-opt` | Repeated. Defaults to `[no-new-privileges]` in rootless mode.                                                     |
+| `cap_add`        | list   | `null`      | `--cap-add`    | Repeated.                                                                                                           |
+| `ulimit`         | list   | `null`      | `--ulimit`     | Repeated. Rootless adds `memlock=-1:-1`, `stack=67108864`.                                                           |
+| `devices`        | list   | `null`      | `--device`     | Repeated. Rootless adds `/dev/infiniband`.                                                                          |
+| `memory_limit`   | string | `null`      | `--memory`     | Container memory cap.                                                                                               |
+| `labels`         | list   | `null`      | `--label`      | Repeated.                                                                                                           |
 
-**`entrypoint`** is for images that ship their own `ENTRYPOINT`. sparkrun launches the container as `<image> bash -c <command>`, so an image whose `ENTRYPOINT` swallows or wraps that command will fail to serve. Set `entrypoint: ""` to neutralize it — no need to rebuild the image with an emptied entrypoint:
+Use `entrypoint: ""` for images that ship an ENTRYPOINT which consumes sparkrun's generated `bash -c <serve command>` tail:
 
 ```yaml
 executor_config:
-  entrypoint: ""   # clear the image's ENTRYPOINT
+  entrypoint: ""
 ```
+
+### LocalExecutor fields (experimental, `executor: local`)
+
+`LocalExecutor` runs the runtime's serve command as a native subprocess on the
+target host — there is no Docker container in the loop. **Limitations**: no
+image, no volumes, no Ray strategy, GPU visibility only honors `gpus: all` or
+`gpus: device=0,2`.
+
+```yaml
+executor: local
+executor_config:
+  working_dir: /opt/myproject
+  log_dir: /var/log/sparkrun
+  pid_dir: /var/run/sparkrun
+  env_file: /etc/sparkrun.env
+  command_prefix: nice -n 10
+  gpus: "device=0,2"            # → CUDA_VISIBLE_DEVICES=0,2
+```
+
+| Key              | Default                                        | Description                                                                       |
+|------------------|------------------------------------------------|-----------------------------------------------------------------------------------|
+| `working_dir`    | `null`                                         | `cd <working_dir>` before launch.                                                 |
+| `log_dir`        | `$HOME/.cache/sparkrun/local/logs`             | Per-container `<log_dir>/<container_name>.log`.                                   |
+| `log_file`       | `null`                                         | Overrides `<log_dir>/...` entirely.                                               |
+| `pid_dir`        | `$HOME/.cache/sparkrun/local/pids`             | Per-container `<pid_dir>/<container_name>.pid`.                                   |
+| `pid_file`       | `null`                                         | Overrides `<pid_dir>/...` entirely.                                               |
+| `env_file`       | `null`                                         | Sourced via `set -a; . <env_file>; set +a` before launch.                         |
+| `command_prefix` | `null`                                         | Prepended verbatim (e.g. `nice -n 10 ionice -c2`).                                |
+
+### K8sExecutor fields (experimental draft, `executor: k8s`)
+
+`K8sExecutor` launches workloads as Kubernetes Pods via `kubectl run`. **Limitations**:
+`kubectl run` (not full manifests) so init containers / sidecars / volume claims
+are unreachable; Docker-specific options (`privileged`, `shm_size`, `ipc`,
+`network`) are silently dropped; no Ray cluster strategy.
+
+```yaml
+executor: k8s
+executor_config:
+  k8s_namespace: ml-prod
+  k8s_context: prod-east
+  k8s_node_selector: nodepool=dgx-spark
+  k8s_image_pull_policy: IfNotPresent
+  kubeconfig: /etc/k8s/admin.conf
+  memory_limit: 128Gi
+```
+
+| Key                      | Default | Description                                                                                          |
+|--------------------------|---------|------------------------------------------------------------------------------------------------------|
+| `k8s_namespace`          | `null`  | `kubectl -n <ns>`.                                                                                   |
+| `k8s_context`            | `null`  | `kubectl --context <ctx>`.                                                                           |
+| `k8s_node_selector`      | `null`  | `key=value[,key=value]`. Emitted as `--overrides` JSON.                                              |
+| `k8s_image_pull_policy`  | `null`  | `--image-pull-policy`.                                                                               |
+| `kubeconfig`             | `null`  | `--kubeconfig`.                                                                                      |
+| `entrypoint`             | `null`  | When set, emits `kubectl run --command`. `""` uses `bash -c <serve command>` to bypass image ENTRYPOINT wrappers. |
 
 **CLI override:** `sparkrun run --no-rm --restart always my-recipe`
 
-All runtimes automatically inherit executor settings — no per-runtime changes needed.
+All runtimes automatically inherit executor settings — no per-runtime changes
+needed.
 
 ---
 
@@ -274,6 +431,28 @@ All runtimes automatically inherit executor settings — no per-runtime changes 
 8. post_commands                    — on CONTROL MACHINE
 9. [stop_after_post]                — optional auto-stop
 ```
+
+### Trust model
+
+`pre_exec`, `post_exec`, and `post_commands` execute shell commands derived
+from the recipe. A recipe is **trusted** (hooks run without prompting) when
+any of these hold:
+
+- the user passed `--trust` on the CLI;
+- the recipe was loaded from a **local path** (no `source_registry`) and was
+  not fetched from a URL;
+- the recipe came from a registry whose `trusted` flag is true in the user's
+  local `registries.yaml`. Every registry shipped as a built-in default is
+  first-party and ships trusted; a registry added with
+  `sparkrun registry add <url>` is untrusted until the user opts in with
+  `--trust` or `sparkrun registry trust <name>`.
+
+Recipes fetched from a **URL** — including `@spark-arena/<uuid>` shortcuts —
+are never auto-trusted, regardless of the above.
+
+Otherwise the user is prompted before each hook surface runs. Trust also gates
+`executor` selection and the `executor_config` privilege keys; see
+[`docs/SECURITY.md`](docs/SECURITY.md) for the full model.
 
 ### pre_exec
 
@@ -359,9 +538,47 @@ builder: eugr
 builder_config:
   repo_url: https://github.com/eugr/spark-vllm-docker.git
   branch: main
+  rebuild: true   # force a fresh image (see below)
 ```
 
-`builder_config` is passed directly to the builder plugin's `prepare_image()`. Contents are builder-specific.
+`builder_config` is passed directly to the builder plugin's `prepare_image()`. Most contents are
+builder-specific, with one standard cross-builder key:
+
+- **`rebuild`** (bool) — request the freshest possible image. It is a no-op for `docker-pull` (the
+  distribution phase already handles pulling). For `eugr` it forces a from-scratch rebuild of
+  locally-built images (bypassing the build cache) and a fresh `docker pull` of pullable registry
+  images. It behaves identically across `local`, `push`, and `delegated` transfer modes.
+
+The `rebuild` key can also be set per-invocation with `sparkrun run --rebuild <recipe>`
+(or `--no-rebuild` to force it off); the CLI flag overrides the recipe's `builder_config.rebuild`.
+
+#### eugr is pull-first
+
+Mirroring upstream `build-and-copy.sh`, the eugr builder **pulls a prebuilt image by default and only
+builds from wheels when `build_args` request it**. A build is requested when `build_args` contains
+`--use-wheels` **or any custom build flag** (`--rebuild-vllm`, `--rebuild-flashinfer`, `--vllm-ref`,
+`--exp-mxfp4`, `--force-download`, `--apply-vllm-pr`, …) — exactly the flags that set the script's
+`CUSTOM_BUILD_REQUESTED`. `build_args` that are empty or contain only the deprecated `--tf5` no-op do
+**not** trigger a build.
+
+**Pull path (default):**
+
+- The eugr nightly `:latest` sentinels — `ghcr.io/spark-arena/dgx-vllm-eugr-nightly(-tf5):latest` and the
+  Docker Hub `eugr/spark-vllm:latest` (short or `docker.io/`-qualified) — resolve to sparkrun's
+  authoritative `ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest` and are pulled.
+- Any other non-pullable eugr image (e.g. a v1 `container: vllm-node`) is reused if already present,
+  otherwise substituted with our nightly and pulled — eugr no longer builds it implicitly.
+- `--rebuild` force-pulls a fresh copy.
+
+**Build path (`--use-wheels` or a custom build flag):**
+
+- The nightly sentinels build locally as `sparkrun-eugr-vllm`; other images build under their own name.
+- `build_args` are forwarded verbatim to `build-and-copy.sh` (so `--use-wheels`, `--vllm-ref`, etc. take
+  effect). The build cache is honored for the standard `--use-wheels` build; `--rebuild` forces a
+  from-scratch rebuild.
+
+Set `defaults.builders.eugr.use_sentinel_image: false` in `~/.config/sparkrun/config.yaml` to opt out of
+pull-first entirely: images are used verbatim and a missing one is built via `build-and-copy.sh`.
 
 ### eugr Builder (v1 Compatibility, Legacy)
 
@@ -418,6 +635,50 @@ command: |
 - `tensor_parallel` → `--split-mode row`, `pipeline_parallel` → `--split-mode layer` (mutually exclusive)
 - Pre-synced GGUF: `-hf` auto-rewritten to `-m` with container cache path
 
+### Vision GGUF models (multimodal projector)
+
+Vision GGUF models ship a companion **multimodal projector** (`mmproj-*.gguf`) alongside the quantized weights. sparkrun
+downloads it automatically (no extra config) and resolves its container path. There is no need to hardcode a snapshot
+path.
+
+```yaml
+model: unsloth/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M
+runtime: llama-cpp
+max_nodes: 1
+container: ghcr.io/spark-arena/dgx-llama-cpp:latest
+
+# Optional projector selector (swept into runtime_config). Defaults to `auto`,
+# which prefers F16 → BF16 → F32 → F8. Pin a precision with e.g. `F32`, give a
+# filename, or set `false` to disable auto-injection.
+mmproj: auto
+
+defaults:
+  port: 8001
+  host: 0.0.0.0
+  alias: qwen3-vl-8b
+  n_gpu_layers: 99
+  ctx_size: 8192
+  flash_attn: on            # valued in modern llama.cpp (on/off/auto)
+  jinja: true
+  top_p: 0.8
+  top_k: 20
+  temperature: 0.7          # → --temp
+  min_p: 0.0
+  presence_penalty: 1.5
+  webui: false              # inverted → --no-webui
+  mmap: false               # inverted → --no-mmap
+```
+
+- The example above is **command-less**: with the projector and sampling options in `defaults`, sparkrun builds the full
+  `llama-server` command and auto-injects `--mmproj <resolved path>`.
+- To place the projector explicitly in a `command:` template, use `{mmproj}` (e.g. `--mmproj {mmproj}`); auto-injection
+  is skipped whenever the rendered command already contains `--mmproj`.
+- `flash_attn` accepts `on`/`off`/`auto` (booleans map to `on`/`off`); `webui`/`mmap` are inverted toggles that emit
+  `--no-webui`/`--no-mmap` only when set false.
+- **GB10 default:** on DGX Spark (GB10), llama.cpp defaults to `mmap: false` (i.e. `--no-mmap`) because memory-mapped
+  GGUF loading performs poorly on its unified memory. This platform default applies only when the recipe is silent on
+  `mmap`; set `mmap: true` in `defaults` to opt back in.
+
 ---
 
 ## Recipe Discovery
@@ -428,9 +689,25 @@ Search order:
 2. **URL** — HTTP/HTTPS fetched and cached
 3. **File path** — exact or with `.yaml`/`.yml` extension
 4. **CWD scan** — `.yaml`/`.yml` files that are valid recipes (must have `model`, `container`, resolvable `runtime`)
-5. **Registry search** — flat + recursive lookup across all enabled registries
+5. **Registry search** — flat + recursive lookup, applied **independently per registry**
 
-Ambiguous names (same recipe in multiple registries) raise an error — use `@registry/name` to disambiguate.
+Each enabled registry is searched on its own terms: a flat `<recipe-dir>/<name>.yaml` wins within that
+registry, and only if that registry has no flat match is its recipe dir scanned recursively. A flat hit in
+one registry never suppresses the recursive scan of another — so a recipe that lives only in a
+subdirectory stays reachable even when a different registry has a flat file with the same stem.
+
+Because the scan is recursive, a bare stem is not always unique *within* one registry —
+`a/foo.yaml` and `b/foo.yaml` are two different recipes. Any name matching more than one recipe raises an
+error rather than guessing, listing path-qualified names you can use verbatim:
+
+```
+Recipe 'foo' is ambiguous — 2 matches in registry 'official' (@official/a/foo, @official/b/foo).
+Use the full name to specify.
+```
+
+`@registry/name` disambiguates across registries, and `@registry/subdir/name` disambiguates within one
+(the scope is split on the first `/`, so everything after it is a path under the registry's recipe dir).
+When stdin is a TTY the CLI offers these as a numbered prompt instead of erroring.
 
 ---
 

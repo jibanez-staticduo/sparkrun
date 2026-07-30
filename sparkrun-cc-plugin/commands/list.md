@@ -33,6 +33,8 @@ sparkrun list --all                         # include hidden registry recipes
 sparkrun list --registry <name>             # filter by registry
 sparkrun list --runtime vllm                # filter by runtime (vllm, sglang, llama-cpp)
 sparkrun list <query>                       # filter by name (contains-match)
+sparkrun list @<registry>                   # shorthand for --registry <registry>
+sparkrun list @<registry>/<query>           # that registry, filtered by <query>
 ```
 
 3. **Search for recipes** by name, model, runtime, or description (contains-match):
@@ -40,6 +42,7 @@ sparkrun list <query>                       # filter by name (contains-match)
 ```bash
 sparkrun recipe search <query>
 sparkrun recipe search <query> --registry <name> --runtime sglang
+sparkrun recipe search @<registry>/<query>  # registry-scoped shorthand
 ```
 
 Use `sparkrun recipe search` as the first attempt when the user wants to find a particular recipe. Only fall back to other approaches if it doesn't return useful results.

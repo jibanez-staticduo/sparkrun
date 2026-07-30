@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from scitrera_app_framework import Variables, register_plugin, get_extensions
 from scitrera_app_framework.util import find_types_in_modules
@@ -58,7 +58,10 @@ def init_sparkrun(v: Variables | None = None, log_level: str = "WARNING") -> Var
     # Import here to avoid circular imports
     from sparkrun.runtimes.base import RuntimePlugin
 
-    # Auto-discover all RuntimePlugin subclasses in sparkrun.runtimes
+    # Auto-discover all RuntimePlugin subclasses in sparkrun.runtimes.
+    # Plugins gated off by a feature flag still register here; they hide
+    # themselves as extensions via ``is_multi_extension`` (see
+    # ``Plugin.is_multi_extension`` overrides / ``core.features``).
     discovered = list(find_types_in_modules("sparkrun.runtimes", RuntimePlugin))
     for runtime_cls in discovered:
         try:
@@ -88,6 +91,76 @@ def init_sparkrun(v: Variables | None = None, log_level: str = "WARNING") -> Var
             logger.debug("Registered builder: %s", builder_cls.__name__)
         except (ValueError, TypeError) as e:
             logger.debug("Skipping builder %s: %s", builder_cls.__name__, e)
+
+    # Auto-discover all Executor subclasses in sparkrun.orchestration.executors
+    from sparkrun.orchestration.executors._base import Executor as _ExecutorPlugin
+
+    discovered_executors = list(find_types_in_modules("sparkrun.orchestration.executors", _ExecutorPlugin))
+    for executor_cls in discovered_executors:
+        try:
+            register_plugin(executor_cls, v=v)
+            logger.debug("Registered executor: %s", executor_cls.__name__)
+        except (ValueError, TypeError) as e:
+            logger.debug("Skipping executor %s: %s", executor_cls.__name__, e)
+
+    # Auto-discover TelemetryProvider subclasses in sparkrun.orchestration.telemetry
+    # (substrate resource sampling, keyed by scope — the telemetry peer of the
+    # executors' query_status). Skip the abstract base (blank scope).
+    from sparkrun.orchestration.telemetry._base import TelemetryProvider as _TelemetryPlugin
+
+    discovered_telemetry = list(find_types_in_modules("sparkrun.orchestration.telemetry", _TelemetryPlugin))
+    for telemetry_cls in discovered_telemetry:
+        if not getattr(telemetry_cls, "scope", ""):
+            logger.debug("Skipping unnamed telemetry provider: %s", telemetry_cls.__name__)
+            continue
+        try:
+            register_plugin(telemetry_cls, v=v)
+            logger.debug("Registered telemetry provider: %s", telemetry_cls.__name__)
+        except (ValueError, TypeError) as e:
+            logger.debug("Skipping telemetry provider %s: %s", telemetry_cls.__name__, e)
+
+    # Auto-discover all Scheduler subclasses in sparkrun.schedulers
+    from sparkrun.core.scheduler import Scheduler as _SchedulerPlugin
+
+    discovered_schedulers = list(find_types_in_modules("sparkrun.schedulers", _SchedulerPlugin))
+    for scheduler_cls in discovered_schedulers:
+        # Skip private base classes that intentionally leave scheduler_name
+        # blank — they exist only to share logic between concrete plugins.
+        if not getattr(scheduler_cls, "scheduler_name", ""):
+            logger.debug("Skipping abstract/base scheduler: %s", scheduler_cls.__name__)
+            continue
+        try:
+            register_plugin(scheduler_cls, v=v)
+            logger.debug("Registered scheduler: %s", scheduler_cls.__name__)
+        except (ValueError, TypeError) as e:
+            logger.debug("Skipping scheduler %s: %s", scheduler_cls.__name__, e)
+
+    # Auto-discover all Transport subclasses in sparkrun.transports. Imported
+    # here (function-local) so ``core`` only touches ``transports`` at
+    # discovery time — no module-level cycle (transports imports core).
+    from sparkrun.transports.base import Transport as _TransportPlugin
+
+    discovered_transports = list(find_types_in_modules("sparkrun.transports", _TransportPlugin))
+    for transport_cls in discovered_transports:
+        # Skip the abstract-ish base (blank transport_name) shared by concrete
+        # transports; only named selectors are registered.
+        if not getattr(transport_cls, "transport_name", ""):
+            logger.debug("Skipping unnamed transport: %s", transport_cls.__name__)
+            continue
+        try:
+            register_plugin(transport_cls, v=v)
+            logger.debug("Registered transport: %s", transport_cls.__name__)
+        except (ValueError, TypeError) as e:
+            logger.debug("Skipping transport %s: %s", transport_cls.__name__, e)
+
+    # External (out-of-tree) plugins from user-configured ``plugins.paths``.
+    # No-op unless configured; never allowed to break startup.
+    from sparkrun.core.external_plugins import load_external_plugins
+
+    try:
+        load_external_plugins(v)
+    except Exception:  # noqa: BLE001 - a broken plugin dir must not kill the CLI
+        logger.exception("External plugin loading failed")
 
     return v
 
@@ -160,6 +233,84 @@ def list_benchmarking_frameworks(v: Variables | None = None) -> list[str]:
 
     all_frameworks = get_extensions(EXT_BENCHMARKING_FRAMEWORKS, v=v)
     return sorted(r.framework_name for r in all_frameworks.values())
+
+
+def list_benchmark_categories(v: Variables | None = None) -> list[str]:
+    """List all benchmark categories implemented by registered frameworks.
+
+    The union of every plugin's ``categories`` tuple, deduplicated and sorted.
+    Used by the CLI to decide which ``sparkrun benchmark <category>``
+    subcommands to register.
+    """
+    if v is None:
+        v = get_variables()
+
+    all_frameworks = get_extensions(EXT_BENCHMARKING_FRAMEWORKS, v=v)
+    seen: set[str] = set()
+    for fw in all_frameworks.values():
+        for cat in getattr(fw, "categories", ()) or ():
+            if cat:
+                seen.add(cat)
+    return sorted(seen)
+
+
+def get_benchmarking_frameworks_for_category(
+    category: str,
+    v: Variables | None = None,
+) -> list["BenchmarkingPlugin"]:
+    """Return all registered frameworks whose ``categories`` includes *category*."""
+    if v is None:
+        v = get_variables()
+
+    all_frameworks = get_extensions(EXT_BENCHMARKING_FRAMEWORKS, v=v)
+    return [fw for fw in all_frameworks.values() if category in (getattr(fw, "categories", ()) or ())]
+
+
+class AmbiguousCategoryError(ValueError):
+    """Raised when a category has multiple frameworks and no default is set."""
+
+
+class CategoryNotFoundError(ValueError):
+    """Raised when a category has no registered frameworks."""
+
+
+def get_default_framework_for_category(
+    category: str,
+    config: Any = None,
+    v: Variables | None = None,
+) -> "BenchmarkingPlugin":
+    """Return the framework to use by default for *category*.
+
+    Resolution order:
+
+    1. If *config* declares ``default_benchmark_framework`` and that
+       framework belongs to *category*, use it.
+    2. If exactly one registered framework belongs to *category*, use it.
+    3. Otherwise raise :class:`AmbiguousCategoryError` (multiple matches) or
+       :class:`CategoryNotFoundError` (no matches).
+    """
+    candidates = get_benchmarking_frameworks_for_category(category, v=v)
+    if not candidates:
+        raise CategoryNotFoundError(
+            "No benchmarking framework registered for category %r. Registered categories: %s" % (category, list_benchmark_categories(v=v))
+        )
+
+    if config is not None:
+        configured_name = getattr(config, "default_benchmark_framework", None)
+        if configured_name:
+            for fw in candidates:
+                if fw.framework_name == configured_name:
+                    return fw
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    names = sorted(fw.framework_name for fw in candidates)
+    raise AmbiguousCategoryError(
+        "Category %r has multiple frameworks (%s). "
+        "Pin one via `defaults.benchmark_framework` in config.yaml or "
+        "pass --framework explicitly." % (category, names)
+    )
 
 
 def get_builder(name: str, v: Variables | None = None) -> "BuilderPlugin":

@@ -212,6 +212,7 @@ class TestRunPreExec:
             hosts_containers=[("spark-01", "sparkrun_abc_solo")],
             commands=["echo hello"],
             config_chain={},
+            trust=True,
         )
         mock_run.assert_called_once()
         call_args = mock_run.call_args
@@ -222,15 +223,16 @@ class TestRunPreExec:
         expected = base64.b64encode(b"echo hello").decode("utf-8")
         assert expected in script
 
-    @mock.patch("sparkrun.core.hosts.is_local_host", return_value=True)
+    @mock.patch("sparkrun.orchestration.primitives.should_run_locally", return_value=True)
     @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
-    def test_run_pre_exec_copy_commands(self, mock_run, mock_is_local):
+    def test_run_pre_exec_copy_commands(self, mock_run, mock_should_run_locally):
         """Dict with 'copy' key produces docker cp calls."""
         mock_run.return_value = self._make_success()
         run_pre_exec(
             hosts_containers=[("spark-01", "sparkrun_abc_solo")],
             commands=[{"copy": "/tmp/mods/patch.sh"}],
             config_chain={},
+            trust=True,
         )
         mock_run.assert_called()
         script = mock_run.call_args[0][1]
@@ -245,6 +247,7 @@ class TestRunPreExec:
                 hosts_containers=[("spark-01", "sparkrun_abc_solo")],
                 commands=["bad-command"],
                 config_chain={},
+                trust=True,
             )
 
     @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
@@ -256,6 +259,7 @@ class TestRunPreExec:
             commands=["echo hello"],
             config_chain={},
             dry_run=True,
+            trust=True,
         )
         # run_script_on_host is still called in dry_run (it handles the dry_run flag itself)
         mock_run.assert_called()
@@ -283,6 +287,7 @@ class TestRunPreExec:
             ],
             commands=["echo hello", "ls /workspace"],
             config_chain={},
+            trust=True,
         )
         # 2 containers * 2 commands = 4 calls
         assert mock_run.call_count == 4
@@ -295,6 +300,7 @@ class TestRunPreExec:
             hosts_containers=[("spark-01", "sparkrun_abc_solo")],
             commands=["echo {model}"],
             config_chain={"model": "llama-7b"},
+            trust=True,
         )
         mock_run.assert_called_once()
         script = mock_run.call_args[0][1]
@@ -310,9 +316,61 @@ class TestRunPreExec:
             hosts_containers=[("spark-01", "sparkrun_abc_solo")],
             commands=["echo ok", {"unknown_key": "value"}],
             config_chain={},
+            trust=True,
         )
         # Only the string command triggers a call
         assert mock_run.call_count == 1
+
+    @mock.patch("sys.stdin")
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    def test_run_pre_exec_trust_false_refuses_without_tty(self, mock_run, mock_stdin):
+        """When trust=False and stdin is not a TTY, RuntimeError is raised."""
+        mock_stdin.isatty.return_value = False
+        mock_run.return_value = self._make_success()
+        with pytest.raises(RuntimeError, match="pre_exec require confirmation"):
+            run_pre_exec(
+                hosts_containers=[("spark-01", "sparkrun_abc_solo")],
+                commands=["echo hello"],
+                config_chain={},
+                trust=False,
+            )
+        # SSH call must NOT have happened — the gate rejects before execution
+        mock_run.assert_not_called()
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    def test_run_pre_exec_trust_true_skips_prompt(self, mock_run):
+        """When trust=True, no confirmation prompt is required and the command runs."""
+        mock_run.return_value = self._make_success()
+        # We don't patch sys.stdin / click.confirm — neither should be consulted.
+        with mock.patch("click.confirm") as mock_confirm:
+            run_pre_exec(
+                hosts_containers=[("spark-01", "sparkrun_abc_solo")],
+                commands=["echo hello"],
+                config_chain={},
+                trust=True,
+            )
+            mock_confirm.assert_not_called()
+        mock_run.assert_called_once()
+
+    @mock.patch("sys.stdin")
+    def test_run_pre_exec_trust_false_user_decline_raises(self, mock_stdin):
+        """Interactive TTY but user declines — RuntimeError is raised."""
+        mock_stdin.isatty.return_value = True
+        with mock.patch("click.confirm", return_value=False):
+            with pytest.raises(RuntimeError, match="pre_exec execution cancelled"):
+                run_pre_exec(
+                    hosts_containers=[("spark-01", "sparkrun_abc_solo")],
+                    commands=["echo hello"],
+                    config_chain={},
+                    trust=False,
+                )
+
+    def test_run_pre_exec_trust_defaults_to_false(self):
+        """Default trust value is False — third-party recipes must opt in."""
+        import inspect
+
+        sig = inspect.signature(run_pre_exec)
+        assert sig.parameters["trust"].default is False
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +396,7 @@ class TestRunPostExec:
             container_name="sparkrun_abc_solo",
             commands=["curl http://localhost:8000/health"],
             context={"port": "8000"},
+            trust=True,
         )
         mock_run.assert_called_once()
         call_args = mock_run.call_args
@@ -358,6 +417,7 @@ class TestRunPostExec:
                 container_name="sparkrun_abc_solo",
                 commands=["bad-command"],
                 context={},
+                trust=True,
             )
 
     @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
@@ -380,6 +440,7 @@ class TestRunPostExec:
             container_name="sparkrun_abc_solo",
             commands=["curl {base_url}/models"],
             context={"base_url": "http://10.0.0.1:8000/v1"},
+            trust=True,
         )
         mock_run.assert_called_once()
         script = mock_run.call_args[0][1]
@@ -395,6 +456,7 @@ class TestRunPostExec:
             container_name="sparkrun_abc_solo",
             commands=["echo step1", "echo step2", "echo step3"],
             context={},
+            trust=True,
         )
         assert mock_run.call_count == 3
 
@@ -408,9 +470,63 @@ class TestRunPostExec:
             commands=["echo hello"],
             context={},
             dry_run=True,
+            trust=True,
         )
         mock_run.assert_called_once()
         assert mock_run.call_args[1].get("dry_run") is True
+
+    @mock.patch("sys.stdin")
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    def test_run_post_exec_trust_false_refuses_without_tty(self, mock_run, mock_stdin):
+        """When trust=False and stdin is not a TTY, RuntimeError is raised."""
+        mock_stdin.isatty.return_value = False
+        mock_run.return_value = self._make_success()
+        with pytest.raises(RuntimeError, match="post_exec require confirmation"):
+            run_post_exec(
+                head_host="spark-01",
+                container_name="sparkrun_abc_solo",
+                commands=["echo hello"],
+                context={},
+                trust=False,
+            )
+        # SSH call must NOT have happened — the gate rejects before execution
+        mock_run.assert_not_called()
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    def test_run_post_exec_trust_true_skips_prompt(self, mock_run):
+        """When trust=True, no confirmation prompt is required and the command runs."""
+        mock_run.return_value = self._make_success()
+        with mock.patch("click.confirm") as mock_confirm:
+            run_post_exec(
+                head_host="spark-01",
+                container_name="sparkrun_abc_solo",
+                commands=["echo hello"],
+                context={},
+                trust=True,
+            )
+            mock_confirm.assert_not_called()
+        mock_run.assert_called_once()
+
+    @mock.patch("sys.stdin")
+    def test_run_post_exec_trust_false_user_decline_raises(self, mock_stdin):
+        """Interactive TTY but user declines — RuntimeError is raised."""
+        mock_stdin.isatty.return_value = True
+        with mock.patch("click.confirm", return_value=False):
+            with pytest.raises(RuntimeError, match="post_exec execution cancelled"):
+                run_post_exec(
+                    head_host="spark-01",
+                    container_name="sparkrun_abc_solo",
+                    commands=["echo hello"],
+                    context={},
+                    trust=False,
+                )
+
+    def test_run_post_exec_trust_defaults_to_false(self):
+        """Default trust value is False — third-party recipes must opt in."""
+        import inspect
+
+        sig = inspect.signature(run_post_exec)
+        assert sig.parameters["trust"].default is False
 
 
 # ---------------------------------------------------------------------------
@@ -572,12 +688,13 @@ class TestRunCopyCommandDelegated:
 
     @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
     def test_copy_source_host_failure_raises(self, mock_run):
-        """RuntimeError raised when delegated copy fails."""
+        """TransferError raised when delegated copy fails."""
         from sparkrun.orchestration.hooks import _run_copy_command
+        from sparkrun.orchestration.transfer import TransferError
 
         mock_run.return_value = self._make_failure()
         cmd = {"copy": "/mods/patch", "dest": "/workspace/mods/patch", "source_host": "head"}
-        with pytest.raises(RuntimeError, match="copy failed"):
+        with pytest.raises(TransferError, match="copy failed"):
             _run_copy_command("head", "container1", cmd, ssh_kwargs={})
 
     def test_copy_source_host_dry_run(self):
@@ -602,3 +719,247 @@ class TestRunCopyCommandDelegated:
 
         # run_script_on_host called for mkdir + docker cp
         assert mock_run.call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# _run_delegated_copy — input validation / injection hardening
+# ---------------------------------------------------------------------------
+
+
+class TestRunCopyCommandDelegatedSecurity:
+    """Verify that malicious source_host and dest values are rejected."""
+
+    def test_source_host_semicolon_raises(self):
+        """source_host with a semicolon is rejected before any SSH call."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+
+        cmd = {"copy": "/mods/patch", "dest": "/workspace/mods/patch", "source_host": "evil; rm -rf $HOME #"}
+        with pytest.raises(ValueError, match="hostname"):
+            _run_copy_command("worker", "container1", cmd, ssh_kwargs={})
+
+    def test_source_host_backtick_raises(self):
+        """source_host with backticks is rejected."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+
+        cmd = {"copy": "/mods/patch", "dest": "/workspace/mods/patch", "source_host": "host`whoami`"}
+        with pytest.raises(ValueError, match="hostname"):
+            _run_copy_command("worker", "container1", cmd, ssh_kwargs={})
+
+    def test_source_host_command_substitution_raises(self):
+        """source_host with $(...) is rejected."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+
+        cmd = {"copy": "/mods/patch", "dest": "/workspace/mods/patch", "source_host": "host$(id)"}
+        with pytest.raises(ValueError, match="hostname"):
+            _run_copy_command("worker", "container1", cmd, ssh_kwargs={})
+
+    def test_source_host_newline_raises(self):
+        """source_host with a newline is rejected."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+
+        cmd = {"copy": "/mods/patch", "dest": "/workspace/mods/patch", "source_host": "host\nevil"}
+        with pytest.raises(ValueError, match="hostname"):
+            _run_copy_command("worker", "container1", cmd, ssh_kwargs={})
+
+    def test_dest_injection_raises(self):
+        """dest with shell metacharacters is rejected by safe_remote_path."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+
+        cmd = {"copy": "/mods/patch", "dest": "/workspace; rm -rf /", "source_host": "head"}
+        with pytest.raises(ValueError):
+            _run_copy_command("worker", "container1", cmd, ssh_kwargs={})
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    def test_valid_hostname_and_ip_pass(self, mock_run):
+        """Valid DNS hostname and IPv4 address pass validation and reach run_script_on_host."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        mock_run.return_value = RemoteResult(host="worker", returncode=0, stdout="ok", stderr="")
+
+        # DNS hostname
+        cmd = {"copy": "/mods/patch", "dest": "/workspace/mods/patch", "source_host": "host01.example.com"}
+        _run_copy_command("worker", "container1", cmd, ssh_kwargs={})
+        mock_run.assert_called()
+
+        mock_run.reset_mock()
+
+        # IPv4 address
+        cmd["source_host"] = "10.0.0.5"
+        _run_copy_command("worker", "container1", cmd, ssh_kwargs={})
+        mock_run.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Error classification for _run_copy_command (rsync path)
+# ---------------------------------------------------------------------------
+
+
+class TestRunCopyCommandErrorClassification:
+    """Verify _run_copy_command raises TransferError with classified reasons."""
+
+    def _make_result(self, host: str, returncode: int, stderr: str = "", stdout: str = "") -> RemoteResult:
+        return RemoteResult(host=host, returncode=returncode, stdout=stdout, stderr=stderr)
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    @mock.patch("sparkrun.orchestration.ssh.run_rsync_parallel")
+    def test_disk_space_raises_transfer_error(self, mock_rsync, mock_run_script):
+        """rsync failure with 'No space left on device' raises TransferError with classified reason."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+        from sparkrun.orchestration.transfer import TransferError
+
+        # mkdir succeeds
+        mock_run_script.return_value = self._make_result("spark-01", 0, stdout="")
+        # rsync fails with disk-space error
+        mock_rsync.return_value = [
+            self._make_result(
+                "spark-01",
+                11,
+                stderr='rsync: [Receiver] mkdir "/tmp/sparkrun_hook_patch/" failed: No space left on device (28)',
+            )
+        ]
+
+        cmd = {"copy": "/local/mods/patch"}
+        with pytest.raises(TransferError) as exc_info:
+            _run_copy_command("spark-01", "ctr1", cmd, ssh_kwargs={})
+
+        err = str(exc_info.value)
+        assert "out of disk space" in err
+        assert "spark-01" in err
+        # Must NOT be a bare RuntimeError
+        assert type(exc_info.value) is TransferError
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    @mock.patch("sparkrun.orchestration.ssh.run_rsync_parallel")
+    def test_first_failure_wins_over_downstream_lstat(self, mock_rsync, mock_run_script):
+        """When mkdir fails (disk space) AND a later step would fail, the FIRST failure (mkdir) is reported."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+        from sparkrun.orchestration.transfer import TransferError
+
+        # mkdir fails — this is the root cause
+        mock_run_script.return_value = self._make_result(
+            "spark-01",
+            1,
+            stderr="mkdir: cannot create directory '/tmp/sparkrun_hook_patch': No space left on device",
+        )
+        # rsync would not even be called, but set a downstream lstat error to be safe
+        mock_rsync.return_value = [
+            self._make_result(
+                "spark-01",
+                1,
+                stderr="lstat /tmp/sparkrun_hook_patch: no such file or directory",
+            )
+        ]
+
+        cmd = {"copy": "/local/mods/patch"}
+        with pytest.raises(TransferError) as exc_info:
+            _run_copy_command("spark-01", "ctr1", cmd, ssh_kwargs={})
+
+        err = str(exc_info.value)
+        # Should report the classified reason from mkdir stderr (root cause),
+        # NOT the lstat message from the downstream step.
+        # "No space left on device" → classified as "out of disk space"
+        assert "out of disk space" in err
+        assert "lstat" not in err
+        # rsync should never have been called because we failed early
+        mock_rsync.assert_not_called()
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    @mock.patch("sparkrun.orchestration.ssh.run_rsync_parallel")
+    def test_transfer_error_not_runtime_error(self, mock_rsync, mock_run_script):
+        """Raised exception is TransferError, not bare RuntimeError."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+        from sparkrun.orchestration.transfer import TransferError
+
+        mock_run_script.return_value = self._make_result("spark-01", 0)
+        mock_rsync.return_value = [self._make_result("spark-01", 23, stderr="permission denied")]
+
+        cmd = {"copy": "/local/mods/patch"}
+        with pytest.raises(TransferError):
+            _run_copy_command("spark-01", "ctr1", cmd, ssh_kwargs={})
+
+        # Confirm it is NOT a plain RuntimeError (TransferError != RuntimeError)
+        with pytest.raises(TransferError):
+            _run_copy_command("spark-01", "ctr1", cmd, ssh_kwargs={})
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    @mock.patch("sparkrun.orchestration.ssh.run_rsync_parallel")
+    def test_permission_denied_classified(self, mock_rsync, mock_run_script):
+        """'permission denied' in rsync stderr is classified correctly."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+        from sparkrun.orchestration.transfer import TransferError
+
+        mock_run_script.return_value = self._make_result("spark-02", 0)
+        mock_rsync.return_value = [
+            self._make_result("spark-02", 23, stderr="rsync: [sender] send_files failed to open ... permission denied")
+        ]
+
+        cmd = {"copy": "/local/mods/weights"}
+        with pytest.raises(TransferError) as exc_info:
+            _run_copy_command("spark-02", "ctr2", cmd, ssh_kwargs={})
+
+        assert "permission denied" in str(exc_info.value)
+        assert "spark-02" in str(exc_info.value)
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    @mock.patch("sparkrun.orchestration.ssh.run_rsync_parallel")
+    def test_run_copy_command_emits_cache_status_table_on_oos(self, mock_rsync, mock_run_script):
+        """When rsync fails with disk-space, format_cache_status_table is invoked."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+        from sparkrun.orchestration.transfer import TransferError
+
+        # mkdir succeeds, rsync fails with OOS
+        mock_run_script.return_value = self._make_result("spark-01", 0)
+        mock_rsync.return_value = [
+            self._make_result(
+                "spark-01",
+                11,
+                stderr="rsync: write failed: No space left on device (28)",
+            )
+        ]
+
+        fake_status = {"spark-01": object()}
+        fake_table = "  Host   Free Space\n  spark-01   0"
+
+        cmd = {"copy": "/local/mods/patch"}
+        with mock.patch("sparkrun.orchestration.disk_info.probe_cache_status", return_value=fake_status) as mock_probe:
+            with mock.patch("sparkrun.utils.cli_formatters.format_cache_status_table", return_value=fake_table) as mock_fmt:
+                with pytest.raises(TransferError) as exc_info:
+                    _run_copy_command("spark-01", "ctr1", cmd, ssh_kwargs={})
+
+                # The cache-status table must have been generated
+                mock_probe.assert_called_once()
+                mock_fmt.assert_called_once()
+
+        err = str(exc_info.value)
+        assert "out of disk space" in err
+        assert "spark-01" in err
+
+    @mock.patch("sparkrun.orchestration.primitives.run_script_on_host")
+    @mock.patch("sparkrun.orchestration.ssh.run_rsync_parallel")
+    def test_run_copy_command_uses_threaded_cache_dir(self, mock_rsync, mock_run_script):
+        """A custom cache_dir threaded into _run_copy_command flows to probe_cache_status."""
+        from sparkrun.orchestration.hooks import _run_copy_command
+        from sparkrun.orchestration.transfer import TransferError
+
+        mock_run_script.return_value = self._make_result("spark-01", 0)
+        mock_rsync.return_value = [
+            self._make_result(
+                "spark-01",
+                11,
+                stderr="rsync: write failed: No space left on device (28)",
+            )
+        ]
+
+        cmd = {"copy": "/local/mods/patch"}
+        with mock.patch("sparkrun.orchestration.disk_info.probe_cache_status", return_value={}) as mock_probe:
+            with pytest.raises(TransferError):
+                _run_copy_command(
+                    "spark-01",
+                    "ctr1",
+                    cmd,
+                    ssh_kwargs={},
+                    cache_dir="/opt/custom-hf-cache",
+                )
+            mock_probe.assert_called_once()
+            assert mock_probe.call_args.kwargs.get("hf_cache_dir") == "/opt/custom-hf-cache"

@@ -124,12 +124,58 @@ def render_hook_commands(
     return rendered
 
 
+def _confirm_hook_execution(hook_label: str, commands: list, trust: bool) -> None:
+    """Shared trust-gating prompt for hook commands.
+
+    When *trust* is True, returns immediately (no prompt).
+    When *trust* is False:
+    - Logs the commands as a warning,
+    - Refuses to proceed if stdin is not a TTY (raises RuntimeError),
+    - Otherwise asks the user to confirm via click.confirm.
+
+    Args:
+        hook_label: Human-readable hook name (e.g. ``"pre_exec"``).
+        commands: Hook command list (string entries are logged; dict
+            entries are summarized).
+        trust: When True, bypass confirmation entirely.
+
+    Raises:
+        RuntimeError: If *trust* is False and either stdin is not a TTY
+            or the user declines.
+    """
+    import sys
+
+    if trust:
+        return
+
+    logger.warning("Recipe %s will execute inside containers:", hook_label)
+    for i, cmd in enumerate(commands, 1):
+        if isinstance(cmd, str):
+            logger.warning("  [%d] %s", i, cmd)
+        elif isinstance(cmd, dict) and "copy" in cmd:
+            logger.warning("  [%d] copy %s -> %s", i, cmd.get("copy"), cmd.get("dest", "<default>"))
+        else:
+            logger.warning("  [%d] %r", i, cmd)
+
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "%s require confirmation but stdin is not a TTY. Use --trust to allow %s from third-party registries."
+            % (hook_label, hook_label)
+        )
+    import click
+
+    if not click.confirm("Allow these %s to run inside containers?" % hook_label, default=False):
+        raise RuntimeError("%s execution cancelled by user." % hook_label)
+
+
 def run_pre_exec(
     hosts_containers: list[tuple[str, str]],
     commands: list[str | dict[str, str]],
     config_chain,
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
+    trust: bool = False,
+    cache_dir: str | None = None,
 ) -> None:
     """Execute pre_exec commands inside containers.
 
@@ -140,18 +186,31 @@ def run_pre_exec(
     - A string: executed as ``docker exec <container> bash -c '<cmd>'``
     - A dict with ``copy`` key: file injection via ``docker cp``
 
+    When *trust* is False (the default), commands from third-party
+    registries require explicit user confirmation before executing.
+    If stdin is not a TTY, execution is refused and a RuntimeError is
+    raised directing the user to pass ``--trust``.
+
     Args:
         hosts_containers: List of (host, container_name) pairs.
         commands: Pre_exec command list from recipe.
         config_chain: Config chain for template substitution.
         ssh_kwargs: SSH connection kwargs.
         dry_run: Show what would be done without executing.
+        trust: Skip confirmation prompt (auto-trust the commands).
+        cache_dir: Effective HuggingFace cache directory on remote hosts.
+            Threaded from the launcher so disk-space failure messages
+            show the correct path rather than the ``$HOME/.cache/huggingface``
+            fallback.
 
     Raises:
-        RuntimeError: If any command fails (fail-fast).
+        RuntimeError: If any command fails (fail-fast), or if *trust*
+            is False and stdin is not a TTY.
     """
     if not commands:
         return
+
+    _confirm_hook_execution("pre_exec", commands, trust)
 
     # Build context from config chain for rendering
     ctx: dict[str, str] = {}
@@ -168,7 +227,7 @@ def run_pre_exec(
     for host, container_name in hosts_containers:
         for i, cmd in enumerate(rendered, 1):
             if isinstance(cmd, dict) and "copy" in cmd:
-                _run_copy_command(host, container_name, cmd, ssh_kwargs, dry_run, label="pre_exec[%d]" % i)
+                _run_copy_command(host, container_name, cmd, ssh_kwargs, dry_run, label="pre_exec[%d]" % i, cache_dir=cache_dir)
             elif isinstance(cmd, str):
                 _run_exec_command(host, container_name, cmd, ssh_kwargs, dry_run, label="pre_exec[%d]" % i)
             else:
@@ -182,10 +241,17 @@ def run_post_exec(
     context: dict[str, str],
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
+    trust: bool = False,
+    cache_dir: str | None = None,  # noqa: ARG001 — reserved for future copy-type post_exec entries
 ) -> None:
     """Execute post_exec commands inside the head container.
 
     Runs after server is confirmed healthy.  Sequential, fail-fast.
+
+    When *trust* is False (the default), commands from third-party
+    registries require explicit user confirmation before executing.
+    If stdin is not a TTY, execution is refused and a RuntimeError is
+    raised directing the user to pass ``--trust``.
 
     Args:
         head_host: Head node hostname.
@@ -194,12 +260,16 @@ def run_post_exec(
         context: Extended variable dict for substitution.
         ssh_kwargs: SSH connection kwargs.
         dry_run: Show what would be done without executing.
+        trust: Skip confirmation prompt (auto-trust the commands).
 
     Raises:
-        RuntimeError: If any command fails (fail-fast).
+        RuntimeError: If any command fails (fail-fast), or if *trust*
+            is False and stdin is not a TTY.
     """
     if not commands:
         return
+
+    _confirm_hook_execution("post_exec", commands, trust)
 
     rendered = render_hook_commands(commands, context)
 
@@ -338,6 +408,7 @@ def _run_copy_command(
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
     label: str = "hook",
+    cache_dir: str | None = None,
 ) -> None:
     """Execute a file copy into a container via docker cp.
 
@@ -362,11 +433,22 @@ def _run_copy_command(
         ssh_kwargs: SSH connection kwargs.
         dry_run: Show what would be done without executing.
         label: Human-readable label for log messages.
+        cache_dir: Effective HuggingFace cache directory on remote hosts.
+            Used when reporting disk-space failures so the cache-status
+            table probes the correct path.  Falls back to
+            ``"$HOME/.cache/huggingface"`` when ``None``.
 
     Raises:
         RuntimeError: If the copy fails.
     """
     from sparkrun.orchestration.primitives import run_script_on_host, should_run_locally
+    from sparkrun.orchestration.transfer import (
+        TransferError,
+        TransferFailure,
+        classify_rsync_failure,
+        map_transfer_failures_detailed,
+        present_and_raise_transfer_failure,
+    )
 
     source = cmd["copy"]
     source_path = Path(source).expanduser()
@@ -396,6 +478,11 @@ def _run_copy_command(
             ssh_kwargs=ssh_kwargs,
             label=label,
         )
+        if not result.success:
+            raise TransferError(
+                "%s copy failed on %s/%s: %s" % (label, host, container_name, result.stderr[:500] if result.stderr else "(no output)")
+            )
+        return
     elif should_run_locally(host, kw.get("ssh_user")):
         # Local: docker cp directly
         script = ("set -e\ndocker exec --user root %(c)s mkdir -p %(dest)s\ndocker cp %(src)s/. %(c)s:%(dest)s/\n") % {
@@ -404,16 +491,38 @@ def _run_copy_command(
             "dest": dest,
         }
         result = run_script_on_host(host, script, ssh_kwargs=ssh_kwargs, timeout=120)
+        if not result.success:
+            raise TransferError(
+                "%s copy failed on %s/%s: %s" % (label, host, container_name, result.stderr[:500] if result.stderr else "(no output)")
+            )
     else:
-        # Remote: rsync source to temp dir, then docker cp
+        # Remote: rsync source to temp dir, then docker cp.
+        # Check steps in order so the FIRST failure (root cause) is reported,
+        # not a downstream artifact (e.g. lstat on a dir that never got created).
         from sparkrun.orchestration.ssh import run_rsync_parallel
 
-        kw = ssh_kwargs or {}
-
         remote_tmp = "/tmp/sparkrun_hook_%s" % basename
-        run_script_on_host(host, "mkdir -p %s" % remote_tmp, ssh_kwargs=ssh_kwargs, timeout=30)
+        mkdir_result = run_script_on_host(host, "mkdir -p %s" % remote_tmp, ssh_kwargs=ssh_kwargs, timeout=30)
+        _effective_cache_dir = cache_dir if cache_dir is not None else "$HOME/.cache/huggingface"
 
-        run_rsync_parallel(
+        if not mkdir_result.success:
+            # Synthesise a RemoteResult-like failure record so classify_rsync_failure
+            # can pattern-match the stderr (e.g. "No space left on device").
+            failure = TransferFailure(
+                host=host,
+                reason=classify_rsync_failure(mkdir_result),
+                detail=(mkdir_result.stderr or mkdir_result.stdout or "")[:400],
+            )
+            present_and_raise_transfer_failure(
+                [failure],
+                operation="%s copy failed" % label,
+                cache_status_hosts=[host],
+                cache_dir=_effective_cache_dir,
+                ssh_kwargs=ssh_kwargs,
+                label="copy",
+            )
+
+        rsync_results = run_rsync_parallel(
             str(source_path) + "/",
             [host],
             remote_tmp + "/",
@@ -421,6 +530,16 @@ def _run_copy_command(
             ssh_key=kw.get("ssh_key"),
             ssh_options=kw.get("ssh_options"),
         )
+        rsync_failures = map_transfer_failures_detailed(rsync_results, [host], [host])
+        if rsync_failures:
+            present_and_raise_transfer_failure(
+                rsync_failures,
+                operation="%s copy failed" % label,
+                cache_status_hosts=[host],
+                cache_dir=_effective_cache_dir,
+                ssh_kwargs=ssh_kwargs,
+                label="copy",
+            )
 
         script = ("set -e\ndocker exec --user root %(c)s mkdir -p %(dest)s\ndocker cp %(tmp)s/. %(c)s:%(dest)s/\nrm -rf %(tmp)s\n") % {
             "c": container_name,
@@ -428,11 +547,10 @@ def _run_copy_command(
             "tmp": remote_tmp,
         }
         result = run_script_on_host(host, script, ssh_kwargs=ssh_kwargs, timeout=120)
-
-    if not result.success:
-        raise RuntimeError(
-            "%s copy failed on %s/%s: %s" % (label, host, container_name, result.stderr[:500] if result.stderr else "(no output)")
-        )
+        if not result.success:
+            raise TransferError(
+                "%s copy failed on %s/%s: %s" % (label, host, container_name, result.stderr[:500] if result.stderr else "(no output)")
+            )
 
 
 def _run_delegated_copy(
@@ -455,6 +573,10 @@ def _run_delegated_copy(
         final ``docker cp`` script.
     """
     from sparkrun.orchestration.primitives import run_script_on_host
+    from sparkrun.utils.shell import safe_remote_path, validate_hostname
+
+    validate_hostname(source_host)
+    dest = safe_remote_path(dest)
 
     basename = Path(source).name
     kw = ssh_kwargs or {}

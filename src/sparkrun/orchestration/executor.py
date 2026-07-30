@@ -1,413 +1,595 @@
-"""Executor abstraction for container engine operations.
+"""Public facade for the executor subsystem.
 
-Provides ``ExecutorConfig`` (typed config from config chain resolution)
-and ``Executor`` (abstract base for container engines like Docker/Podman).
+Concrete executor implementations live under
+:mod:`sparkrun.orchestration.executors` (the package).  This module
+re-exports the ABC + config + extension point, and adds the
+resolution helpers used by both the launcher and the lifecycle
+commands (``sparkrun stop`` / ``sparkrun logs``).
 
-Runtimes call ``self.executor.*`` instead of importing ``docker.py``
-directly, making them container-engine-agnostic.
+**The unified executor path.**  This module is the only sanctioned
+entry point for selecting an :class:`Executor`.  Callers must go
+through one of:
+
+- :func:`resolve_executor` — full resolution chain (CLI → recipe →
+  runtime.default_executor() → per-executor adjustments →
+  SparkrunConfig → per-executor defaults → dataclass field defaults).
+  Used by ``core.launcher`` and the lifecycle helpers in
+  ``cli._stop_logs``.
+- :func:`get_executor` — look up a registered executor *class* by
+  ``executor_name``.  Mirrors :func:`get_runtime` / :func:`get_builder`.
+  Returns the class (not the SAF singleton) because executors carry
+  per-launch state on ``self.config``.
+- :func:`list_executors` — enumerate registered executor names.
+
+The hardcoded ``_KNOWN_EXECUTORS`` set has been retired; the set of
+valid executor selectors is now whatever SAF has discovered under the
+``sparkrun.executor`` extension point (see ``core.bootstrap``).
 """
 
 from __future__ import annotations
 
 import logging
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from typing import Mapping, TYPE_CHECKING
 
-from scitrera_app_framework.util import ext_parse_bool
+from scitrera_app_framework import Variables, get_extensions
+from scitrera_app_framework.api import EnvPlacement
 
-from sparkrun.scripts import read_script
-from sparkrun.utils import merge_env
-from sparkrun.utils.shell import b64_encode_cmd, quote
+from sparkrun.orchestration.executors._base import (
+    EXT_EXECUTOR,
+    Executor,
+    ExecutorConfig,
+    accelerator_vendor_for,
+)
+from sparkrun.orchestration.executors.docker import DOCKER_DEFAULTS, DockerExecutor
+
+if TYPE_CHECKING:
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.cluster_status import ClusterStatus
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.hardware import HostHardware
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.runtimes.base import RuntimePlugin
 
 logger = logging.getLogger(__name__)
 
-# Default executor settings for DGX Spark GPU workloads.
-# Lowest priority in the config chain: CLI → recipe → these defaults.
-EXECUTOR_DEFAULTS = {
-    "auto_remove": True,
-    "restart_policy": None,
-    "privileged": True,
-    "gpus": "all",
-    "ipc": "host",
-    "shm_size": "32gb",
-    "network": "host",
-    "user": None,
-    "security_opt": None,
-    "cap_add": None,
-    "ulimit": None,
-    "devices": None,
-    "entrypoint": None,
-}
+
+#: Alias for :data:`DockerExecutor.default_config()`.  Importable from
+#: this module so that callers and tests have a stable public name for
+#: the Docker-flavoured defaults without reaching into the
+#: implementation package.
+EXECUTOR_DEFAULTS = DOCKER_DEFAULTS
 
 
-@dataclass
-class ExecutorConfig:
-    """Typed view of resolved executor settings.
+__all__ = [
+    "EXT_EXECUTOR",
+    "EXECUTOR_DEFAULTS",
+    "DOCKER_DEFAULTS",
+    "Executor",
+    "ExecutorConfig",
+    "ExecutorUnavailableError",
+    "accelerator_vendor_for",
+    "cluster_status_scope",
+    "get_executor",
+    "list_executors",
+    "query_status_for_cluster",
+    "resolve_executor",
+]
 
-    Constructed from a config chain (or plain dict) after CLI → recipe →
-    defaults layering.
+
+# ---------------------------------------------------------------------------
+# Status introspection (cluster-scoped, cross-executor merge).
+# ---------------------------------------------------------------------------
+
+
+def _resolve_status_scope(
+    cluster: "ClusterDefinition | None",
+    *,
+    executor: str | None = None,
+    config: "SparkrunConfig | None" = None,
+    v: Variables | None = None,
+) -> tuple[str, str]:
+    """Return ``(scope, default_executor_name)`` for *cluster*'s status query.
+
+    The scope is the :attr:`Executor.status_scope` of the executor the cluster
+    would launch with — resolved via the canonical
+    :func:`resolve_executor_name` chain (an explicit *executor* override wins,
+    then the cluster's pin, then config/defaults).  So an SSH cluster resolves
+    to ``"host"`` (docker/local), a Modal cluster to ``"modal"``, a k8s cluster
+    to ``"k8s"``.  Raises whatever ``resolve_executor_name`` raises when the
+    chosen executor is unknown / gated off — callers degrade gracefully.
+    """
+    cli_overrides = {"executor": executor} if executor else None
+    name = _resolve_executor_name(cli_overrides=cli_overrides, recipe=None, cluster=cluster, runtime=None, config=config, v=v)
+    return getattr(get_executor(name, v), "status_scope", "host"), name
+
+
+def cluster_status_scope(
+    cluster: "ClusterDefinition | None",
+    *,
+    executor: str | None = None,
+    config: "SparkrunConfig | None" = None,
+    v: Variables | None = None,
+) -> str:
+    """Return the status-discovery scope for *cluster* (see :func:`_resolve_status_scope`)."""
+    return _resolve_status_scope(cluster, executor=executor, config=config, v=v)[0]
+
+
+def query_status_for_cluster(
+    cluster: "ClusterDefinition | None",
+    hosts: list[str],
+    *,
+    executor: str | None = None,
+    ssh_kwargs: dict | None = None,
+    host_hardware: "Mapping[str, HostHardware] | None" = None,
+    config: "SparkrunConfig | None" = None,
+    v: Variables | None = None,
+) -> "ClusterStatus":
+    """Query every enabled executor on the cluster's status substrate, merged.
+
+    The single status source behind :func:`sparkrun.api.status`.  Resolves the
+    cluster's *scope* (:func:`cluster_status_scope`), then queries **all
+    enabled executors sharing that scope** and merges their snapshots — they
+    inspect disjoint state on the same substrate, so the merge is a complete
+    view.  For an SSH cluster that's docker + local (native pidfile workloads
+    are invisible to ``docker ps`` and vice-versa); for a provider cluster
+    (``modal`` / ``k8s``) it's that provider alone.
+
+    The cluster's default executor is queried **first**, so it wins any
+    per-``cluster_id`` collision.  A single failing executor is skipped (never
+    breaks the whole status).  When the cluster's executor can't be resolved
+    (e.g. a provider executor whose plugin / feature flag is unavailable), the
+    query degrades to an empty snapshot with a logged warning rather than
+    raising.
+    """
+    from sparkrun.core.cluster_status import ClusterStatus, empty_status
+
+    try:
+        scope, default_name = _resolve_status_scope(cluster, executor=executor, config=config, v=v)
+    except Exception:
+        logger.warning(
+            "Could not resolve an executor for status on this cluster; returning an empty snapshot",
+            exc_info=True,
+        )
+        return empty_status(list(hosts))
+
+    # Enabled executors sharing the cluster's scope (list_executors already
+    # excludes feature-gated-off executors).  Default executor first
+    # (authoritative on collision), the rest in a deterministic order.
+    try:
+        enabled = list_executors(v)
+    except Exception:
+        enabled = [default_name]
+    in_scope = [n for n in enabled if getattr(get_executor(n, v), "status_scope", "host") == scope]
+    ordered = [default_name] + sorted(n for n in in_scope if n != default_name)
+
+    snapshots: list[ClusterStatus] = []
+    for name in ordered:
+        try:
+            ex = resolve_executor(cluster=cluster, cli_overrides={"executor": name}, rootless=False, auto_user=False, config=config, v=v)
+            snapshots.append(ex.query_status(list(hosts), ssh_kwargs=ssh_kwargs, host_hardware=host_hardware))
+        except Exception:  # noqa: BLE001 - one backend failing never breaks status
+            logger.debug("Status query via executor %r failed; skipping", name, exc_info=True)
+
+    if not snapshots:
+        return empty_status(list(hosts))
+    return ClusterStatus.merge(snapshots)
+
+
+# ---------------------------------------------------------------------------
+# Plugin lookup (mirrors get_runtime / get_builder).
+# ---------------------------------------------------------------------------
+
+
+def get_executor(name: str, v: Variables | None = None) -> type[Executor]:
+    """Look up a registered :class:`Executor` *class* by ``executor_name``.
+
+    Unlike :func:`get_runtime`/:func:`get_builder`, this returns the
+    **class** rather than the SAF singleton instance: executors carry
+    per-launch state on ``self.config``, so callers always instantiate
+    a fresh one with the resolved config.
+
+    Falls back to a hard-coded mapping when SAF isn't initialized
+    (e.g. test harnesses that build executors directly without going
+    through ``init_sparkrun``).
+    """
+    if v is None:
+        try:
+            from sparkrun.core.bootstrap import get_variables
+
+            v = get_variables()
+        except Exception:  # pragma: no cover - degraded path
+            v = None
+
+    if v is not None:
+        try:
+            all_executors = get_extensions(EXT_EXECUTOR, v=v)
+            for _plugin_name, plugin in all_executors.items():
+                if plugin.executor_name == name:
+                    return type(plugin)
+        except Exception:
+            logger.debug("Falling back to static executor lookup for %r", name, exc_info=True)
+
+    # Static fallback — keeps :func:`resolve_executor` working in test
+    # paths and other harnesses that bypass the full ``init_sparkrun``
+    # plugin-discovery bootstrap.
+    if name == "docker":
+        return DockerExecutor
+    if name == "local":
+        from sparkrun.orchestration.executors.local import LocalExecutor
+
+        return LocalExecutor
+    if name == "k8s":
+        from sparkrun.orchestration.executors.k8s import K8sExecutor
+
+        return K8sExecutor
+
+    raise ValueError("Unknown executor: %r" % name)
+
+
+def list_executors(v: Variables | None = None) -> list[str]:
+    """Return registered executor names (sorted)."""
+    if v is None:
+        from sparkrun.core.bootstrap import get_variables
+
+        v = get_variables()
+    all_executors = get_extensions(EXT_EXECUTOR, v=v)
+    return sorted(plugin.executor_name for plugin in all_executors.values())
+
+
+# ---------------------------------------------------------------------------
+# Resolution helpers (chain construction).
+# ---------------------------------------------------------------------------
+
+
+def _coerce_str(value) -> str | None:
+    """Return *value* coerced to ``str`` iff it's a real string-ish.
+
+    Guards against MagicMock / other non-string objects sneaking
+    through the chain (common in launcher unit tests).
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        return value.decode() if isinstance(value, bytes) else value
+    return None
+
+
+def _coerce_dict(value) -> dict:
+    """Return *value* iff it's a real dict, else ``{}``.
+
+    Guards against MagicMock attributes returning auto-magic stand-ins.
+    """
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _recipe_exec_dict(recipe: "Recipe | None") -> dict:
+    """Flatten a recipe's executor selector + config into a chain layer."""
+    if recipe is None:
+        return {}
+    cfg = _coerce_dict(getattr(recipe, "executor_config", None))
+    selector = _coerce_str(getattr(recipe, "executor", "")) or ""
+    if selector and "executor" not in cfg:
+        cfg["executor"] = selector
+    return cfg
+
+
+def _cluster_exec_dict(cluster: "ClusterDefinition | None") -> dict:
+    """Flatten a cluster definition's executor selector + config into a chain layer.
+
+    Cluster-level executor settings sit between the recipe and the runtime
+    in both the name-selection and config chains.  Rationale: a cluster's
+    declared executor (e.g. ``executor: k8s``) is sharper than the
+    runtime's generic default but should still defer to a recipe that
+    explicitly pins a different executor.
+    """
+    if cluster is None:
+        return {}
+    cfg = _coerce_dict(getattr(cluster, "executor_config", None))
+    selector = _coerce_str(getattr(cluster, "executor", "")) or ""
+    if selector and "executor" not in cfg:
+        cfg["executor"] = selector
+    return cfg
+
+
+def _builder_exec_dict(recipe: "Recipe | None", v: Variables | None) -> dict:
+    """Contribute ``{"env_file": ...}`` from the recipe's builder, or ``{}``.
+
+    When a recipe names a builder whose :meth:`BuilderPlugin.default_env_file`
+    returns a non-empty path (e.g. an environment builder that produced a venv
+    activation script), that path becomes the default executor ``env_file``.
+    An explicit ``executor_config.env_file`` in the recipe/CLI wins (this layer
+    sits below the recipe layer); the builder default beats the cluster,
+    runtime, and config layers.  The builder outranks the cluster because an
+    environment builder's ``env_file`` (e.g. venv activation) is *essential* to
+    running the workload — a cluster's generic ``env_file`` must not silently
+    suppress it and leave the serve command under the wrong interpreter.  Any
+    error (unknown builder, resolution failure) contributes nothing and never
+    breaks resolution.
+    """
+    if recipe is None:
+        return {}
+    builder_name = _coerce_str(getattr(recipe, "builder", None))
+    if not builder_name:
+        return {}
+    try:
+        from sparkrun.core.bootstrap import get_builder
+
+        builder = get_builder(builder_name, v)
+        env_file = _coerce_str(builder.default_env_file(recipe))
+        if env_file:
+            return {"env_file": env_file}
+    except Exception:
+        logger.debug("Builder env_file resolution failed for %r", builder_name, exc_info=True)
+    return {}
+
+
+def _runtime_exec_dict(runtime: "RuntimePlugin | None") -> dict:
+    """Flatten ``runtime.default_executor()`` into a chain layer."""
+    if runtime is None:
+        return {}
+    fn = getattr(runtime, "default_executor", None)
+    if not callable(fn):
+        return {}
+    try:
+        val = fn()
+    except Exception:
+        return {}
+    val = _coerce_str(val)
+    return {"executor": val} if val else {}
+
+
+def _runtime_exec_config_dict(runtime: "RuntimePlugin | None") -> dict:
+    """Flatten ``runtime.default_executor_config()`` into a chain layer."""
+    if runtime is None:
+        return {}
+    fn = getattr(runtime, "default_executor_config", None)
+    if not callable(fn):
+        return {}
+    return _coerce_dict(fn())
+
+
+def _config_exec_dict(config: "SparkrunConfig | None") -> dict:
+    """Flatten SparkrunConfig executor defaults into a chain layer."""
+    if config is None:
+        return {}
+    cfg = _coerce_dict(getattr(config, "executor_config", None))
+    selector = _coerce_str(getattr(config, "default_executor", None))
+    if selector and "executor" not in cfg:
+        cfg["executor"] = selector
+    return cfg
+
+
+def _known_executor_names(v: Variables | None = None) -> set[str]:
+    """Return the set of executor names registered via SAF.
+
+    The static fallback covers test paths that bypass ``init_sparkrun``
+    (and the SAF registry).  Mirrors :func:`get_executor`'s fallback so
+    the two stay in lockstep.
+    """
+    if v is None:
+        try:
+            from sparkrun.core.bootstrap import get_variables
+
+            v = get_variables()
+        except Exception:  # pragma: no cover - degraded path
+            v = None
+
+    if v is not None:
+        try:
+            all_executors = get_extensions(EXT_EXECUTOR, v=v)
+            names = {plugin.executor_name for plugin in all_executors.values() if getattr(plugin, "executor_name", "")}
+            if names:
+                return names
+        except Exception:
+            logger.debug("Falling back to static executor name set", exc_info=True)
+
+    # Static fallback (matches get_executor's hardcoded branch).
+    return {"docker", "local", "k8s"}
+
+
+def _resolve_executor_name(
+    *,
+    cli_overrides: dict | None,
+    recipe: "Recipe | None",
+    cluster: "ClusterDefinition | None",
+    runtime: "RuntimePlugin | None",
+    config: "SparkrunConfig | None",
+    v: Variables | None = None,
+) -> str:
+    """Pick the executor name from the chain (CLI → recipe → cluster → runtime → config).
+
+    When no layer names an executor, falls back to the baseline default (see
+    :func:`_default_executor_name` — ``"docker"`` unless it's been disabled).
+    When a layer *does* name one that isn't available — either an unknown
+    selector or a real executor gated off by a feature flag — this raises
+    :class:`ExecutorUnavailableError` rather than silently downgrading to
+    docker. Running an explicitly-requested workload on the wrong executor
+    is worse than failing loudly.
+    """
+    known: set[str] | None = None
+    for layer in (
+        cli_overrides,
+        _recipe_exec_dict(recipe),
+        _cluster_exec_dict(cluster),
+        _runtime_exec_dict(runtime),
+        _config_exec_dict(config),
+    ):
+        if not layer:
+            continue
+        name = layer.get("executor") or layer.get("executor_type")
+        name = _coerce_str(name)
+        if not name:
+            continue
+        name = name.strip().lower()
+        if known is None:
+            known = _known_executor_names(v)
+        if name in known:
+            return name
+        raise _executor_unavailable_error(name, known, config)
+    return _default_executor_name(known, v, config)
+
+
+#: The historical baseline executor, used when no layer names one.
+_DEFAULT_EXECUTOR = "docker"
+
+
+def _default_executor_name(known: set[str] | None, v: Variables | None, config: "SparkrunConfig | None") -> str:
+    """Baseline executor name when no chain layer names one.
+
+    Historically always ``"docker"``.  Now that docker gates like every other
+    executor (``executor.docker``, on by default), a disable is honored: return
+    docker when it's enabled, else the sole enabled executor (the natural pick
+    when a host disables docker and enables exactly one alternative), else raise
+    so the user names one explicitly — never silently run on a backend the
+    operator turned off.
+
+    Note the static ``_known_executor_names`` fallback (SAF not initialized —
+    test harnesses) always includes docker, so this is a no-op there; the
+    fallback only diverges once SAF is up *and* ``executor.docker`` is off.
+    """
+    if known is None:
+        known = _known_executor_names(v)
+    if _DEFAULT_EXECUTOR in known:
+        return _DEFAULT_EXECUTOR
+    if len(known) == 1:
+        return next(iter(known))
+    raise ExecutorUnavailableError(
+        "The default executor %r is disabled and no executor is named. Set one "
+        "explicitly via a recipe/cluster `executor:` selector or `default_executor` "
+        "in config. Available: %s" % (_DEFAULT_EXECUTOR, sorted(known))
+    )
+
+
+def resolve_executor_name(
+    *,
+    cli_overrides: dict | None = None,
+    recipe: "Recipe | None" = None,
+    cluster: "ClusterDefinition | None" = None,
+    runtime: "RuntimePlugin | None" = None,
+    config: "SparkrunConfig | None" = None,
+    v: Variables | None = None,
+) -> str:
+    """Public: the executor name the resolution chain selects (no construction).
+
+    Thin wrapper over :func:`_resolve_executor_name` for callers that need
+    only the *name* to branch on (e.g. ``api.run`` deciding whether to take
+    the k8s JobSet path) without building the executor.  Raises
+    :class:`ExecutorUnavailableError` for an explicitly-named-but-unavailable
+    executor, exactly like the full resolution.
+    """
+    return _resolve_executor_name(cli_overrides=cli_overrides, recipe=recipe, cluster=cluster, runtime=runtime, config=config, v=v)
+
+
+class ExecutorUnavailableError(ValueError):
+    """Raised when an explicitly-requested executor isn't available.
+
+    Subclasses :class:`ValueError` so existing ``except ValueError`` handlers
+    around executor resolution keep working.
     """
 
-    auto_remove: bool = True
-    restart_policy: str | None = None
-    privileged: bool = True
-    gpus: str = "all"
-    ipc: str = "host"
-    shm_size: str = "25gb"
-    network: str = "host"
-    user: str | None = None
-    security_opt: list[str] | None = None
-    cap_add: list[str] | None = None
-    ulimit: list[str] | None = None
-    devices: list[str] | None = None
-    memory_limit: str | None = None
-    labels: list[str] | None = None
-    entrypoint: str | None = None
 
-    @classmethod
-    def from_chain(cls, chain) -> ExecutorConfig:
-        """Build from a config chain or plain dict."""
-        raw_sec = chain.get("security_opt")
-        if isinstance(raw_sec, str):
-            raw_sec = [raw_sec]
-        raw_cap = chain.get("cap_add")
-        if isinstance(raw_cap, str):
-            raw_cap = [raw_cap]
-        raw_ulimit = chain.get("ulimit")
-        if isinstance(raw_ulimit, str):
-            raw_ulimit = [raw_ulimit]
-        raw_devices = chain.get("devices")
-        if isinstance(raw_devices, str):
-            raw_devices = [raw_devices]
-        raw_labels = chain.get("labels")
-        if isinstance(raw_labels, str):
-            raw_labels = [raw_labels]
+def _executor_unavailable_error(name: str, known: set[str], config: "SparkrunConfig | None") -> ExecutorUnavailableError:
+    """Build a helpful :class:`ExecutorUnavailableError` for selector *name*.
 
-        # Fallback to EXECUTOR_DEFAULTS for None values. With Variables,
-        # falsy values like False/0 are preserved correctly, but None
-        # still means "not set" and should fall back.
-        def _get(key):
-            v = chain.get(key)
-            val = v if v is not None else EXECUTOR_DEFAULTS.get(key)
-            logger.debug("ExecutorConfig resolve: %s=%r (from chain: %r)", key, val, v)
-            return val
-
-        return cls(
-            auto_remove=ext_parse_bool(_get("auto_remove")),
-            restart_policy=chain.get("restart_policy") or None,
-            privileged=ext_parse_bool(_get("privileged")),
-            gpus=str(_get("gpus")),
-            ipc=str(_get("ipc")),
-            shm_size=str(_get("shm_size")),
-            network=str(_get("network")),
-            user=chain.get("user") or None,
-            security_opt=raw_sec or None,
-            cap_add=raw_cap or None,
-            ulimit=raw_ulimit or None,
-            devices=raw_devices or None,
-            memory_limit=chain.get("memory_limit") or None,
-            labels=raw_labels or None,
-            # NOTE: do not collapse with ``or None`` -- an empty string is a
-            # meaningful value here ("" clears the image's ENTRYPOINT), distinct
-            # from None ("not set", leave the image's ENTRYPOINT untouched).
-            entrypoint=chain.get("entrypoint"),
-        )
-
-    def __post_init__(self):
-        # Docker does not allow --rm with --restart
-        if self.restart_policy:
-            self.auto_remove = False
-
-
-class Executor(ABC):
-    """Abstract base for container engine executors.
-
-    Low-level methods (abstract) generate engine-specific command strings.
-    High-level methods (concrete) compose scripts from low-level methods
-    and bash templates.
+    Distinguishes a real-but-gated executor (actionable: enable the flag)
+    from an unknown selector (typo / not installed).
     """
-
-    def __init__(self, config: ExecutorConfig | None = None):
-        self.config = config or ExecutorConfig()
-
-    # --- Low-level command generators (abstract) ---
-
-    @abstractmethod
-    def run_cmd(
-        self,
-        image: str,
-        command: str = "",
-        container_name: str | None = None,
-        detach: bool = True,
-        env: dict[str, str] | None = None,
-        volumes: dict[str, str] | None = None,
-        extra_opts: list[str] | None = None,
-    ) -> str:
-        """Generate a container run command string."""
-        ...
-
-    @abstractmethod
-    def exec_cmd(
-        self,
-        container_name: str,
-        command: str,
-        detach: bool = False,
-        env: dict[str, str] | None = None,
-    ) -> str:
-        """Generate a container exec command string."""
-        ...
-
-    @abstractmethod
-    def stop_cmd(self, container_name: str, force: bool = True) -> str:
-        """Generate a container stop/remove command string."""
-        ...
-
-    @abstractmethod
-    def logs_cmd(
-        self,
-        container_name: str,
-        follow: bool = False,
-        tail: int | None = None,
-    ) -> str:
-        """Generate a container logs command string."""
-        ...
-
-    @abstractmethod
-    def inspect_exists_cmd(self, image: str) -> str:
-        """Generate a command to check if an image exists locally."""
-        ...
-
-    @abstractmethod
-    def pull_cmd(self, image: str) -> str:
-        """Generate an image pull command string."""
-        ...
-
-    # --- Naming helpers (concrete, shared across executors) ---
-
-    @staticmethod
-    def container_name(cluster_id: str, role: str = "head") -> str:
-        """Generate a deterministic container name: ``{cluster_id}_{role}``."""
-        return "%s_%s" % (cluster_id, role)
-
-    @staticmethod
-    def node_container_name(cluster_id: str, rank: int) -> str:
-        """Generate a ranked node container name: ``{cluster_id}_node_{rank}``."""
-        return "%s_node_%d" % (cluster_id, rank)
-
-    @staticmethod
-    def enumerate_containers(cluster_id: str, num_hosts: int) -> list[str]:
-        """Return all possible container names for a cluster.
-
-        Covers solo, Ray (head/worker), and native (node_N) patterns.
-        """
-        names = [
-            "%s_solo" % cluster_id,
-            "%s_head" % cluster_id,
-            "%s_worker" % cluster_id,
-        ]
-        for rank in range(num_hosts):
-            names.append("%s_node_%d" % (cluster_id, rank))
-        return names
-
-    # --- High-level script generators (concrete) ---
-
-    def generate_launch_script(
-        self,
-        image: str,
-        container_name: str,
-        command: str,
-        env: dict[str, str] | None = None,
-        volumes: dict[str, str] | None = None,
-        nccl_env: dict[str, str] | None = None,
-        detach: bool = True,
-        extra_docker_opts: list[str] | None = None,
-    ) -> str:
-        """Generate a script that cleans up then launches a container.
-
-        Absorbs ``scripts.py::generate_container_launch_script``.
-        """
-
-        all_env = merge_env(nccl_env, env)
-        cleanup = self.stop_cmd(container_name)
-        run = self.run_cmd(
-            image=image,
-            command=command,
-            container_name=container_name,
-            detach=detach,
-            env=all_env,
-            volumes=volumes,
-            extra_opts=extra_docker_opts,
+    gate = _gated_off_feature(name, config)
+    if gate is not None:
+        return ExecutorUnavailableError(
+            "Executor %r is disabled by feature flag %r. Enable it with "
+            "`sparkrun setup features enable %s`. Be careful that you only do that "
+            "if you know what you're doing..." % (name, gate, gate)
         )
+    return ExecutorUnavailableError("Unknown executor %r. Available: %s" % (name, sorted(known)))
 
-        template = read_script("container_launch.sh")
-        return template.format(
-            container_name=quote(container_name),
-            image=quote(image),
-            cleanup_cmd=cleanup,
-            run_cmd=run,
-        )
 
-    def generate_exec_serve_script(
-        self,
-        container_name: str,
-        serve_command: str,
-        env: dict[str, str] | None = None,
-        detached: bool = True,
-    ) -> str:
-        """Generate a script that executes the serve command inside a running container.
+def _gated_off_feature(name: str, config: "SparkrunConfig | None") -> str | None:
+    """Return the feature flag gating executor *name* off, or ``None``.
 
-        Absorbs ``scripts.py::generate_exec_serve_script``.
-        """
+    Used to turn the generic "unknown executor" warning into an actionable
+    "disabled by feature flag" message when a user pins a known-but-gated
+    executor (e.g. ``executor: k8s`` on the stable channel).
+    """
+    from sparkrun.core.features import get_feature, is_feature_enabled
 
-        env_exports = ""
-        if env:
-            for key, value in sorted(env.items()):
-                env_exports += "export %s=%s; " % (key, quote(str(value)))
+    feature = "executor.%s" % name
+    if get_feature(feature) is None:
+        return None
+    if is_feature_enabled(feature, config=config):
+        return None  # enabled — absence must be a different problem
+    return feature
 
-        full_cmd = "%s%s" % (env_exports, serve_command)
 
-        # Base64 encode the command to avoid all bash string-escaping/quoting bugs
-        # when passing it into `docker exec ... bash -c "..."`
-        b64_cmd = b64_encode_cmd(full_cmd)
+def resolve_executor(
+    *,
+    recipe: "Recipe | None" = None,
+    cluster: "ClusterDefinition | None" = None,
+    runtime: "RuntimePlugin | None" = None,
+    config: "SparkrunConfig | None" = None,
+    cli_overrides: dict | None = None,
+    rootless: bool = True,
+    auto_user: bool = True,
+    v: Variables | None = None,
+) -> Executor:
+    """Single entry point that produces an :class:`Executor` for a launch.
 
-        script_name = "exec_serve_detached.sh" if detached else "exec_serve_foreground.sh"
-        template = read_script(script_name)
-        return template.format(
-            container_name=quote(container_name),
-            b64_cmd=b64_cmd,
-        )
+    Layers the resolution chain (highest → lowest precedence):
 
-    def generate_ray_head_script(
-        self,
-        image: str,
-        container_name: str,
-        ray_port: int = 46379,
-        dashboard_port: int = 8265,
-        dashboard: bool = False,
-        env: dict[str, str] | None = None,
-        volumes: dict[str, str] | None = None,
-        nccl_env: dict[str, str] | None = None,
-        extra_docker_opts: list[str] | None = None,
-    ) -> str:
-        """Generate a script that starts a Ray head node in a container.
+        1. ``cli_overrides``
+        2. ``recipe.executor`` + ``recipe.executor_config``
+        3. ``builder.default_env_file()``  *(``env_file`` default only)*
+        4. ``cluster.executor`` + ``cluster.executor_config``
+        5. ``runtime.default_executor()``  *(name selection only)*
+        6. ``cls.apply_runtime_adjustments(rootless=, auto_user=)``
+        7. ``runtime.default_executor_config()``
+        8. ``config.default_executor`` + ``config.executor_config``
+        9. ``cls.default_config()``
+        10. :class:`ExecutorConfig` dataclass field defaults
 
-        Absorbs ``scripts.py::generate_ray_head_script``.
-        """
+    The cluster layer sits between the recipe (workload-specific) and
+    the runtime/config (generic) so a cluster's standing preferences
+    (e.g. ``executor: k8s``, ``executor_config.shm_size: 16g``) govern
+    unless a sharper layer overrides.  The builder's ``env_file`` default
+    sits just above the cluster: an environment builder's activation
+    script is essential to running the workload, so a cluster's generic
+    ``env_file`` must not suppress it (recipe/CLI still win).  Note the
+    builder layer contributes only ``env_file`` — never the executor name,
+    which is resolved separately by :func:`_resolve_executor_name`.
 
-        all_env = merge_env({"RAY_memory_monitor_refresh_ms": "0"}, nccl_env, env)
+    The selected executor class comes from :func:`get_executor` (SAF
+    plugin registry); the resulting :class:`ExecutorConfig` is built
+    by :meth:`ExecutorConfig.from_chain`.  Returns a fresh
+    per-launch instance.
+    """
+    name = _resolve_executor_name(
+        cli_overrides=cli_overrides,
+        recipe=recipe,
+        cluster=cluster,
+        runtime=runtime,
+        config=config,
+        v=v,
+    )
+    cls = get_executor(name, v)
 
-        dashboard_flags = ""
-        if dashboard:
-            dashboard_flags = "--include-dashboard=True --dashboard-host 0.0.0.0 --dashboard-port %d " % dashboard_port
-
-        cleanup = self.stop_cmd(container_name)
-        run = self.run_cmd(
-            image=image,
-            command=("ray start --block --head --port %d --node-ip-address $NODE_IP %s--disable-usage-stats" % (ray_port, dashboard_flags)),
-            container_name=container_name,
-            detach=True,
-            env=all_env,
-            volumes=volumes,
-            extra_opts=extra_docker_opts,
-        )
-
-        template = read_script("ray_head.sh")
-        return template.format(
-            cleanup_cmd=cleanup,
-            run_cmd=run,
-        )
-
-    def generate_ray_worker_script(
-        self,
-        image: str,
-        container_name: str,
-        head_ip: str,
-        ray_port: int = 46379,
-        env: dict[str, str] | None = None,
-        volumes: dict[str, str] | None = None,
-        nccl_env: dict[str, str] | None = None,
-        extra_docker_opts: list[str] | None = None,
-    ) -> str:
-        """Generate a script that starts a Ray worker node.
-
-        Absorbs ``scripts.py::generate_ray_worker_script``.
-        """
-
-        all_env = merge_env({"RAY_memory_monitor_refresh_ms": "0"}, nccl_env, env)
-
-        cleanup = self.stop_cmd(container_name)
-        run = self.run_cmd(
-            image=image,
-            command=("ray start --block --address=%s:%d --node-ip-address $NODE_IP" % (head_ip, ray_port)),
-            container_name=container_name,
-            detach=True,
-            env=all_env,
-            volumes=volumes,
-            extra_opts=extra_docker_opts,
-        )
-
-        template = read_script("ray_worker.sh")
-        return template.format(
-            cleanup_cmd=cleanup,
-            run_cmd=run,
-            head_ip=head_ip,
-            ray_port=ray_port,
-        )
-
-    def generate_node_script(
-        self,
-        image: str,
-        container_name: str,
-        serve_command: str,
-        label: str = "node",
-        env: dict[str, str] | None = None,
-        volumes: dict[str, str] | None = None,
-        nccl_env: dict[str, str] | None = None,
-        extra_docker_opts: list[str] | None = None,
-    ) -> str:
-        """Generate a script that launches a container with a direct entrypoint command.
-
-        Unlike the sleep-infinity + exec pattern used in solo mode, the
-        serve command runs as the container's entrypoint.  Used for native
-        and RPC cluster nodes.
-
-        Absorbs ``base.py::_generate_node_script``.
-        """
-
-        all_env = merge_env(nccl_env, env)
-        cleanup = self.stop_cmd(container_name)
-        run = self.run_cmd(
-            image=image,
-            command=serve_command,
-            container_name=container_name,
-            detach=True,
-            env=all_env,
-            volumes=volumes,
-            extra_opts=extra_docker_opts,
-        )
-
-        return (
-            "#!/bin/bash\n"
-            "set -uo pipefail\n"
-            "\n"
-            "printf 'Cleaning up existing container: %%s\\n' %(name)s\n"
-            "%(cleanup)s\n"
-            "\n"
-            "printf 'Launching %%s: %%s\\n' %(label)s %(name)s\n"
-            "%(run_cmd)s\n"
-            "\n"
-            "# Verify container started\n"
-            "sleep 1\n"
-            "if docker ps --format '{{.Names}}' | grep -q '^%(name)s$'; then\n"
-            "    printf 'Container %%s launched successfully\\n' %(name)s\n"
-            "else\n"
-            "    printf 'ERROR: Container %%s failed to start\\n' %(name)s >&2\n"
-            "    docker logs %(name)s 2>&1 | tail -20 || true\n"
-            "    exit 1\n"
-            "fi\n"
-        ) % {
-            "name": quote(container_name),
-            "cleanup": cleanup,
-            "run_cmd": run,
-            "label": quote(label),
-        }
+    chain = Variables(
+        sources=(
+            cli_overrides or {},
+            _recipe_exec_dict(recipe),
+            _builder_exec_dict(recipe, v),
+            _cluster_exec_dict(cluster),
+            _runtime_exec_dict(runtime),
+            cls.apply_runtime_adjustments(rootless=rootless, auto_user=auto_user),
+            _runtime_exec_config_dict(runtime),
+            _config_exec_dict(config),
+            cls.default_config(),
+        ),
+        env_placement=EnvPlacement.IGNORED,
+    )
+    exec_cfg = ExecutorConfig.from_chain(chain)
+    executor = cls(exec_cfg)
+    # Post-construction enrichment that needs the SparkrunConfig / Variables
+    # the executor-agnostic chain can't carry (e.g. the k8s executor
+    # resolving its kubectl binary from sparkrun's managed cache).
+    executor.finalize_config(config=config, v=v)
+    return executor

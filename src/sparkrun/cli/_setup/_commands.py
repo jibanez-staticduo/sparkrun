@@ -10,6 +10,7 @@ from .._common import (
     _detect_shell,
     _get_cluster_manager,
     _require_uv,
+    _get_context,
     resolve_cluster_config,
     _resolve_setup_context,
     _shell_rc_file,
@@ -54,12 +55,22 @@ def setup_completion(ctx, shell):
 
     completion_var = "_SPARKRUN_COMPLETE"
 
+    # Resolve the absolute path to the installed `sparkrun` so the completion
+    # snippet doesn't depend on PATH ordering in the shell rc file (issue #198).
+    # shutil.which() returns what the shell itself resolves -- typically the
+    # stable ~/.local/bin/sparkrun shim -- rather than an internal uv
+    # version-specific venv path. Fall back to the bare command if unresolved.
+    from sparkrun.utils.shell import quote
+    import shutil
+
+    sparkrun_cmd = quote(shutil.which("sparkrun") or "sparkrun")
+
     if shell == "bash":
-        snippet = 'eval "$(%s=bash_source sparkrun)"' % completion_var
+        snippet = 'eval "$(%s=bash_source %s)"' % (completion_var, sparkrun_cmd)
     elif shell == "zsh":
-        snippet = 'eval "$(%s=zsh_source sparkrun)"' % completion_var
+        snippet = 'eval "$(%s=zsh_source %s)"' % (completion_var, sparkrun_cmd)
     elif shell == "fish":
-        snippet = "%s=fish_source sparkrun | source" % completion_var
+        snippet = "%s=fish_source %s | source" % (completion_var, sparkrun_cmd)
 
     # Check if already installed
     if rc_file.exists():
@@ -106,9 +117,8 @@ def setup_install(ctx, shell, no_update_registries, stable, beta, alpha, yolo):
 
     from sparkrun.cli._self_update import channel_from_flags, install_argv
     from sparkrun.core.channels import CHANNEL_STABLE
-    from sparkrun.core.config import SparkrunConfig
 
-    config = SparkrunConfig()
+    config = _get_context(ctx).config
     requested = channel_from_flags(stable, beta, alpha, yolo)
     channel = requested if requested is not None else config.self_update_channel
 
@@ -194,9 +204,15 @@ def setup_update(ctx, no_update_registries, stable, beta, alpha, yolo):
         update_argv,
         warn_if_downgrade,
     )
-    from sparkrun.core.config import SparkrunConfig
 
-    config = SparkrunConfig()
+    # Import telemetry NOW, before a possible cross-version downgrade overwrites
+    # the on-disk package mid-run and makes the module unavailable.
+    try:
+        from sparkrun.telemetry import emit_update_event
+    except Exception:
+        emit_update_event = None
+
+    config = _get_context(ctx).config
     current = config.self_update_channel
     requested = channel_from_flags(stable, beta, alpha, yolo)
     channel = requested if requested is not None else current
@@ -220,7 +236,8 @@ def setup_update(ctx, no_update_registries, stable, beta, alpha, yolo):
         click.echo("Switching to the %s channel..." % channel)
 
     old_identity = capture_old_identity()
-    click.echo("Checking for updates (current: %s)..." % old_identity[0])
+    old_version = old_identity[0]
+    click.echo("Checking for updates (current: %s)..." % old_version)
     result = subprocess.run(
         install_argv(uv, channel) if switching else update_argv(uv, channel),
         capture_output=True,
@@ -233,7 +250,9 @@ def setup_update(ctx, no_update_registries, stable, beta, alpha, yolo):
     config.set_self_update_channel(channel)
     # The running process still has the old module cached, so ask the newly
     # installed binary for its identity (version for stable, commit for git).
-    click.echo(describe_change(channel, old_identity, new_binary_identity()))
+    new_identity = new_binary_identity()
+    new_version = new_identity[0]
+    click.echo(describe_change(channel, old_identity, new_identity))
 
     # Update recipe registries from the newly installed binary — the
     # running process still has old code, so we must shell out.
@@ -247,10 +266,26 @@ def setup_update(ctx, no_update_registries, stable, beta, alpha, yolo):
         if reg_result.returncode != 0:
             click.echo("Warning: registry update failed (non-fatal).", err=True)
 
+    if emit_update_event is not None:
+        try:
+            emit_update_event(
+                config,
+                command="sparkrun setup update",
+                old_version=old_version,
+                new_version=new_version,
+                upgraded=True,
+                self_upgrade_attempted=True,
+                channel=channel,
+                requested_channel=requested,
+            )
+        except Exception:
+            pass  # best-effort: telemetry must never break `setup update`
+
 
 @setup.command("version", hidden=True)
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable version identity (version, channel, commit)")
-def setup_version(as_json):
+@click.pass_context
+def setup_version(ctx, as_json):
     """Print the installed sparkrun version identity.
 
     Hidden helper used by the self-update flow to compare builds across a uv
@@ -258,15 +293,180 @@ def setup_version(as_json):
     """
     import json as _json
 
-    from sparkrun.core.config import SparkrunConfig
     from sparkrun.core.version import display_version, installed_identity
 
-    config = SparkrunConfig()
+    config = _get_context(ctx).config
     base, commit = installed_identity()
     if as_json:
         click.echo(_json.dumps({"version": base, "channel": config.self_update_channel, "commit": commit}))
     else:
         click.echo(display_version(config, base))
+
+
+@setup.command("telemetry")
+@click.option("--enable", "enable", is_flag=True, help="Enable anonymous telemetry in config")
+@click.option("--disable", "disable", is_flag=True, help="Disable anonymous telemetry in config")
+@click.pass_context
+def setup_telemetry(ctx, enable, disable):
+    """View or change anonymous telemetry settings."""
+    from sparkrun.telemetry.config import (
+        NO_TELEMETRY_ENV,
+        env_telemetry_override,
+        persistent_telemetry_setting,
+        set_persistent_telemetry,
+        telemetry_enabled,
+    )
+
+    if enable and disable:
+        raise click.ClickException("Choose only one of --enable or --disable.")
+
+    sctx = _get_context(ctx)
+    config = sctx.config
+    if enable:
+        set_persistent_telemetry(config, True)
+        click.echo("Telemetry enabled in config.")
+    elif disable:
+        set_persistent_telemetry(config, False)
+        click.echo("Telemetry disabled in config.")
+
+    effective = telemetry_enabled(config)
+    persisted = persistent_telemetry_setting(config)
+    env_override = env_telemetry_override()
+
+    persisted_text = "default enabled" if persisted is None else ("enabled" if persisted else "disabled")
+    click.echo("Telemetry: %s" % ("enabled" if effective else "disabled"))
+    click.echo("Config:    %s" % persisted_text)
+    if env_override is not None:
+        click.echo("Env:       %s" % ("enabled" if env_override else "disabled"))
+    else:
+        click.echo("Env:       set %s=1 to opt out for one process" % NO_TELEMETRY_ENV)
+
+
+SETUP_FEATURES_FLAG = "cli.setup.features"
+
+
+def _setup_features_visible_at_import() -> bool:
+    """Resolve --help visibility for the 'setup features' group.
+
+    Visibility-only: the group is always functional, this just decides whether
+    it appears in ``setup --help`` (on by default for beta/alpha channels).
+    """
+    try:
+        from sparkrun.core.config import SparkrunConfig
+
+        return SparkrunConfig().is_feature_enabled(SETUP_FEATURES_FLAG)
+    except Exception:  # noqa: BLE001 — never let a config read break CLI import
+        return False
+
+
+@setup.group("features", hidden=not _setup_features_visible_at_import())
+def setup_features():
+    """View and toggle advanced feature flags.
+
+    Feature flags gate experimental capabilities (e.g. the ``local`` and
+    ``k8s`` executors). Each flag has a per-channel default; explicit
+    overrides written here take precedence. See ``setup features list``.
+
+    Always functional; hidden from ``setup --help`` unless the
+    ``cli.setup.features`` flag resolves on (default: on for beta/alpha).
+    """
+
+
+def _feature_state(config, flag):
+    """Return ``(enabled, source, override)`` for *flag* under *config*."""
+    from sparkrun.core.features import feature_source
+
+    enabled = config.is_feature_enabled(flag.name)
+    source = feature_source(flag.name, config=config)
+    override = config.feature_override(flag.name)
+    return enabled, source, override
+
+
+@setup_features.command("list")
+@click.pass_context
+def setup_features_list(ctx):
+    """List all feature flags and their effective state."""
+    from sparkrun.core.features import all_features
+
+    config = _get_context(ctx).config
+    channel = config.feature_channel
+    flags = all_features()
+    if not flags:
+        click.echo("No feature flags registered.")
+        return
+
+    click.echo("Feature channel: %s" % channel)
+    click.echo("")
+    width = max(len(f.name) for f in flags)
+    for flag in flags:
+        enabled, source, _override = _feature_state(config, flag)
+        state = "on " if enabled else "off"
+        click.echo("%-*s  %s  (%-7s)  %s" % (width, flag.name, state, source, flag.description))
+
+
+def _require_known_flag(name):
+    """Return the :class:`FeatureFlag` for *name* or raise a ClickException."""
+    from sparkrun.core.features import all_features, get_feature
+
+    flag = get_feature(name)
+    if flag is None:
+        known = ", ".join(f.name for f in all_features()) or "(none)"
+        raise click.ClickException("Unknown feature flag %r. Known flags: %s" % (name, known))
+    return flag
+
+
+def _set_feature_override(config, name, value):
+    """Persist ``features.<name> = value`` to config and save.
+
+    Writes the literal flag name (e.g. ``executor.k8s``) as a single key
+    under ``features`` — ``config.set`` splits on dots, so the nested
+    ``features`` dict is edited directly instead.
+    """
+    features = config.get("features")
+    if not isinstance(features, dict):
+        features = {}
+    features[name] = value
+    config.set("features", features)
+    config.save()
+
+
+@setup_features.command("enable")
+@click.argument("name")
+@click.pass_context
+def setup_features_enable(ctx, name):
+    """Force feature NAME on (writes features.<name>: true)."""
+    _require_known_flag(name)
+    config = _get_context(ctx).config
+    _set_feature_override(config, name, True)
+    click.echo("Feature %r enabled. Restart in-progress commands to pick up the change." % name)
+
+
+@setup_features.command("disable")
+@click.argument("name")
+@click.pass_context
+def setup_features_disable(ctx, name):
+    """Force feature NAME off (writes features.<name>: false)."""
+    _require_known_flag(name)
+    config = _get_context(ctx).config
+    _set_feature_override(config, name, False)
+    click.echo("Feature %r disabled." % name)
+
+
+@setup_features.command("reset")
+@click.argument("name")
+@click.pass_context
+def setup_features_reset(ctx, name):
+    """Clear the explicit override for NAME (revert to channel default)."""
+    _require_known_flag(name)
+    config = _get_context(ctx).config
+    features = config.get("features")
+    if isinstance(features, dict) and name in features:
+        del features[name]
+        config.save()
+        click.echo("Feature %r override cleared; now follows the channel default." % name)
+    else:
+        click.echo("Feature %r had no explicit override." % name)
+    click.echo("Effective (channel %s): %s" % (config.feature_channel, "on" if config.is_feature_enabled(name) else "off"))
 
 
 def _run_ssh_diagnose(host_list, user, local_user):
@@ -774,7 +974,7 @@ def setup_ssh(ctx, hosts, hosts_file, cluster_name, extra_hosts, include_self, u
 
     from sparkrun.core.hosts import resolve_hosts
     from sparkrun.core.config import SparkrunConfig
-    from sparkrun.orchestration.primitives import local_ip_for
+    from sparkrun.utils.net import local_ip_for
 
     config = SparkrunConfig()
 
@@ -901,8 +1101,20 @@ def setup_ssh(ctx, hosts, hosts_file, cluster_name, extra_hosts, include_self, u
     help="CX7 topology (auto-detected by default)",
     hidden=True,
 )
+@click.option(
+    "--interfaces",
+    default=None,
+    help="Limit which CX7 interfaces are used (comma-separated names or globs, e.g. '*np1'). "
+    "Saved to the cluster and reused on subsequent runs.",
+)
+@click.option(
+    "--port",
+    type=click.Choice(["0", "1"]),
+    default=None,
+    help="Convenience selector for the Nth physical CX7 port pair (equivalent to --interfaces '*npN').",
+)
 @click.pass_context
-def setup_cx7(ctx, hosts, hosts_file, cluster_name, user, dry_run, force, mtu, subnet1, subnet2, topology):
+def setup_cx7(ctx, hosts, hosts_file, cluster_name, user, dry_run, force, mtu, subnet1, subnet2, topology, interfaces, port):
     """Configure CX7 network interfaces on cluster hosts.
 
     Detects ConnectX-7 interfaces, assigns static IPs with jumbo frames
@@ -931,11 +1143,18 @@ def setup_cx7(ctx, hosts, hosts_file, cluster_name, user, dry_run, force, mtu, s
       sparkrun setup cx7 --cluster mylab --subnet1 192.168.11.0/24 --subnet2 192.168.12.0/24
 
       sparkrun setup cx7 --cluster mylab --force
+
+      sparkrun setup cx7 --cluster two --interfaces '*np1'   # pin a port pair
+
+      sparkrun setup cx7 --cluster two --port 1              # same, by port index
     """
     from sparkrun.core.config import SparkrunConfig
     from sparkrun.orchestration.networking import (
         CX7Topology,
+        _group_interfaces_by_port,
         configure_cx7_host,
+        filter_cx7_interfaces,
+        ring_ports_error,
         detect_cx7_for_hosts,
         detect_topology,
         select_subnets,
@@ -949,6 +1168,14 @@ def setup_cx7(ctx, hosts, hosts_file, cluster_name, user, dry_run, force, mtu, s
     if (subnet1 is None) != (subnet2 is None):
         click.echo("Error: --subnet1 and --subnet2 must be specified together.", err=True)
         sys.exit(1)
+
+    # Interface selection: --interfaces (globs/names) and --port are mutually exclusive.
+    if interfaces and port is not None:
+        click.echo("Error: --interfaces and --port cannot be used together.", err=True)
+        sys.exit(1)
+    explicit_interfaces: list[str] | None = None
+    if interfaces:
+        explicit_interfaces = [s.strip() for s in interfaces.split(",") if s.strip()]
 
     import os
 
@@ -969,6 +1196,67 @@ def setup_cx7(ctx, hosts, hosts_file, cluster_name, user, dry_run, force, mtu, s
     if not hosts_with_cx7:
         click.echo("Error: No CX7 interfaces detected on any host.", err=True)
         sys.exit(1)
+
+    # Resolve the effective interface filter:
+    #   explicit --interfaces / --port  >  cluster's saved fabric_interfaces  >  None (auto)
+    effective_interfaces: list[str] | None = None
+    interfaces_explicit = False
+    if explicit_interfaces:
+        effective_interfaces = explicit_interfaces
+        interfaces_explicit = True
+    elif port is not None:
+        import re
+
+        rep = next(iter(hosts_with_cx7.values()))
+        groups = _group_interfaces_by_port(rep.interfaces)
+        pidx = int(port)
+        if pidx >= len(groups):
+            click.echo(
+                "Error: --port %d requested but only %d physical port group(s) detected." % (pidx, len(groups)),
+                err=True,
+            )
+            sys.exit(1)
+        m = re.search(r"np(\d+)$", groups[pidx][0].name)
+        if not m:
+            click.echo(
+                "Error: could not derive a port glob from interface '%s'; use --interfaces instead." % groups[pidx][0].name,
+                err=True,
+            )
+            sys.exit(1)
+        effective_interfaces = ["*np%s" % m.group(1)]
+        # The glob is derived from one host; verify it yields a pair on every
+        # host so a heterogeneous cluster fails fast here rather than deep in
+        # planning.
+        bad_hosts = [h for h, d in hosts_with_cx7.items() if len(filter_cx7_interfaces(d.interfaces, effective_interfaces)) < 2]
+        if bad_hosts:
+            click.echo(
+                "Error: --port %d (%s) does not select 2 interfaces on: %s. Use --interfaces with explicit names."
+                % (pidx, effective_interfaces[0], ", ".join(bad_hosts)),
+                err=True,
+            )
+            sys.exit(1)
+        interfaces_explicit = True
+    else:
+        # Fall back to a previously-saved per-cluster selection.
+        saved_cluster = cluster_name
+        if not saved_cluster:
+            try:
+                _mgr = _get_cluster_manager()
+                saved_cluster = _mgr.get_default() if _mgr else None
+            except Exception:
+                saved_cluster = None
+        if saved_cluster:
+            try:
+                _mgr = _get_cluster_manager()
+                if _mgr:
+                    saved = _mgr.get(saved_cluster).fabric_interfaces
+                    if saved:
+                        effective_interfaces = list(saved)
+            except Exception:
+                pass
+
+    if effective_interfaces:
+        click.echo("Interface filter: %s" % ", ".join(effective_interfaces))
 
     # Lazy sudo handling — uses ensure_sudo_password() which tests NOPASSWD,
     # prompts, verifies, and supports cross-user fallback.  The sudo_ssh_kwargs
@@ -1020,16 +1308,13 @@ def setup_cx7(ctx, hosts, hosts_file, cluster_name, user, dry_run, force, mtu, s
                 err=True,
             )
             sys.exit(1)
-        from sparkrun.orchestration.networking import _group_interfaces_by_port
-
         for h, det in hosts_with_cx7.items():
-            port_groups = _group_interfaces_by_port(det.interfaces)
-            if len(port_groups) < 2:
-                click.echo(
-                    "Error: %s: ring topology requires 2 physical ports (4 interfaces), "
-                    "but only %d port group(s) found (%d interfaces)" % (h, len(port_groups), len(det.interfaces)),
-                    err=True,
-                )
+            # Honor the interface filter so the pre-check matches what
+            # plan_ring_cx7 will actually see, via the shared validator.
+            ring_ifaces = filter_cx7_interfaces(det.interfaces, effective_interfaces)
+            err = ring_ports_error(h, ring_ifaces)
+            if err:
+                click.echo("Error: %s" % err, err=True)
                 sys.exit(1)
     elif topology == "direct":
         effective_topology = CX7Topology.DIRECT
@@ -1086,9 +1371,9 @@ def setup_cx7(ctx, hosts, hosts_file, cluster_name, user, dry_run, force, mtu, s
 
     # Step 4: Plan
     if effective_topology == CX7Topology.RING:
-        plan = plan_ring_cx7(detections, topology_result, all_subnets, mtu=mtu, force=force)
+        plan = plan_ring_cx7(detections, topology_result, all_subnets, mtu=mtu, force=force, interfaces=effective_interfaces)
     else:
-        plan = plan_cluster_cx7(detections, all_subnets[0], all_subnets[1], mtu=mtu, force=force)
+        plan = plan_cluster_cx7(detections, all_subnets[0], all_subnets[1], mtu=mtu, force=force, interfaces=effective_interfaces)
 
     # Display plan
     for hp in plan.host_plans:
@@ -1214,6 +1499,16 @@ def setup_cx7(ctx, hosts, hosts_file, cluster_name, user, dry_run, force, mtu, s
                 click.echo("Saved topology '%s' to cluster '%s'." % (effective_topology.value, effective_cluster))
         except Exception as e:
             click.echo("Warning: could not save topology to cluster: %s" % e, err=True)
+
+    # Persist an explicitly-chosen interface filter so subsequent runs reuse it.
+    if effective_cluster and interfaces_explicit and effective_interfaces:
+        try:
+            mgr = _get_cluster_manager()
+            if mgr:
+                mgr.update(effective_cluster, fabric_interfaces=effective_interfaces)
+                click.echo("Saved interface filter %s to cluster '%s'." % (effective_interfaces, effective_cluster))
+        except Exception as e:
+            click.echo("Warning: could not save interface filter to cluster: %s" % e, err=True)
 
     subnet_strs = [str(s) for s in all_subnets]
     if configured and not dry_run:
@@ -1396,13 +1691,17 @@ def setup_fix_permissions(ctx, hosts, hosts_file, cluster_name, user, cache_dir,
     # --save-sudo: install scoped sudoers entry on each host
     if save_sudo:
         click.echo("Installing sudoers entry for passwordless chown...")
-        from sparkrun.utils.shell import validate_unix_username
-        import re as _re
+        from sparkrun.utils.shell import validate_sudoers_path, validate_unix_username
 
         validate_unix_username(user)
         safe_cache_dir = cache_path or ""
-        if safe_cache_dir and not _re.fullmatch(r"[/a-zA-Z0-9_.~-]+", safe_cache_dir):
-            raise click.UsageError("cache_dir contains unsafe characters: %r" % safe_cache_dir)
+        # Empty means auto-detect inside the script; only non-empty values are
+        # interpolated into the sudoers rule and must be validated.
+        if safe_cache_dir:
+            try:
+                validate_sudoers_path(safe_cache_dir)
+            except ValueError as exc:
+                raise click.UsageError(str(exc))
         sudoers_script = read_script("fix_permissions_sudoers.sh").format(
             user=user,
             cache_dir=safe_cache_dir,

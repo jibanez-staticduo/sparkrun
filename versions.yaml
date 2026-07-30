@@ -2,7 +2,7 @@
 # Run: python scripts/update-versions.py             to sync all files
 # Run: python scripts/update-versions.py --check     to verify (CI-friendly)
 
-sparkrun: 0.2.40
+sparkrun: 0.3.0
 sparkrun-cc-plugin: 0.0.4
 sparkrun-openclaw-plugin: 0.0.1
 
@@ -16,6 +16,59 @@ preferred_versions:
     "pyyaml": "6.0.3"
     "huggingface_hub": "1.14.0"
     "textual": "8.2.5"
+
+# GitHub Actions generation. Run: generate-ci-gha [--check|--force]
+ci:
+  # Pinned, not floating: a bare `scitrera-repo-tools` picks up the newest
+  # release, so an unrelated generator change would surface as CI drift on
+  # whatever PR happened to run next. Bump deliberately.
+  repo_tools_source: "scitrera-repo-tools==0.1.21"
+  test_branches: [ main, develop ]
+  python:
+    # requires-python is >=3.12; 3.11 would not install.
+    test_versions: [ "3.12", "3.13" ]
+    install: 'pip install -e ".[dev]"'
+    # Matches what publish.yml ran: fail fast, long tracebacks.
+    test_command: 'pytest -v --tb=long -x'
+    # Disabled for now: ruff reports 3063 findings here, because [tool.ruff] in
+    # pyproject.toml sets line-length and target-version but never pins
+    # `select`, so the linter inherits whatever defaults its current release
+    # ships — and 0.16 widened them substantially. Enable this once `select` is
+    # pinned in pyproject.toml and a `ruff` entry is added to
+    # preferred_versions.python. Turning it on before then makes every PR red.
+    lint: none
+    setup_steps:
+      # The runner image ships ~20GB of toolchains this repo never uses, and
+      # the ML dependencies pulled in by the test extras do not fit alongside
+      # them. Carried over from publish.yml, where it was load-bearing.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h /
+        working_directory: .
+    # Refuse to publish when the pushed tag disagrees with versions.yaml.
+    verify_tag_version: sparkrun
+    # Makes a re-run of a release idempotent rather than a 400 from PyPI.
+    skip_if_published: true
+  npm:
+    # engines.node is >=22.
+    node_version: "22"
+    # No `typescript` in devDependencies, so `npx --no-install tsc` has nothing
+    # to run; the package ships its TypeScript source directly (main: index.ts).
+    lint: none
+    # Load-bearing: publish-npm.yml passed --provenance, which needs an OIDC
+    # token, which needs id-token: write on the publish job.
+    use_provenance: true
+    # The reason this repo could not adopt the generated publish workflow
+    # before. sparkrun-openclaw-plugin is versioned independently (0.0.1) of
+    # sparkrun (0.3.0), and 0.0.1 is already on npm — so every `v0.3.x` tag
+    # would re-publish an unchanged version and npm would reject it, failing
+    # the release. The hand-written workflow guarded this by diffing
+    # package.json against HEAD~1; this asks the registry instead, which does
+    # not depend on what the previous commit happened to contain.
+    skip_if_published: true
 
 project_rules:
   sparkrun:

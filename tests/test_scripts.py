@@ -1,7 +1,7 @@
 """Unit tests for sparkrun.orchestration.scripts module."""
 
 from sparkrun.orchestration.scripts import generate_ip_detect_script
-from sparkrun.orchestration.executor_docker import DockerExecutor
+from sparkrun.orchestration.executors.docker import DockerExecutor
 from sparkrun.utils.shell import b64_encode_cmd
 
 _executor = DockerExecutor()
@@ -84,7 +84,10 @@ def test_generate_container_launch_script_with_volumes():
 
 
 def test_generate_ray_head_script():
-    """Contains ray start --head, port, no dashboard by default."""
+    """The primitive defaults to dashboard off, emitting --include-dashboard=False.
+
+    Ray starts the dashboard when the flag is absent, so 'off' must be explicit.
+    """
     script = generate_ray_head_script(
         image="ray-image:latest",
         container_name="ray-head",
@@ -97,12 +100,28 @@ def test_generate_ray_head_script():
     assert "NODE_IP" in script
     assert "docker rm -f ray-head" in script
 
-    expected_cmd = "ray start --block --head --port 46379 --node-ip-address $NODE_IP --disable-usage-stats"
+    expected_cmd = "ray start --block --head --port 46379 --node-ip-address $NODE_IP --include-dashboard=False --disable-usage-stats"
+    assert b64_encode_cmd(expected_cmd) in script
+
+
+def test_generate_ray_head_script_dashboard_off_explicit():
+    """dashboard=False emits --include-dashboard=False (no host/port flags)."""
+    script = generate_ray_head_script(
+        image="ray-image:latest",
+        container_name="ray-head",
+        ray_port=46379,
+        dashboard_port=8265,
+        dashboard=False,
+    )
+
+    # The exact b64-encoded command already asserts the absence of any
+    # --dashboard-host/--dashboard-port flags in the off state.
+    expected_cmd = "ray start --block --head --port 46379 --node-ip-address $NODE_IP --include-dashboard=False --disable-usage-stats"
     assert b64_encode_cmd(expected_cmd) in script
 
 
 def test_generate_ray_head_script_with_dashboard():
-    """With dashboard=True, includes dashboard flags."""
+    """With dashboard=True, includes dashboard flags bound to 0.0.0.0."""
     script = generate_ray_head_script(
         image="ray-image:latest",
         container_name="ray-head",
@@ -164,7 +183,7 @@ def test_generate_ray_worker_script_with_nccl():
 
 
 def test_generate_exec_serve_script_detached():
-    """Uses nohup for background execution."""
+    """Launches the serve detached via `docker exec -d` (survives proot/fastvfs)."""
     script = generate_exec_serve_script(
         container_name="my-container",
         serve_command="vllm serve model",
@@ -172,8 +191,12 @@ def test_generate_exec_serve_script_detached():
     )
 
     assert script.startswith("#!/bin/bash")
-    assert "docker exec my-container" in script
-    assert "nohup" in script
+    assert "docker exec my-container" in script  # foreground write of the serve script
+    # Detached launch owned by docker (not an in-shell `nohup ... &`, which
+    # proot/fastvfs kills when the exec returns), with a self-recorded PID.
+    assert "docker exec -d my-container" in script
+    assert "echo $$ > /tmp/sparkrun_serve.pid" in script
+    assert "nohup bash" not in script  # the old in-shell background command is gone
     assert "/tmp/sparkrun_serve.log" in script
     assert "tail -f" in script
     assert b64_encode_cmd("vllm serve model") in script

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import yaml
+
+from sparkrun.core.hardware import HostHardware, default_dgx_spark_hardware
+
+if TYPE_CHECKING:
+    from sparkrun.core.cluster_status import ClusterStatus
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +36,111 @@ class ClusterError(Exception):
 # Sentinel for "not provided" to distinguish from explicit None
 _UNSET = object()
 
+# ``${VAR}`` reference in a cluster env value, resolved from ClusterDefinition.env_file.
+_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _parse_env_file(path: str) -> dict[str, str]:
+    """Parse a ``KEY=VALUE`` env file into a dict (no shell execution).
+
+    Skips blank lines and ``#`` comments; strips one layer of matching
+    single/double quotes from values.  Raises :class:`ClusterError` if the
+    file cannot be read.
+    """
+    p = Path(path).expanduser()
+    try:
+        text = p.read_text()
+    except OSError as e:
+        raise ClusterError("could not read env_file %s: %s" % (path, e)) from e
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        key, _, value = s.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            out[key] = value
+    return out
+
+
+@dataclass
+class ModelDistributionPrefs:
+    """Per-cluster model-distribution preferences.
+
+    Defaults reproduce the historical behavior exactly:
+      * ``preserve_perms=True`` — rsync uses ``-a`` (archive) and the
+        best-effort cache chown runs before transfer.
+      * ``skip_fan_out=False`` — the model is rsynced to every host.
+
+    On a cluster whose ``cache_dir`` is a shared mount (NFS/CIFS), both
+    are typically flipped: ``preserve_perms=False`` drops the
+    owner/group/perm preservation that fails under root_squash, and
+    ``skip_fan_out=True`` skips the redundant per-host rsync because the
+    model is already visible on every node once downloaded once.
+
+    ``enabled=False`` turns model distribution off entirely — no local
+    download and no per-host transfer.  Use it when the weights are already
+    present on every node (e.g. a shared NFS mount populated out-of-band), so
+    sparkrun should never fetch or copy them.  This is stronger than
+    ``skip_fan_out`` (which still downloads the model once locally).
+    """
+
+    preserve_perms: bool = True
+    skip_fan_out: bool = False
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ModelDistributionPrefs":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            preserve_perms=bool(data.get("preserve_perms", True)),
+            skip_fan_out=bool(data.get("skip_fan_out", False)),
+            enabled=bool(data.get("enabled", True)),
+        )
+
+    def is_default(self) -> bool:
+        return self.enabled and self.preserve_perms and not self.skip_fan_out
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if not self.preserve_perms:
+            out["preserve_perms"] = False
+        if self.skip_fan_out:
+            out["skip_fan_out"] = True
+        if not self.enabled:
+            out["enabled"] = False
+        return out
+
+
+@dataclass
+class ClusterDistributionConfig:
+    """Cluster-level resource-distribution preferences (``distribution:`` block)."""
+
+    model: ModelDistributionPrefs = field(default_factory=ModelDistributionPrefs)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ClusterDistributionConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(model=ModelDistributionPrefs.from_dict(data.get("model")))
+
+    def is_default(self) -> bool:
+        return self.model.is_default()
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        model = self.model.to_dict()
+        if model:
+            out["model"] = model
+        return out
+
 
 @dataclass
 class ClusterDefinition:
@@ -44,6 +154,154 @@ class ClusterDefinition:
     transfer_mode: str | None = None
     transfer_interface: str | None = None
     topology: str | None = None
+    fabric_interfaces: list[str] = field(default_factory=list)
+    """Optional high-speed-fabric interface selection for this cluster.
+
+    A list of interface-name globs/exact names (e.g. ``["*np1"]``) that
+    ``setup cx7`` / the setup wizard apply when more than two CX7
+    interfaces are present, so the cluster pins a specific port pair
+    (see issue #203).  Empty means "auto" (port-group default).  Named
+    generically (not ``cx7_interfaces``) so it survives the planned
+    high-speed-fabric abstraction; distinct from
+    :attr:`transfer_interface`, which selects the data-transfer NIC.
+    """
+    distribution: ClusterDistributionConfig = field(default_factory=ClusterDistributionConfig)
+    """Cluster-level model/resource distribution preferences (see
+    :class:`ClusterDistributionConfig`).  Defaults reproduce historical
+    behavior; shared-cache clusters typically set
+    ``distribution.model.skip_fan_out`` and clear
+    ``distribution.model.preserve_perms``."""
+    hosts_hardware: dict[str, HostHardware] = field(default_factory=dict)
+    """Optional per-host hardware metadata, keyed by host name/address.
+
+    Hosts absent from this dict are assumed to be DGX Sparks (see
+    :func:`sparkrun.core.hardware.default_dgx_spark_hardware`).  Reading
+    code should go through :meth:`hardware_for` rather than indexing
+    this dict directly so the default fallback is preserved.
+    """
+    executor: str | None = None
+    """Default executor selector for workloads on this cluster.
+
+    Inserted into the executor-name resolution chain between the
+    recipe's selector and ``runtime.default_executor()`` — see
+    :func:`sparkrun.orchestration.executor.resolve_executor`.  A
+    cluster that bakes ``executor: k8s`` here makes every recipe land
+    on the K8s executor unless the recipe (or CLI) overrides.
+    """
+    executor_config: dict[str, Any] | None = None
+    """Cluster-level executor option defaults (memory_limit, privileged, …).
+
+    Layered into the executor *config* resolution chain between the
+    recipe-level options and the global ``SparkrunConfig``.  Lets a
+    cluster express "every workload here gets these baseline executor
+    settings" while still letting recipes/CLI tighten things.
+    """
+    scheduler: str | None = None
+    """Default scheduler selector for workloads on this cluster.
+
+    Inserted into the scheduler resolution chain between the recipe's
+    ``scheduler`` selector and the greedy emergency fallback — see
+    :func:`sparkrun.api.run` and :func:`sparkrun.api.schedule`.  A
+    cluster that bakes ``scheduler: occupancy-sparse`` here makes every
+    recipe land on the occupancy-sparse scheduler unless the recipe (or
+    CLI) overrides.
+    """
+    max_gpu_memory_utilization: float | None = None
+    """Cluster-wide default usable-memory cap (``0.0`` < x ≤ ``1.0``).
+
+    The cluster-wide tier of
+    :func:`sparkrun.core.limits.resolve_max_gpu_memory_utilization`: scales
+    each accelerator's ``memory_gb`` for scheduling / fit when the accelerator
+    itself declares no ``max_gpu_memory_utilization`` and no per-type entry in
+    :attr:`accelerator_memory_limits` applies.  ``None`` defers to the platform
+    tier (e.g. GB10 → 0.85) and ultimately the ``1.0`` hard fallback.
+    """
+    accelerator_memory_limits: dict[str, float] = field(default_factory=dict)
+    """Per-accelerator-type usable-memory caps, keyed by accelerator ``model``
+    (e.g. ``{"gb10": 0.85, "h200": 0.95}``).
+
+    Takes precedence over :attr:`max_gpu_memory_utilization` but is overridden
+    by a value set directly on an :class:`~sparkrun.core.hardware.AcceleratorSpec`.
+    """
+    env: dict[str, str] = field(default_factory=dict)
+    """Cluster-level container environment, layered **under** recipe ``env``
+    and CLI overrides (precedence: CLI ``-e``/``-o`` > recipe ``env`` >
+    cluster ``env``).
+
+    Values may contain ``${VAR}`` references resolved at launch time from
+    :attr:`env_file` (see :meth:`resolve_env`) — so secrets stay in the
+    user's env file and never land in this YAML.  Typically populated by
+    ``cluster import`` as a rename/selection table over a legacy
+    ``CONTAINER_*`` block.  Import-owned (rewritten wholesale on sync).
+    """
+    env_file: str | None = None
+    """Path to an env file (``KEY=VALUE`` lines) that ``${VAR}`` references
+    in :attr:`env` resolve against.  Read locally on the control machine at
+    launch; values are emitted per host, so the file need not exist on
+    remote nodes.  Distinct from :attr:`sync_source` (which may point at the
+    same file but means "where this cluster was imported from")."""
+    sync_source: str | None = None
+    """Provenance + re-sync identity, formatted ``<type>:<location>``
+    (e.g. ``spark_vllm_docker:/path/to/.env``).  ``cluster import`` upserts
+    by matching this, so re-import updates the same cluster even if it was
+    renamed.  Generic by design so future import sources can reuse it."""
+    transport: str = "ssh"
+    """Connectivity transport selector (see :mod:`sparkrun.transports`).
+
+    ``"ssh"`` (default) means the hosts are plain SSH targets — no preparation.
+    A provider transport (e.g. ``"thunder"``) runs an out-of-band ``prepare``
+    step at run/connect init to materialize ephemeral connection details (fresh
+    IP/port, SSH key, managed ssh alias) before any SSH runs.  Orthogonal to
+    :attr:`executor` (which selects *how the workload runs* on the host)."""
+    provider_ref: str | None = None
+    """Opaque stable handle for the backing provider resource, when
+    :attr:`transport` is provider-backed (e.g. a Thunder instance uuid).  Used
+    by the transport to re-resolve the resource across sessions and as the
+    re-import identity for ``cluster import <provider>``."""
+
+    def resolve_env(self) -> dict[str, str]:
+        """Resolve :attr:`env`, substituting ``${VAR}`` from :attr:`env_file`.
+
+        ``${VAR}`` references resolve **only** against the cluster's own
+        ``env_file`` — never ``os.environ`` or recipe env — so this cannot
+        be used to exfiltrate arbitrary host secrets.  A reference with no
+        matching key in the file (or with no ``env_file`` configured at all)
+        raises :class:`ClusterError`.
+        """
+        if not self.env:
+            return {}
+        needs_file = any(_ENV_REF_RE.search(str(v)) for v in self.env.values())
+        file_vars: dict[str, str] = {}
+        if needs_file:
+            if not self.env_file:
+                raise ClusterError("cluster '%s' env uses ${...} references but has no env_file configured" % self.name)
+            file_vars = _parse_env_file(self.env_file)
+
+        resolved: dict[str, str] = {}
+        for key, raw in self.env.items():
+
+            def _sub(m: "re.Match[str]") -> str:
+                var = m.group(1)
+                if var not in file_vars:
+                    raise ClusterError(
+                        "cluster '%s' env[%s] references ${%s}, not found in env_file %s" % (self.name, key, var, self.env_file)
+                    )
+                return file_vars[var]
+
+            resolved[key] = _ENV_REF_RE.sub(_sub, str(raw))
+        return resolved
+
+    def hardware_for(self, host: str) -> HostHardware:
+        """Return hardware metadata for *host*, defaulting to DGX Spark.
+
+        When a host has no explicit entry, behave as if it were a DGX
+        Spark (1× GB10, 121 GB unified memory).  Keeps homogeneous DGX
+        clusters working without per-host metadata blocks.
+        """
+        hw = self.hosts_hardware.get(host)
+        if hw is None:
+            return default_dgx_spark_hardware()
+        return hw
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dictionary (omits None optional fields)."""
@@ -58,6 +316,30 @@ class ClusterDefinition:
             d["transfer_interface"] = self.transfer_interface
         if self.topology:
             d["topology"] = self.topology
+        if self.fabric_interfaces:
+            d["fabric_interfaces"] = list(self.fabric_interfaces)
+        if self.env:
+            d["env"] = dict(self.env)
+        if self.env_file:
+            d["env_file"] = self.env_file
+        if self.sync_source:
+            d["sync_source"] = self.sync_source
+        if self.transport and self.transport != "ssh":
+            d["transport"] = self.transport
+        if self.provider_ref:
+            d["provider_ref"] = self.provider_ref
+        if self.hosts_hardware:
+            d["hosts_hardware"] = {h: hw.to_dict() for h, hw in self.hosts_hardware.items()}
+        if self.executor:
+            d["executor"] = self.executor
+        if self.executor_config:
+            d["executor_config"] = dict(self.executor_config)
+        if self.scheduler:
+            d["scheduler"] = self.scheduler
+        if self.max_gpu_memory_utilization is not None:
+            d["max_gpu_memory_utilization"] = self.max_gpu_memory_utilization
+        if self.accelerator_memory_limits:
+            d["accelerator_memory_limits"] = dict(self.accelerator_memory_limits)
         return d
 
 
@@ -167,6 +449,18 @@ class ClusterManager:
         transfer_mode: str | None = None,
         transfer_interface: str | None = None,
         topology: str | None = None,
+        fabric_interfaces: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        env_file: str | None = None,
+        sync_source: str | None = None,
+        transport: str = "ssh",
+        provider_ref: str | None = None,
+        hosts_hardware: dict[str, HostHardware] | None = None,
+        executor: str | None = None,
+        executor_config: dict[str, Any] | None = None,
+        scheduler: str | None = None,
+        max_gpu_memory_utilization: float | None = None,
+        distribution: ClusterDistributionConfig | None = None,
     ) -> None:
         """Create a new named cluster.
 
@@ -179,6 +473,14 @@ class ClusterManager:
             transfer_mode: Optional transfer mode (local, push, delegated)
             transfer_interface: Optional transfer interface (cx7, mgmt)
             topology: Optional CX7 topology (direct, switch, ring)
+            fabric_interfaces: Optional high-speed-fabric interface globs/names
+                (e.g. ``["*np1"]``) pinning a specific CX7 port pair.
+            env: Optional cluster-level container env (values may use
+                ``${VAR}`` resolved from ``env_file``).
+            env_file: Optional path backing ``${VAR}`` references in ``env``.
+            sync_source: Optional ``<type>:<location>`` import provenance.
+            hosts_hardware: Optional per-host hardware metadata.  Missing
+                entries fall back to DGX Spark via :meth:`ClusterDefinition.hardware_for`.
 
         Raises:
             ClusterError: If cluster already exists or name is invalid
@@ -206,6 +508,18 @@ class ClusterManager:
             transfer_mode=transfer_mode,
             transfer_interface=transfer_interface,
             topology=topology,
+            fabric_interfaces=list(fabric_interfaces) if fabric_interfaces else [],
+            env=dict(env) if env else {},
+            env_file=env_file,
+            sync_source=sync_source,
+            transport=transport,
+            provider_ref=provider_ref,
+            hosts_hardware=dict(hosts_hardware) if hosts_hardware else {},
+            executor=executor,
+            executor_config=dict(executor_config) if executor_config else None,
+            scheduler=scheduler,
+            max_gpu_memory_utilization=max_gpu_memory_utilization,
+            distribution=distribution if distribution is not None else ClusterDistributionConfig(),
         )
         self._write_cluster(cluster_def)
         logger.info("Created cluster '%s' with %d hosts", name, len(hosts))
@@ -238,6 +552,16 @@ class ClusterManager:
         transfer_mode: str | None = _UNSET,
         transfer_interface: str | None = _UNSET,
         topology: str | None = _UNSET,
+        fabric_interfaces: list[str] | None = _UNSET,
+        env: dict[str, str] | None = _UNSET,
+        env_file: str | None = _UNSET,
+        sync_source: str | None = _UNSET,
+        hosts_hardware: dict[str, HostHardware] | None = _UNSET,
+        executor: str | None = _UNSET,
+        executor_config: dict[str, Any] | None = _UNSET,
+        scheduler: str | None = _UNSET,
+        max_gpu_memory_utilization: float | None = _UNSET,
+        distribution: ClusterDistributionConfig | None = _UNSET,
     ) -> None:
         """Update existing cluster definition.
 
@@ -250,6 +574,11 @@ class ClusterManager:
             transfer_mode: Transfer mode (if provided; pass ``None`` explicitly to clear)
             transfer_interface: Transfer interface (if provided; pass ``None`` explicitly to clear)
             topology: CX7 topology (if provided; pass ``None`` explicitly to clear)
+            fabric_interfaces: Fabric interface globs/names (if provided; pass empty list to clear)
+            env: Cluster-level container env (if provided; pass empty dict to clear)
+            env_file: Env file path backing ``${VAR}`` refs (if provided; pass ``None`` to clear)
+            sync_source: Import provenance / re-sync identity (if provided; pass ``None`` to clear)
+            hosts_hardware: Per-host hardware metadata (if provided; pass empty dict to clear).
 
         Raises:
             ClusterError: If cluster does not exist
@@ -291,6 +620,46 @@ class ClusterManager:
         if topology is not _UNSET:
             cluster_def.topology = topology
             logger.debug("Updated topology for cluster '%s'", name)
+
+        if fabric_interfaces is not _UNSET:
+            cluster_def.fabric_interfaces = list(fabric_interfaces) if fabric_interfaces else []
+            logger.debug("Updated fabric_interfaces for cluster '%s'", name)
+
+        if env is not _UNSET:
+            cluster_def.env = dict(env) if env else {}
+            logger.debug("Updated env for cluster '%s'", name)
+
+        if env_file is not _UNSET:
+            cluster_def.env_file = env_file
+            logger.debug("Updated env_file for cluster '%s'", name)
+
+        if sync_source is not _UNSET:
+            cluster_def.sync_source = sync_source
+            logger.debug("Updated sync_source for cluster '%s'", name)
+
+        if hosts_hardware is not _UNSET:
+            cluster_def.hosts_hardware = dict(hosts_hardware) if hosts_hardware else {}
+            logger.debug("Updated hosts_hardware for cluster '%s'", name)
+
+        if executor is not _UNSET:
+            cluster_def.executor = executor
+            logger.debug("Updated executor for cluster '%s'", name)
+
+        if executor_config is not _UNSET:
+            cluster_def.executor_config = dict(executor_config) if executor_config else None
+            logger.debug("Updated executor_config for cluster '%s'", name)
+
+        if scheduler is not _UNSET:
+            cluster_def.scheduler = scheduler
+            logger.debug("Updated scheduler for cluster '%s'", name)
+
+        if max_gpu_memory_utilization is not _UNSET:
+            cluster_def.max_gpu_memory_utilization = max_gpu_memory_utilization
+            logger.debug("Updated max_gpu_memory_utilization for cluster '%s'", name)
+
+        if distribution is not _UNSET:
+            cluster_def.distribution = distribution if distribution is not None else ClusterDistributionConfig()
+            logger.debug("Updated distribution prefs for cluster '%s'", name)
 
         # Write back
         self._write_cluster(cluster_def)
@@ -406,6 +775,32 @@ class ClusterManager:
             data["transfer_interface"] = cluster_def.transfer_interface
         if cluster_def.topology is not None:
             data["topology"] = cluster_def.topology
+        if cluster_def.fabric_interfaces:
+            data["fabric_interfaces"] = list(cluster_def.fabric_interfaces)
+        if cluster_def.env:
+            data["env"] = dict(cluster_def.env)
+        if cluster_def.env_file:
+            data["env_file"] = cluster_def.env_file
+        if cluster_def.sync_source:
+            data["sync_source"] = cluster_def.sync_source
+        if cluster_def.transport and cluster_def.transport != "ssh":
+            data["transport"] = cluster_def.transport
+        if cluster_def.provider_ref:
+            data["provider_ref"] = cluster_def.provider_ref
+        if cluster_def.hosts_hardware:
+            data["hosts_hardware"] = {h: hw.to_dict() for h, hw in cluster_def.hosts_hardware.items()}
+        if cluster_def.executor:
+            data["executor"] = cluster_def.executor
+        if cluster_def.executor_config:
+            data["executor_config"] = dict(cluster_def.executor_config)
+        if cluster_def.scheduler:
+            data["scheduler"] = cluster_def.scheduler
+        if cluster_def.max_gpu_memory_utilization is not None:
+            data["max_gpu_memory_utilization"] = cluster_def.max_gpu_memory_utilization
+        if cluster_def.accelerator_memory_limits:
+            data["accelerator_memory_limits"] = dict(cluster_def.accelerator_memory_limits)
+        if cluster_def.distribution and not cluster_def.distribution.is_default():
+            data["distribution"] = cluster_def.distribution.to_dict()
 
         with cluster_path.open("w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
@@ -421,6 +816,36 @@ class ClusterManager:
             raise ClusterError(f"Invalid cluster file format: {cluster_path}")
 
         logger.debug("Read cluster definition from %s", cluster_path)
+        raw_hw = data.get("hosts_hardware") or {}
+        hosts_hardware: dict[str, HostHardware] = {}
+        if isinstance(raw_hw, dict):
+            for host, entry in raw_hw.items():
+                if isinstance(entry, dict):
+                    hosts_hardware[str(host)] = HostHardware.from_dict(entry)
+
+        raw_exec_cfg = data.get("executor_config")
+        executor_config: dict[str, Any] | None = None
+        if isinstance(raw_exec_cfg, dict) and raw_exec_cfg:
+            executor_config = dict(raw_exec_cfg)
+
+        raw_max_util = data.get("max_gpu_memory_utilization")
+        max_gpu_memory_utilization = float(raw_max_util) if raw_max_util is not None else None
+
+        raw_fabric_ifaces = data.get("fabric_interfaces") or []
+        fabric_interfaces: list[str] = [str(x) for x in raw_fabric_ifaces] if isinstance(raw_fabric_ifaces, list) else []
+
+        raw_env = data.get("env") or {}
+        cluster_env: dict[str, str] = {str(k): str(v) for k, v in raw_env.items()} if isinstance(raw_env, dict) else {}
+
+        accelerator_memory_limits: dict[str, float] = {}
+        raw_accel_limits = data.get("accelerator_memory_limits")
+        if isinstance(raw_accel_limits, dict):
+            for model, value in raw_accel_limits.items():
+                try:
+                    accelerator_memory_limits[str(model)] = float(value)
+                except (TypeError, ValueError):
+                    logger.warning("Ignoring non-numeric accelerator_memory_limits[%r]=%r", model, value)
+
         return ClusterDefinition(
             name=data.get("name", cluster_path.stem),
             hosts=data.get("hosts", []),
@@ -430,6 +855,19 @@ class ClusterManager:
             transfer_mode=data.get("transfer_mode"),
             transfer_interface=data.get("transfer_interface"),
             topology=data.get("topology"),
+            fabric_interfaces=fabric_interfaces,
+            env=cluster_env,
+            env_file=data.get("env_file"),
+            sync_source=data.get("sync_source"),
+            transport=str(data.get("transport") or "ssh"),
+            provider_ref=data.get("provider_ref"),
+            hosts_hardware=hosts_hardware,
+            executor=data.get("executor"),
+            executor_config=executor_config,
+            scheduler=data.get("scheduler"),
+            max_gpu_memory_utilization=max_gpu_memory_utilization,
+            accelerator_memory_limits=accelerator_memory_limits,
+            distribution=ClusterDistributionConfig.from_dict(data.get("distribution")),
         )
 
 
@@ -438,94 +876,56 @@ class ClusterManager:
 # ---------------------------------------------------------------------------
 
 
-def query_cluster_status(
-    host_list: list[str],
-    ssh_kwargs: dict[str, Any],
+def classify_cluster_status(
+    snapshot: "ClusterStatus",
+    *,
     cache_dir: str,
+    host_list: list[str],
 ) -> ClusterStatusResult:
-    """Query sparkrun containers on hosts and classify them.
+    """Shape a :class:`~sparkrun.core.cluster_status.ClusterStatus` snapshot
+    into the CLI-display :class:`ClusterStatusResult`.
 
-    Runs ``docker ps`` on each host in parallel, parses the output,
-    groups containers into clusters vs solo entries, enriches with
-    cached job metadata, and identifies idle hosts and pending ops.
+    Pure presentation — no executor resolution, no SSH.  The snapshot is
+    produced by :func:`sparkrun.api.status` (the single status source, which
+    owns executor resolution + the cross-executor merge); this classifies its
+    workloads into cluster groups vs solo entries, enriches each with cached
+    job metadata, and derives idle hosts + relevant pending ops.
 
     Args:
-        host_list: Target hostnames/IPs to query.
-        ssh_kwargs: SSH connection keyword arguments.
+        snapshot: The merged :class:`ClusterStatus` from ``api.status``.
         cache_dir: Cache directory for job metadata and pending ops.
+        host_list: The hosts that were queried (used to derive idle hosts and
+            filter pending ops); a host absent from ``snapshot.hosts`` and not
+            in ``snapshot.errors`` is neither reachable nor idle.
 
     Returns:
         A :class:`ClusterStatusResult` with all collected data.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from sparkrun.orchestration.primitives import run_command_on_host
     from sparkrun.orchestration.job_metadata import load_job_metadata
     from sparkrun.core.pending_ops import list_pending_ops
 
-    docker_cmd = "docker ps --filter 'name=sparkrun_' --format '{{.Names}}\\t{{.Status}}\\t{{.Image}}'"
-
-    # Query all hosts in parallel (dispatches local vs SSH automatically)
-    with ThreadPoolExecutor(max_workers=len(host_list)) as executor:
-        futures = {
-            executor.submit(
-                run_command_on_host,
-                host,
-                docker_cmd,
-                ssh_kwargs=ssh_kwargs,
-                timeout=15,
-            ): host
-            for host in host_list
-        }
-        results = {}
-        for future in as_completed(futures):
-            host = futures[future]
-            results[host] = future.result()
-
-    # Collect per-host container info: list of (name, status, image)
-    host_containers: dict[str, list[tuple[str, str, str]]] = {}
-    errors: dict[str, str] = {}
-    for host in host_list:
-        result = results[host]
-        if not result.success:
-            errors[host] = result.stderr.strip()
-            continue
-        entries = []
-        for line in result.stdout.strip().splitlines():
-            if not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) == 3:
-                entries.append((parts[0], parts[1], parts[2]))
-            else:
-                entries.append((line.strip(), "", ""))
-        host_containers[host] = entries
-
-    # Build cluster groups: cluster_id -> [(host, role, status, image), ...]
-    # Anything ending in _solo is standalone; everything else is grouped
-    # by cluster_id (name up to last underscore-delimited role suffix).
+    # Classify the snapshot into cluster groups vs solo entries.  Roles
+    # and per-container detail come from the executors' ContainerDetail now
+    # (a ``_solo`` name / ``solo`` role is standalone; everything else groups
+    # by the workload's cluster_id).
     groups: dict[str, list[tuple[str, str, str, str]]] = {}
-    raw_solo_entries: list[tuple[str, str, str, str]] = []
+    raw_solo_entries: list[tuple[str, str, Any]] = []  # (cluster_id, host, ContainerDetail)
     total_containers = 0
+    reachable_hosts: set[str] = set()
+    host_container_counts: dict[str, int] = {}
 
-    for host in host_list:
-        for name, status, image in host_containers.get(host, []):
-            total_containers += 1
-            if name.endswith("_solo"):
-                raw_solo_entries.append((host, name, status, image))
-            else:
-                # Extract cluster_id by stripping the role suffix.
-                # Patterns: sparkrun_hash_head, sparkrun_hash_worker,
-                #           sparkrun_hash_node_0 (SGLang)
-                # Strategy: find the cluster_id prefix (sparkrun_{12-char hash})
-                # and treat the rest as the role.
-                prefix_end = name.find("_", len("sparkrun_"))
-                if 0 < prefix_end < len(name) - 1:
-                    cluster_id = name[:prefix_end]
-                    role = name[prefix_end + 1 :]
+    for hostocc in snapshot.hosts:
+        reachable_hosts.add(hostocc.host)
+        count = 0
+        for w in hostocc.workloads:
+            for c in w.containers:
+                total_containers += 1
+                count += 1
+                if c.name.endswith("_solo") or c.role == "solo":
+                    raw_solo_entries.append((w.cluster_id, hostocc.host, c))
                 else:
-                    cluster_id = name
-                    role = "?"
-                groups.setdefault(cluster_id, []).append((host, role, status, image))
+                    groups.setdefault(w.cluster_id, []).append((hostocc.host, c.role, c.status, c.image))
+        host_container_counts[hostocc.host] = count
 
     # Enrich groups with job metadata
     cluster_groups: dict[str, ClusterGroup] = {}
@@ -534,13 +934,17 @@ def query_cluster_status(
         cluster_groups[cid] = ClusterGroup(cluster_id=cid, members=members, meta=meta)
 
     solo_entries: list[ClusterSoloEntry] = []
-    for host, name, status, image in raw_solo_entries:
-        cid = name.removesuffix("_solo")
+    for cid, host, c in raw_solo_entries:
         meta = load_job_metadata(cid, cache_dir=cache_dir) or {}
-        solo_entries.append(ClusterSoloEntry(cluster_id=cid, host=host, name=name, status=status, image=image, meta=meta))
+        solo_entries.append(ClusterSoloEntry(cluster_id=cid, host=host, name=c.name, status=c.status, image=c.image, meta=meta))
 
-    # Idle hosts: no containers and no errors
-    idle_hosts = [h for h in host_list if h not in errors and not host_containers.get(h)]
+    # Unreachable hosts (absent from the snapshot's hosts) surfaced as errors.
+    errors = dict(snapshot.errors)
+
+    # Idle hosts: reachable (present in the merged snapshot) with zero
+    # containers and no error.  A host absent from the snapshot is an error
+    # (or was never reachable), not idle — matches the pre-refactor behavior.
+    idle_hosts = [h for h in host_list if h in reachable_hosts and host_container_counts.get(h, 0) == 0 and h not in errors]
 
     # Pending operations filtered to relevant hosts
     pending = list_pending_ops(cache_dir=cache_dir)
@@ -572,6 +976,33 @@ class ResolvedClusterConfig:
     transfer_mode: str | None = None
     transfer_interface: str | None = None
     topology: str | None = None
+    transport: str = "ssh"
+    """Cluster connectivity transport selector (see :mod:`sparkrun.transports`).
+    Mirrors :attr:`ClusterDefinition.transport`; ``"ssh"`` for plain clusters."""
+    provider_ref: str | None = None
+    """Provider resource handle for a provider-backed :attr:`transport`
+    (e.g. a Thunder instance uuid).  Mirrors :attr:`ClusterDefinition.provider_ref`."""
+    executor: str | None = None
+    """Cluster-level default executor selector — consumed by
+    :func:`sparkrun.orchestration.executor.resolve_executor` between
+    recipe and runtime in the name-selection chain."""
+    executor_config: dict[str, Any] | None = None
+    """Cluster-level default executor options — consumed by
+    :func:`sparkrun.orchestration.executor.resolve_executor` between
+    recipe and ``SparkrunConfig`` in the config chain."""
+    scheduler: str | None = None
+    """Cluster-level default scheduler selector — consumed by
+    :func:`sparkrun.api.run` between the recipe's ``scheduler`` and the
+    greedy emergency fallback in the resolution chain."""
+    preserve_model_perms: bool = True
+    """When ``False``, model rsync drops owner/group/perm preservation
+    (``-r --links`` instead of ``-a``) and the best-effort cache chown is
+    skipped — for shared/NFS caches under root_squash.  Mirrors
+    ``cluster.distribution.model.preserve_perms``."""
+    skip_model_fan_out: bool = False
+    """When ``True``, the per-host model rsync fan-out is skipped (the model
+    is downloaded once to the shared cache).  Mirrors
+    ``cluster.distribution.model.skip_fan_out``."""
 
     def resolve_transfer_config(self, config, transfer_mode_override: str | None = None):
         """Resolve transfer configuration against defaults.
@@ -644,7 +1075,24 @@ def resolve_cluster_config(
         cfg.transfer_interface = cluster_def.transfer_interface
         cfg.cache_dir = cluster_def.cache_dir
         cfg.topology = cluster_def.topology
+        cfg.preserve_model_perms = cluster_def.distribution.model.preserve_perms
+        cfg.skip_model_fan_out = cluster_def.distribution.model.skip_fan_out
     else:
         logger.debug("explicit hosts; not using cluster for transfer_mode, transfer_interface, cache_dir, and topology")
+
+    # Executor selector and config are cluster-deployment properties,
+    # not host-list properties — apply them whenever the cluster is
+    # named, even with explicit --hosts.  Rationale: if you tell sparkrun
+    # which cluster you're targeting, its executor defaults should
+    # govern regardless of how host addresses are supplied.
+    cfg.executor = cluster_def.executor
+    cfg.executor_config = dict(cluster_def.executor_config) if cluster_def.executor_config else None
+    cfg.scheduler = cluster_def.scheduler
+
+    # Transport is a cluster-deployment property (like executor): it governs
+    # how the cluster's hosts are reached, so it applies whenever the cluster
+    # is named, even with explicit --hosts.
+    cfg.transport = cluster_def.transport
+    cfg.provider_ref = cluster_def.provider_ref
 
     return cfg

@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, TYPE_CHECKING
 
+from scitrera_app_framework import ext_parse_bool
+
 from sparkrun.runtimes.base import RuntimePlugin
 from sparkrun.runtimes._vllm_common import VllmMixin, VLLM_FLAG_MAP, VLLM_BOOL_FLAGS
 
@@ -70,6 +72,9 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         # If recipe has an explicit command template, render it
         rendered = recipe.render_command(config)
         if rendered:
+            # Honor a defaults/-o value for the backend over a literal in the
+            # command template (e.g. -o distributed_executor_backend=ray).
+            rendered = self._apply_distributed_backend(rendered, config, skip_keys)
             # Ensure --distributed-executor-backend ray is present for cluster mode
             if is_cluster and "--distributed-executor-backend" not in rendered:
                 rendered = rendered.rstrip() + " --distributed-executor-backend ray"
@@ -89,40 +94,14 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             return rendered
 
         # Otherwise, build command from structured defaults
-        return self._build_command(recipe, config, is_cluster, num_nodes, skip_keys=skip_keys)
-
-    def _build_command(
-        self, recipe: Recipe, config, is_cluster: bool, num_nodes: int, skip_keys: set[str] | frozenset[str] = frozenset()
-    ) -> str:
-        """Build the vllm serve command from structured config."""
-        parts = ["vllm", "serve", recipe.model]
-
-        # Auto-inject cluster args
-        if is_cluster:
-            tp = config.get("tensor_parallel")
-            if tp:
-                parts.extend(["-tp", str(tp)])
-            parts.extend(["--distributed-executor-backend", "ray"])
-        else:
-            tp = config.get("tensor_parallel")
-            if tp:
-                parts.extend(["-tp", str(tp)])
-
-        # Add flags from defaults (skip tp since handled above)
-        skip = {"tensor_parallel"}
-        if is_cluster:
-            skip.add("distributed_executor_backend")
-        skip.update(skip_keys)
-        parts.extend(
-            self.build_flags_from_map(
-                config,
-                VLLM_FLAG_MAP,
-                bool_keys=VLLM_BOOL_FLAGS,
-                skip_keys=skip,
-            )
+        return self._build_command(
+            recipe,
+            config,
+            is_cluster,
+            num_nodes,
+            skip_keys=skip_keys,
+            cluster_backend="ray",
         )
-
-        return " ".join(parts)
 
     def get_cluster_env(self, head_ip: str, num_nodes: int) -> dict[str, str]:
         """Return ray vLLM-specific cluster environment variables."""
@@ -203,6 +182,27 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         """vLLM uses sleep-infinity + exec, so tail the serve log file."""
         return "file"
 
+    def _worker_log_source(self, cluster_id, host, rank, *, ranked: bool, head_mode: str):
+        """Ray workers log to container stdout, not to a serve log.
+
+        The one runtime where workers don't share the head's log mode: only
+        the head execs ``vllm serve`` (into ``/tmp/sparkrun_serve.log``),
+        while a worker container's PID 1 *is* ``ray start --block``, so its
+        output is the container's own stdout and ``docker logs`` is the
+        right reader.  Ranks live inside the Ray cluster rather than mapping
+        to containers, so worker sources carry no rank.
+        """
+        from sparkrun.core.log_source import MODE_STDOUT, LogSource
+
+        return LogSource(
+            host=host,
+            container=self._resolve_executor().container_name(cluster_id, "worker"),
+            role="worker",
+            rank=None,
+            mode=MODE_STDOUT,
+            path=None,
+        )
+
     # --- Cluster launch / stop ---
 
     def _stop_cluster(
@@ -215,8 +215,8 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         """Stop a vLLM Ray cluster."""
         from sparkrun.orchestration.primitives import build_ssh_kwargs, cleanup_containers
 
-        head_container = self.executor.container_name(cluster_id, "head")
-        worker_container = self.executor.container_name(cluster_id, "worker")
+        head_container = self._resolve_executor().container_name(cluster_id, "head")
+        worker_container = self._resolve_executor().container_name(cluster_id, "worker")
         ssh_kwargs = build_ssh_kwargs(config)
 
         cleanup_containers(
@@ -227,6 +227,24 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         )
         logger.info("Cluster '%s' stopped on %d host(s)", cluster_id, len(hosts))
         return 0
+
+    @staticmethod
+    def _resolve_dashboard(dashboard: bool | None, recipe) -> bool:
+        """Resolve the tri-state Ray dashboard toggle to a concrete bool.
+
+        Precedence: an explicit ``True``/``False`` (from ``--dashboard`` /
+        ``--no-dashboard`` or the API) wins; otherwise the recipe's
+        ``runtime_config.dashboard`` (a YAML bool or ``"true"``/``"on"`` string,
+        coerced via SAF's ``ext_parse_bool``) applies; failing that, the
+        dashboard defaults on (Ray starts it when ``--include-dashboard`` is
+        absent).
+        """
+        if dashboard is not None:
+            return dashboard
+        value = (getattr(recipe, "runtime_config", None) or {}).get("dashboard")
+        if value is None:
+            return True
+        return ext_parse_bool(value)
 
     def _run_cluster(
         self,
@@ -245,7 +263,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         comm_env: "ClusterCommEnv | None" = None,
         ray_port: int = 46379,
         dashboard_port: int = 8265,
-        dashboard: bool = False,
+        dashboard: bool | None = None,
         extra_docker_opts: list[str] | None = None,
         **kwargs,
     ) -> int:
@@ -261,8 +279,10 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         import time
         from sparkrun.runtimes._cluster_ops import (
             ClusterContext,
+            cleanup_after_failure,
             cleanup_named_containers,
-            resolve_ib_env,
+            dump_serve_log,
+            resolve_comm_env,
             find_port,
             run_pre_serve_hooks,
         )
@@ -270,11 +290,31 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         from sparkrun.orchestration.ssh import run_remote_script
 
         progress = kwargs.pop("progress", None)
+        cluster = kwargs.pop("cluster", None)
+        backends = kwargs.pop("backends", None)
+        trust = kwargs.pop("trust", False)
+        placement = kwargs.pop("placement", None)
         combined_docker_opts = (self.get_extra_docker_opts() or []) + (extra_docker_opts or [])
 
-        ctx = ClusterContext.build(self, hosts, image, cluster_id, env, cache_dir, config, dry_run)
-        head_container = self.executor.container_name(cluster_id, "head")
-        worker_container = self.executor.container_name(cluster_id, "worker")
+        # Resolve the tri-state dashboard toggle now so the rest of the cluster
+        # launch works with a concrete bool.
+        dashboard = self._resolve_dashboard(dashboard, recipe)
+
+        ctx = ClusterContext.build(
+            self,
+            hosts,
+            image,
+            cluster_id,
+            env,
+            cache_dir,
+            config,
+            dry_run,
+            cluster=cluster,
+            recipe=recipe,
+            placement=placement,
+        )
+        head_container = self._resolve_executor().container_name(cluster_id, "head")
+        worker_container = self._resolve_executor().container_name(cluster_id, "worker")
 
         if progress:
             progress.begin_runtime_steps(5)
@@ -294,7 +334,13 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             progress.step("Detecting InfiniBand")
         else:
             logger.info("Step 2/5: InfiniBand detection...")
-        comm_env = resolve_ib_env(ctx, comm_env)
+        # When the launcher resolved per-host backends, route through
+        # CollectiveBackend.env_for_host via resolve_comm_env; otherwise
+        # fall through to the deprecated legacy resolver for callers
+        # that haven't threaded backends yet.
+        if backends is None:
+            raise RuntimeError("backends is None; legacy IB env resolution is deprecated and no backends were provided.")
+        comm_env = resolve_comm_env(ctx, comm_env, backends=backends)
         logger.info("Step 2/5: IB step done (%.1fs)", time.monotonic() - t0)
 
         # Auto-detect available ports to avoid collisions with running instances
@@ -319,7 +365,13 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         else:
             logger.info("Step 3/5: Launching Ray head on %s...", ctx.head_host)
         head_nccl_env = comm_env.get_env(ctx.head_host) if comm_env else None
-        head_script = self.executor.generate_ray_head_script(
+        executor = self._resolve_executor()
+        head_labels = executor.workload_labels_for_cluster(
+            cluster_id=cluster_id,
+            recipe=recipe,
+            runtime=self,
+        )
+        head_script = executor.generate_ray_head_script(
             image=image,
             container_name=head_container,
             ray_port=ray_port,
@@ -329,6 +381,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             volumes=ctx.volumes,
             nccl_env=head_nccl_env,
             extra_docker_opts=combined_docker_opts or None,
+            sparkrun_labels=head_labels or None,
         )
         head_result = run_remote_script(
             ctx.head_host,
@@ -338,7 +391,16 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             **ctx.ssh_kwargs,
         )
         if not head_result.success and not dry_run:
-            logger.error("Failed to launch Ray head: %s", head_result.stderr)
+            logger.error("Failed to launch Ray head on %s (rc=%d):", ctx.head_host, head_result.returncode)
+            for line in (head_result.stderr or "").rstrip().splitlines():
+                logger.error("  %s", line)
+            cleanup_after_failure(
+                ctx,
+                executor,
+                container_names=[head_container],
+                hosts=[ctx.head_host],
+                reason="Ray head launch failed",
+            )
             return 1
 
         head_ip = head_result.last_line if not dry_run else "<HEAD_IP>"
@@ -346,6 +408,13 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             logger.error(
                 "Could not determine head IP from output: %s",
                 head_result.stdout[-200:],
+            )
+            cleanup_after_failure(
+                ctx,
+                executor,
+                container_names=[head_container],
+                hosts=[ctx.head_host],
+                reason="Ray head IP not parseable",
             )
             return 1
         logger.info("  Ray head launched. HEAD_IP=%s", head_ip)
@@ -366,6 +435,13 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
                     ctx.head_host,
                     head_container,
                 )
+                cleanup_after_failure(
+                    ctx,
+                    executor,
+                    container_names=[head_container],
+                    hosts=[ctx.head_host],
+                    reason="Ray head port did not open",
+                )
                 return 1
         logger.info("Step 3/5: Ray head ready (%.1fs)", time.monotonic() - t0)
 
@@ -384,12 +460,21 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             # interfaces (e.g. wired on head, wifi on a worker) get the
             # right GLOO_SOCKET_IFNAME / NCCL_SOCKET_IFNAME / etc.
             from concurrent.futures import ThreadPoolExecutor, as_completed
+            from sparkrun.orchestration.ssh import resolve_parallel_cap
+            from sparkrun.runtimes._cluster_ops import _config_ssh_cap
 
-            with ThreadPoolExecutor(max_workers=len(ctx.worker_hosts)) as _wpool:
+            # Ray manages per-actor ranks internally; each host runs one
+            # ``{cluster_id}_worker`` container, so we omit the rank label.
+            _worker_labels = executor.workload_labels_for_cluster(
+                cluster_id=cluster_id,
+                recipe=recipe,
+                runtime=self,
+            )
+            with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(ctx.worker_hosts), _config_ssh_cap(ctx.config))) as _wpool:
                 _wfutures = {}
                 for _whost in ctx.worker_hosts:
                     _whost_env = comm_env.get_env(_whost) if comm_env else None
-                    _wscript = self.executor.generate_ray_worker_script(
+                    _wscript = executor.generate_ray_worker_script(
                         image=image,
                         container_name=worker_container,
                         head_ip=head_ip,
@@ -398,6 +483,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
                         volumes=ctx.volumes,
                         nccl_env=_whost_env,
                         extra_docker_opts=combined_docker_opts or None,
+                        sparkrun_labels=_worker_labels or None,
                     )
                     _wfutures[
                         _wpool.submit(
@@ -411,12 +497,18 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
                     ] = _whost
                 worker_results = [f.result() for f in as_completed(_wfutures)]
             failed = [r for r in worker_results if not r.success and not dry_run]
-            for r in failed:
-                logger.warning(
-                    "  Worker launch may have failed on %s: %s",
-                    r.host,
-                    r.stderr[:100],
+            if failed:
+                for r in failed:
+                    logger.error("Ray worker launch failed on %s (rc=%d):", r.host, r.returncode)
+                    for line in (r.stderr or "").rstrip().splitlines():
+                        logger.error("  %s", line)
+                cleanup_after_failure(
+                    ctx,
+                    executor,
+                    container_names=[head_container, worker_container],
+                    reason=f"{len(failed)} Ray worker(s) failed to launch",
                 )
+                return 1
             if not dry_run:
                 logger.info(
                     "  Waiting 3s for workers to connect to head at %s:%d...",
@@ -437,7 +529,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         all_containers = [(ctx.head_host, head_container)]
         for worker in ctx.worker_hosts:
             all_containers.append((worker, worker_container))
-        run_pre_serve_hooks(self, ctx, all_containers, recipe, overrides)
+        run_pre_serve_hooks(self, ctx, all_containers, recipe, overrides, trust=trust, cache_dir=cache_dir)
 
         # Prevent vLLM Ray from propagating per-host NCCL/transport env
         # vars from head to workers (GitHub issue #135).  Must run BEFORE
@@ -462,14 +554,15 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
                 ctx.head_host,
                 head_container,
             )
-        exec_script = self.executor.generate_exec_serve_script(
+        exec_script = executor.generate_exec_serve_script(
             container_name=head_container,
             serve_command=serve_command,
             env=ctx.all_env,
             detached=detached,
+            sparkrun_labels=head_labels or None,
         )
 
-        self._print_connection_info(hosts, cluster_id, head_ip=head_ip, dashboard_port=dashboard_port)
+        self._print_connection_info(hosts, cluster_id, head_ip=head_ip, dashboard_port=dashboard_port, dashboard=dashboard)
 
         exec_result = run_remote_script(
             ctx.head_host,
@@ -482,15 +575,29 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
 
         if dry_run:
             return 0
-        return exec_result.returncode
+        if not exec_result.success:
+            logger.error("Failed to exec serve on Ray head %s (rc=%d):", ctx.head_host, exec_result.returncode)
+            for line in (exec_result.stderr or "").rstrip().splitlines():
+                logger.error("  %s", line)
+            # `docker logs` is blind to the serve script's redirected output
+            # file -- emit it explicitly so the user sees the real traceback.
+            dump_serve_log(ctx.head_host, head_container, ctx.ssh_kwargs)
+            cleanup_after_failure(
+                ctx,
+                executor,
+                container_names=[head_container, worker_container],
+                reason="Ray serve exec failed",
+            )
+            return 1
+        return 0
 
-    def _print_connection_info(self, hosts, cluster_id, head_ip=None, dashboard_port=8265):
+    def _print_connection_info(self, hosts, cluster_id, head_ip=None, dashboard_port=8265, dashboard=True):
         """Print vLLM-specific connection info including Dashboard URL."""
         logger.info("=" * 60)
         logger.info("Cluster launched successfully. Nodes: %d", len(hosts))
         logger.info("")
         logger.info("To view logs:    sparkrun logs <recipe> --hosts %s", ",".join(hosts))
         logger.info("To stop cluster: sparkrun stop <recipe> --hosts %s", ",".join(hosts))
-        if head_ip:
+        if head_ip and dashboard:
             logger.info("Dashboard:       http://%s:%d", head_ip, dashboard_port)
         logger.info("=" * 60)

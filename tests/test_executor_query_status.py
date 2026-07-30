@@ -1,0 +1,619 @@
+"""Tests for Executor.query_status and the label-schema vocabulary.
+
+Covers:
+
+- :meth:`Executor.workload_labels` produces the canonical key set.
+- :meth:`Executor.query_status` default returns a safe zero-occupancy
+  snapshot (K8sExecutor inherits this in Phase 1).
+- :func:`sparkrun.orchestration.executors.docker._parse_docker_ps_output`
+  groups containers by ``cluster_id``, recovers rank from name,
+  honors labels when present, and ignores non-sparkrun names.
+- :func:`sparkrun.orchestration.executors.local._parse_local_pidfile_output`
+  groups pidfile lines by cluster_id.
+- End-to-end ``DockerExecutor.query_status`` via mocked
+  ``run_remote_scripts_parallel``.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+from sparkrun.core.cluster_status import ClusterStatus, RunningWorkload
+from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+from sparkrun.orchestration.executors._base import (
+    LABEL_CLUSTER_ID,
+    LABEL_INTENT_ID,
+    LABEL_MODEL,
+    LABEL_RANK,
+    LABEL_RECIPE,
+    LABEL_RUNTIME,
+    LABEL_SERVED_MODEL_NAME,
+    Executor,
+)
+from sparkrun.orchestration.executors.docker import (
+    DockerExecutor,
+    _parse_docker_labels,
+    _parse_docker_ps_output,
+)
+from sparkrun.orchestration.executors.k8s import K8sExecutor
+from sparkrun.orchestration.executors.local import (
+    LocalExecutor,
+    _parse_local_pidfile_output,
+)
+from sparkrun.orchestration.ssh import RemoteResult
+
+
+# --------------------------------------------------------------------------
+# workload_labels
+# --------------------------------------------------------------------------
+
+
+def test_workload_labels_minimal_has_cluster_id_and_intent():
+    """The intent_id is auto-derived from the cluster_id when not provided.
+
+    Callers that hand in a canonical
+    ``sparkrun_<intent>_<placement_token>`` cluster_id always get
+    ``sparkrun.intent_id`` populated for free; this is the discovery
+    surface load-aware schedulers rely on at stop time.
+    """
+    labels = Executor.workload_labels("sparkrun_abc123abc123abc1_def456abcdef")
+    assert labels == {
+        LABEL_CLUSTER_ID: "sparkrun_abc123abc123abc1_def456abcdef",
+        LABEL_INTENT_ID: "abc123abc123abc1",
+    }
+
+
+def test_workload_labels_full_set():
+    labels = Executor.workload_labels(
+        "sparkrun_abc123abc123abc1_def456abcdef",
+        recipe_name="@arena/qwen3-1.7b-vllm",
+        runtime_name="vllm",
+        rank=3,
+        model="Qwen/Qwen3-1.7B",
+        served_model_name="qwen3",
+    )
+    assert labels[LABEL_CLUSTER_ID] == "sparkrun_abc123abc123abc1_def456abcdef"
+    assert labels[LABEL_INTENT_ID] == "abc123abc123abc1"
+    assert labels[LABEL_RECIPE] == "@arena/qwen3-1.7b-vllm"
+    assert labels[LABEL_RUNTIME] == "vllm"
+    assert labels[LABEL_RANK] == "3"
+    assert labels[LABEL_MODEL] == "Qwen/Qwen3-1.7B"
+    assert labels[LABEL_SERVED_MODEL_NAME] == "qwen3"
+
+
+def test_workload_labels_skips_empty_model_and_served_name():
+    """Falsy model / served_model_name are omitted (consistent with recipe/runtime)."""
+    labels = Executor.workload_labels("sparkrun_x", model="", served_model_name="")
+    assert LABEL_MODEL not in labels
+    assert LABEL_SERVED_MODEL_NAME not in labels
+
+
+def test_workload_labels_explicit_intent_id():
+    """Explicit intent_id wins over cluster_id-derived value."""
+    labels = Executor.workload_labels("sparkrun_unrecognized_form", intent_id="abc123abc123")
+    assert labels[LABEL_INTENT_ID] == "abc123abc123"
+
+
+def test_workload_labels_rank_zero_emitted():
+    """Rank=0 is meaningful (the head rank) and should be emitted."""
+    labels = Executor.workload_labels("sparkrun_x", rank=0)
+    assert labels[LABEL_RANK] == "0"
+
+
+def test_workload_labels_skips_empty_strings():
+    """Empty recipe/runtime aren't emitted (falsy treatment)."""
+    labels = Executor.workload_labels("sparkrun_x", recipe_name="", runtime_name="")
+    assert LABEL_RECIPE not in labels
+    assert LABEL_RUNTIME not in labels
+
+
+# --------------------------------------------------------------------------
+# Default Executor.query_status — safe zero-occupancy
+# --------------------------------------------------------------------------
+
+
+def test_k8s_query_status_default_returns_empty_with_executor_name():
+    """K8sExecutor inherits the default empty-status implementation in Phase 1."""
+    status = K8sExecutor().query_status(["host-a", "host-b"])
+    assert isinstance(status, ClusterStatus)
+    assert status.executor == "k8s"
+    assert len(status.hosts) == 2
+    assert all(h.used_slots == 0 and h.free_slots == 0 for h in status.hosts)
+    assert all(h.workloads == () for h in status.hosts)
+
+
+def test_default_query_status_empty_hosts_returns_empty():
+    status = K8sExecutor().query_status([])
+    assert status.hosts == ()
+    assert status.executor == "k8s"
+
+
+# --------------------------------------------------------------------------
+# Docker label parsing
+# --------------------------------------------------------------------------
+
+
+def test_parse_docker_labels_basic():
+    assert _parse_docker_labels("a=1,b=2,c=3") == {"a": "1", "b": "2", "c": "3"}
+
+
+def test_parse_docker_labels_empty():
+    assert _parse_docker_labels("") == {}
+    assert _parse_docker_labels(None) == {}  # type: ignore[arg-type]
+
+
+def test_parse_docker_labels_ignores_malformed_tokens():
+    assert _parse_docker_labels("a=1,malformed,b=2") == {"a": "1", "b": "2"}
+
+
+# --------------------------------------------------------------------------
+# Docker ps output parsing
+# --------------------------------------------------------------------------
+
+
+def _docker_ps_line(name: str, container_id: str = "abc123", labels: str = "") -> str:
+    return json.dumps(
+        {
+            "Names": name,
+            "ID": container_id,
+            "Image": "vllm:latest",
+            "Labels": labels,
+            "State": "running",
+            "Status": "Up 5 minutes",
+        }
+    )
+
+
+def test_parse_docker_ps_empty_output():
+    workloads, used = _parse_docker_ps_output("", "host-a")
+    assert workloads == []
+    assert used == 0
+
+
+def test_parse_docker_ps_solo_container():
+    stdout = _docker_ps_line("sparkrun_abc123abc123abc1_def456abcdef_solo", container_id="cid-1")
+    workloads, used = _parse_docker_ps_output(stdout, "host-a")
+    assert used == 1
+    assert len(workloads) == 1
+    w = workloads[0]
+    assert w.cluster_id == "sparkrun_abc123abc123abc1_def456abcdef"
+    assert w.ranks_on_host == 1
+    assert "cid-1" in w.container_ids
+
+
+def test_parse_docker_ps_multi_rank_aggregates():
+    """Two ranks of the same cluster on one host = one workload with ranks_on_host=2."""
+    stdout = "\n".join(
+        [
+            _docker_ps_line("sparkrun_abc123abc123abc1_def456abcdef_node_0", container_id="c0"),
+            _docker_ps_line("sparkrun_abc123abc123abc1_def456abcdef_node_1", container_id="c1"),
+        ]
+    )
+    workloads, used = _parse_docker_ps_output(stdout, "host-a")
+    assert used == 2
+    assert len(workloads) == 1
+    assert workloads[0].ranks_on_host == 2
+    assert set(workloads[0].container_ids) == {"c0", "c1"}
+
+
+def test_parse_docker_ps_distinct_clusters_kept_separate():
+    stdout = "\n".join(
+        [
+            _docker_ps_line("sparkrun_aaa111aaa111aaa1_aaa222aaa222_solo"),
+            _docker_ps_line("sparkrun_bbb222bbb222bbb2_bbb333bbb333_solo"),
+        ]
+    )
+    workloads, used = _parse_docker_ps_output(stdout, "host-a")
+    assert used == 2
+    cluster_ids = {w.cluster_id for w in workloads}
+    assert cluster_ids == {"sparkrun_aaa111aaa111aaa1_aaa222aaa222", "sparkrun_bbb222bbb222bbb2_bbb333bbb333"}
+
+
+def test_parse_docker_ps_ignores_non_sparkrun_names():
+    stdout = "\n".join(
+        [
+            _docker_ps_line("my-postgres", container_id="pg"),
+            _docker_ps_line("sparkrun_abc123abc123abc1_def456abcdef_solo", container_id="sr"),
+            _docker_ps_line("some-other-container"),
+        ]
+    )
+    workloads, used = _parse_docker_ps_output(stdout, "host-a")
+    assert used == 1
+    assert workloads[0].cluster_id == "sparkrun_abc123abc123abc1_def456abcdef"
+
+
+def test_parse_docker_ps_labels_populate_recipe_and_runtime():
+    stdout = _docker_ps_line(
+        "sparkrun_abc123abc123abc1_def456abcdef_solo",
+        labels="%s=@arena/qwen3-vllm,%s=vllm" % (LABEL_RECIPE, LABEL_RUNTIME),
+    )
+    workloads, _ = _parse_docker_ps_output(stdout, "host-a")
+    assert workloads[0].recipe_name == "@arena/qwen3-vllm"
+    assert workloads[0].runtime_name == "vllm"
+
+
+def test_parse_docker_ps_labels_rank_override():
+    """When sparkrun.rank label is present, it overrides the name-derived rank."""
+    stdout = _docker_ps_line(
+        "sparkrun_abc123abc123abc1_def456abcdef_node_5",
+        labels="%s=7" % LABEL_RANK,
+    )
+    workloads, _ = _parse_docker_ps_output(stdout, "host-a")
+    # Single sighting → one rank on this host regardless of the rank index.
+    assert workloads[0].ranks_on_host == 1
+
+
+def test_parse_docker_ps_populates_container_detail():
+    """Each sighting yields a ContainerDetail with name/status/image/role."""
+    stdout = _docker_ps_line(
+        "sparkrun_abc123abc123abc1_def456abcdef_solo",
+        container_id="cid-1",
+    )
+    workloads, _ = _parse_docker_ps_output(stdout, "host-a")
+    assert len(workloads[0].containers) == 1
+    detail = workloads[0].containers[0]
+    assert detail.name == "sparkrun_abc123abc123abc1_def456abcdef_solo"
+    assert detail.role == "solo"
+    assert detail.status == "Up 5 minutes"
+    assert detail.image == "vllm:latest"
+
+
+def test_parse_docker_ps_multi_rank_collects_both_containers():
+    """A two-rank workload carries a ContainerDetail per rank with node roles."""
+    stdout = "\n".join(
+        [
+            _docker_ps_line("sparkrun_abc123abc123abc1_def456abcdef_node_0", container_id="c0"),
+            _docker_ps_line("sparkrun_abc123abc123abc1_def456abcdef_node_1", container_id="c1"),
+        ]
+    )
+    workloads, _ = _parse_docker_ps_output(stdout, "host-a")
+    roles = {c.role for c in workloads[0].containers}
+    assert roles == {"node_0", "node_1"}
+    assert all(c.image == "vllm:latest" for c in workloads[0].containers)
+
+
+def test_parse_docker_ps_ignores_non_json_lines():
+    stdout = "\n".join(
+        [
+            "this is not json",
+            _docker_ps_line("sparkrun_abc123abc123abc1_def456abcdef_solo"),
+            "",
+        ]
+    )
+    workloads, used = _parse_docker_ps_output(stdout, "host-a")
+    assert used == 1
+    assert len(workloads) == 1
+
+
+# --------------------------------------------------------------------------
+# DockerExecutor.query_status — integration with mocked SSH
+# --------------------------------------------------------------------------
+
+
+def _mock_remote_results(per_host_stdout: dict[str, str], returncode: int = 0) -> list[RemoteResult]:
+    return [RemoteResult(host=host, returncode=returncode, stdout=stdout, stderr="") for host, stdout in per_host_stdout.items()]
+
+
+def test_docker_query_status_two_hosts_one_solo_each():
+    executor = DockerExecutor()
+    per_host = {
+        "host-a": _docker_ps_line("sparkrun_aaa111aaa111aaa1_aaa222aaa222_solo"),
+        "host-b": _docker_ps_line("sparkrun_bbb222bbb222bbb2_bbb333bbb333_solo"),
+    }
+    with patch(
+        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+        return_value=_mock_remote_results(per_host),
+    ):
+        status = executor.query_status(["host-a", "host-b"])
+    assert status.executor == "docker"
+    assert len(status.hosts) == 2
+    occ_a = status.for_host("host-a")
+    occ_b = status.for_host("host-b")
+    assert occ_a is not None and occ_a.used_slots == 1
+    assert occ_b is not None and occ_b.used_slots == 1
+    # DGX Spark default = 1 GPU/host → no free slots when one workload is on it.
+    assert occ_a.free_slots == 0
+    assert occ_b.free_slots == 0
+
+
+def test_docker_query_status_unreachable_host_is_skipped():
+    executor = DockerExecutor()
+    results = [
+        RemoteResult(host="host-a", returncode=0, stdout=_docker_ps_line("sparkrun_aaaaaaaaaaaaaaaa_aaaaaaaaaaaa_solo"), stderr=""),
+        RemoteResult(host="host-down", returncode=-1, stdout="", stderr="ssh: unreachable"),
+    ]
+    with patch(
+        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+        return_value=results,
+    ):
+        status = executor.query_status(["host-a", "host-down"])
+    # host-down is omitted; caller can detect via for_host()
+    assert {h.host for h in status.hosts} == {"host-a"}
+    assert status.for_host("host-down") is None
+
+
+def test_docker_query_status_respects_host_hardware_capacity():
+    """A 4-GPU host with 2 ranks running shows 2 used, 2 free."""
+    executor = DockerExecutor()
+    h200 = HostHardware(accelerators=[AcceleratorSpec(vendor="nvidia", model="h200", count=4, memory_gb=141.0)])
+    stdout = "\n".join(
+        [
+            _docker_ps_line("sparkrun_aaaaaaaaaaaaaaaa_aaaaaaaaaaaa_node_0"),
+            _docker_ps_line("sparkrun_aaaaaaaaaaaaaaaa_aaaaaaaaaaaa_node_1"),
+        ]
+    )
+    with patch(
+        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+        return_value=_mock_remote_results({"big-host": stdout}),
+    ):
+        status = executor.query_status(["big-host"], host_hardware={"big-host": h200})
+    occ = status.for_host("big-host")
+    assert occ is not None
+    assert occ.used_slots == 2
+    assert occ.free_slots == 2
+
+
+def test_docker_query_status_empty_host_list():
+    """Empty input → empty status, no SSH attempted."""
+    with patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel") as mock_ssh:
+        status = DockerExecutor().query_status([])
+        assert status.hosts == ()
+        mock_ssh.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# LocalExecutor pidfile parsing + query_status
+# --------------------------------------------------------------------------
+
+
+def test_parse_local_pidfile_output_empty():
+    workloads, used = _parse_local_pidfile_output("")
+    assert workloads == []
+    assert used == 0
+
+
+def test_parse_local_pidfile_output_single():
+    stdout = "sparkrun_abc123abc123abc1_def456abcdef_solo\t12345\n"
+    workloads, used = _parse_local_pidfile_output(stdout)
+    assert used == 1
+    assert workloads[0].cluster_id == "sparkrun_abc123abc123abc1_def456abcdef"
+    assert workloads[0].ranks_on_host == 1
+
+
+def test_parse_local_pidfile_output_multi_rank():
+    stdout = "sparkrun_abc123abc123abc1_def456abcdef_node_0\t100\nsparkrun_abc123abc123abc1_def456abcdef_node_1\t200\n"
+    workloads, used = _parse_local_pidfile_output(stdout)
+    assert used == 2
+    assert len(workloads) == 1
+    assert workloads[0].ranks_on_host == 2
+
+
+def test_parse_local_pidfile_output_ignores_non_sparkrun():
+    stdout = "redis-server\t1\nsparkrun_abcabcabcabcabca_bcabcabcabca_solo\t2\n"
+    workloads, used = _parse_local_pidfile_output(stdout)
+    assert used == 1
+    assert workloads[0].cluster_id == "sparkrun_abcabcabcabcabca_bcabcabcabca"
+
+
+def test_parse_local_pidfile_output_populates_container_detail():
+    """A pidfile line yields a ContainerDetail with pid-based status + local image."""
+    stdout = "sparkrun_abc123abc123abc1_def456abcdef_solo\t12345\n"
+    workloads, _ = _parse_local_pidfile_output(stdout)
+    assert len(workloads[0].containers) == 1
+    detail = workloads[0].containers[0]
+    assert detail.name == "sparkrun_abc123abc123abc1_def456abcdef_solo"
+    assert detail.role == "solo"
+    assert detail.status == "Up (pid 12345)"
+    assert detail.image == "(local process)"
+
+
+def test_local_query_status_runs_ssh_script():
+    executor = LocalExecutor()
+    with patch(
+        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+        return_value=_mock_remote_results({"host-a": "sparkrun_abcdef012345abcd_ef0123456789_solo\t999\n"}),
+    ) as mock_ssh:
+        status = executor.query_status(["host-a"])
+    assert mock_ssh.called
+    assert status.executor == "local"
+    assert status.for_host("host-a").used_slots == 1
+
+
+def test_local_query_status_empty_host_list():
+    with patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel") as mock_ssh:
+        status = LocalExecutor().query_status([])
+        assert status.hosts == ()
+        mock_ssh.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# Running workload data shape (round-trip with new runtime_name field)
+# --------------------------------------------------------------------------
+
+
+def test_running_workload_runtime_name_optional():
+    w = RunningWorkload(cluster_id="x")
+    assert w.runtime_name is None
+
+    w2 = RunningWorkload(cluster_id="x", runtime_name="vllm")
+    assert w2.runtime_name == "vllm"
+
+
+# --------------------------------------------------------------------------
+# ClusterStatus.merged_with (docker + local supplemental merge)
+# --------------------------------------------------------------------------
+
+
+def _host(host, *, workloads=(), used=0, free=0):
+    from sparkrun.core.cluster_status import HostOccupancy
+
+    return HostOccupancy(host=host, workloads=tuple(workloads), used_slots=used, free_slots=free)
+
+
+def test_merged_with_combines_workloads_and_sums_slots_same_host():
+    """Two snapshots over the same host merge workloads and sum used slots."""
+    from sparkrun.core.cluster_status import ClusterStatus
+
+    docker = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="sparkrun_docker")], used=1, free=3),),
+        queried_at=100.0,
+        executor="docker",
+    )
+    local = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="sparkrun_local")], used=1, free=3),),
+        queried_at=50.0,
+        executor="local",
+    )
+    merged = docker.merged_with(local)
+
+    occ = merged.for_host("h1")
+    assert occ is not None
+    ids = {w.cluster_id for w in occ.workloads}
+    assert ids == {"sparkrun_docker", "sparkrun_local"}
+    assert occ.used_slots == 2
+    # capacity (used+free from the primary) == 4 → 4 - 2 = 2 free.
+    assert occ.free_slots == 2
+    # Primary metadata is kept.
+    assert merged.queried_at == 100.0
+    assert merged.executor == "docker"
+
+
+def test_merged_with_preserves_host_in_only_one_snapshot():
+    """A host present in only the local snapshot is appended after primary hosts."""
+    from sparkrun.core.cluster_status import ClusterStatus
+
+    docker = ClusterStatus(hosts=(_host("h1", used=0, free=4),), executor="docker")
+    local = ClusterStatus(
+        hosts=(
+            _host("h1", used=0, free=4),
+            _host("h2", workloads=[RunningWorkload(cluster_id="sparkrun_only_local")], used=1, free=3),
+        ),
+        executor="local",
+    )
+    merged = docker.merged_with(local)
+
+    assert [h.host for h in merged.hosts] == ["h1", "h2"]
+    h2 = merged.for_host("h2")
+    assert h2 is not None
+    assert h2.workloads[0].cluster_id == "sparkrun_only_local"
+
+
+def test_merged_with_dedups_shared_cluster_id():
+    """A cluster_id seen in both snapshots is kept once (primary wins)."""
+    from sparkrun.core.cluster_status import ClusterStatus
+
+    docker = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="dup", recipe_name="from-docker")], used=1, free=3),),
+        executor="docker",
+    )
+    local = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="dup", recipe_name="from-local")], used=1, free=3),),
+        executor="local",
+    )
+    merged = docker.merged_with(local)
+
+    occ = merged.for_host("h1")
+    assert occ is not None
+    assert len(occ.workloads) == 1
+    assert occ.workloads[0].recipe_name == "from-docker"
+    # A shared cluster_id must NOT double-count slots: the workload occupies
+    # one slot, not two, so capacity(4) - 1 = 3 free (not 2).
+    assert occ.used_slots == 1
+    assert occ.free_slots == 3
+
+
+def test_merged_with_unions_containers_for_shared_cluster_id():
+    """A shared cluster_id absorbs the disjoint docker + local realizations."""
+    from sparkrun.core.cluster_status import ClusterStatus, ContainerDetail
+
+    docker_detail = ContainerDetail(name="sparkrun_dup_solo", role="solo", status="Up 1 min", image="vllm:latest")
+    local_detail = ContainerDetail(name="sparkrun_dup_local_solo", role="solo", status="Up (pid 9)", image="(local process)")
+    docker = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="dup", containers=(docker_detail,))], used=1, free=3),),
+        executor="docker",
+    )
+    local = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="dup", containers=(local_detail,))], used=1, free=3),),
+        executor="local",
+    )
+    merged = docker.merged_with(local)
+
+    occ = merged.for_host("h1")
+    assert occ is not None
+    assert len(occ.workloads) == 1
+    names = {c.name for c in occ.workloads[0].containers}
+    assert names == {"sparkrun_dup_solo", "sparkrun_dup_local_solo"}
+
+
+def test_merged_with_dedups_containers_by_name():
+    """Identical container names across snapshots collapse to one (primary wins)."""
+    from sparkrun.core.cluster_status import ClusterStatus, ContainerDetail
+
+    d1 = ContainerDetail(name="sparkrun_dup_solo", role="solo", status="from-docker", image="vllm:latest")
+    d2 = ContainerDetail(name="sparkrun_dup_solo", role="solo", status="from-local", image="(local process)")
+    docker = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="dup", containers=(d1,))], used=1, free=3),),
+        executor="docker",
+    )
+    local = ClusterStatus(
+        hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="dup", containers=(d2,))], used=1, free=3),),
+        executor="local",
+    )
+    occ = docker.merged_with(local).for_host("h1")
+    assert occ is not None
+    assert len(occ.workloads[0].containers) == 1
+    assert occ.workloads[0].containers[0].status == "from-docker"
+
+
+# --------------------------------------------------------------------------
+# ClusterStatus.merge — N-way fold (priority order)
+# --------------------------------------------------------------------------
+
+
+def test_merge_empty_returns_empty():
+    assert ClusterStatus.merge([]).hosts == ()
+
+
+def test_merge_single_returns_same_object():
+    snap = ClusterStatus(hosts=(_host("h1", used=1, free=3),), executor="docker")
+    assert ClusterStatus.merge([snap]) is snap  # zero-cost single-executor scope
+
+
+def test_merge_folds_in_priority_order():
+    a = ClusterStatus(hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="a")], used=1, free=3),), executor="docker")
+    b = ClusterStatus(hosts=(_host("h1", workloads=[RunningWorkload(cluster_id="b")], used=1, free=3),), executor="local")
+    merged = ClusterStatus.merge([a, b])
+    occ = merged.for_host("h1")
+    assert occ is not None
+    assert {w.cluster_id for w in occ.workloads} == {"a", "b"}
+    assert occ.used_slots == 2
+    assert merged.executor == "docker"  # first snapshot is authoritative
+
+
+# --------------------------------------------------------------------------
+# cluster_status_scope — the executor↔cluster substrate intersection
+# --------------------------------------------------------------------------
+
+
+def test_cluster_status_scope_host_for_ssh_cluster():
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.orchestration.executor import cluster_status_scope
+
+    assert cluster_status_scope(ClusterDefinition(name="c", hosts=["h"])) == "host"
+
+
+def test_cluster_status_scope_follows_pinned_executor():
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.orchestration.executor import cluster_status_scope
+
+    # A k8s-pinned cluster resolves to the k8s substrate, not "host".
+    assert cluster_status_scope(ClusterDefinition(name="c", hosts=["h"], executor="k8s")) == "k8s"
+
+
+def test_cluster_status_scope_executor_override_wins():
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.orchestration.executor import cluster_status_scope
+
+    # An explicit executor override picks the scope even on a bare cluster.
+    assert cluster_status_scope(ClusterDefinition(name="c", hosts=["h"]), executor="local") == "host"

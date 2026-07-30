@@ -9,8 +9,20 @@ from typing import Any, TYPE_CHECKING
 
 from scitrera_app_framework import Plugin, Variables, ext_parse_bool
 
+from sparkrun.core.log_source import (
+    MODE_FILE,
+    MODE_STDOUT,
+    SCOPE_ALL,
+    SCOPE_HEAD,
+    SERVE_LOG_PATH,
+    LogSource,
+)
+
 if TYPE_CHECKING:
+    from sparkrun.core.backend_select import BackendBundle
+    from sparkrun.core.cluster_manager import ClusterDefinition
     from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.parallelism import ParallelismConfig
     from sparkrun.core.recipe import Recipe
     from sparkrun.orchestration.comm_env import ClusterCommEnv
     from sparkrun.orchestration.executor import Executor
@@ -38,21 +50,47 @@ class RuntimePlugin(Plugin):
     runtime_name: str = ""
     default_image_prefix: str = ""
 
+    # --- Hardware compatibility ---
+    requires_capability: frozenset[str] = frozenset()
+    """Capabilities or accelerator-model names every placed host must advertise.
+
+    Empty (default) means the runtime accepts any host.  An entry matches
+    when *any* accelerator on the host has that tag in
+    :attr:`AcceleratorSpec.capabilities` **or** when its
+    :attr:`AcceleratorSpec.model` equals the entry.  This lets runtimes
+    pin to specific accelerator models (e.g. ``"gb10"`` for Atlas/Eugr)
+    without having to coordinate a separate capability-tag taxonomy.
+    """
+
     # --- Executor ---
-    _executor: Executor | None = None
+    #
+    # The active executor is set by :meth:`run` (which receives one
+    # from :func:`sparkrun.orchestration.executor.resolve_executor`
+    # in the launcher).  Lifecycle paths (``sparkrun stop`` /
+    # ``sparkrun logs``) that don't go through :meth:`run` either
+    # assign one explicitly or let :meth:`_resolve_executor` resolve
+    # the default via the unified chain.  No lazy DockerExecutor
+    # fallback property — selection always flows through
+    # :func:`sparkrun.orchestration.executor.resolve_executor`.
+    executor: Executor | None = None
 
-    @property
-    def executor(self) -> Executor:
-        """Return the executor, lazily defaulting to DockerExecutor."""
-        if self._executor is None:
-            from sparkrun.orchestration.executor_docker import DockerExecutor
+    def _resolve_executor(self) -> Executor:
+        """Return the active executor, resolving via the unified chain if unset.
 
-            self._executor = DockerExecutor()
-        return self._executor
+        Internal helper for runtime methods that may run *outside* the
+        :meth:`run` call (notably :meth:`follow_logs`, :meth:`stop`,
+        and naming helpers like :meth:`get_head_container_name`).
+        When :attr:`executor` has been explicitly set (the common
+        ``run()`` path), return it as-is.  Otherwise resolve a fresh
+        one from :func:`resolve_executor` so naming + lifecycle helpers
+        keep working under the new "no lazy default" contract.
+        """
+        if self.executor is not None:
+            return self.executor
+        from sparkrun.orchestration.executor import resolve_executor
 
-    @executor.setter
-    def executor(self, value: Executor) -> None:
-        self._executor = value
+        self.executor = resolve_executor(runtime=self, rootless=False, auto_user=False)
+        return self.executor
 
     # --- SAF Plugin interface ---
 
@@ -115,6 +153,40 @@ class RuntimePlugin(Plugin):
             return recipe.container
         return "%s:latest" % self.default_image_prefix
 
+    def default_image_for(self, host_hardware=None) -> str | None:
+        """Return a default container image for a given host's hardware.
+
+        Resolution order:
+
+        1. If *host_hardware* matches a registered
+           :class:`HardwarePlatformPlugin` (via
+           :func:`sparkrun.platforms.resolve_platform`) and that
+           platform publishes a default for this runtime, return it.
+        2. Otherwise fall back to the legacy
+           ``{default_image_prefix}:latest``.
+        3. Return ``None`` when no prefix is declared, so callers can
+           surface "no default image; set ``recipe.container`` explicitly".
+
+        Subclasses are encouraged to override this rather than
+        :meth:`resolve_container` for vendor-specific defaults; doing so
+        keeps explicit ``recipe.container`` values authoritative across
+        all hosts.
+        """
+        if host_hardware is not None:
+            try:
+                from sparkrun.platforms import resolve_platform
+
+                platform = resolve_platform(host_hardware)
+            except Exception:
+                platform = None
+            if platform is not None:
+                img = platform.default_image(self.runtime_name)
+                if img is not None:
+                    return img
+        if self.default_image_prefix:
+            return "%s:latest" % self.default_image_prefix
+        return None
+
     # noinspection PyMethodMayBeStatic
     def get_common_env(self):
         """Return environment variables common to either solo or cluster mode for this runtime."""
@@ -158,6 +230,33 @@ class RuntimePlugin(Plugin):
         """
         return "ray"
 
+    def default_executor(self) -> str | None:
+        """Return the runtime's preferred executor when nothing else is set.
+
+        Sits *below* the recipe-level ``executor`` field and CLI overrides
+        in the executor resolution chain, and *above* the hardcoded
+        global default (``"docker"``).  Allows specialised runtimes to
+        opt into a non-Docker default — for example, a future
+        Apple-MLX runtime could return ``"local"`` because there is no
+        sensible Docker image for it.
+
+        Returns:
+            ``None`` (default) — defer to the global default (``"docker"``).
+            ``"docker"`` / ``"local"`` / ``"k8s"`` — pin a specific executor
+            unless overridden by recipe or CLI.
+        """
+        return None
+
+    def default_executor_config(self) -> dict[str, Any]:
+        """Return runtime-specific executor config defaults.
+
+        This sits below recipe and cluster executor_config, but above global
+        SparkrunConfig and per-executor defaults.  Runtime authors should use it
+        for options that should be overridable by a workload, such as clearing
+        an image entrypoint for a runtime-specific container.
+        """
+        return {}
+
     def get_family(self) -> str:
         """Return the canonical runtime family name.
 
@@ -181,6 +280,105 @@ class RuntimePlugin(Plugin):
         """
         return None
 
+    @staticmethod
+    def _resolve_master_addr(
+        head_ip: str,
+        node_rank: int,
+        replica_size: int,
+        hosts: list[str] | None = None,
+        placement=None,
+    ) -> str:
+        """Resolve the master-address for *node_rank* under hybrid tp+dp.
+
+        For pure DP (``replica_size == 1``) or pure TP (``replica_size ==
+        num_nodes``) this always returns *head_ip*.  For hybrid tp+dp
+        clusters, the master-addr points at the *first* host of the
+        current node's data-parallel replica (rank
+        ``dp_rank * replica_size``).
+
+        Resolution priority for the replica head:
+
+        1. ``placement.host_for_rank(dp_rank * replica_size)`` when a
+           placement object is supplied (multi-rank-per-host topologies).
+        2. ``hosts[dp_rank * replica_size]`` when a host list is supplied
+           (1-GPU-per-host topologies).
+        3. *head_ip* as final fallback (unit-test / solo paths).
+
+        Args:
+            head_ip: The cluster head node IP.
+            node_rank: Global rank for this node.
+            replica_size: ``tp * pp`` — number of ranks per DP replica.
+                Pass ``1`` when no replica grouping applies.
+            hosts: Optional list of hosts ordered by rank.
+            placement: Optional :class:`RankAssignment` from the
+                placement engine.
+        """
+        if replica_size <= 0:
+            replica_size = 1
+        dp_rank = node_rank // replica_size
+        if placement is not None and placement.total_ranks >= (dp_rank + 1) * replica_size:
+            return placement.host_for_rank(dp_rank * replica_size)
+        if hosts and len(hosts) >= (dp_rank + 1) * replica_size:
+            return hosts[dp_rank * replica_size]
+        return head_ip
+
+    def _make_node_command_args(
+        self,
+        head_ip: str,
+        num_nodes: int,
+        node_rank: int,
+        init_port: int,
+        hosts: list[str] | None = None,
+        placement=None,
+        replica_size: int = 1,
+    ) -> dict[str, str]:
+        """Return the canonical per-node distributed-init arg dict.
+
+        Computes the four values every native multi-node runtime needs
+        when emitting a node-specific serve command:
+
+        * ``num_nodes`` — total participating nodes (``--nnodes`` /
+          ``--world-size``).
+        * ``node_rank`` — this node's rank within the cluster (or within
+          its DP replica when *replica_size* > 1).
+        * ``master_addr`` — the rendezvous host for *node_rank* (see
+          :meth:`_resolve_master_addr`).
+        * ``master_port`` — the rendezvous port.
+
+        Runtimes layer their own flag spelling on top — e.g. SGLang emits
+        ``--dist-init-addr HOST:PORT`` + ``--nnodes`` + ``--node-rank``;
+        vLLM-distributed emits ``--nnodes`` + ``--node-rank`` +
+        ``--master-addr`` + ``--master-port``; Atlas emits ``--world-size``
+        + ``--rank`` + ``--master-addr`` + ``--master-port``.
+
+        Args:
+            head_ip: The cluster head node IP (fallback master_addr).
+            num_nodes: Total node count.  When *replica_size* > 1, this
+                stays as the *global* node count; callers wanting the
+                intra-replica nnodes pass *replica_size* explicitly via
+                the returned dict's ``num_nodes`` value-override pattern.
+            node_rank: Global rank for this node.
+            init_port: Master coordination port.
+            hosts: Optional host list (1-GPU-per-host topologies).
+            placement: Optional :class:`RankAssignment`.
+            replica_size: ``tp * pp`` when hybrid tp+dp is in play; the
+                value used to compute the per-replica master address.
+                Pass ``1`` (default) for pure DP / pure TP.
+        """
+        master_addr = self._resolve_master_addr(
+            head_ip=head_ip,
+            node_rank=node_rank,
+            replica_size=replica_size,
+            hosts=hosts,
+            placement=placement,
+        )
+        return {
+            "num_nodes": str(num_nodes),
+            "node_rank": str(node_rank),
+            "master_addr": master_addr,
+            "master_port": str(init_port),
+        }
+
     def generate_node_command(
         self,
         recipe: Recipe,
@@ -191,6 +389,7 @@ class RuntimePlugin(Plugin):
         init_port: int = 25000,
         skip_keys: set[str] | frozenset[str] = frozenset(),
         hosts: list[str] | None = None,
+        placement=None,
     ) -> str:
         """Generate the serve command for a specific node in native clustering.
 
@@ -208,6 +407,11 @@ class RuntimePlugin(Plugin):
                 support hybrid tp+dp rank math (e.g. vLLM) use this to
                 compute per-replica master addresses.  Ignored by runtimes
                 without that support.
+            placement: Optional :class:`RankAssignment` from the
+                placement engine.  When present, runtimes that support
+                multi-rank-per-host topologies use it instead of
+                indexing ``hosts[i]``.  Back-compat ``None`` keeps the
+                legacy 1-GPU-per-host behavior.
 
         Returns:
             The full command string for this node.
@@ -246,6 +450,8 @@ class RuntimePlugin(Plugin):
         dry_run: bool,
         recipe: Recipe | None = None,
         config_chain=None,
+        trust: bool = False,
+        cache_dir: str | None = None,
     ) -> None:
         """Hook called after containers are launched but before serve command.
 
@@ -260,11 +466,25 @@ class RuntimePlugin(Plugin):
             dry_run: Dry-run mode.
             recipe: The loaded recipe (for pre_exec commands).
             config_chain: Config chain for template substitution.
+            trust: When True, bypass the pre_exec confirmation prompt.
+                Resolved upstream in ``launch_inference`` via
+                :func:`sparkrun.core.launcher.resolve_recipe_trust`.
+            cache_dir: Effective HuggingFace cache directory on remote hosts.
+                Threaded from the launcher so disk-space failure messages
+                show the correct path.
         """
         if recipe and recipe.pre_exec:
             from sparkrun.orchestration.hooks import run_pre_exec
 
-            run_pre_exec(hosts_containers, recipe.pre_exec, config_chain, ssh_kwargs=ssh_kwargs, dry_run=dry_run)
+            run_pre_exec(
+                hosts_containers,
+                recipe.pre_exec,
+                config_chain,
+                ssh_kwargs=ssh_kwargs,
+                dry_run=dry_run,
+                trust=trust,
+                cache_dir=cache_dir,
+            )
 
     def get_extra_volumes(self) -> dict[str, str]:
         """Return additional volume mounts for this runtime.
@@ -287,12 +507,37 @@ class RuntimePlugin(Plugin):
 
         The base implementation sets ``HF_HOME`` so HuggingFace
         libraries find the cache at the rootless-compatible mount
-        point (``/cache/huggingface``).
+        point (``/cache/huggingface``).  It also sets ``HF_HUB_CACHE``
+        (``$HF_HOME/hub``) explicitly: some clients (e.g. the Rust
+        ``hf-hub``-based tokenary runtime) honor ``HF_HUB_CACHE`` but
+        not ``HF_HOME``, so without this they'd fall back to
+        ``~/.cache/huggingface`` and miss the mounted cache.
 
         Returns:
             Dict of env var name -> value.
         """
-        return {"HF_HOME": "/cache/huggingface"}
+        return {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub"}
+
+    def finalize_host_comm_env(self, host_env: dict[str, str]) -> dict[str, str]:
+        """Final per-host adjustment of the resolved comm env before launch.
+
+        Called once per host in the native-cluster launch path with that
+        host's merged comm env (shared + per-host overrides, including
+        ``NODE_IP`` after any fabric-init re-pin).  The base implementation
+        is a no-op; runtimes override to derive runtime-specific per-host
+        vars from the finalized network selection — e.g. vLLM mirrors
+        ``NODE_IP`` into ``VLLM_HOST_IP`` so vLLM advertises the same address
+        the init network resolved to, rather than inferring it from the
+        default route.
+
+        Args:
+            host_env: The host's resolved comm env.  Do not mutate; return a
+                new dict when adding keys.
+
+        Returns:
+            The (possibly augmented) per-host env dict.
+        """
+        return host_env
 
     def get_extra_docker_opts(self) -> list[str]:
         """Return additional ``docker run`` options for this runtime.
@@ -306,20 +551,6 @@ class RuntimePlugin(Plugin):
         """
         return []
 
-    def get_executor_config_defaults(self) -> dict:
-        """Runtime-level defaults merged into the executor config chain.
-
-        Override to set executor options (e.g. ``entrypoint``) that should
-        apply by default for this runtime but remain overridable by the
-        recipe's ``executor_config`` and CLI flags. Sits just above the
-        built-in ``EXECUTOR_DEFAULTS`` in priority, so both the recipe and
-        the CLI win over it.
-
-        Returns:
-            Dict of executor config keys -> values (empty by default).
-        """
-        return {}
-
     def validate_recipe(self, recipe: Recipe) -> list[str]:
         """Return list of warnings/errors for runtime-specific fields.
 
@@ -332,31 +563,65 @@ class RuntimePlugin(Plugin):
             issues.append("[%s] model is required" % self.runtime_name)
         return issues
 
-    def compute_required_nodes(self, recipe: Recipe, overrides: dict[str, Any] | None = None) -> int | None:
-        """Compute the number of nodes required to run this recipe.
+    # noinspection PyUnusedLocal
+    def world_size(
+        self,
+        parallelism: ParallelismConfig,
+        *,
+        recipe: Recipe,
+        cluster: ClusterDefinition,
+    ) -> int:
+        """Total rank count this runtime needs for *parallelism*.
 
-        On DGX Spark (1 GPU per node), the total node count is the
-        product of tensor, pipeline, and data parallelism: ``tp * pp * dp``.
+        Default: ``parallelism.total_gpus`` (``tp * pp * dp``).  Override
+        when parallelism dimensions multiply differently (e.g. Atlas's
+        MoE mesh where ``world_size == tp * ep``) or when hardware
+        shape affects rank count.
+
+        The result is threaded through
+        :attr:`sparkrun.core.scheduler.SchedulingRequest.total_ranks`
+        so schedulers stay agnostic to runtime-specific rank-count
+        semantics.
 
         Args:
-            recipe: The loaded recipe.
-            overrides: CLI override values (merged into config chain).
-
-        Returns:
-            Required node count, or ``None`` if no parallelism config
-            is set (meaning "use all provided hosts, no trimming").
+            parallelism: Resolved parallelism dimensions.
+            recipe: The loaded recipe (passed by keyword for future use
+                — runtimes may inspect recipe fields to refine the
+                count).
+            cluster: The cluster the workload will run on (passed by
+                keyword for future use — runtimes may consult hardware
+                shape via ``cluster.hardware_for(host)``).
         """
-        from sparkrun.core.parallelism import extract_parallelism
+        return parallelism.total_gpus
 
-        config = recipe.build_config_chain(overrides or {})
-        # Check raw values first — return None when nothing is configured
-        tp_val = config.get("tensor_parallel")
-        pp_val = config.get("pipeline_parallel")
-        dp_val = config.get("data_parallel")
-        if tp_val is None and pp_val is None and dp_val is None:
-            return None
-        p = extract_parallelism(config)
-        return p.total_nodes
+    @staticmethod
+    def reconcile_flag_in_command(command: str, flag: str, value: object, *, override: bool = False) -> str:
+        """Reconcile a rendered command string with a desired ``flag value``.
+
+        ``Recipe.render_command`` only substitutes ``{placeholders}``; a
+        literal flag baked into a recipe ``command`` is passed through
+        untouched, so a config/CLI value that is not wired as a placeholder
+        gets silently dropped.  This is the single primitive for fixing that
+        class of template exception, with two policies:
+
+        - ``override=False`` (*fill*): append ``flag value`` only when *flag*
+          is absent; an existing occurrence is left exactly as the template
+          author wrote it.  (Used for ``served_model_name``.)
+        - ``override=True``: force *flag* to *value* — replace the value of
+          an existing ``flag <token>`` occurrence, or append when absent.
+          (Used so e.g. ``-o distributed_executor_backend=mp`` wins over a
+          recipe command that hardcodes ``--distributed-executor-backend
+          ray``.)
+
+        Idempotent; *value* is stringified.
+        """
+        if flag in command:
+            if not override:
+                return command
+            import re
+
+            return re.sub(re.escape(flag) + r"\s+\S+", "%s %s" % (flag, value), command, count=1)
+        return "%s %s %s" % (command.rstrip(), flag, value)
 
     @staticmethod
     def _augment_served_model_name(
@@ -369,9 +634,9 @@ class RuntimePlugin(Plugin):
 
         When a recipe uses an explicit command template that omits the
         ``{served_model_name}`` placeholder, CLI overrides for
-        ``--served-model-name`` are silently dropped.  This helper
-        checks whether the override was consumed and appends the
-        appropriate flag if not.
+        ``--served-model-name`` are silently dropped.  This helper appends
+        the flag (fill policy — an existing value is left intact) so the
+        override is honored.
 
         Args:
             command: The rendered command string.
@@ -388,9 +653,7 @@ class RuntimePlugin(Plugin):
         value = config.get("served_model_name")
         if value is None:
             return command
-        if flag in command:
-            return command
-        return "%s %s %s" % (command.rstrip(), flag, value)
+        return RuntimePlugin.reconcile_flag_in_command(command, flag, value, override=False)
 
     @staticmethod
     def build_flags_from_map(
@@ -500,81 +763,146 @@ class RuntimePlugin(Plugin):
 
     # --- Log following interface ---
 
+    def log_sources(
+        self,
+        cluster_id: str,
+        hosts: list[str],
+        *,
+        is_solo: bool = False,
+        scope: str = SCOPE_HEAD,
+    ) -> list["LogSource"]:
+        """Describe where this workload's output lives, as data.
+
+        The declarative half of the log path: the runtime knows *what* to
+        read (which containers, and whether each one's output is on the
+        container's stdout or in an in-container file), the executor knows
+        *how* to read it on its substrate, and
+        :func:`sparkrun.api.logs` composes the two.  Returning a list rather
+        than printing is what lets the CLI, the desktop sidecar, and
+        ``--json`` all render the same stream.
+
+        Naming is derived from :meth:`_head_container_name` rather than
+        re-branching on :meth:`cluster_strategy`, so a runtime that
+        overrides the head name gets consistent worker names for free
+        (llama.cpp declares the ``native`` strategy but uses the
+        ``head``/``worker`` scheme — one override, not two).
+
+        Args:
+            cluster_id: Cluster identifier the containers are named for.
+            hosts: Cluster hosts; ``hosts[0]`` is the head. Rank *i* maps to
+                ``hosts[i]``, matching the positional convention the ranked
+                teardown path uses.
+            is_solo: Force the single-container solo shape.
+            scope: :data:`SCOPE_HEAD` (default) for just the primary log,
+                :data:`SCOPE_ALL` to also name every worker/rank.
+
+        Returns:
+            Sources ordered head-first, then workers by rank — which is also
+            the grouping order a non-follow read emits them in.
+        """
+        executor = self._resolve_executor()
+        host_list = list(hosts) or ["localhost"]
+
+        if is_solo or len(host_list) <= 1:
+            return [
+                LogSource(
+                    host=host_list[0],
+                    container=executor.container_name(cluster_id, "solo"),
+                    role="solo",
+                    rank=0,
+                    mode=MODE_FILE,
+                    path=SERVE_LOG_PATH,
+                )
+            ]
+
+        head_mode = MODE_FILE if self._cluster_log_mode() == "file" else MODE_STDOUT
+        head_name = self._head_container_name(cluster_id)
+        # Ranked scheme ({cid}_node_N) vs head/worker scheme ({cid}_head +
+        # {cid}_worker), decided by what the head-name hook actually returned.
+        ranked = head_name == executor.node_container_name(cluster_id, 0)
+
+        head = LogSource(
+            host=host_list[0],
+            container=head_name,
+            role="node_0" if ranked else "head",
+            rank=0,
+            mode=head_mode,
+            path=SERVE_LOG_PATH if head_mode == MODE_FILE else None,
+        )
+        if scope != SCOPE_ALL:
+            return [head]
+
+        sources = [head]
+        for rank, host in enumerate(host_list[1:], start=1):
+            sources.append(self._worker_log_source(cluster_id, host, rank, ranked=ranked, head_mode=head_mode))
+        return sources
+
+    def _worker_log_source(
+        self,
+        cluster_id: str,
+        host: str,
+        rank: int,
+        *,
+        ranked: bool,
+        head_mode: str,
+    ) -> "LogSource":
+        """Describe one worker's log source (hook for :meth:`log_sources`).
+
+        Workers inherit the head's mode by default because a runtime
+        launches every node the same way — llama.cpp's RPC workers, like its
+        head, go through ``generate_exec_serve_script`` and write to the
+        in-container serve log.  Ray is the exception (its workers run
+        ``ray start --block`` as PID 1 and never host a serve process), and
+        overrides this.
+        """
+        executor = self._resolve_executor()
+        return LogSource(
+            host=host,
+            container=(executor.node_container_name(cluster_id, rank) if ranked else executor.container_name(cluster_id, "worker")),
+            role=("node_%d" % rank) if ranked else "worker",
+            rank=rank,
+            mode=head_mode,
+            path=SERVE_LOG_PATH if head_mode == MODE_FILE else None,
+        )
+
     def follow_logs(
         self,
         hosts: list[str],
         cluster_id: str = "sparkrun0",
         config: SparkrunConfig | None = None,
         dry_run: bool = False,
-        tail: int = 100,
+        tail: int | None = 100,
+        follow: bool = True,
+        scope: str = SCOPE_HEAD,
     ) -> None:
-        """Follow container logs after a successful launch.
+        """Print this workload's logs, optionally following.
 
-        Solo mode tails the serve log file inside the container
-        (``/tmp/sparkrun_serve.log``), which is the correct approach
-        for all runtimes using the sleep-infinity + exec pattern.
+        A thin printing shim over :meth:`log_sources` +
+        :func:`~sparkrun.orchestration.logs.print_log_sources`, kept for the
+        post-launch attach in ``cli/_run.py`` (which streams inline during a
+        launch rather than rendering an :func:`sparkrun.api.logs` iterator).
+        Sharing the source machinery means the attach and ``sparkrun logs``
+        can't disagree about which container to read.
 
-        Cluster mode delegates to :meth:`_follow_cluster_logs`, which
-        subclasses should override.
+        Args:
+            tail: Number of existing log lines to show; ``None`` shows
+                the whole log.
+            follow: When ``True`` (default — post-launch attach), keep
+                streaming new lines; when ``False``, dump and exit.
+            scope: :data:`SCOPE_HEAD` (default) or :data:`SCOPE_ALL`.
         """
-        if len(hosts) <= 1:
-            from sparkrun.orchestration.primitives import build_ssh_kwargs
-            from sparkrun.orchestration.ssh import stream_container_file_logs
-
-            host = hosts[0] if hosts else "localhost"
-            container_name = self.executor.container_name(cluster_id, "solo")
-            ssh_kwargs = build_ssh_kwargs(config)
-            stream_container_file_logs(
-                host,
-                container_name,
-                tail=tail,
-                dry_run=dry_run,
-                **ssh_kwargs,
-            )
-            return
-
-        self._follow_cluster_logs(hosts, cluster_id, config, dry_run, tail)
-
-    def _follow_cluster_logs(
-        self,
-        hosts: list[str],
-        cluster_id: str,
-        config: SparkrunConfig | None,
-        dry_run: bool,
-        tail: int,
-    ) -> None:
-        """Follow logs for a multi-node cluster.
-
-        Uses :meth:`_cluster_log_mode` and :meth:`_head_container_name`
-        to determine the log tailing strategy and target container.
-        Subclasses control behaviour by overriding those hooks rather
-        than this method.
-        """
+        from sparkrun.orchestration.logs import print_log_sources
         from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-        ssh_kwargs = build_ssh_kwargs(config)
-        container_name = self._head_container_name(cluster_id)
-
-        if self._cluster_log_mode() == "file":
-            from sparkrun.orchestration.ssh import stream_container_file_logs
-
-            stream_container_file_logs(
-                hosts[0],
-                container_name,
-                tail=tail,
-                dry_run=dry_run,
-                **ssh_kwargs,
-            )
-        else:
-            from sparkrun.orchestration.ssh import stream_remote_logs
-
-            stream_remote_logs(
-                hosts[0],
-                container_name,
-                tail=tail,
-                dry_run=dry_run,
-                **ssh_kwargs,
-            )
+        sources = self.log_sources(cluster_id, hosts, is_solo=len(hosts) <= 1, scope=scope)
+        print_log_sources(
+            self._resolve_executor(),
+            sources,
+            follow=follow,
+            tail=tail,
+            ssh_kwargs=build_ssh_kwargs(config),
+            dry_run=dry_run,
+        )
 
     def get_head_container_name(self, cluster_id: str, is_solo: bool = False) -> str:
         """Return the expected head/solo container name for *cluster_id*.
@@ -585,7 +913,7 @@ class RuntimePlugin(Plugin):
         ``{cluster_id}_node_0`` for SGLang and vLLM distributed).
         """
         if is_solo:
-            return self.executor.container_name(cluster_id, "solo")
+            return self._resolve_executor().container_name(cluster_id, "solo")
         return self._head_container_name(cluster_id)
 
     def _head_container_name(self, cluster_id: str) -> str:
@@ -596,8 +924,8 @@ class RuntimePlugin(Plugin):
         to ``{cluster_id}_head``.  Subclasses can still override.
         """
         if self.cluster_strategy() == "native":
-            return self.executor.node_container_name(cluster_id, 0)
-        return self.executor.container_name(cluster_id, "head")
+            return self._resolve_executor().node_container_name(cluster_id, 0)
+        return self._resolve_executor().container_name(cluster_id, "head")
 
     def _cluster_log_mode(self) -> str:
         """Return the log tailing mode for cluster containers.
@@ -637,9 +965,12 @@ class RuntimePlugin(Plugin):
         detached: bool = True,
         comm_env: ClusterCommEnv | None = None,
         ib_ip_map: dict[str, str] | None = None,
+        ib_iface_map: dict[str, str] | None = None,
         skip_keys: set[str] | frozenset[str] = frozenset(),
         executor: Executor | None = None,
         extra_docker_opts: list[str] | None = None,
+        backends: "dict[str, BackendBundle] | None" = None,
+        trust: bool = False,
         **kwargs,
     ) -> int:
         """Launch a workload -- delegates to solo or cluster implementation.
@@ -671,6 +1002,18 @@ class RuntimePlugin(Plugin):
                 the pre-built *serve_command*).
             executor: Container executor (defaults to DockerExecutor).
             extra_docker_opts: Additional docker run arguments (e.g., ports).
+            backends: Optional per-host :class:`BackendBundle` map (one
+                entry per host in *hosts*).  When provided, the cluster
+                orchestrator uses ``backends[host].collective.env_for_host``
+                to emit NCCL/RCCL/HCCL env vars; ``None`` keeps the
+                legacy NCCL generator path in
+                :func:`sparkrun.runtimes._cluster_ops.resolve_comm_env`
+                for back-compat with callers that haven't threaded
+                backends through yet.
+            trust: When True, suppress the interactive confirmation
+                prompt for recipe-defined ``pre_exec`` hooks.  Resolved
+                upstream by :func:`sparkrun.core.launcher.resolve_recipe_trust`
+                (CLI ``--trust`` OR local recipe OR default-registry).
             **kwargs: Runtime-specific keyword arguments (e.g. ray_port,
                 dashboard_port, init_port, rpc_port).
 
@@ -678,12 +1021,15 @@ class RuntimePlugin(Plugin):
             Exit code (0 = success).
         """
         if executor is not None:
-            self._executor = executor
+            self.executor = executor
 
         # Extract progress from kwargs (flows through from launcher)
         progress = kwargs.pop("progress", None)
 
         if len(hosts) <= 1:
+            # Pop cluster-aware kwargs that solo path doesn't need yet
+            # (placement is meaningless for single-host workloads).
+            kwargs.pop("cluster", None)
             return self._run_solo(
                 host=hosts[0] if hosts else "localhost",
                 image=image,
@@ -699,6 +1045,8 @@ class RuntimePlugin(Plugin):
                 overrides=overrides,
                 progress=progress,
                 extra_docker_opts=extra_docker_opts,
+                backends=backends,
+                trust=trust,
                 # TODO: kwargs?
             )
         return self._run_cluster(
@@ -715,9 +1063,12 @@ class RuntimePlugin(Plugin):
             detached=detached,
             comm_env=comm_env,
             ib_ip_map=ib_ip_map,
+            ib_iface_map=ib_iface_map,
             skip_keys=skip_keys,
             progress=progress,
             extra_docker_opts=extra_docker_opts,
+            backends=backends,
+            trust=trust,
             **kwargs,
         )
 
@@ -801,6 +1152,8 @@ class RuntimePlugin(Plugin):
         overrides: dict[str, Any] | None = None,
         progress=None,
         extra_docker_opts: list[str] | None = None,
+        backends: "dict[str, BackendBundle] | None" = None,
+        trust: bool = False,
     ) -> int:
         """Launch a single-node inference workload.
 
@@ -808,6 +1161,14 @@ class RuntimePlugin(Plugin):
         1. Detect InfiniBand on the target host (optional).
         2. Launch container with ``sleep infinity``.
         3. Execute the serve command inside the container.
+
+        The optional *backends* mapping is accepted for API symmetry
+        with :meth:`_run_cluster` but isn't consumed: solo IB detection
+        already routes the head host's NCCL env through
+        :func:`detect_infiniband` (NCCL output) which is byte-identical
+        to ``backends[host].collective.env_for_host`` for NVIDIA hosts.
+        Non-NVIDIA solo launches would need to convert *backends* into
+        an explicit env block — out of scope for this back-compat shim.
         """
         import time
         from sparkrun.orchestration.primitives import (
@@ -815,6 +1176,7 @@ class RuntimePlugin(Plugin):
             build_volumes,
             detect_infiniband,
             detect_infiniband_local,
+            resolved_model_volume,
             run_script_on_host,
             should_run_locally,
         )
@@ -822,8 +1184,8 @@ class RuntimePlugin(Plugin):
 
         ssh_kwargs = build_ssh_kwargs(config)
         is_local = should_run_locally(host, ssh_kwargs.get("ssh_user"))
-        container_name = self.executor.container_name(cluster_id, "solo")
-        volumes = build_volumes(cache_dir, extra=self.get_extra_volumes())
+        container_name = self._resolve_executor().container_name(cluster_id, "solo")
+        volumes = build_volumes(cache_dir, extra={**self.get_extra_volumes(), **resolved_model_volume(recipe)})
         all_env = merge_env(
             self.get_common_env(),  # base env
             self.get_solo_env(),  # solo-specific
@@ -868,7 +1230,13 @@ class RuntimePlugin(Plugin):
                 host,
                 image,
             )
-        launch_script = self.executor.generate_launch_script(
+        executor = self._resolve_executor()
+        sparkrun_labels = executor.workload_labels_for_cluster(
+            cluster_id=cluster_id,
+            recipe=recipe,
+            runtime=self,
+        )
+        launch_script = executor.generate_launch_script(
             image=image,
             container_name=container_name,
             command="sleep infinity",
@@ -876,6 +1244,7 @@ class RuntimePlugin(Plugin):
             volumes=volumes,
             nccl_env=comm_env.get_env(host) if comm_env else None,
             extra_docker_opts=combined_docker_opts or None,
+            sparkrun_labels=sparkrun_labels or None,
         )
         result = run_script_on_host(
             host,
@@ -885,13 +1254,34 @@ class RuntimePlugin(Plugin):
             dry_run=dry_run,
         )
         if not result.success and not dry_run:
-            logger.error("Failed to launch container: %s", result.stderr)
+            logger.error("Failed to launch container on %s (rc=%d):", host, result.returncode)
+            for line in (result.stderr or "").rstrip().splitlines():
+                logger.error("  %s", line)
+            from sparkrun.runtimes._cluster_ops import cleanup_solo_after_failure
+
+            cleanup_solo_after_failure(
+                executor,
+                host,
+                container_name,
+                ssh_kwargs,
+                dry_run=dry_run,
+                cluster_id=cluster_id,
+                reason="solo container launch failed",
+            )
             return 1
         logger.info("Step 2/3: Container launched (%.1fs)", time.monotonic() - t0)
 
         # Pre-serve hook (e.g., apply mods to container, run pre_exec)
         config_chain = recipe.build_config_chain(overrides) if recipe else None
-        self._pre_serve([(host, container_name)], ssh_kwargs, dry_run, recipe=recipe, config_chain=config_chain)
+        self._pre_serve(
+            [(host, container_name)],
+            ssh_kwargs,
+            dry_run,
+            recipe=recipe,
+            config_chain=config_chain,
+            trust=trust,
+            cache_dir=cache_dir,
+        )
 
         # Step 3: Execute serve command
         t0 = time.monotonic()
@@ -900,11 +1290,13 @@ class RuntimePlugin(Plugin):
         else:
             logger.info("Step 3/3: Executing serve command in %s...", container_name)
         logger.debug("Serve command: %s", serve_command)
-        exec_script = self.executor.generate_exec_serve_script(
+        exec_script = executor.generate_exec_serve_script(
             container_name=container_name,
             serve_command=serve_command,
             env=all_env,
             detached=detached,
+            volumes=volumes,
+            sparkrun_labels=sparkrun_labels or None,
         )
         result = run_script_on_host(
             host,
@@ -927,6 +1319,17 @@ class RuntimePlugin(Plugin):
             elif result.stdout:
                 for line in result.stdout.rstrip().splitlines():
                     logger.error("  %s", line)
+            from sparkrun.runtimes._cluster_ops import cleanup_solo_after_failure
+
+            cleanup_solo_after_failure(
+                executor,
+                host,
+                container_name,
+                ssh_kwargs,
+                dry_run=dry_run,
+                cluster_id=cluster_id,
+                reason="solo serve exec failed",
+            )
 
         return result.returncode
 
@@ -945,7 +1348,7 @@ class RuntimePlugin(Plugin):
             should_run_locally,
         )
 
-        container_name = self.executor.container_name(cluster_id, "solo")
+        container_name = self._resolve_executor().container_name(cluster_id, "solo")
         ssh_kwargs = build_ssh_kwargs(config)
         is_local = should_run_locally(host, ssh_kwargs.get("ssh_user"))
 
@@ -967,6 +1370,8 @@ class RuntimePlugin(Plugin):
         volumes: dict[str, str] | None = None,
         nccl_env: dict[str, str] | None = None,
         extra_docker_opts: list[str] | None = None,
+        *,
+        sparkrun_labels: dict[str, str] | None = None,
     ) -> str:
         """Generate a script that launches a container with a direct entrypoint command.
 
@@ -987,7 +1392,7 @@ class RuntimePlugin(Plugin):
         Returns:
             Complete bash script as a string.
         """
-        return self.executor.generate_node_script(
+        return self._resolve_executor().generate_node_script(
             image=image,
             container_name=container_name,
             serve_command=serve_command,
@@ -996,6 +1401,7 @@ class RuntimePlugin(Plugin):
             volumes=volumes,
             nccl_env=nccl_env,
             extra_docker_opts=extra_docker_opts,
+            sparkrun_labels=sparkrun_labels,
         )
 
     # --- Banner / connection info ---
@@ -1054,10 +1460,10 @@ class RuntimePlugin(Plugin):
 
         ssh_kwargs = build_ssh_kwargs(config)
         for rank, host in enumerate(hosts):
-            container_name = self.executor.node_container_name(cluster_id, rank)
+            container_name = self._resolve_executor().node_container_name(cluster_id, rank)
             run_remote_command(
                 host,
-                self.executor.stop_cmd(container_name),
+                self._resolve_executor().stop_cmd(container_name),
                 timeout=30,
                 dry_run=dry_run,
                 **ssh_kwargs,
@@ -1082,6 +1488,7 @@ class RuntimePlugin(Plugin):
         detached: bool = True,
         comm_env: ClusterCommEnv | None = None,
         ib_ip_map: dict[str, str] | None = None,
+        ib_iface_map: dict[str, str] | None = None,
         init_port: int = 25000,
         skip_keys: set[str] | frozenset[str] = frozenset(),
         banner_title: str = "Native Cluster Launcher",
@@ -1089,6 +1496,8 @@ class RuntimePlugin(Plugin):
         node_label: str = "node",
         progress=None,
         extra_docker_opts: list[str] | None = None,
+        backends: "dict[str, BackendBundle] | None" = None,
+        trust: bool = False,
         **kwargs,
     ) -> int:
         """Orchestrate a multi-node native cluster (shared by SGLang, vLLM distributed).
@@ -1130,6 +1539,8 @@ class RuntimePlugin(Plugin):
         from sparkrun.runtimes._cluster_ops import ClusterContext, run_native_cluster
 
         topology = kwargs.pop("topology", None)
+        cluster = kwargs.pop("cluster", None)
+        placement = kwargs.pop("placement", None)
         ctx = ClusterContext.build(
             runtime=self,
             hosts=hosts,
@@ -1140,6 +1551,9 @@ class RuntimePlugin(Plugin):
             config=config,
             dry_run=dry_run,
             topology=topology,
+            cluster=cluster,
+            recipe=recipe,
+            placement=placement,
         )
         return run_native_cluster(
             runtime=self,
@@ -1148,6 +1562,7 @@ class RuntimePlugin(Plugin):
             overrides=overrides,
             comm_env=comm_env,
             ib_ip_map=ib_ip_map,
+            ib_iface_map=ib_iface_map,
             init_port=init_port,
             skip_keys=skip_keys,
             banner_title=banner_title,
@@ -1157,6 +1572,9 @@ class RuntimePlugin(Plugin):
             follow=kwargs.get("follow", True),
             progress=progress,
             extra_docker_opts=extra_docker_opts,
+            backends=backends,
+            trust=trust,
+            cache_dir=cache_dir,
         )
 
     def _print_connection_info(self, hosts, cluster_id, *, per_node_logs=False):
@@ -1180,7 +1598,7 @@ class RuntimePlugin(Plugin):
                     "  Node %d: ssh %s 'docker logs %s'",
                     rank,
                     host,
-                    self.executor.node_container_name(cluster_id, rank),
+                    self._resolve_executor().node_container_name(cluster_id, rank),
                 )
         logger.info("=" * 60)
 
@@ -1240,7 +1658,7 @@ class RuntimePlugin(Plugin):
         # Pass the inner script via the executor's exec context.
         # This replaces the hardcoded `docker exec` and correctly utilizes
         # b64_wrap_bash internally (for DockerExecutor) to avoid quoting issues.
-        outer_script = self.executor.exec_cmd(
+        outer_script = self._resolve_executor().exec_cmd(
             container_name=container_name,
             command=inner_script,
             detach=False,

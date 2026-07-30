@@ -64,7 +64,7 @@ class TestPhaseLabels:
 
     def test_phase_labels_content(self):
         assert PHASE_LABELS[1] == "Preparing"
-        assert PHASE_LABELS[2] == "Building image"
+        assert PHASE_LABELS[2] == "Building"
         assert PHASE_LABELS[3] == "Distributing resources"
         assert PHASE_LABELS[4] == "Syncing tuning configs"
         assert PHASE_LABELS[5] == "Launching runtime"
@@ -104,7 +104,7 @@ class TestLaunchProgressPhases:
         p = LaunchProgress(Verbosity.DEFAULT)
         with caplog.at_level(PROGRESS, logger="sparkrun.progress"):
             p.phase_skip(2, "no builder")
-        assert "[2/6] Building image" in caplog.text
+        assert "[2/6] Building" in caplog.text
         assert "skipped (no builder)" in caplog.text
 
     def test_phase_skip_no_reason(self, caplog):
@@ -273,7 +273,7 @@ class TestFullPipeline:
         text = caplog.text
         # All phases visible
         assert "[1/6] Preparing" in text
-        assert "[2/6] Building image" in text
+        assert "[2/6] Building" in text
         assert "[3/6] Distributing resources" in text
         assert "[4/6] Syncing tuning configs" in text
         assert "[5/6] Launching runtime" in text

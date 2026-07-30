@@ -29,7 +29,9 @@ from sparkrun.runtimes._util import default_env_hf_offline, parse_flag_value_fro
 from sparkrun.runtimes.base import RuntimePlugin
 
 if TYPE_CHECKING:
+    from sparkrun.core.cluster_manager import ClusterDefinition
     from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.parallelism import ParallelismConfig
     from sparkrun.core.recipe import Recipe
     from sparkrun.orchestration.comm_env import ClusterCommEnv
 
@@ -58,6 +60,13 @@ _ATLAS_FLAG_MAP = {
     "kv_high_precision_layers": "--kv-high-precision-layers",
     "tool_call_parser": "--tool-call-parser",
     "tool_max_tokens": "--tool-max-tokens",
+    # Takes an explicit bool VALUE (`--disable-tool-grammar true`), not a
+    # bare toggle: it overrides MODEL.toml's `[behavior].disable_tool_grammar`,
+    # so "absent" and "false" are genuinely different. Hence it is NOT in
+    # `_ATLAS_BOOL_FLAGS`; `_normalize_config` lowercases the value because
+    # Rust's bool parser rejects Python's `str(True)` == "True".
+    "disable_tool_grammar": "--disable-tool-grammar",
+    "fp8_kv_calibration_tokens": "--fp8-kv-calibration-tokens",
     "scheduling_policy": "--scheduling-policy",
     "tbt_deadline_ms": "--tbt-deadline-ms",
     "max_prefill_tokens": "--max-prefill-tokens",
@@ -132,6 +141,13 @@ class AtlasRuntime(RuntimePlugin):
     runtime_name = "atlas"
     default_image_prefix = "avarok/atlas-gb10"
 
+    # Atlas's NCCL constants in get_cluster_env() are validated for the
+    # DGX Spark GB10 RoCEv2 fabric.  Generalising them is its own
+    # workstream; until then, gate to GB10 hosts so other accelerators
+    # surface an actionable compatibility error rather than a silent
+    # NCCL misconfiguration.
+    requires_capability = frozenset({"gb10"})
+
     def cluster_strategy(self) -> str:
         """Atlas handles its own multi-rank distribution via NCCL, not Ray."""
         return "native"
@@ -200,11 +216,26 @@ class AtlasRuntime(RuntimePlugin):
         Accepts ``auth_token`` as an alias for the canonical ``api_key``
         key so users can use either in recipe defaults; flag emission
         only looks at the canonical key.
+
+        Also renders ``disable_tool_grammar`` as a lowercase ``true``/
+        ``false`` string.  It is a value-taking flag (not a toggle), and
+        the default ``str(value)`` rendering would emit Python's ``True``,
+        which Atlas' Rust bool parser rejects.  A YAML bool (``True``) and
+        a quoted string (``"True"``/``"TRUE"``) reach us differently, so
+        both cases are folded to lowercase here; any non-bool-ish string is
+        left untouched so Atlas surfaces its own parse error rather than us
+        guessing.
         """
         if not config.get("api_key"):
             alias = config.get("auth_token")
             if alias:
                 config.set("api_key", alias)
+
+        val = config.get("disable_tool_grammar")
+        if isinstance(val, bool):
+            config.set("disable_tool_grammar", "true" if val else "false")
+        elif isinstance(val, str) and val.strip().lower() in ("true", "false"):
+            config.set("disable_tool_grammar", val.strip().lower())
 
     def generate_command(
         self,
@@ -252,6 +283,7 @@ class AtlasRuntime(RuntimePlugin):
         init_port: int = 29500,
         skip_keys: set[str] | frozenset[str] = frozenset(),
         hosts: list[str] | None = None,
+        placement=None,
     ) -> str:
         """Generate the per-rank ``atlas serve`` command.
 
@@ -343,33 +375,32 @@ class AtlasRuntime(RuntimePlugin):
 
     # --- Parallelism ---
 
-    def compute_required_nodes(self, recipe: Recipe, overrides: dict[str, Any] | None = None) -> int | None:
-        """Atlas world_size = max(tp*ep, tp, ep).
+    def world_size(
+        self,
+        parallelism: ParallelismConfig,
+        *,
+        recipe: Recipe,
+        cluster: ClusterDefinition,
+    ) -> int:
+        """Atlas world size = ``tensor_parallel * expert_parallel``.
 
-        Atlas supports overlapping ``tp == ep`` topology (both groups
-        live on the same physical ranks) as well as the orthogonal
-        ``tp * ep`` mesh. Sparkrun's stock ``compute_required_nodes``
-        only considers ``tensor_parallel * pipeline_parallel *
-        data_parallel``, so we override to factor in ``ep_size``.
+        Atlas composes TP and EP on an orthogonal mesh (see module
+        docstring), so the rank count is ``tp * ep`` rather than the
+        ``tp * pp * dp`` product the base class computes.
+
+        Note: :meth:`validate_recipe` still rejects ``world_size > 1``
+        because multi-node Atlas launch isn't ready yet.  This override
+        exists so the scheduler-side math is correct when that
+        validation relaxes.
         """
-        config = recipe.build_config_chain(overrides or {})
-        tp = _coerce_int(config.get("tensor_parallel"), default=1)
-        ep = _coerce_int(config.get("ep_size"), default=1)
-
-        if tp <= 1 and ep <= 1:
-            return None
+        tp = parallelism.tensor_parallel
+        ep = parallelism.expert_parallel
 
         if tp == ep and tp > 1:
-            # Overlapping groups: both TP and EP share the same ranks.
-            result = tp
+            world_size = tp  # shared tp+ep case
         else:
-            result = tp * ep
-
-        # result > 1 drives the native NCCL cluster path: generate_node_command()
-        # assigns per-rank --rank/--world-size/--master-addr/--master-port and the
-        # cluster env carries the validated GB10 RoCEv2 NCCL settings. The published
-        # EP=2 recipes (qwen3.5-122b-a10b, minimax-m2.7) require this to launch.
-        return result
+            world_size = tp * ep
+        return world_size
 
     # --- Cluster env ---
 
@@ -406,14 +437,12 @@ class AtlasRuntime(RuntimePlugin):
             "NCCL_MAX_NCHANNELS": "2",
         }
 
-    def get_executor_config_defaults(self) -> dict:
-        """Clear the image's ENTRYPOINT so the generated ``bash -c`` runs.
+    def default_executor_config(self) -> dict[str, Any]:
+        """Clear the Atlas image ENTRYPOINT by default.
 
-        The Atlas image ships its own ENTRYPOINT; sparkrun launches the
-        container with ``bash -c <command>``, so the entrypoint must be
-        cleared. Routed through ``executor_config`` (rather than a raw
-        ``--entrypoint`` in ``get_extra_docker_opts``) so a recipe can
-        still override it.
+        The public Atlas image ships an ENTRYPOINT.  sparkrun needs its
+        generated ``bash -c`` launcher to run directly, but recipes and cluster
+        config can still override this default through executor_config.
         """
         return {"entrypoint": ""}
 
@@ -425,11 +454,6 @@ class AtlasRuntime(RuntimePlugin):
         run the storage path unconfined. ``IPC_LOCK`` + ``memlock=-1``
         unblock ``ibv_reg_mr``; ``SYS_NICE`` is needed by the SQPOLL
         kernel thread.
-
-        The ENTRYPOINT clear lives in ``get_executor_config_defaults`` so
-        recipes can override it; ``cap_add``/``security_opt`` stay here as
-        unconditional appends (they must not be dropped by, e.g., rootless
-        mode zeroing ``cap_add`` in the executor config chain).
         """
         return [
             "--cap-add=IPC_LOCK",
@@ -500,12 +524,3 @@ class AtlasRuntime(RuntimePlugin):
             node_label="atlas rank",
             **kwargs,
         )
-
-
-def _coerce_int(value: Any, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
