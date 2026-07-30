@@ -239,26 +239,30 @@ def test_build_join_scripts_hostname():
 
 
 def test_cli_join_hostname_defaults_to_cluster_name(monkeypatch):
-    import os
-    from pathlib import Path
-
     from click.testing import CliRunner
 
     from sparkrun.core.cluster_manager import ClusterManager
+    from sparkrun.core.config import get_config_root
 
     monkeypatch.setenv("SPARKRUN_FEATURE_CLI_SETUP_TAILSCALE", "1")
     monkeypatch.setenv("TS_API_CLIENT_ID", "cid")
     monkeypatch.setenv("TS_API_CLIENT_SECRET", "sec")
 
-    root = Path(os.environ["STATEFUL_ROOT"])
+    # Created where the CLI actually resolves clusters. `get_config_root()`
+    # falls back to DEFAULT_CONFIG_DIR whenever the SAF stateful root is not
+    # ready, which is always the case under pytest -- so writing to
+    # STATEFUL_ROOT put the fixture somewhere the command never reads. The
+    # test then only passed on a machine whose real config happened to define
+    # a cluster of this name.
+    root = get_config_root()
     root.mkdir(parents=True, exist_ok=True)
-    ClusterManager(root).create("thunder-0", ["tnr-abc"], user="ubuntu")
+    ClusterManager(root).create("ts-fixture-cluster", ["tnr-abc"], user="ubuntu")
 
     from sparkrun.cli import main
 
-    r = CliRunner().invoke(main, ["setup", "tailscale", "join", "--dry-run", "--cluster", "thunder-0"])
+    r = CliRunner().invoke(main, ["setup", "tailscale", "join", "--dry-run", "--cluster", "ts-fixture-cluster"])
     assert r.exit_code == 0, r.output
-    assert "as 'thunder-0'" in r.output
+    assert "as 'ts-fixture-cluster'" in r.output
 
 
 def test_parse_join_result():

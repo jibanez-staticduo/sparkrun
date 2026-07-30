@@ -37,6 +37,16 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
     # so the CLI tests that exercise it keep passing (the gate itself is tested
     # explicitly in test_k8s_setup with the env override cleared).
     monkeypatch.setenv("SPARKRUN_FEATURE_CLI_SETUP_K8S", "1")
+    # Point the user config dir at the sandbox too. STATEFUL_ROOT alone does
+    # not cover it: DEFAULT_CONFIG_DIR is computed from Path.home() at import
+    # time, so without this a test silently reads the developer's real
+    # ~/.config/sparkrun -- its default cluster, its saved clusters, its
+    # registries. Such a test passes on the machine that wrote that config and
+    # fails everywhere else, which is the most expensive way to find out.
+    import sparkrun.core.config as _config_module
+
+    monkeypatch.setattr(_config_module, "DEFAULT_CONFIG_DIR", tmp_path / "config", raising=False)
+
     import sparkrun.core.bootstrap
 
     sparkrun.core.bootstrap._variables = None

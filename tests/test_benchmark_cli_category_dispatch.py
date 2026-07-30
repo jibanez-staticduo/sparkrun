@@ -107,7 +107,7 @@ def test_explicit_performance_subcommand_sets_category():
     captured = {}
     runner = CliRunner()
     with patch("sparkrun.cli._benchmark._run_benchmark", side_effect=_make_capture_side_effect(captured)):
-        runner.invoke(benchmark_group, ["performance", "my-recipe"], catch_exceptions=False)
+        runner.invoke(benchmark_group, ["performance", "my-recipe", "--hosts", "h1"], catch_exceptions=False)
     assert captured.get("category") == "performance"
 
 
@@ -120,7 +120,7 @@ def test_perf_alias_routes_to_performance():
     captured = {}
     runner = CliRunner()
     with patch("sparkrun.cli._benchmark._run_benchmark", side_effect=_make_capture_side_effect(captured)):
-        runner.invoke(benchmark_group, ["perf", "my-recipe"], catch_exceptions=False)
+        runner.invoke(benchmark_group, ["perf", "my-recipe", "--hosts", "h1"], catch_exceptions=False)
     assert captured.get("category") == "performance"
 
 
@@ -133,7 +133,7 @@ def test_explicit_tools_subcommand_sets_category():
     captured = {}
     runner = CliRunner()
     with patch("sparkrun.cli._benchmark._run_benchmark", side_effect=_make_capture_side_effect(captured)):
-        runner.invoke(benchmark_group, ["tools", "my-recipe"], catch_exceptions=False)
+        runner.invoke(benchmark_group, ["tools", "my-recipe", "--hosts", "h1"], catch_exceptions=False)
     assert captured.get("category") == "tools"
 
 
@@ -146,7 +146,7 @@ def test_bare_benchmark_recipe_falls_back_to_performance():
     captured = {}
     runner = CliRunner()
     with patch("sparkrun.cli._benchmark._run_benchmark", side_effect=_make_capture_side_effect(captured)):
-        runner.invoke(benchmark_group, ["my-recipe"], catch_exceptions=False)
+        runner.invoke(benchmark_group, ["my-recipe", "--hosts", "h1"], catch_exceptions=False)
     assert captured.get("category") == "performance"
 
 
@@ -158,7 +158,7 @@ def test_run_subcommand_preserves_legacy_no_category():
     from sparkrun.cli._benchmark import benchmark as benchmark_group
 
     with patch("sparkrun.cli._benchmark._run_benchmark", side_effect=_make_capture_side_effect(captured)):
-        runner.invoke(benchmark_group, ["run", "my-recipe"], catch_exceptions=False)
+        runner.invoke(benchmark_group, ["run", "my-recipe", "--hosts", "h1"], catch_exceptions=False)
     assert captured.get("category") is None
 
 
@@ -176,7 +176,7 @@ def test_category_command_accepts_fresh_flag():
     captured = {}
     runner = CliRunner()
     with patch("sparkrun.cli._benchmark._run_benchmark", side_effect=_make_capture_side_effect(captured)):
-        runner.invoke(benchmark_group, ["performance", "my-recipe", "--fresh"], catch_exceptions=False)
+        runner.invoke(benchmark_group, ["performance", "my-recipe", "--fresh", "--hosts", "h1"], catch_exceptions=False)
     assert captured.get("fresh") is True
 
 
@@ -190,7 +190,7 @@ def test_category_command_accepts_resume_flag():
     captured = {}
     runner = CliRunner()
     with patch("sparkrun.cli._benchmark._run_benchmark", side_effect=_make_capture_side_effect(captured)):
-        runner.invoke(benchmark_group, ["performance", "my-recipe", "--resume"], catch_exceptions=False)
+        runner.invoke(benchmark_group, ["performance", "my-recipe", "--resume", "--hosts", "h1"], catch_exceptions=False)
     assert captured.get("resume_mode") == ResumeMode.IF_EXISTS
 
 

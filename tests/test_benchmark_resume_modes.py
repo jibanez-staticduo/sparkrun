@@ -192,7 +192,10 @@ def test_cli_resume_and_fresh_are_mutually_exclusive():
     from sparkrun.cli._benchmark import benchmark_run
 
     runner = CliRunner()
-    result = runner.invoke(benchmark_run, ["my-recipe", "--resume", "--fresh"])
+    # --hosts is supplied so the command reaches the mutual-exclusion check.
+    # Without it host resolution exits first, and the test then passes on
+    # `exit_code != 0` for entirely the wrong reason.
+    result = runner.invoke(benchmark_run, ["my-recipe", "--resume", "--fresh", "--hosts", "h1"])
     # click UsageError exits with non-zero code
     assert result.exit_code != 0
     output_text = result.output + (str(result.exception) if result.exception else "")

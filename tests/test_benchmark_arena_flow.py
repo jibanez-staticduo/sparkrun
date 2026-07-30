@@ -62,12 +62,15 @@ def test_arena_flag_triggers_preflight_and_finalize():
         patch("sparkrun.cli._arena_flow.preflight_arena", side_effect=_fake_preflight),
         patch("sparkrun.cli._arena_flow.finalize_arena", side_effect=_fake_finalize),
     ):
-        runner.invoke(
+        result = runner.invoke(
             benchmark_group,
-            ["perf", "my-recipe", "--arena", "--local-test"],
+            ["perf", "my-recipe", "--arena", "--local-test", "--hosts", "h1"],
             catch_exceptions=False,
         )
 
+    # Asserted before the order check: without it, an early exit shows up as an
+    # empty capture list rather than as the error that caused it.
+    assert result.exit_code == 0, "CLI exited %s: %s" % (result.exit_code, result.output)
     assert captured["order"] == ["preflight", "run_benchmark", "finalize"]
     assert captured["kwargs"].get("submission_id_for_extras") == "sub-test-123"
     assert captured["kwargs"].get("profile") == "@official/spark-arena-v2"
@@ -89,11 +92,12 @@ def test_arena_flag_does_not_override_explicit_profile():
         patch("sparkrun.cli._arena_flow.preflight_arena", return_value=("s", "@official/spark-arena-v2")),
         patch("sparkrun.cli._arena_flow.finalize_arena"),
     ):
-        runner.invoke(
+        result = runner.invoke(
             benchmark_group,
-            ["perf", "my-recipe", "--arena", "--local-test", "--profile", "custom"],
+            ["perf", "my-recipe", "--arena", "--local-test", "--profile", "custom", "--hosts", "h1"],
             catch_exceptions=False,
         )
+    assert result.exit_code == 0, "CLI exited %s: %s" % (result.exit_code, result.output)
     assert captured.get("profile") == "custom"
 
 
@@ -117,12 +121,16 @@ def test_arena_flag_absent_no_preflight():
         patch("sparkrun.cli._arena_flow.preflight_arena", side_effect=_fake_preflight),
         patch("sparkrun.cli._arena_flow.finalize_arena", side_effect=_fake_finalize),
     ):
-        runner.invoke(
+        result = runner.invoke(
             benchmark_group,
-            ["perf", "my-recipe"],
+            ["perf", "my-recipe", "--hosts", "h1"],
             catch_exceptions=False,
         )
 
+    # This test asserts only negatives, so it passes vacuously if the command
+    # exits before dispatch. Pin the exit code so it proves the *absence* of a
+    # preflight on a run that actually happened.
+    assert result.exit_code == 0, "CLI exited %s: %s" % (result.exit_code, result.output)
     assert not captured["preflight_called"]
     assert not captured["finalize_called"]
 
