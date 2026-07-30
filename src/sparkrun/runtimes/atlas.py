@@ -375,38 +375,6 @@ class AtlasRuntime(RuntimePlugin):
 
     # --- Parallelism ---
 
-    def validate_recipe(self, recipe: Recipe) -> list[str]:
-        """Validate Atlas-specific recipe fields.
-
-        Atlas composes tensor parallelism (``tensor_parallel``) and
-        expert parallelism (``ep_size``) on either an overlapping
-        (``tp == ep``) or orthogonal (``tp * ep``) mesh. The current
-        sparkrun integration only supports a single-node Atlas
-        deployment, so any combination that would produce ``world_size
-        > 1`` is rejected here. Multi-node Atlas support is planned;
-        when it lands this check should be relaxed.
-        """
-        issues = super().validate_recipe(recipe)
-        defaults = recipe.defaults or {}
-        tp = _coerce_int(defaults.get("tensor_parallel"), default=1)
-        ep = _coerce_int(defaults.get("ep_size"), default=1)
-
-        if tp <= 1 and ep <= 1:
-            return issues
-
-        if tp == ep and tp > 1:
-            world_size = tp
-        else:
-            world_size = tp * ep
-
-        if world_size > 1:
-            issues.append(
-                "[atlas] Atlas runtime currently only supports single node; "
-                "tensor_parallel=%d ep_size=%d implies world_size=%d. "
-                "Support for multiple nodes is coming soon." % (tp, ep, world_size)
-            )
-        return issues
-
     def world_size(
         self,
         parallelism: ParallelismConfig,
@@ -556,12 +524,3 @@ class AtlasRuntime(RuntimePlugin):
             node_label="atlas rank",
             **kwargs,
         )
-
-
-def _coerce_int(value: Any, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default

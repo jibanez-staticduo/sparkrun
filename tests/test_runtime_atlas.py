@@ -1,5 +1,7 @@
 """Unit tests for the Atlas runtime plugin."""
 
+import pytest
+
 from sparkrun.core.recipe import Recipe
 from sparkrun.runtimes.atlas import AtlasRuntime
 
@@ -258,35 +260,27 @@ def test_atlas_validate_recipe_solo():
     assert runtime.validate_recipe(_recipe()) == []
 
 
-def test_atlas_validate_recipe_overlapping_tp_eq_ep_flagged():
-    """tp=2, ep=2 → world_size=2, currently single-node-only → flagged."""
+@pytest.mark.parametrize(
+    "defaults",
+    [
+        {"tensor_parallel": 2, "ep_size": 2},  # overlapping mesh, world_size=2
+        {"ep_size": 2},  # pure EP, world_size=2
+        {"tensor_parallel": 2, "ep_size": 4},  # orthogonal mesh, world_size=8
+        {"tensor_parallel": 1, "ep_size": 1},  # no-op
+    ],
+)
+def test_atlas_validate_recipe_allows_multi_node(defaults):
+    """Multi-rank parallelism is no longer flagged as unsupported.
+
+    Atlas ran single-node-only in an earlier sparkrun integration, and
+    ``validate_recipe`` appended a "currently only supports single node"
+    issue for any ``world_size > 1``.  The restriction is lifted; because
+    ``recipe.validate()`` issues surface as *warnings* rather than errors,
+    leaving the check in place did not block a multi-node launch — it just
+    printed a false claim on every one.
+    """
     runtime = AtlasRuntime()
-    recipe = _recipe(defaults={"tensor_parallel": 2, "ep_size": 2})
-    issues = runtime.validate_recipe(recipe)
-    assert any("atlas" in issue and "single node" in issue for issue in issues)
-
-
-def test_atlas_validate_recipe_pure_ep_flagged():
-    """ep_size=2 alone → world_size=2 → flagged (single-node-only)."""
-    runtime = AtlasRuntime()
-    recipe = _recipe(defaults={"ep_size": 2})
-    issues = runtime.validate_recipe(recipe)
-    assert any("atlas" in issue and "single node" in issue for issue in issues)
-
-
-def test_atlas_validate_recipe_orthogonal_tp_ep_flagged():
-    """tp=2, ep=4 → world_size=8 (orthogonal mesh) → flagged."""
-    runtime = AtlasRuntime()
-    recipe = _recipe(defaults={"tensor_parallel": 2, "ep_size": 4})
-    issues = runtime.validate_recipe(recipe)
-    assert any("atlas" in issue and "single node" in issue for issue in issues)
-
-
-def test_atlas_validate_recipe_tp_eq_1_ep_eq_1_passes():
-    """tp=1 and ep=1 are no-ops → not flagged."""
-    runtime = AtlasRuntime()
-    recipe = _recipe(defaults={"tensor_parallel": 1, "ep_size": 1})
-    assert runtime.validate_recipe(recipe) == []
+    assert runtime.validate_recipe(_recipe(defaults=defaults)) == []
 
 
 # --- Cluster env / docker opts ---
