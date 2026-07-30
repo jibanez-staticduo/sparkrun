@@ -30,6 +30,26 @@ Repository: <https://github.com/spark-arena/sparkrun>
 - **Console-free library API**: the `sparkrun.api` package no longer imports
   the CLI; `api.run` / `api.benchmark` / `api.resume_benchmark` share a single
   placement authority and raise typed errors instead of writing to stdout.
+  The CLI is now a renderer over it, so anything the CLI does is reachable
+  from Python.
+- **Pluggable placement**: `occupancy-sparse` (new-cluster default),
+  `occupancy-dense`, and `greedy` (the 0.2.x behavior). Occupancy schedulers
+  place against *live* cluster state, so concurrent runs stop colliding.
+  Clusters with no `scheduler` key keep `greedy`, so upgrading never silently
+  moves existing workloads.
+- **Unified, cross-executor status**: `api.status` sweeps every enabled
+  executor on a cluster's substrate and merges. A native `local` workload and
+  a docker container are invisible to each other's introspection; both now
+  appear in `status`, `cluster monitor`, and `stop --all`.
+- **Feature flags**: channel-aware gating (`stable` / `beta` / `alpha`) for
+  experimental capabilities, managed with `sparkrun setup features`. Every
+  experimental surface in this release is off by default on every channel.
+- **Out-of-tree plugins**: runtimes, executors, transports, and CLI commands
+  can ship outside the repo, loaded from `plugins.paths`. The Thunder Compute
+  transport moved out of core to become the first consumer.
+- **Update channels and telemetry**: `sparkrun update --stable|--beta|--alpha`,
+  plus anonymous opt-out usage telemetry
+  (`sparkrun setup telemetry`, `SPARKRUN_NO_TELEMETRY`).
 
 ## New
 
@@ -135,6 +155,101 @@ Repository: <https://github.com/spark-arena/sparkrun>
   by `run`, `benchmark`, and the CLI).
 - New `api.resume_benchmark(...)` entry point; benchmark resume is no longer
   CLI-only.
+- Sub-namespaces group the larger surfaces — `api.proxy`, `api.setup`,
+  `api.tailscale`, `api.k8s` — each with `_ops.py` for the console-free logic
+  and `_errors.py` for its typed exceptions.
+- Every entry point takes an optional `SparkrunContext` (`sctx`) so a chain of
+  calls shares config, registry manager, and cluster manager rather than
+  rebuilding them per call.
+
+### Scheduling and placement
+
+- `schedulers/` is a SAF extension point (`EXT_SCHEDULER`). Three ship:
+  `greedy`, `occupancy-sparse`, `occupancy-dense`.
+- Selection chain: `--scheduler` → recipe `scheduler:` → cluster `scheduler`.
+  Nothing named → `greedy`, with a hint recommending the upgrade — that is
+  what preserves 0.2.x placement for existing clusters.
+- Occupancy schedulers spread *between* workloads, not within one: a single
+  job's ranks still pack onto as few hosts as possible so tensor-parallel
+  traffic rides the fastest link.
+- `core/limits.py` resolves a per-accelerator usable-memory cap for scheduling
+  and fit (`--max-gpu-mem-util`; GB10 defaults to 0.85 because unified memory
+  contends with the host). It does **not** affect the serving
+  `--gpu-memory-utilization`.
+- `InsufficientCapacity` carries the status snapshot, host list, and requested
+  slot count, so callers can render capacity diagnostics without a second SSH
+  round-trip.
+
+### Status, monitoring, and logs
+
+- `api.status` (lean occupancy) and `api.status_report` (display tier) are the
+  two entry points; `query_status_for_cluster` merges every enabled executor
+  sharing the cluster's `status_scope`. A single failing executor is skipped
+  rather than breaking the report.
+- `TelemetryProvider` (`EXT_TELEMETRY`) is the telemetry peer of
+  `Executor.query_status`, selected by scope. `api.live_monitor` composes
+  telemetry with the occupancy poll into `MonitorFrame` snapshots, which drive
+  the `cluster monitor` TUI — so its Jobs column shows every executor's
+  workloads.
+- Log locations are data (`core/log_source.py`). Runtimes that serve via
+  `docker exec` inside a sleep-infinity container are structurally invisible
+  to `docker logs`; `sparkrun logs` resolves the right source per runtime and
+  gains `-f/--follow`, `-a/--all-sources`, and `-n/--lines`.
+
+### Feature flags, plugins, transports
+
+- `core/features.py`: `FeatureFlag` registry with per-channel defaults.
+  Resolution is env (`SPARKRUN_FEATURE_<NAME>`) → config → channel → baseline
+  → fail-closed for unknown flags. Managed with `sparkrun setup features`.
+- Plugins self-gate by declaring `required_feature_flag`; a gated plugin stays
+  registered but is absent from resolution and tab-completion. An explicitly
+  requested but unavailable executor raises `ExecutorUnavailableError` rather
+  than silently downgrading to docker.
+- `transports/` is the connectivity seam — how hosts are reached and prepared,
+  orthogonal to the executor. `ssh` is the default and a no-op, so existing
+  clusters are byte-identical to before transports existed.
+- `core/external_plugins.py` loads out-of-tree plugins from `plugins.paths`
+  (gated behind `core.external_plugins`, off by default), and `cli/ext.py`
+  lets them attach Click commands to the built-in tree.
+
+### Setup and platform work
+
+- `sparkrun setup check` — a non-destructive readiness probe over the things
+  the wizard configures, with `--json`. The seed of a per-platform step
+  registry with paired check/apply stages.
+- SSH access bootstrap (`api/setup/`) runs first in the wizard, since every
+  later phase assumes passwordless control→host SSH. Written to work on a bare
+  Windows control machine: only `ssh` and `ssh-keygen`, no local `bash`, no
+  paramiko, and key material travels over stdin rather than argv.
+- NVIDIA CDI spec generation; GPUs are requested via CDI rather than `--gpus`.
+- `sparkrun setup tailscale` (gated) publishes an inference endpoint on a
+  tailnet using JIT-minted, tagged OAuth keys — control-plane only, never a
+  data path (NCCL stays on InfiniBand/CX7).
+- `sparkrun setup k8s` (gated) — kubectl acquisition, least-privilege service
+  account, Kueue install, JobSet launch.
+
+### Benchmarking
+
+- Per-category CLI: `sparkrun benchmark performance` (alias `perf`) and
+  `sparkrun benchmark tools`; bare `benchmark <recipe>` falls through to
+  `performance`. New categories appear automatically when a plugin registers
+  them.
+- Non-interactive `--resume` / `--fresh`, and `--arena` to run the Spark Arena
+  flow from either entry point.
+- Run identity is tied to recipe *content*, and the container image is pinned
+  by content-addressable digest on first launch, so a re-pushed tag or a
+  rebuilt local image cannot change the bits mid-sweep.
+
+### Proxy
+
+- The generated config file is the single source of truth for the model list.
+  LiteLLM's runtime mutation endpoints need a DB-backed model store, so
+  applying a change means rewriting the config and restarting — skipped
+  entirely when the desired model set already matches disk.
+- A gateway seam (`proxy/gateway.py`): `gateway.litellm` gates availability,
+  `proxy.gateway` pins selection, and exactly one gateway is used at a time.
+  Bringing a gateway *up* is gated; stop/status/sync are not, so a running
+  proxy stays manageable after the flag is turned off.
 
 ## Breaking changes
 
@@ -188,8 +303,30 @@ Repository: <https://github.com/spark-arena/sparkrun>
 - **Secret masking in logs.** `token`/`key`/`password`/`secret` env values are
   masked in the docker executor DEBUG output (per-var dump and full command).
 - Trust gating on `pre_exec` / `post_exec` / `post_commands` (single decision
-  via `resolve_recipe_trust`). Local recipes and default-registry recipes are
-  auto-trusted; third-party registry recipes require `--trust` or prompt.
+  via `resolve_recipe_trust`). Local recipes and recipes from a registry
+  marked `trusted` are auto-trusted; anything else requires `--trust` or
+  prompts.
+- **Trust became a per-registry local decision**, stored as a `trusted:` field
+  on each entry in the user's own `registries.yaml`. A repository manifest
+  cannot grant itself trust. Every registry sparkrun ships as a built-in
+  default is first-party and ships trusted; a registry added with
+  `sparkrun registry add <url>` is untrusted until the user opts in with
+  `--trust` or `sparkrun registry trust <name>`.
+- **Container-escape surfaces are trust-gated**
+  (`core/launcher.py:_enforce_recipe_mount_trust`). An untrusted recipe may
+  not supply host bind-mounts, may not set the `executor_config` privilege
+  keys (`privileged`, `cap_add`, `security_opt`, `devices`, `user`,
+  `volumes`), and may not select an executor other than `docker` — the
+  rootless, namespaced container is the sandbox that justifies running a
+  registry recipe's serve command at all. Innocuous resource knobs
+  (`shm_size`, `ipc`, `network`, `memory_limit`, `ulimit`, …) are
+  deliberately not gated.
+- **A mount denylist applies regardless of trust**
+  (`utils/shell.py:assert_safe_mount_source`): the host root, the docker
+  control socket, SSH keys, and kernel pseudo-filesystems are refused even for
+  a trusted recipe. It validates the literal path shape rather than trusting
+  control-machine `realpath`, because the mount happens on a remote host whose
+  symlink layout differs.
 - `orchestration/transfer.py:_run_delegated_copy` validates `source_host`
   against the validated host list and rejects `dest` paths that escape the
   cache root.

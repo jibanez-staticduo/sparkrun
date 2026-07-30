@@ -24,16 +24,17 @@ registry whose name cannot be resolved against the local `registries.yaml`.
 
 ### Where the trust bit comes from
 
-- **Default registries**: bootstrap-curated entries shipped via
-  `core/registry.py:FALLBACK_DEFAULT_REGISTRIES` are marked `trusted=True`
-  when their URL is in `BOOTSTRAP_REGISTRY_URLS`:
-  - `https://github.com/dbotwinick/sparkrun-recipe-registry.git`
-  - `https://github.com/spark-arena/recipe-registry.git`
-  - `https://github.com/spark-arena/community-recipe-registry.git`
+- **Default registries**: every entry shipped in
+  `core/registry.py:FALLBACK_DEFAULT_REGISTRIES` declares `trusted=True` on
+  the entry itself.  All built-in defaults are first-party recipe sources, so
+  all of them ship trusted — including `eugr` and `atlas`, which are not
+  bootstrap-discovery URLs.
 
-  This preserves out-of-the-box behavior for first-run installs.  Default
-  entries whose URLs are not in `BOOTSTRAP_REGISTRY_URLS` (currently
-  `eugr`, `atlas`) ship `trusted=False`.
+  Trust is declared **per entry**, not derived from `BOOTSTRAP_REGISTRY_URLS`
+  (that list exists for bootstrap-time manifest discovery and deliberately
+  differs).  `FALLBACK_DEFAULT_REGISTRIES` is the single source of truth for
+  "which registries ship trusted"; `_default_trusted_urls()` exposes it to the
+  migration below.
 
 - **Bootstrap manifest discovery**: when `_init_defaults_from_manifests`
   successfully clones a bootstrap URL and reads its
@@ -48,8 +49,17 @@ registry whose name cannot be resolved against the local `registries.yaml`.
 
 - **Migration**: when an existing `registries.yaml` predates the
   `trusted` field, sparkrun performs a one-time migration on next load,
-  marking entries whose URL is in `BOOTSTRAP_REGISTRY_URLS` as
-  `trusted=True` and leaving the rest `trusted=False`.
+  marking entries whose (normalized) URL matches a registry that ships
+  trusted — `_default_trusted_urls()` — and leaving the rest `trusted=False`.
+  Comparison strips a trailing `/` and `.git`, since `eugr`'s default URL
+  carries no `.git` suffix while the others do.
+
+  Deriving this from the default list rather than `BOOTSTRAP_REGISTRY_URLS`
+  is deliberate: otherwise marking a registry trusted would reach only fresh
+  installs, and anyone upgrading from a pre-trust config would silently keep
+  it untrusted.  A user who has **already** migrated keeps whatever their
+  `registries.yaml` says — re-trusting a registry their own config marks
+  untrusted is not a decision the migration makes for them.
 
 ### CLI surface
 
@@ -78,18 +88,46 @@ Three hook surfaces consult the trust flag (all in
 `post_launch_lifecycle(trust=...)` (which gates `post_exec` + `post_commands`).
 The same recipe gets the same answer for every surface.
 
+## What trust gates beyond hooks
+
+`core/launcher.py:_enforce_recipe_mount_trust` refuses these
+container-escape surfaces for an **untrusted** recipe, at the single launch
+choke point:
+
+- `executor_config` privilege keys (`_TRUST_GATED_EXECUTOR_KEYS`):
+  `privileged`, `cap_add`, `security_opt`, `devices`, `user`, `volumes`.
+  Each maps to a `docker run` flag that defeats the rootless hardening or
+  exposes host state, and each sits *above* the executor's rootless
+  `apply_runtime_adjustments` layer in the resolution chain — so a recipe
+  setting them would otherwise win over the hardening.
+- **Executor selection** (`_TRUSTED_DEFAULT_EXECUTORS`): restricted to
+  `docker`.  The rootless, namespaced container is the sandbox that justifies
+  running a registry/URL recipe's serve `command` without a prompt; `local`
+  runs it natively via `setsid bash -c` and `k8s` wedges it into
+  `kubectl run`, either of which is arbitrary host code execution.
+- The undocumented `cluster_config` launch overrides
+  (`resolved_model_path` / `remote_cache_dir` / `local_cache_dir`), which
+  identity-mount a host directory and repoint the serve argument at it.
+
+Innocuous resource knobs are deliberately **not** gated: `shm_size`, `ipc`,
+`network`, `memory_limit`, `ulimit`, `restart_policy`, `auto_remove`,
+`labels`.
+
+`utils/shell.py:assert_safe_mount_source` applies **regardless of trust**:
+the host root, the Docker control socket, SSH keys, and kernel
+pseudo-filesystems are refused outright, even for a trusted recipe.  It
+validates the *literal* path shape (absolute, no `..`, not under a forbidden
+subtree) rather than trusting control-machine `realpath`, because the mount
+happens on a remote host whose symlink layout differs.
+
 ## What trust does *not* gate
 
-Recipe-driven privileged fields are **not** allowlisted by the trust model:
+Once a recipe **is** trusted — local path, a registry marked `trusted`,
+`sparkrun registry trust`, or `--trust` — all of the above become available
+to it with no second prompt for `cap_add: SYS_ADMIN`.
 
-- `executor_config.cap_add`, `devices`, `security_opt`, `privileged`,
-  `ulimit`, `user`, `network` — Docker executor pass-through.
-- `executor_config.extra_opts` (Local), `k8s_*` fields (K8s).
-- Bind-mounts derived from `volumes` / cache-dir resolution.
-
-Adding a third-party registry **implies trusting its recipes' privileged
-fields**. There is no second prompt for `cap_add: SYS_ADMIN`. If you don't
-trust a registry, don't add it.
+Adding and trusting a third-party registry **implies trusting its recipes'
+privileged fields**. If you don't trust a registry, don't trust it.
 
 ## Git URL hardening
 

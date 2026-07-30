@@ -76,9 +76,21 @@ On DGX Spark (1 GPU per node), `tensor_parallel: N` = N hosts.
 | Field            | Type   | Default | Description                                                                                    |
 |------------------|--------|---------|------------------------------------------------------------------------------------------------|
 | `defaults`       | map    | `{}`    | Default values for serve flags. CLI overrides take priority                                    |
-| `env`            | map    | `{}`    | Container environment variables. Supports `$VAR` / `${VAR}` expansion from control machine env |
+| `env`            | map    | `{}`    | Container environment variables. Values are passed through **literally** (see note below) |
 | `command`        | string | `null`  | Command template. `{key}` placeholders resolved from config chain                              |
 | `runtime_config` | map    | `{}`    | Runtime-specific config. Unknown top-level keys are auto-swept here                            |
+
+> **`env` values are not expanded.** Control-machine environment variables are
+> no longer substituted into recipe `env`. A `${HF_TOKEN}` in a recipe reaches
+> the container as the literal string `${HF_TOKEN}`, not the token. This closed
+> an exfiltration path: a third-party recipe could otherwise write
+> `env: {LEAK: "${AWS_SECRET_ACCESS_KEY}"}` and have the control machine's
+> secrets substituted into a container it controls.
+>
+> To forward a secret, use a **cluster-level** `env` block with an `env_file`
+> (`core/cluster_manager.py:ClusterDefinition.resolve_env`) — `${VAR}`
+> references there resolve at launch time from that file only, never from
+> `os.environ`, so secrets stay out of both the recipe and the cluster YAML.
 
 ### Metadata
 
@@ -427,13 +439,20 @@ from the recipe. A recipe is **trusted** (hooks run without prompting) when
 any of these hold:
 
 - the user passed `--trust` on the CLI;
-- the recipe was loaded from a **local path** (no `source_registry`);
-- the recipe came from one of the **default registries** (`@official`,
-  `@sparkrun-transitional`, `@community`).
+- the recipe was loaded from a **local path** (no `source_registry`) and was
+  not fetched from a URL;
+- the recipe came from a registry whose `trusted` flag is true in the user's
+  local `registries.yaml`. Every registry shipped as a built-in default is
+  first-party and ships trusted; a registry added with
+  `sparkrun registry add <url>` is untrusted until the user opts in with
+  `--trust` or `sparkrun registry trust <name>`.
 
-Otherwise the user is prompted before each hook surface runs. See
-[`docs/SECURITY.md`](docs/SECURITY.md) for the full trust model and the list
-of privileged recipe fields that are **not** allowlisted by trust gating.
+Recipes fetched from a **URL** — including `@spark-arena/<uuid>` shortcuts —
+are never auto-trusted, regardless of the above.
+
+Otherwise the user is prompted before each hook surface runs. Trust also gates
+`executor` selection and the `executor_config` privilege keys; see
+[`docs/SECURITY.md`](docs/SECURITY.md) for the full model.
 
 ### pre_exec
 

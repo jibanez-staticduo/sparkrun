@@ -150,7 +150,10 @@ logs warnings (does not raise).
 6. Builder phase (optional).
 7. **`resolve_per_host_backends(host_list, cluster=...)`** — returns
    `dict[host, BackendBundle]`. Hosts that fail to resolve are dropped from the
-   dict; runtimes fall back to legacy `resolve_ib_env`.
+   dict; per-host env then flows through
+   `_cluster_ops.resolve_comm_env(ctx, comm_env, backends)`, which falls back
+   to the legacy NCCL generator for those hosts (byte-identical for NVIDIA).
+   The old `resolve_ib_env` wrapper has been removed.
 8. **Compatibility check** — for runtimes with `requires_capability`, walk every
    host, accumulate errors, raise `IncompatibleHardwareError` if any.
 9. **Platform validation** — `resolve_platform(hw).validate_host(hw)` per host;

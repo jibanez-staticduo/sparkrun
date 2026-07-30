@@ -25,9 +25,19 @@ point. It layers (highest priority first):
 8. **Per-executor defaults** — `cls.default_config()` (e.g. `DOCKER_DEFAULTS`).
 9. **Dataclass field defaults** — `ExecutorConfig` declares the floor.
 
-Unknown selectors log a warning and degrade to `"docker"`. The set of known
-selectors is queried from SAF via `get_extensions(EXT_EXECUTOR, v=v)`; the
-hardcoded `_KNOWN_EXECUTORS` set was retired in 0.3.0.
+A selector that is unknown — or names a real executor whose feature flag is
+off — raises `ExecutorUnavailableError` naming the flag to enable. Resolution
+never silently degrades to `"docker"`: running an explicitly-requested workload
+on the wrong backend is worse than failing loudly.
+
+When *no* layer names an executor, `_default_executor_name` returns `docker`
+when enabled, else the sole remaining enabled executor, else raises. So
+disabling `executor.docker` is honored rather than being overridden by a
+hardcoded baseline.
+
+The set of known selectors is queried from SAF via
+`get_extensions(EXT_EXECUTOR, v=v)`; the hardcoded `_KNOWN_EXECUTORS` set was
+retired in 0.3.0.
 
 ## SAF discovery
 

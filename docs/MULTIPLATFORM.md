@@ -100,8 +100,11 @@ class BackendBundle:
 3. Otherwise call `collectives.get_backend(vendor)` and wrap the result.
 
 `launcher.py:resolve_per_host_backends(host_list, cluster=...)` runs this per
-host, silently dropping failures so partial-vendor coverage still launches and
-runtimes fall back to legacy `resolve_ib_env` per missing host.
+host, silently dropping failures so partial-vendor coverage still launches.
+Per-host env then flows through
+`_cluster_ops.resolve_comm_env(ctx, comm_env, backends)`, which falls back to
+the legacy NCCL generator for any host missing from the map — byte-identical
+output for NVIDIA. (The `resolve_ib_env` wrapper itself has been removed.)
 
 The bundle is threaded all the way through to `runtime.run(..., backends=...)`
 and persisted in `orchestration/job_metadata.py` so post-launch commands can
