@@ -47,13 +47,7 @@ def proxy():
 @click.option(
     "--master-key",
     default=None,
-    help="Bearer token for stateless LiteLLM auth (no DB). Required when enabling the UI.",
-)
-@click.option(
-    "--enable-ui/--no-enable-ui",
-    "enable_ui",
-    default=None,
-    help="Enable the LiteLLM /ui (requires --master-key; adds a sqlite DATABASE_URL).",
+    help="Bearer token for stateless LiteLLM auth (no DB required).",
 )
 @host_options
 @click.option("--foreground", is_flag=True, help="Run in foreground (default: daemonize)")
@@ -70,7 +64,6 @@ def start(
     port,
     bind_host,
     master_key,
-    enable_ui,
     cluster_name,
     hosts,
     hosts_file,
@@ -105,16 +98,19 @@ def start(
     # persisted. Drives the legacy-0.0.0.0 security warning in the engine.
     host_configured = bind_host is not None or proxy_cfg.host_configured
     effective_key = master_key if master_key is not None else proxy_cfg.master_key
-    effective_enable_ui = enable_ui if enable_ui is not None else proxy_cfg.enable_ui
-    effective_ui_username = proxy_cfg.ui_username
-    effective_ui_password = proxy_cfg.ui_password
 
-    if effective_enable_ui and not effective_key:
+    # `enable_ui` was removed: LiteLLM's /ui is DB-backed and its schema.prisma
+    # declares provider="postgresql", so the sqlite DATABASE_URL this used to
+    # set was rejected at schema validation and the proxy exited before binding
+    # a port.  A proxy.yaml left over from that era is warned about and ignored
+    # rather than refused — otherwise the stale key would block every start.
+    if proxy_cfg.enable_ui:
         click.echo(
-            "Error: --enable-ui requires --master-key (or proxy.master_key in proxy.yaml).",
+            "Warning: proxy.enable_ui in proxy.yaml is obsolete and ignored.\n"
+            "LiteLLM's /ui requires a PostgreSQL database and a generated prisma\n"
+            "client, neither of which sparkrun provisions. Remove the key to silence this.",
             err=True,
         )
-        sys.exit(1)
 
     # Persist any explicitly-supplied CLI overrides to proxy.yaml so they
     # stick across restarts.  Done before the is_running() check so intent
@@ -125,7 +121,6 @@ def start(
             port=port,
             bind_host=bind_host,
             master_key=master_key,
-            enable_ui=enable_ui,
             discover_interval=discover_interval,
         )
         if changed:
@@ -161,8 +156,10 @@ def start(
             models_str = ", ".join(ep.actual_models) if ep.actual_models else ep.model
             click.echo("  %s:%d — %s (%s)" % (ep.host, ep.port, models_str, ep.runtime))
 
-    # Generate config
-    config_dict = build_litellm_config(healthy, effective_key)
+    # Generate config.  Aliases go in up front rather than being applied
+    # after startup — applying them later would rewrite the config and
+    # restart the proxy we just started.
+    config_dict = build_litellm_config(healthy, effective_key, aliases=proxy_cfg.aliases)
 
     if dry_run:
         click.echo("")
@@ -180,9 +177,6 @@ def start(
         host=effective_host,
         port=effective_port,
         master_key=effective_key,
-        enable_ui=effective_enable_ui,
-        ui_username=effective_ui_username,
-        ui_password=effective_ui_password,
         host_configured=host_configured,
     )
 
@@ -242,23 +236,19 @@ def start(
         click.echo("Proxy started. API: http://localhost:%d/v1" % effective_port)
         if effective_key:
             click.echo("Management API key: %s" % effective_key)
-        if effective_enable_ui:
-            from sparkrun.proxy import DEFAULT_UI_USERNAME
-
-            ui_user = effective_ui_username or DEFAULT_UI_USERNAME
-            click.echo("UI available at http://%s:%d/ui (login: %s)" % (effective_host, effective_port, ui_user))
         if auto_discover:
             click.echo("Auto-discover enabled (every %ds)" % effective_interval)
 
-        # Apply configured aliases via management API
+        # Aliases were baked into the config above; report the ones that
+        # actually resolved to a live backend.
         aliases = proxy_cfg.aliases
         if aliases:
-            import time
-
-            time.sleep(1)  # Brief delay for proxy readiness
-            added, _removed = engine.sync_aliases(aliases)
-            if added:
-                click.echo("Applied %d alias(es)." % added)
+            applied = {e["model_name"] for e in config_dict["model_list"]} & set(aliases)
+            if applied:
+                click.echo("Applied %d alias(es)." % len(applied))
+            skipped = set(aliases) - applied
+            if skipped:
+                click.echo("Alias(es) awaiting their target model: %s" % ", ".join(sorted(skipped)))
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +285,7 @@ def stop(dry_run):
 
 @proxy.command()
 @json_option()
-@click.pass_context
-def status(ctx, output_json):
+def status(output_json):
     """Show proxy process status and registered models."""
     from sparkrun.proxy.engine import ProxyEngine
 
@@ -311,10 +300,6 @@ def status(ctx, output_json):
         return
 
     running = engine.is_running()
-
-    # Resolve proxy config now that we've passed the no-state early exit
-    sctx = _get_context(ctx)
-    proxy_cfg = sctx.proxy_config
 
     # Autodiscover status
     ad_pid = state.get("autodiscover_pid")
@@ -348,11 +333,6 @@ def status(ctx, output_json):
         }
         if ad_pid:
             data["autodiscover"] = {"pid": int(ad_pid), "running": ad_running}
-        if proxy_cfg.enable_ui:
-            data["ui"] = {
-                "enabled": True,
-                "url": "http://%s:%s/ui" % (state.get("host", "?"), state.get("port", "?")),
-            }
         print_json(data)
         return
 
@@ -361,9 +341,6 @@ def status(ctx, output_json):
     click.echo("  Host:   %s" % state.get("host", "?"))
     click.echo("  Port:   %s" % state.get("port", "?"))
     click.echo("  Start:  %s" % state.get("started_at", "?"))
-
-    if proxy_cfg.enable_ui:
-        click.echo("  UI:     enabled (http://%s:%s/ui)" % (state.get("host", "?"), state.get("port", "?")))
 
     if ad_pid:
         if ad_running:
@@ -458,7 +435,7 @@ def models(refresh, output_json):
     Uses the management API to query the running proxy.
     With --refresh, re-discovers endpoints and adds new models.
     """
-    from sparkrun.proxy.engine import ProxyEngine
+    from sparkrun.proxy.engine import ProxyEngine, ProxyRestartError
 
     engine = ProxyEngine()
 
@@ -476,7 +453,11 @@ def models(refresh, output_json):
             click.echo("Re-discovering endpoints...")
         endpoints = discover_endpoints()
         healthy = [ep for ep in endpoints if ep.healthy]
-        added, removed = engine.sync_models(healthy)
+        try:
+            added, removed = engine.sync_models(healthy)
+        except ProxyRestartError as exc:
+            click.echo("Error: %s" % exc, err=True)
+            sys.exit(1)
         if not output_json:
             if added or removed:
                 parts = []
@@ -484,7 +465,7 @@ def models(refresh, output_json):
                     parts.append("added %d" % added)
                 if removed:
                     parts.append("removed %d stale" % removed)
-                click.echo("Synced proxy models: %s." % ", ".join(parts))
+                click.echo("Synced proxy models: %s (proxy restarted)." % ", ".join(parts))
             else:
                 click.echo("Proxy models already in sync.")
 
@@ -534,7 +515,7 @@ def alias_add(alias_name, target_model):
 
       sparkrun proxy alias add my-model "Qwen/Qwen3-1.7B"
     """
-    from sparkrun.proxy.engine import ProxyEngine
+    from sparkrun.proxy.engine import ProxyEngine, ProxyRestartError
 
     sctx = _get_context(click.get_current_context())
     proxy_cfg = sctx.proxy_config
@@ -542,13 +523,18 @@ def alias_add(alias_name, target_model):
     proxy_cfg.save()
     click.echo("Alias added: %s -> %s" % (alias_name, target_model))
 
-    # Apply to running proxy via management API (no restart)
+    # Apply to the running proxy (rewrites the config and restarts it).
     engine = ProxyEngine()
     if engine.is_running():
-        if engine.add_alias_via_api(alias_name, target_model):
-            click.echo("Alias applied to running proxy.")
+        try:
+            added, _removed = engine.sync_aliases(proxy_cfg.aliases)
+        except ProxyRestartError as exc:
+            click.echo("Error: %s" % exc, err=True)
+            sys.exit(1)
+        if added:
+            click.echo("Alias applied to running proxy (restarted).")
         else:
-            click.echo("Warning: could not apply alias — target model '%s' not found in proxy." % target_model, err=True)
+            click.echo("Note: target model '%s' is not currently served by the proxy." % target_model)
             click.echo("The alias is saved and will apply when the target model is loaded.")
 
 
@@ -561,7 +547,7 @@ def alias_remove(alias_name):
 
       sparkrun proxy alias remove my-model
     """
-    from sparkrun.proxy.engine import ProxyEngine
+    from sparkrun.proxy.engine import ProxyEngine, ProxyRestartError
 
     sctx = _get_context(click.get_current_context())
     proxy_cfg = sctx.proxy_config
@@ -572,12 +558,16 @@ def alias_remove(alias_name):
     proxy_cfg.save()
     click.echo("Alias removed: %s" % alias_name)
 
-    # Remove from running proxy via management API (no restart)
+    # Remove from the running proxy (rewrites the config and restarts it).
     engine = ProxyEngine()
     if engine.is_running():
-        removed = engine.remove_alias_via_api(alias_name)
+        try:
+            _added, removed = engine.sync_aliases(proxy_cfg.aliases)
+        except ProxyRestartError as exc:
+            click.echo("Error: %s" % exc, err=True)
+            sys.exit(1)
         if removed:
-            click.echo("Removed %d alias entry/entries from running proxy." % removed)
+            click.echo("Removed %d alias entry/entries from running proxy (restarted)." % removed)
         else:
             click.echo("Alias was not active in the running proxy.")
 
@@ -727,7 +717,7 @@ def load_cmd(
 
     if not dry_run:
         # Try to register with running proxy
-        from sparkrun.proxy.engine import ProxyEngine
+        from sparkrun.proxy.engine import ProxyEngine, ProxyRestartError
 
         engine = ProxyEngine()
         if engine.is_running():
@@ -738,9 +728,15 @@ def load_cmd(
             time.sleep(2)  # Brief delay for server startup
             endpoints = discover_endpoints()
             healthy = [ep for ep in endpoints if ep.healthy]
-            added, removed = engine.sync_models(healthy)
+            try:
+                added, _removed = engine.sync_models(healthy)
+            except ProxyRestartError as exc:
+                click.echo("Error: %s" % exc, err=True)
+                sys.exit(1)
             if added:
-                click.echo("Registered %d model(s) with proxy." % added)
+                click.echo("Registered %d model(s) with proxy (restarted)." % added)
+            else:
+                click.echo("Warning: model did not appear in proxy discovery.", err=True)
 
 
 @proxy.command("unload")
@@ -763,7 +759,7 @@ def unload_cmd(ctx, recipe_name, hosts, hosts_file, cluster_name, dry_run):
 
     if not dry_run:
         # Sync proxy to remove the now-stale model entry
-        from sparkrun.proxy.engine import ProxyEngine
+        from sparkrun.proxy.engine import ProxyEngine, ProxyRestartError
 
         engine = ProxyEngine()
         if engine.is_running():
@@ -772,9 +768,13 @@ def unload_cmd(ctx, recipe_name, hosts, hosts_file, cluster_name, dry_run):
 
             endpoints = discover_endpoints()
             healthy = [ep for ep in endpoints if ep.healthy]
-            _added, removed = engine.sync_models(healthy)
+            try:
+                _added, removed = engine.sync_models(healthy)
+            except ProxyRestartError as exc:
+                click.echo("Error: %s" % exc, err=True)
+                sys.exit(1)
             if removed:
-                click.echo("Removed %d stale model(s) from proxy." % removed)
+                click.echo("Removed %d stale model(s) from proxy (restarted)." % removed)
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +788,6 @@ def _persist_cli_overrides(
     port,
     bind_host,
     master_key,
-    enable_ui,
     discover_interval,
 ) -> list[str]:
     """Persist explicitly-supplied CLI flags to ``proxy.yaml``.
@@ -803,7 +802,6 @@ def _persist_cli_overrides(
         ("port", port, proxy_cfg.port),
         ("host", bind_host, proxy_cfg.host),
         ("master_key", master_key, proxy_cfg.master_key),
-        ("enable_ui", enable_ui, proxy_cfg.enable_ui),
         ("discover_interval", discover_interval, proxy_cfg.discover_interval),
     ]
 

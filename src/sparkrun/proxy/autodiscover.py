@@ -1,10 +1,18 @@
 """Background auto-discovery process for the sparkrun proxy.
 
-Periodically re-discovers inference endpoints and syncs the proxy's
-model list via the LiteLLM management API.  Designed to run as a
-detached subprocess spawned by ``ProxyEngine.start()``.
+Periodically re-discovers inference endpoints and reconciles the proxy's
+model list with them.  Designed to run as a detached subprocess spawned by
+``ProxyEngine.start()``.
 
-Exits automatically when the proxy process (monitored by PID) dies.
+Reconciliation rewrites the litellm config and restarts the proxy, because
+LiteLLM's runtime mutation endpoints require a DB sparkrun does not
+provision (see ``ProxyEngine.apply_desired_state``).  A sweep that finds no
+change does nothing at all, so a steady-state cluster is never disturbed.
+
+Exits automatically when the proxy dies.  The proxy PID is re-read from the
+state file each check rather than pinned at startup, so a restart — whether
+performed by this process or by a ``sparkrun proxy`` command — is followed
+instead of being mistaken for a shutdown.
 """
 
 from __future__ import annotations
@@ -22,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 _SHUTDOWN = False
 
+# Consecutive 1s checks with no live proxy before we conclude it is really
+# gone.  A restart briefly has no PID at all, so a single miss must not be
+# read as a shutdown; `proxy stop` signals us directly, so a generous value
+# only ever delays the exit of an otherwise-idle daemon.
+PROXY_GONE_TOLERANCE = 30
+
 
 def _handle_signal(signum, _frame):
     global _SHUTDOWN
@@ -33,8 +47,11 @@ def _proxy_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        # Alive, just not ours to signal.
+        return True
 
 
 def run_autodiscover(config_path: str) -> None:
@@ -80,14 +97,22 @@ def run_autodiscover(config_path: str) -> None:
         host_list,
     )
 
+    missing_streak = 0
+
     while not _SHUTDOWN:
         # Sleep in small increments so we respond to signals promptly
         for _ in range(interval):
             if _SHUTDOWN:
                 break
             time.sleep(1)
-            if not _proxy_alive(proxy_pid):
-                logger.info("Proxy PID %d gone, exiting auto-discover", proxy_pid)
+            current_pid = engine.current_pid()
+            if current_pid is not None and _proxy_alive(current_pid):
+                missing_streak = 0
+                proxy_pid = current_pid
+                continue
+            missing_streak += 1
+            if missing_streak >= PROXY_GONE_TOLERANCE:
+                logger.info("Proxy gone (last PID %s), exiting auto-discover", proxy_pid)
                 return
 
         if _SHUTDOWN:
@@ -101,22 +126,23 @@ def run_autodiscover(config_path: str) -> None:
                 cache_dir=cache_dir,
             )
             healthy = [ep for ep in endpoints if ep.healthy]
-            added, removed = engine.sync_models(healthy)
+
+            # Models and aliases are reconciled in ONE call: they share a
+            # single config file, so applying them separately would rewrite
+            # and restart the proxy twice per sweep.  Aliases are re-read
+            # each sweep so an alias added between sweeps is picked up.
+            proxy_cfg._load()
+            added, removed = engine.apply_desired_state(healthy, proxy_cfg.aliases)
             if added or removed:
-                logger.info("Auto-discover sync: added=%d, removed=%d", added, removed)
+                logger.info(
+                    "Auto-discover: config updated (+%d/-%d model entries), proxy restarted",
+                    added,
+                    removed,
+                )
             else:
                 logger.debug("Auto-discover: no changes")
-
-            # Apply configured aliases (re-read config each sweep
-            # so alias add/remove between sweeps is picked up)
-            proxy_cfg._load()
-            aliases = proxy_cfg.aliases
-            if aliases:
-                a_added, a_removed = engine.sync_aliases(aliases)
-                if a_added or a_removed:
-                    logger.info("Auto-discover alias sync: added=%d, removed=%d", a_added, a_removed)
         except Exception:
-            logger.debug("Auto-discover sweep failed", exc_info=True)
+            logger.warning("Auto-discover sweep failed", exc_info=True)
 
     logger.info("Auto-discover shutting down")
 

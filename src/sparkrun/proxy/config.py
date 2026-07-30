@@ -14,7 +14,6 @@ import yaml
 
 from sparkrun.proxy import (
     DEFAULT_DISCOVER_INTERVAL,
-    DEFAULT_ENABLE_UI,
     DEFAULT_MASTER_KEY,
     DEFAULT_PROXY_HOST,
     DEFAULT_PROXY_PORT,
@@ -96,17 +95,14 @@ class ProxyConfig:
 
     @property
     def enable_ui(self) -> bool:
-        return bool(self._data.get("proxy", {}).get("enable_ui", DEFAULT_ENABLE_UI))
+        """True when an obsolete ``enable_ui`` is still set in proxy.yaml.
 
-    @property
-    def ui_username(self) -> str | None:
-        val = self._data.get("proxy", {}).get("ui_username")
-        return str(val) if val is not None else None
-
-    @property
-    def ui_password(self) -> str | None:
-        val = self._data.get("proxy", {}).get("ui_password")
-        return str(val) if val is not None else None
+        The LiteLLM ``/ui`` is not supported — it is DB-backed and its
+        ``schema.prisma`` requires PostgreSQL.  This survives only so
+        ``proxy start`` can warn about (and ignore) a stale key rather than
+        silently dropping a setting the user believes is active.
+        """
+        return bool(self._data.get("proxy", {}).get("enable_ui", False))
 
     def set_proxy(self, **kwargs: Any) -> None:
         """Update proxy settings (port, host, master_key, etc.)."""

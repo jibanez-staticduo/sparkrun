@@ -92,7 +92,6 @@ class TestPersistCliOverrides:
             port=None,
             bind_host=None,
             master_key=None,
-            enable_ui=None,
             discover_interval=None,
         )
         assert changed == []
@@ -112,7 +111,6 @@ class TestPersistCliOverrides:
             port=None,
             bind_host=None,
             master_key="sk-existing",
-            enable_ui=None,
             discover_interval=None,
         )
         assert changed == []
@@ -126,10 +124,9 @@ class TestPersistCliOverrides:
             port=5000,
             bind_host=None,
             master_key="sk-new",
-            enable_ui=True,
             discover_interval=None,
         )
-        assert set(changed) == {"port", "master_key", "enable_ui"}
+        assert set(changed) == {"port", "master_key"}
 
         # Re-read fresh to confirm persisted to disk.
         from sparkrun.proxy.config import ProxyConfig
@@ -137,29 +134,27 @@ class TestPersistCliOverrides:
         fresh = ProxyConfig(real_proxy_cfg.config_path)
         assert fresh.port == 5000
         assert fresh.master_key == "sk-new"
-        assert fresh.enable_ui is True
 
-    def test_enable_ui_false_is_explicit_and_persists(self, real_proxy_cfg):
-        """``enable_ui=False`` must be treated as an explicit user choice."""
+    def test_bind_host_false_value_still_persists(self, real_proxy_cfg):
+        """A falsy-but-explicit value is an explicit user choice, not "unset"."""
         from sparkrun.cli._proxy import _persist_cli_overrides
 
-        real_proxy_cfg.set_proxy(enable_ui=True)
+        real_proxy_cfg.set_proxy(host="0.0.0.0")
         real_proxy_cfg.save()
 
         changed = _persist_cli_overrides(
             real_proxy_cfg,
             port=None,
-            bind_host=None,
+            bind_host="127.0.0.1",
             master_key=None,
-            enable_ui=False,
             discover_interval=None,
         )
-        assert changed == ["enable_ui"]
+        assert changed == ["host"]
 
         from sparkrun.proxy.config import ProxyConfig
 
         fresh = ProxyConfig(real_proxy_cfg.config_path)
-        assert fresh.enable_ui is False
+        assert fresh.host == "127.0.0.1"
 
 
 # =====================================================================
@@ -288,22 +283,40 @@ class TestStartCli:
         assert patch_engine.start_called is True
 
     def test_restart_with_flags_persists_and_restarts(self, patch_proxy_config, patch_discovery, patch_engine, proxy_yaml: Path):
-        """--restart --enable-ui --master-key: persist both, stop, then start."""
+        """--restart --port --master-key: persist both, stop, then start."""
         from sparkrun.cli._proxy import proxy
 
         patch_engine.running = True
 
         result = CliRunner().invoke(
             proxy,
-            ["start", "--restart", "--enable-ui", "--master-key", "sk-NEW"],
+            ["start", "--restart", "--port", "4321", "--master-key", "sk-NEW"],
         )
         assert result.exit_code == 0, result.output
         assert "Saved proxy.yaml" in result.output
 
         data = yaml.safe_load(proxy_yaml.read_text())
         assert data["proxy"]["master_key"] == "sk-NEW"
-        assert data["proxy"]["enable_ui"] is True
+        assert data["proxy"]["port"] == 4321
         assert patch_engine.stop_called is True
+        assert patch_engine.start_called is True
+
+    def test_stale_enable_ui_warns_but_still_starts(self, patch_proxy_config, patch_discovery, patch_engine):
+        """A leftover ``enable_ui: true`` warns and is ignored, never blocks.
+
+        The UI is unsupported (LiteLLM's /ui needs PostgreSQL), but a key
+        persisted by an older sparkrun must not make the proxy unstartable —
+        the user would be stuck until they hand-edited proxy.yaml.
+        """
+        from sparkrun.cli._proxy import proxy
+
+        patch_proxy_config.set_proxy(enable_ui=True)
+        patch_proxy_config.save()
+
+        result = CliRunner().invoke(proxy, ["start"])
+
+        assert result.exit_code == 0, result.output
+        assert "obsolete and ignored" in result.output
         assert patch_engine.start_called is True
 
     def test_start_no_op_master_key_does_not_save(self, patch_proxy_config, patch_discovery, patch_engine, proxy_yaml: Path):

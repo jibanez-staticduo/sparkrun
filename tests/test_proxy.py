@@ -1131,41 +1131,59 @@ class TestEngineLifecycle:
 # =====================================================================
 
 
-class TestEngineManagementAPI:
-    """Test management API client methods."""
+class TestWaitForExit:
+    """Test process-exit detection, which gates every proxy restart."""
 
-    def test_add_model_via_api(self, state_dir: Path):
-        """add_model_via_api constructs correct request."""
-        from sparkrun.proxy.discovery import DiscoveredEndpoint
-        from sparkrun.proxy.engine import ProxyEngine
+    def test_zombie_child_counts_as_exited(self):
+        """A dead-but-unreaped child must not read as still running.
 
-        engine = ProxyEngine(state_dir=state_dir)
+        ``os.kill(pid, 0)`` succeeds on a zombie, so naive polling waits out
+        the full timeout and then escalates to SIGKILL against a process
+        that already exited — leaving the restart with no replacement.  The
+        auto-discover daemon spawns each replacement proxy itself, so from
+        its second restart onward the old proxy is exactly this case.
+        """
+        import subprocess
+        import sys
+        import time
 
-        ep = DiscoveredEndpoint(
-            cluster_id="sparkrun_abc",
-            model="test/model",
-            served_model_name=None,
-            runtime="vllm",
-            host="10.0.0.1",
-            port=8000,
-            healthy=True,
-            actual_models=["test/model"],
-        )
+        from sparkrun.proxy.engine import _wait_for_exit
 
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"status": "ok"}'
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        time.sleep(0.5)  # exited, but deliberately not reaped
 
-        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
-            result = engine.add_model_via_api(ep)
+        # Precondition: the zombie still answers a liveness signal.
+        os.kill(proc.pid, 0)
 
-        assert result is True
-        # Verify the request was made
-        call_args = mock_urlopen.call_args
-        req = call_args[0][0]
-        assert req.method == "POST"
-        assert "/model/new" in req.full_url
+        started = time.monotonic()
+        assert _wait_for_exit(proc.pid, 10.0) is True
+        assert time.monotonic() - started < 5.0, "should return promptly, not time out"
+
+        proc.returncode = 0  # already reaped by _wait_for_exit
+
+    def test_live_process_reported_as_running(self):
+        """A genuinely running process must not be reported as exited."""
+        import subprocess
+        import sys
+
+        from sparkrun.proxy.engine import _wait_for_exit
+
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            assert _wait_for_exit(proc.pid, 1.0) is False
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+class TestEngineModelQueryAPI:
+    """Test the read-only management API client methods.
+
+    Only queries remain: LiteLLM's mutation endpoints (``/model/new``,
+    ``/model/delete``) require a DB-backed model store and answer
+    ``500 No DB Connected`` against a sparkrun-launched proxy, so model
+    changes go through the config file instead.
+    """
 
     def test_list_models_via_api(self, state_dir: Path):
         """list_models_via_api parses response."""
@@ -1201,270 +1219,279 @@ class TestEngineManagementAPI:
 
         assert models == []
 
-    def test_remove_model_via_api(self, state_dir: Path):
-        """remove_model_via_api sends POST /model/delete."""
+    def test_mutation_endpoints_are_gone(self, state_dir: Path):
+        """The DB-dependent mutators must not come back as silent no-ops.
+
+        They returned False/0 on failure, which callers read as "nothing to
+        do" — the exact shape of the bug this replaced.
+        """
         from sparkrun.proxy.engine import ProxyEngine
 
         engine = ProxyEngine(state_dir=state_dir)
+        for dead in ("add_model_via_api", "remove_model_via_api", "add_alias_via_api", "remove_alias_via_api"):
+            assert not hasattr(engine, dead), "%s should have been removed" % dead
 
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"status": "ok"}'
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
-            result = engine.remove_model_via_api("model-id-123")
+def _ep(model: str, host: str = "10.0.0.1", port: int = 8000, api_key: str | None = None):
+    """Build a healthy DiscoveredEndpoint for the sync tests."""
+    from sparkrun.proxy.discovery import DiscoveredEndpoint
 
-        assert result is True
-        req = mock_urlopen.call_args[0][0]
-        assert req.method == "POST"
-        assert "/model/delete" in req.full_url
-        payload = json.loads(req.data)
-        assert payload["id"] == "model-id-123"
+    return DiscoveredEndpoint(
+        cluster_id="sparkrun_%s" % model.replace("/", "_"),
+        model=model,
+        served_model_name=None,
+        runtime="vllm",
+        host=host,
+        port=port,
+        healthy=True,
+        actual_models=[model],
+        api_key=api_key,
+    )
 
-    def test_remove_model_api_failure(self, state_dir: Path):
-        """remove_model_via_api returns False on failure."""
+
+class TestApplyDesiredState:
+    """Test config-regeneration + restart, the only way models change."""
+
+    def _engine(self, state_dir: Path, running: bool = True):
         from sparkrun.proxy.engine import ProxyEngine
 
-        engine = ProxyEngine(state_dir=state_dir)
+        engine = ProxyEngine(state_dir=state_dir, master_key="sk-test")
+        engine._test_running = running
+        return engine
 
-        with patch("urllib.request.urlopen", side_effect=Exception("connection refused")):
-            result = engine.remove_model_via_api("model-id-123")
+    def _seed(self, engine, endpoints, aliases=None):
+        """Write a config representing the proxy's current state."""
+        from sparkrun.proxy.engine import build_litellm_config, write_config
 
-        assert result is False
-
-    def test_sync_models_adds_new(self, state_dir: Path):
-        """sync_models adds models not yet registered."""
-        from sparkrun.proxy.discovery import DiscoveredEndpoint
-        from sparkrun.proxy.engine import ProxyEngine
-
-        engine = ProxyEngine(state_dir=state_dir)
-
-        ep = DiscoveredEndpoint(
-            cluster_id="sparkrun_abc",
-            model="test/model",
-            served_model_name=None,
-            runtime="vllm",
-            host="10.0.0.1",
-            port=8000,
-            healthy=True,
-            actual_models=["test/model"],
+        write_config(
+            build_litellm_config(endpoints, master_key=engine.master_key, aliases=aliases),
+            engine.config_path,
         )
 
-        # No models registered yet
+    def test_noop_when_already_in_sync(self, state_dir: Path):
+        """An unchanged endpoint set must not rewrite or restart anything."""
+        engine = self._engine(state_dir)
+        ep = _ep("test/model")
+        self._seed(engine, [ep])
+        mtime_before = engine.config_path.stat().st_mtime_ns
+
         with (
-            patch.object(engine, "list_models_via_api", return_value=[]),
-            patch.object(engine, "add_model_via_api", return_value=True) as mock_add,
+            patch.object(type(engine), "is_running", return_value=True),
+            patch.object(engine, "_restart_proxy") as mock_restart,
         ):
-            added, removed = engine.sync_models([ep])
+            added, removed = engine.apply_desired_state([ep])
+
+        assert (added, removed) == (0, 0)
+        mock_restart.assert_not_called()
+        assert engine.config_path.stat().st_mtime_ns == mtime_before
+
+    def test_new_endpoint_rewrites_config_and_restarts(self, state_dir: Path):
+        """A newly discovered endpoint lands in the config and restarts the proxy."""
+        import yaml
+
+        engine = self._engine(state_dir)
+        old, new = _ep("old/model"), _ep("new/model", host="10.0.0.2")
+        self._seed(engine, [old])
+
+        with (
+            patch.object(type(engine), "is_running", return_value=True),
+            patch.object(engine, "_restart_proxy", return_value=4321) as mock_restart,
+        ):
+            added, removed = engine.apply_desired_state([old, new])
+
+        assert (added, removed) == (1, 0)
+        mock_restart.assert_called_once()
+        written = yaml.safe_load(engine.config_path.read_text())
+        names = {m["model_name"] for m in written["model_list"]}
+        assert names == {"old/model", "new/model"}
+
+    def test_vanished_endpoint_is_removed(self, state_dir: Path):
+        """An endpoint that disappeared is dropped from the config."""
+        import yaml
+
+        engine = self._engine(state_dir)
+        self._seed(engine, [_ep("old/model")])
+
+        with (
+            patch.object(type(engine), "is_running", return_value=True),
+            patch.object(engine, "_restart_proxy", return_value=4321),
+        ):
+            added, removed = engine.apply_desired_state([])
+
+        assert (added, removed) == (0, 1)
+        written = yaml.safe_load(engine.config_path.read_text())
+        assert written["model_list"] == []
+
+    def test_not_running_writes_config_without_restart(self, state_dir: Path):
+        """With no proxy running the config is still updated for next start."""
+        engine = self._engine(state_dir, running=False)
+        self._seed(engine, [])
+
+        with (
+            patch.object(type(engine), "is_running", return_value=False),
+            patch.object(engine, "_restart_proxy") as mock_restart,
+        ):
+            added, removed = engine.apply_desired_state([_ep("test/model")])
+
+        assert (added, removed) == (1, 0)
+        mock_restart.assert_not_called()
+
+    def test_restart_false_suppresses_restart(self, state_dir: Path):
+        """restart=False updates the config but leaves the process alone."""
+        engine = self._engine(state_dir)
+        self._seed(engine, [])
+
+        with (
+            patch.object(type(engine), "is_running", return_value=True),
+            patch.object(engine, "_restart_proxy") as mock_restart,
+        ):
+            added, _removed = engine.apply_desired_state([_ep("test/model")], restart=False)
 
         assert added == 1
-        assert removed == 0
-        mock_add.assert_called_once_with(ep)
+        mock_restart.assert_not_called()
 
-    def test_sync_models_removes_stale(self, state_dir: Path):
-        """sync_models removes models whose backends are gone."""
-        from sparkrun.proxy.engine import ProxyEngine
+    def test_restart_failure_raises(self, state_dir: Path):
+        """A failed restart must surface, not be swallowed as a no-op."""
+        from sparkrun.proxy.engine import ProxyRestartError
 
-        engine = ProxyEngine(state_dir=state_dir)
+        engine = self._engine(state_dir)
+        self._seed(engine, [])
 
-        registered = [
-            {
-                "model_name": "old/model",
-                "model_info": {"id": "old-id-123"},
-                "litellm_params": {"api_base": "http://10.0.0.99:8000/v1"},
-            },
-        ]
-
-        # No healthy endpoints — the old model should be removed
         with (
-            patch.object(engine, "list_models_via_api", return_value=registered),
-            patch.object(engine, "remove_model_via_api", return_value=True) as mock_rm,
+            patch.object(type(engine), "is_running", return_value=True),
+            patch.object(engine, "_restart_proxy", return_value=None),
+            pytest.raises(ProxyRestartError),
         ):
-            added, removed = engine.sync_models([])
+            engine.apply_desired_state([_ep("test/model")])
 
-        assert added == 0
-        assert removed == 1
-        mock_rm.assert_called_once_with("old-id-123")
+    def test_restart_never_rotates_master_key(self, state_dir: Path):
+        """general_settings is carried over, so a bare engine can't change auth.
 
-    def test_sync_models_skips_healthy(self, state_dir: Path):
-        """sync_models does not remove models with healthy backends."""
-        from sparkrun.proxy.discovery import DiscoveredEndpoint
-        from sparkrun.proxy.engine import ProxyEngine
+        The CLI constructs ``ProxyEngine()`` bare in several places; if the
+        regenerated config took that default master key, a sync would
+        silently re-key the running proxy and lock out every client.
+        """
+        import yaml
+        from sparkrun.proxy.engine import ProxyEngine, build_litellm_config, write_config
+
+        write_config(build_litellm_config([], master_key="sk-REAL-RUNNING-KEY"), state_dir / "litellm_config.yaml")
+
+        bare = ProxyEngine(state_dir=state_dir, master_key="sk-wrong-default")
+        with (
+            patch.object(type(bare), "is_running", return_value=True),
+            patch.object(bare, "_restart_proxy", return_value=1),
+        ):
+            bare.apply_desired_state([_ep("test/model")])
+
+        written = yaml.safe_load(bare.config_path.read_text())
+        assert written["general_settings"]["master_key"] == "sk-REAL-RUNNING-KEY"
+
+    def test_sync_models_preserves_configured_aliases(self, state_dir: Path):
+        """sync_models without explicit aliases must not drop them."""
+        import yaml
+
+        engine = self._engine(state_dir)
+        ep = _ep("Qwen/Qwen3-1.7B")
+        self._seed(engine, [ep], aliases={"my-model": "Qwen/Qwen3-1.7B"})
+
+        with (
+            patch.object(type(engine), "is_running", return_value=True),
+            patch.object(engine, "_restart_proxy", return_value=1),
+            patch.object(engine, "_configured_aliases", return_value={"my-model": "Qwen/Qwen3-1.7B"}),
+        ):
+            engine.sync_models([ep, _ep("other/model", host="10.0.0.9")])
+
+        written = yaml.safe_load(engine.config_path.read_text())
+        assert "my-model" in {m["model_name"] for m in written["model_list"]}
+
+
+class TestEngineAliases:
+    """Test alias handling now that aliases live in the config file."""
+
+    def test_alias_emitted_for_live_target(self):
+        """An alias becomes an extra model_list entry on the target's backend."""
+        from sparkrun.proxy.engine import build_litellm_config
+
+        config = build_litellm_config([_ep("Qwen/Qwen3-1.7B")], aliases={"my-model": "Qwen/Qwen3-1.7B"})
+
+        alias_entries = [m for m in config["model_list"] if m["model_name"] == "my-model"]
+        assert len(alias_entries) == 1
+        assert alias_entries[0]["litellm_params"]["model"] == "openai/Qwen/Qwen3-1.7B"
+        assert alias_entries[0]["litellm_params"]["api_base"] == "http://10.0.0.1:8000/v1"
+
+    def test_alias_skipped_when_target_absent(self):
+        """An alias whose target has no backend is omitted, not emitted broken."""
+        from sparkrun.proxy.engine import build_litellm_config
+
+        config = build_litellm_config([_ep("other/model")], aliases={"my-model": "Qwen/Qwen3-1.7B"})
+
+        assert "my-model" not in {m["model_name"] for m in config["model_list"]}
+
+    def test_alias_spans_every_backend_of_target(self):
+        """A tp-replicated model gets one alias entry per backend."""
+        from sparkrun.proxy.engine import build_litellm_config
+
+        eps = [_ep("Qwen/Qwen3-1.7B", host="10.0.0.1"), _ep("Qwen/Qwen3-1.7B", host="10.0.0.2")]
+        config = build_litellm_config(eps, aliases={"my-model": "Qwen/Qwen3-1.7B"})
+
+        alias_bases = {m["litellm_params"]["api_base"] for m in config["model_list"] if m["model_name"] == "my-model"}
+        assert alias_bases == {"http://10.0.0.1:8000/v1", "http://10.0.0.2:8000/v1"}
+
+    def test_endpoints_from_config_ignores_aliases(self, state_dir: Path):
+        """Recovering endpoints from config must not resurrect aliases as models."""
+        from sparkrun.proxy.engine import ProxyEngine, build_litellm_config, write_config
 
         engine = ProxyEngine(state_dir=state_dir)
-
-        ep = DiscoveredEndpoint(
-            cluster_id="sparkrun_abc",
-            model="test/model",
-            served_model_name=None,
-            runtime="vllm",
-            host="10.0.0.1",
-            port=8000,
-            healthy=True,
-            actual_models=["test/model"],
+        write_config(
+            build_litellm_config([_ep("Qwen/Qwen3-1.7B")], aliases={"my-model": "Qwen/Qwen3-1.7B"}),
+            engine.config_path,
         )
 
-        registered = [
-            {
-                "model_name": "test/model",
-                "model_info": {"id": "good-id"},
-                "litellm_params": {"api_base": "http://10.0.0.1:8000/v1"},
-            },
-        ]
+        recovered = engine._endpoints_from_config()
+
+        assert [e.model for e in recovered] == ["Qwen/Qwen3-1.7B"]
+        assert recovered[0].host == "10.0.0.1"
+        assert recovered[0].port == 8000
+
+    def test_sync_aliases_keeps_existing_models(self, state_dir: Path):
+        """Adding an alias must not drop the models already being served."""
+        import yaml
+        from sparkrun.proxy.engine import ProxyEngine, build_litellm_config, write_config
+
+        engine = ProxyEngine(state_dir=state_dir, master_key="sk-test")
+        write_config(build_litellm_config([_ep("Qwen/Qwen3-1.7B")], master_key="sk-test"), engine.config_path)
 
         with (
-            patch.object(engine, "list_models_via_api", return_value=registered),
-            patch.object(engine, "remove_model_via_api") as mock_rm,
-            patch.object(engine, "add_model_via_api") as mock_add,
+            patch.object(type(engine), "is_running", return_value=True),
+            patch.object(engine, "_restart_proxy", return_value=1),
         ):
-            added, removed = engine.sync_models([ep])
-
-        assert added == 0
-        assert removed == 0
-        mock_rm.assert_not_called()
-        mock_add.assert_not_called()
-
-
-# =====================================================================
-# Tests: Engine — alias API
-# =====================================================================
-
-
-class TestEngineAliasAPI:
-    """Test API-based alias management methods."""
-
-    def test_add_alias_via_api(self, state_dir: Path):
-        """add_alias_via_api finds target backends and registers alias."""
-        from sparkrun.proxy.engine import ProxyEngine
-
-        engine = ProxyEngine(state_dir=state_dir)
-
-        registered = [
-            {
-                "model_name": "Qwen/Qwen3-1.7B",
-                "litellm_params": {
-                    "model": "openai/Qwen/Qwen3-1.7B",
-                    "api_base": "http://10.0.0.1:8000/v1",
-                    "api_key": "not-needed",
-                },
-            },
-        ]
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"status": "ok"}'
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with (
-            patch.object(engine, "list_models_via_api", return_value=registered),
-            patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen,
-        ):
-            result = engine.add_alias_via_api("my-model", "Qwen/Qwen3-1.7B")
-
-        assert result is True
-        call_args = mock_urlopen.call_args
-        req = call_args[0][0]
-        import json
-
-        body = json.loads(req.data)
-        assert body["model_name"] == "my-model"
-        assert body["litellm_params"]["api_base"] == "http://10.0.0.1:8000/v1"
-
-    def test_add_alias_target_not_found(self, state_dir: Path):
-        """add_alias_via_api returns False when target model is not registered."""
-        from sparkrun.proxy.engine import ProxyEngine
-
-        engine = ProxyEngine(state_dir=state_dir)
-
-        with patch.object(engine, "list_models_via_api", return_value=[]):
-            result = engine.add_alias_via_api("my-model", "nonexistent/model")
-
-        assert result is False
-
-    def test_remove_alias_via_api(self, state_dir: Path):
-        """remove_alias_via_api removes all entries with the alias name."""
-        from sparkrun.proxy.engine import ProxyEngine
-
-        engine = ProxyEngine(state_dir=state_dir)
-
-        registered = [
-            {
-                "model_name": "my-model",
-                "model_info": {"id": "alias-id-1"},
-                "litellm_params": {"api_base": "http://10.0.0.1:8000/v1"},
-            },
-            {
-                "model_name": "real-model",
-                "model_info": {"id": "real-id"},
-                "litellm_params": {"api_base": "http://10.0.0.1:8000/v1"},
-            },
-        ]
-
-        with (
-            patch.object(engine, "list_models_via_api", return_value=registered),
-            patch.object(engine, "remove_model_via_api", return_value=True) as mock_rm,
-        ):
-            removed = engine.remove_alias_via_api("my-model")
-
-        assert removed == 1
-        mock_rm.assert_called_once_with("alias-id-1")
-
-    def test_sync_aliases_adds_missing(self, state_dir: Path):
-        """sync_aliases adds aliases not yet registered."""
-        from sparkrun.proxy.engine import ProxyEngine
-
-        engine = ProxyEngine(state_dir=state_dir)
-
-        registered = [
-            {
-                "model_name": "Qwen/Qwen3-1.7B",
-                "litellm_params": {
-                    "model": "openai/Qwen/Qwen3-1.7B",
-                    "api_base": "http://10.0.0.1:8000/v1",
-                },
-            },
-        ]
-
-        with (
-            patch.object(engine, "list_models_via_api", return_value=registered),
-            patch.object(engine, "add_alias_via_api", return_value=True) as mock_add,
-        ):
-            added, removed = engine.sync_aliases({"my-model": "Qwen/Qwen3-1.7B"})
+            added, _removed = engine.sync_aliases({"my-model": "Qwen/Qwen3-1.7B"})
 
         assert added == 1
-        assert removed == 0
-        mock_add.assert_called_once_with("my-model", "Qwen/Qwen3-1.7B")
+        written = yaml.safe_load(engine.config_path.read_text())
+        names = {m["model_name"] for m in written["model_list"]}
+        assert names == {"Qwen/Qwen3-1.7B", "my-model"}
 
-    def test_sync_aliases_skips_existing(self, state_dir: Path):
-        """sync_aliases does not re-add aliases already registered."""
-        from sparkrun.proxy.engine import ProxyEngine
+    def test_sync_aliases_removes_dropped_alias(self, state_dir: Path):
+        """Removing an alias from config removes its entry from the proxy."""
+        import yaml
+        from sparkrun.proxy.engine import ProxyEngine, build_litellm_config, write_config
 
-        engine = ProxyEngine(state_dir=state_dir)
+        engine = ProxyEngine(state_dir=state_dir, master_key="sk-test")
+        write_config(
+            build_litellm_config([_ep("Qwen/Qwen3-1.7B")], master_key="sk-test", aliases={"my-model": "Qwen/Qwen3-1.7B"}),
+            engine.config_path,
+        )
 
-        registered = [
-            {
-                "model_name": "Qwen/Qwen3-1.7B",
-                "litellm_params": {
-                    "model": "openai/Qwen/Qwen3-1.7B",
-                    "api_base": "http://10.0.0.1:8000/v1",
-                },
-            },
-            {
-                "model_name": "my-model",
-                "litellm_params": {
-                    "model": "openai/Qwen/Qwen3-1.7B",
-                    "api_base": "http://10.0.0.1:8000/v1",
-                },
-            },
-        ]
+        with (
+            patch.object(type(engine), "is_running", return_value=True),
+            patch.object(engine, "_restart_proxy", return_value=1),
+        ):
+            _added, removed = engine.sync_aliases({})
 
-        with patch.object(engine, "list_models_via_api", return_value=registered), patch.object(engine, "add_alias_via_api") as mock_add:
-            added, removed = engine.sync_aliases({"my-model": "Qwen/Qwen3-1.7B"})
-
-        assert added == 0
-        assert removed == 0
-        mock_add.assert_not_called()
+        assert removed == 1
+        written = yaml.safe_load(engine.config_path.read_text())
+        assert {m["model_name"] for m in written["model_list"]} == {"Qwen/Qwen3-1.7B"}
 
 
 # =====================================================================
@@ -1810,8 +1837,6 @@ class TestCLI:
             patch("sparkrun.proxy.config.ProxyConfig.master_key", new_callable=lambda: property(lambda s: "sk-test")),
             patch("sparkrun.proxy.config.ProxyConfig.aliases", new_callable=lambda: property(lambda s: {})),
             patch("sparkrun.proxy.config.ProxyConfig.enable_ui", new_callable=lambda: property(lambda s: False)),
-            patch("sparkrun.proxy.config.ProxyConfig.ui_username", new_callable=lambda: property(lambda s: None)),
-            patch("sparkrun.proxy.config.ProxyConfig.ui_password", new_callable=lambda: property(lambda s: None)),
             patch("sparkrun.proxy.config.ProxyConfig.auto_discover", new_callable=lambda: property(lambda s: True)),
             patch(
                 "sparkrun.proxy.config.ProxyConfig.discover_interval",
