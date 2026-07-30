@@ -76,56 +76,38 @@ def patch_discovery():
 
 
 # =====================================================================
-# _persist_cli_overrides helper
+# _persist_overrides helper (api.proxy)
 # =====================================================================
 
 
 class TestPersistCliOverrides:
-    """Direct unit tests for the persistence helper."""
+    """Direct unit tests for the persistence helper (now in api.proxy)."""
 
     def test_no_flags_supplied_returns_empty(self, real_proxy_cfg):
         """None values are skipped — nothing changes, nothing written."""
-        from sparkrun.cli._proxy import _persist_cli_overrides
+        from sparkrun.api.proxy._ops import ProxyStartOptions, _persist_overrides
 
-        changed = _persist_cli_overrides(
-            real_proxy_cfg,
-            port=None,
-            bind_host=None,
-            master_key=None,
-            discover_interval=None,
-        )
+        changed = _persist_overrides(real_proxy_cfg, ProxyStartOptions())
         assert changed == []
         # File should not have been created by save()
         assert not real_proxy_cfg.config_path.exists()
 
     def test_supplied_value_matching_current_is_skipped(self, real_proxy_cfg):
         """A flag whose value equals the saved value is a no-op (no write, no echo)."""
-        from sparkrun.cli._proxy import _persist_cli_overrides
+        from sparkrun.api.proxy._ops import ProxyStartOptions, _persist_overrides
 
         real_proxy_cfg.set_proxy(master_key="sk-existing")
         real_proxy_cfg.save()
         mtime_before = real_proxy_cfg.config_path.stat().st_mtime_ns
 
-        changed = _persist_cli_overrides(
-            real_proxy_cfg,
-            port=None,
-            bind_host=None,
-            master_key="sk-existing",
-            discover_interval=None,
-        )
+        changed = _persist_overrides(real_proxy_cfg, ProxyStartOptions(master_key="sk-existing"))
         assert changed == []
         assert real_proxy_cfg.config_path.stat().st_mtime_ns == mtime_before
 
     def test_supplied_value_persists_and_returns_key(self, real_proxy_cfg):
-        from sparkrun.cli._proxy import _persist_cli_overrides
+        from sparkrun.api.proxy._ops import ProxyStartOptions, _persist_overrides
 
-        changed = _persist_cli_overrides(
-            real_proxy_cfg,
-            port=5000,
-            bind_host=None,
-            master_key="sk-new",
-            discover_interval=None,
-        )
+        changed = _persist_overrides(real_proxy_cfg, ProxyStartOptions(port=5000, master_key="sk-new"))
         assert set(changed) == {"port", "master_key"}
 
         # Re-read fresh to confirm persisted to disk.
@@ -137,18 +119,12 @@ class TestPersistCliOverrides:
 
     def test_bind_host_false_value_still_persists(self, real_proxy_cfg):
         """A falsy-but-explicit value is an explicit user choice, not "unset"."""
-        from sparkrun.cli._proxy import _persist_cli_overrides
+        from sparkrun.api.proxy._ops import ProxyStartOptions, _persist_overrides
 
         real_proxy_cfg.set_proxy(host="0.0.0.0")
         real_proxy_cfg.save()
 
-        changed = _persist_cli_overrides(
-            real_proxy_cfg,
-            port=None,
-            bind_host="127.0.0.1",
-            master_key=None,
-            discover_interval=None,
-        )
+        changed = _persist_overrides(real_proxy_cfg, ProxyStartOptions(host="127.0.0.1"))
         assert changed == ["host"]
 
         from sparkrun.proxy.config import ProxyConfig

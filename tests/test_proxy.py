@@ -1779,7 +1779,7 @@ class TestCLI:
         runner = CliRunner()
         with (
             patch("sparkrun.proxy.config.ProxyConfig.__init__", return_value=None),
-            patch("sparkrun.proxy.config.ProxyConfig.list_aliases", return_value=[]),
+            patch("sparkrun.proxy.config.ProxyConfig.aliases", new_callable=lambda: property(lambda s: {})),
         ):
             result = runner.invoke(proxy, ["alias", "list"])
 
@@ -1837,6 +1837,7 @@ class TestCLI:
             patch("sparkrun.proxy.config.ProxyConfig.master_key", new_callable=lambda: property(lambda s: "sk-test")),
             patch("sparkrun.proxy.config.ProxyConfig.aliases", new_callable=lambda: property(lambda s: {})),
             patch("sparkrun.proxy.config.ProxyConfig.enable_ui", new_callable=lambda: property(lambda s: False)),
+            patch("sparkrun.proxy.config.ProxyConfig.gateway", new_callable=lambda: property(lambda s: None)),
             patch("sparkrun.proxy.config.ProxyConfig.auto_discover", new_callable=lambda: property(lambda s: True)),
             patch(
                 "sparkrun.proxy.config.ProxyConfig.discover_interval",

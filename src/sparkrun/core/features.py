@@ -257,6 +257,22 @@ FEATURE_CLI_SETUP_TAILSCALE = register_feature(
     )
 )
 
+# The LiteLLM gateway is the only inference-gateway implementation today and
+# ships ENABLED on every channel (``default=True``, no channel overrides), like
+# ``executor.docker``.  It carries a flag so an alternate gateway can be added
+# as a peer rather than a special case, and so a deployment that doesn't want
+# the LiteLLM dependency can drop it.  Exactly one gateway is used at a time:
+# that is arbitrated at *resolution* time (see
+# :func:`sparkrun.proxy.gateway.resolve_gateway`), not by the flag registry,
+# which has no notion of mutually-exclusive flags.
+FEATURE_GATEWAY_LITELLM = register_feature(
+    FeatureFlag(
+        name="gateway.litellm",
+        description="LiteLLM gateway behind 'sparkrun proxy' (enabled on all channels; one gateway is used at a time)",
+        default=True,
+    )
+)
+
 # Loading out-of-tree plugins from ``plugins.paths`` executes user-supplied
 # Python at startup; keep it off by default on every channel so a stock install
 # never reads (let alone imports) external plugin directories unless the user

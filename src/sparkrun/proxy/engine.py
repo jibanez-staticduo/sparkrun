@@ -33,6 +33,7 @@ from sparkrun.proxy import (
     DEFAULT_PROXY_PORT,
 )
 from sparkrun.proxy.discovery import DiscoveredEndpoint
+from sparkrun.proxy.gateway import require_gateway_enabled
 from sparkrun.utils.fs import open_private_write
 
 logger = logging.getLogger(__name__)
@@ -285,7 +286,19 @@ def write_config(config_dict: dict[str, Any], config_path: Path | None = None) -
 
 
 class ProxyEngine:
-    """Manages the litellm proxy subprocess and its management API."""
+    """Manages the litellm proxy subprocess and its management API.
+
+    This is the LiteLLM *gateway* implementation.  :attr:`gateway_name` and
+    :attr:`required_feature_flag` are the seam a second gateway plugs into
+    (see :mod:`sparkrun.proxy.gateway`); ``start()`` is the single point that
+    enforces the flag.
+    """
+
+    #: Selector this implementation answers to (``proxy.gateway`` in proxy.yaml).
+    gateway_name = "litellm"
+
+    #: Feature flag gating this gateway; enabled on every channel.
+    required_feature_flag = "gateway.litellm"
 
     def __init__(
         self,
@@ -340,7 +353,18 @@ class ProxyEngine:
 
         Returns:
             0 on success, non-zero on failure.
+
+        Raises:
+            GatewayUnavailableError: this gateway's feature flag is off.
         """
+        # The one enforcement point for the gateway flag: bringing a gateway
+        # *up*.  Stop / status / model sync / the auto-discover daemon's
+        # restart path stay ungated so a proxy started while the flag was on
+        # remains manageable (and stoppable) if it is later turned off.
+        # Checked before --dry-run so a dry run can't advertise a start that
+        # would be refused.
+        require_gateway_enabled(self.gateway_name)
+
         cmd = self._build_command(config_path)
         if cmd is None:
             return 1
@@ -963,6 +987,10 @@ class ProxyEngine:
             "pid": pid,
             "port": self.port,
             "host": self.host,
+            # Which gateway implementation owns this process.  Management
+            # paths (stop / status / sync) read it back so they act on what
+            # is *running* rather than on what is currently configured.
+            "gateway": self.gateway_name,
             "master_key": self.master_key,
             "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }

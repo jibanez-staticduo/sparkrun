@@ -81,6 +81,18 @@ class ProxyConfig:
         return "host" in self._data.get("proxy", {})
 
     @property
+    def gateway(self) -> str | None:
+        """Explicitly pinned gateway implementation, or ``None``.
+
+        The selector half of :mod:`sparkrun.proxy.gateway` — availability is a
+        feature flag in ``config.yaml``, *which* gateway to use is this key.
+        ``None`` (the normal case) means "resolve the default"; pinning a
+        gateway that is disabled is an error rather than a silent fallback.
+        """
+        val = self._data.get("proxy", {}).get("gateway")
+        return str(val) if val else None
+
+    @property
     def master_key(self) -> str | None:
         val = self._data.get("proxy", {}).get("master_key", DEFAULT_MASTER_KEY)
         return str(val) if val is not None else None

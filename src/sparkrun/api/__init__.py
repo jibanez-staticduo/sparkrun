@@ -32,6 +32,7 @@ field additions are non-breaking, field removals are breaking.
 from __future__ import annotations
 
 from sparkrun.api import k8s
+from sparkrun.api import proxy
 from sparkrun.api import setup
 from sparkrun.api import tailscale
 from sparkrun.api._benchmark import benchmark, resume_benchmark
@@ -82,6 +83,7 @@ from sparkrun.api._telemetry import LiveMonitorSession, live_monitor, open_live_
 __all__ = [
     # Subpackages
     "k8s",
+    "proxy",
     "setup",
     "tailscale",
     # Session context

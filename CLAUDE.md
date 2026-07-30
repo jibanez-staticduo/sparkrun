@@ -62,7 +62,7 @@ src/sparkrun/
 ├── tuning/             # Triton fused MoE kernel tuning for SGLang and vLLM
 ├── builders/           # Container image builder plugins (docker-pull, eugr)
 ├── diagnostics/        # Host and run diagnostic collection (NDJSON output)
-├── proxy/              # LiteLLM-based inference proxy gateway
+├── proxy/              # Inference gateway (LiteLLM engine + gateway selection seam)
 ├── benchmarking/       # Benchmark framework plugins and result export (llama-benchy)
 ├── utils/              # Shared helpers (coerce_value, suppress_noisy_loggers, etc.)
 └── scripts/            # Embedded bash scripts (IB detection, container launch, etc.)
@@ -110,7 +110,7 @@ The CLI was split from a single `cli.py` into a package for maintainability. The
 | `_tune.py`        | `tune` command group — run Triton fused MoE kernel tuning (SGLang and vLLM)                                                                                                                                                                                       |
 | `_wizard.py`      | `setup wizard` command — guided cluster setup                                                                                                                                                                                                                     |
 | `_check.py`       | `setup check` command — non-destructive readiness probe of a cluster's hosts against the wizard's setup steps (ordered `SETUP_CHECKS` registry; seed of a future per-platform step system with paired check/apply stages)                                          |
-| `_proxy.py`       | `proxy` command group — LiteLLM inference proxy management                                                                                                                                                                                                        |
+| `_proxy.py`       | `proxy` command group — thin renderer over `api.proxy` (see Inference Gateway below)                                                                                                                                                                              |
 | `_monitor_tui.py` | Textual TUI for `cluster monitor`                                                                                                                                                                                                                                 |
 | `ext.py`          | Plugin CLI-command extension point — `register_cli_command(cmd, parent=…)` + `PluggableGroup` (see below)                                                                                                                                                          |
 
@@ -360,6 +360,47 @@ exposure is a **raw tailnet port** (`http://<ip>:<port>/v1`), not `tailscale ser
 control-machine `tailscale ip` probes used by `expose --proxy`). Layering: `cli → api.tailscale →
 orchestration.tailscale → {orchestration.ssh/sudo, core.config}`. Design spec: `.slop/tailscale-setup.md`.
 
+### Inference Gateway (`proxy/` + `api/proxy/`)
+
+The **gateway** is the process fronting every discovered inference endpoint
+behind one OpenAI-compatible API. Today there is exactly one implementation —
+`ProxyEngine` (LiteLLM) — but the vocabulary and the seams are in place so a
+second can be added as a peer rather than a special case. One word throughout:
+**gateway** is the pluggable family, `proxy` is the user-facing command.
+
+Two mechanisms, deliberately separate:
+
+- **Availability** — `gateway.<name>` feature flag. `gateway.litellm` ships
+  **enabled on every channel** (`default=True`, like `executor.docker`); a
+  future gateway would ship off. Declared on the implementation as
+  `ProxyEngine.required_feature_flag` / `gateway_name`, pre-shaping the
+  eventual `GatewayPlugin`.
+- **Selection** — exactly one gateway is used at a time, arbitrated in
+  `proxy/gateway.py:resolve_gateway()`: an explicit name (`proxy.gateway:` in
+  `proxy.yaml`) must be known *and* enabled; with no name, the default wins
+  when enabled, else the single remaining enabled gateway, else
+  `AmbiguousGatewayError`. The flag registry has **no** notion of
+  mutually-exclusive flags — nothing stops a user enabling two, so resolution
+  refuses to guess (mirrors `_default_executor_name`).
+
+**Gate placement**: `ProxyEngine.start()` is the *one* enforcement point —
+bringing a gateway up, checked before `--dry-run` so a dry run can't advertise
+a start that would be refused. `stop` / `status` / `models` / `sync` /
+`alias_*` and the auto-discover daemon's `_restart_proxy` path are **ungated**:
+a proxy started while the flag was on must stay manageable (and stoppable)
+after it is turned off, and the daemon keeps driving the engine it was started
+with. Same rule `cleanup_cluster_transport` follows for transports.
+
+`api/proxy/` is the console-free facade (mirrors `api/tailscale/`): `start`,
+`stop`, `status`, `models`, `sync`, `add_alias` / `remove_alias` /
+`list_aliases`, plus `resolve_gateway` / `list_gateways`. `cli/_proxy.py` is a
+renderer over it, and the desktop sidecar calls it directly. `_engine_class()`
+is the single place a gateway name becomes an implementation. The state file
+records `gateway`, so management paths bind to *what is running* rather than to
+what is currently configured. Layering: `cli → api.proxy → sparkrun.proxy →
+{core, orchestration}`; `sparkrun.proxy` imports of `api` stay deferred
+(`proxy.discovery` imports `sparkrun.api`, so module-level would be circular).
+
 ### SSH Access Bootstrap (`api/setup/`)
 
 Every setup phase — CX7 detection, shared-cache detection, the mesh itself —
@@ -591,6 +632,11 @@ baseline-default resolution honors that: `_resolve_executor_name` no longer
 hard-codes `"docker"` when no layer names an executor — `_default_executor_name`
 returns docker when enabled, else the sole enabled executor, else raises "name
 one / set `default_executor`" (never silently runs on a disabled backend).
+
+**Gateway gate (`gateway.litellm`)**: same shape as the docker gate — ships
+enabled on every channel, exists so an alternate inference gateway can be added
+as a peer. Exclusivity ("one gateway at a time") is arbitrated at *resolution*,
+not by the flag registry. See Inference Gateway above.
 
 **Visibility-only gate**: `cli.setup.features` (via `channel_defaults`, **on for
 `beta`/`alpha`, off for `stable`**) is different — it does NOT gate execution.
