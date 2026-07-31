@@ -56,15 +56,26 @@ def build_read_command(
     (:func:`~sparkrun.orchestration.ssh.should_run_locally`), so reading a
     workload on the control machine itself doesn't pointlessly round-trip
     through sshd — and doesn't break when SSH-to-self isn't configured.
+
+    The two branches quote differently, and must. Locally the argv reaches
+    ``execve`` untouched, so *command* is already a single argument. Over SSH
+    it does not: ``ssh`` joins its trailing argv into one string and the
+    remote login shell re-splits it on whitespace. An unquoted
+    ``["bash", "-c", command]`` therefore arrives as
+    ``bash -c docker exec … tail …``, where ``bash -c`` takes only ``docker``
+    as the command and the rest become ``$0, $1, …`` — so the remote runs a
+    bare ``docker`` and prints its help instead of the logs. Quoting collapses
+    *command* back into the single word ``bash -c`` expects.
     """
     from sparkrun.orchestration.ssh import build_ssh_cmd, should_run_locally
+    from sparkrun.utils.shell import quote
 
     kwargs = dict(ssh_kwargs or {})
     command = executor.read_logs_cmd(source, follow=follow, tail=tail)
 
     if should_run_locally(source.host, kwargs.get("ssh_user")):
         return ["bash", "-c", command]
-    return build_ssh_cmd(source.host, **kwargs) + ["bash", "-c", command]
+    return build_ssh_cmd(source.host, **kwargs) + ["bash", "-c", quote(command)]
 
 
 def _spawn(cmd: list[str]) -> subprocess.Popen:

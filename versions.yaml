@@ -2,7 +2,7 @@
 # Run: python scripts/update-versions.py             to sync all files
 # Run: python scripts/update-versions.py --check     to verify (CI-friendly)
 
-sparkrun: 0.3.0
+sparkrun: 0.3.1
 sparkrun-cc-plugin: 0.0.4
 sparkrun-openclaw-plugin: 0.0.1
 
@@ -24,6 +24,13 @@ ci:
   # whatever PR happened to run next. Bump deliberately.
   repo_tools_source: "scitrera-repo-tools==0.1.21"
   test_branches: [ main, develop ]
+  # Cut a GitHub release on every version tag, with the built sdist + wheel
+  # attached and notes generated from the commits since the previous tag.
+  # Without this a tag lands on PyPI while the repo's Releases page shows
+  # nothing, so the tag is the only record and there is nowhere to point at
+  # for "what changed". Runs after the publish jobs, so a release only appears
+  # for a tag that actually shipped.
+  github_release: true
   python:
     # requires-python is >=3.12; 3.11 would not install.
     test_versions: [ "3.12", "3.13" ]
