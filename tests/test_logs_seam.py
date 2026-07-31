@@ -104,6 +104,54 @@ class TestBuildReadCommand:
 
         assert cmd[0] == "bash"
 
+    def test_remote_command_survives_ssh_argv_flattening(self):
+        """The command must still be one word after the remote shell re-splits it.
+
+        `ssh` does not preserve argv: it joins its trailing arguments into a
+        single string and the remote login shell splits that on whitespace.
+        An unquoted `["bash", "-c", command]` therefore arrives as
+        `bash -c docker exec … tail …`, where `bash -c` consumes only
+        `docker` and the rest become $0, $1, … — the remote runs a bare
+        `docker` and prints its help instead of the logs.
+
+        This models that round-trip rather than asserting on the local argv,
+        because the local argv looked perfectly correct while the feature was
+        completely broken over SSH.
+        """
+        import shlex
+
+        source = LogSource(host="10.0.0.5", container="c", mode=MODE_FILE, path="/tmp/serve.log")
+        expected = DockerExecutor().read_logs_cmd(source, follow=True, tail=100)
+
+        cmd = build_read_command(DockerExecutor(), source, follow=True, tail=100, ssh_kwargs={})
+
+        # What sshd hands the remote shell, and what that shell makes of it.
+        remote_line = " ".join(cmd[cmd.index("bash") :])
+        assert shlex.split(remote_line) == ["bash", "-c", expected]
+
+    def test_local_command_is_not_double_quoted(self):
+        """Locally the argv reaches execve untouched, so quoting would break it.
+
+        The two branches must quote differently; a shared "just quote it"
+        would turn the local path into `bash -c "'docker exec …'"`.
+        """
+        source = LogSource(host="localhost", container="c", mode=MODE_FILE, path="/tmp/serve.log")
+        expected = DockerExecutor().read_logs_cmd(source, follow=True, tail=100)
+
+        cmd = build_read_command(DockerExecutor(), source, follow=True, tail=100, ssh_kwargs={})
+        assert cmd == ["bash", "-c", expected]
+
+    def test_remote_stdout_mode_also_survives(self):
+        """The docker-logs (non-file) read path goes through the same quoting."""
+        import shlex
+
+        source = LogSource(host="10.0.0.5", container="c", mode=MODE_STDOUT)
+        expected = DockerExecutor().read_logs_cmd(source, follow=False, tail=50)
+
+        cmd = build_read_command(DockerExecutor(), source, follow=False, tail=50, ssh_kwargs={})
+        remote_line = " ".join(cmd[cmd.index("bash") :])
+        assert shlex.split(remote_line) == ["bash", "-c", expected]
+
 
 # --------------------------------------------------------------------------
 # Reader: ordering contract
