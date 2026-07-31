@@ -43,10 +43,16 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Rewrite local refs to version pins
-        run: uvx --from 'scitrera-repo-tools==0.1.21' sync-versions --release
+        run: uvx --from 'scitrera-repo-tools==0.1.22' sync-versions --release
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::notice::No package-lock.json; using 'npm install'. Commit a lockfile for reproducible installs."
+            npm install
+          fi
         working-directory: sparkrun-openclaw-plugin
 
       - name: Build
