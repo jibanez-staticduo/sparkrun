@@ -135,6 +135,38 @@ class TestRenderHookCommand:
         result = render_hook_command("curl {base_url}/models", ctx)
         assert result == "curl http://10.0.0.1:8000/v1/models"
 
+    def test_render_placeholder_inside_json_payload(self):
+        """A placeholder inside a JSON body resolves.
+
+        The common post_exec shape — a warm-up ``curl`` that POSTs JSON.  vpd's
+        regex matched from the payload's opening brace through the
+        placeholder's closing brace and restored the span verbatim, so the hook
+        sent a literal ``{model}`` to the server.
+        """
+        ctx = {"base_url": "http://10.0.0.1:8000/v1", "model": "llama-7b"}
+        result = render_hook_command(
+            'curl {base_url}/chat/completions -d \'{"model":"{model}","stream":false}\'',
+            ctx,
+        )
+
+        assert result == 'curl http://10.0.0.1:8000/v1/chat/completions -d \'{"model":"llama-7b","stream":false}\''
+
+    def test_render_json_without_placeholders_untouched(self):
+        """A JSON payload with nothing to substitute passes through unchanged."""
+        cmd = "curl -d '{\"stream\": false}' http://h/x"
+
+        assert render_hook_command(cmd, {"model": "llama-7b"}) == cmd
+
+    def test_render_doubled_braces_preserved(self):
+        """Hook commands are not v1 templates — ``{{`` stays two braces."""
+        assert render_hook_command("echo '{{keep}}'", {"keep": "X"}) == "echo '{{keep}}'"
+
+    def test_render_terminates_on_self_growing_value(self):
+        """A self-referential context value must not hang the render."""
+        result = render_hook_command("echo {a}", {"a": "x{a}"})
+
+        assert result.endswith("{a}")
+
 
 # ---------------------------------------------------------------------------
 # render_hook_commands
