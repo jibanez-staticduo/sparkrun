@@ -241,6 +241,34 @@ All remote operations use **SSH stdin piping** — scripts are generated as Pyth
 - **`collectives/`** — `CollectiveBackend` ABC + implementations: `nccl.py` (default; wraps `infiniband.py`), `rccl.py` (AMD scaffold), `hccl.py` (Intel Gaudi scaffold). `get_backend(vendor)` is the lookup.
 - **`hooks.py`** — `pre_exec` / `post_exec` / `post_commands` runners. Trust gating via `_confirm_hook_execution(trust=...)`.
 
+**Session guard** (`ssh.py:wrap_with_session_guard` + `scripts/session_guard.sh`):
+remote payloads run via `ssh <host> bash -s`, i.e. **without a PTY**, so on
+disconnect sshd's session process exits without signalling its child (the
+SIGHUP-on-disconnect path is PTY-only) and the payload is merely reparented —
+a killed `sparkrun` would leave `hf download` / `docker pull` / rsync fan-outs
+running on the cluster, invisible from the control node and stacking across
+retries (issue #240). The guard backgrounds the payload in its own process
+group (`set -m` outside, `set +m` *inside*, so a payload that backgrounds its
+own jobs stays in one killable group) and polls its own PPID; on reparent it
+TERMs then KILLs the group. Transparent otherwise — stdout, stderr and rc pass
+through.
+
+It is **opt-in** per call site via `session_guard=True` on `run_remote_script`,
+`run_remote_scripts_parallel` and `run_remote_script_streaming` (mirroring the
+`allow_local` precedent), and is on for the long, expensive payloads only:
+`_distribute_from_head` (both steps), `sync_resource_to_hosts` (model + image
+parallel sync), and the eugr container build. Short status probes stay
+unguarded — an orphaned `docker ps` is harmless. Never applied on the
+local-dispatch path (no session to lose) or under `--dry-run`. Kill switch:
+`SPARKRUN_NO_SESSION_GUARD=1`.
+
+The control-node half is `cli/_common.py:install_termination_handlers`, called
+from the `main` group callback: SIGTERM/SIGHUP raise `KeyboardInterrupt`, so
+`subprocess.run`'s existing kill-on-exception cleanup drops the SSH client (and
+every `KeyboardInterrupt` state-preservation path already in the codebase runs).
+`SIGKILL` remains unreachable — it leaves the ssh client alive, the session
+healthy, and the guard correctly dormant.
+
 ### Status Discovery ("what's running where?")
 
 All workload-status discovery flows through **one source**, `api.status`, in two

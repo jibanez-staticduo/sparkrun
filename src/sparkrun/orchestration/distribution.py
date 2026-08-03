@@ -150,6 +150,11 @@ def _distribute_from_head(
     transfer counts) is visible in real time at INFO+ verbosity.  At default
     verbosity the output is captured silently and surfaced on failure.
 
+    Both are also run under the session guard
+    (:func:`~sparkrun.orchestration.ssh.wrap_with_session_guard`): these are the
+    long, expensive remote payloads, and a launch killed on the control node
+    must not leave a download or an rsync fan-out running on the head.
+
     Args:
         head: Head hostname (``hosts[0]``).
         hosts: Full cluster host list (head + workers).
@@ -181,6 +186,7 @@ def _distribute_from_head(
         timeout=timeout,
         dry_run=dry_run,
         quiet=_quiet,
+        session_guard=True,
     )
     if not ensure_result.success:
         logger.error("Failed to ensure %s on head %s (rc=%d)", resource_label, head, ensure_result.returncode)
@@ -207,6 +213,7 @@ def _distribute_from_head(
         timeout=timeout,
         dry_run=dry_run,
         quiet=_quiet,
+        session_guard=True,
     )
 
     if dist_result.success:

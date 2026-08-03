@@ -1283,6 +1283,9 @@ class EugrBuilder(BuilderPlugin):
             ssh_options=kw.get("ssh_options"),
             timeout=1800,
             quiet=True,
+            # A 30-minute container build must not outlive the launch that
+            # started it — see wrap_with_session_guard.
+            session_guard=True,
         )
 
         # Persist captured output to the local log file (best-effort)
