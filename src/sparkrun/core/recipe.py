@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 # multi-line commands.
 _TRAILING_SPACE_CONTINUATION_RE = re.compile(r"\\ +\n")
 
+# v1 brace-escape masking (see _mask_brace_escapes).  The sentinels are control
+# characters YAML 1.2 forbids in scalar content, so they cannot collide with
+# anything a recipe or an override value can legitimately carry.
+_LBRACE_SENTINEL = "\x00"
+_RBRACE_SENTINEL = "\x01"
+_LBRACE_RUN_RE = re.compile(r"\{+")
+_RBRACE_RUN_RE = re.compile(r"\}+")
+
 _RAY_BACKEND_RE = re.compile(r"--distributed-executor-backend\s+ray\b")
 _CMD_VLLM_RE = re.compile(r"^vllm\s+serve\b")
 _CMD_SGLANG_RE = re.compile(r"^(?:sglang\s+serve|python3?\s+-m\s+sglang\.launch_server)\b")
@@ -344,8 +352,48 @@ def _collapse_brace_escapes(value: str) -> str:
     ``--diffusion-config '{{"canvas_length": 256}}'``.  Once substitution has
     run, the doubled braces are collapsed back to single braces, matching
     eugr's own ``run-recipe.sh``.
+
+    Used for *values* (recipe defaults), which are never placeholder templates
+    themselves.  Command templates go through :func:`_mask_brace_escapes` /
+    :func:`_unmask_brace_escapes` instead, which survive substitution.
     """
     return value.replace("{{", "{").replace("}}", "}")
+
+
+def _mask_brace_escapes(value: str) -> str:
+    """Replace v1 ``{{``/``}}`` escapes with sentinels so substitution can't see them.
+
+    Collapsing escapes *after* substitution is not enough: vpd's placeholder
+    regex is ``\\{(.*?)\\}``, so the leading brace of a ``{{`` escape opens a
+    match that runs to the first ``}`` — swallowing any placeholder nested
+    inside the escaped span.  ``'{{"n":{tokens}}}'`` therefore matches as one
+    bogus key and ``{tokens}`` is never substituted.  Masking first leaves the
+    escaped braces invisible to the regex, so only real placeholders match.
+
+    Brace runs are paired from the side away from the placeholder name, which
+    is what disambiguates an odd-length run:
+
+    - ``{`` runs pair left-to-right, so ``{{{k}`` is a literal ``{`` followed
+      by the placeholder ``{k}``.
+    - ``}`` runs pair right-to-left, so ``{k}}}`` is the placeholder ``{k}``
+      followed by a literal ``}`` (the DeepSeek ``--speculative-config`` shape,
+      where a placeholder ends a JSON object).
+    """
+
+    def _mask_open(m: re.Match) -> str:
+        pairs, odd = divmod(len(m.group()), 2)
+        return _LBRACE_SENTINEL * pairs + "{" * odd
+
+    def _mask_close(m: re.Match) -> str:
+        pairs, odd = divmod(len(m.group()), 2)
+        return "}" * odd + _RBRACE_SENTINEL * pairs
+
+    return _RBRACE_RUN_RE.sub(_mask_close, _LBRACE_RUN_RE.sub(_mask_open, value))
+
+
+def _unmask_brace_escapes(value: str) -> str:
+    """Restore :func:`_mask_brace_escapes` sentinels as single literal braces."""
+    return value.replace(_LBRACE_SENTINEL, "{").replace(_RBRACE_SENTINEL, "}")
 
 
 def _resolve_v1_migration(recipe: Recipe) -> None:
@@ -1009,6 +1057,17 @@ class Recipe:
 
         rendered = self.command.strip()
 
+        # v1 (eugr) recipes escape literal braces as '{{'/'}}' so they survive
+        # the {placeholder} substitution below (e.g. JSON-valued flags like
+        # --diffusion-config '{{...}}').  Mask them to sentinels *first* so the
+        # escaped braces are invisible to vpd's placeholder regex — otherwise
+        # an escaped span swallows any placeholder nested inside it — then
+        # restore them as single literal braces once substitution is done, so
+        # the runtime receives valid JSON rather than doubled braces.
+        escaped = self.recipe_version == "1"
+        if escaped:
+            rendered = _mask_brace_escapes(rendered)
+
         # Use vpd arg_substitute for {placeholder} replacement
         # Iterate to handle nested substitutions
         last = None
@@ -1016,13 +1075,8 @@ class Recipe:
             last = rendered
             rendered = arg_substitute(rendered, config_chain)
 
-        # v1 (eugr) recipes escape literal braces as '{{'/'}}' so they survive
-        # the {placeholder} substitution above (e.g. JSON-valued flags like
-        # --diffusion-config '{{...}}').  Collapse them back now that
-        # substitution is done, so the runtime receives valid JSON rather than
-        # doubled braces.  Done post-substitution to preserve the escaping.
-        if self.recipe_version == "1":
-            rendered = _collapse_brace_escapes(rendered)
+        if escaped:
+            rendered = _unmask_brace_escapes(rendered)
 
         # Fix trailing spaces after backslash line-continuations.
         # ``\<space><newline>`` → ``\<newline>``

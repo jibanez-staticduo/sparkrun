@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -480,6 +482,115 @@ def test_render_command_collapses_v1_brace_escapes():
     assert "{{" not in rendered
     assert "}}" not in rendered
     assert "--port 8000" in rendered
+
+
+def test_render_command_substitutes_placeholder_inside_v1_brace_escapes():
+    """A ``{placeholder}`` nested inside a ``{{...}}`` escape is still substituted.
+
+    vpd's placeholder regex is ``\\{(.*?)\\}``, so the leading brace of the
+    escape opens a match that runs to the *inner* placeholder's closing brace
+    and swallows it — the whole span resolves to no key and is put back
+    verbatim.  Masking the escapes before substitution is what keeps the
+    placeholder visible.  Shape taken from eugr's deepseek-v4-flash recipe.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-json-placeholder",
+            "model": "deepseek-ai/DeepSeek-V4-Flash",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {"port": 8000, "num_speculative_tokens": 2},
+            "command": 'vllm serve m --port {port} --speculative-config \'{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}\'',
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert '--speculative-config \'{"method":"mtp","num_speculative_tokens":2}\'' in rendered
+    assert "--port 8000" in rendered
+    assert "{num_speculative_tokens}" not in rendered
+    assert "{{" not in rendered
+    assert "}}" not in rendered
+
+
+def test_render_command_v1_brace_escapes_survive_json_round_trip():
+    """The rendered JSON-valued flags actually parse as JSON, with overrides applied."""
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-json-round-trip",
+            "model": "m",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {"num_speculative_tokens": 2},
+            "command": (
+                "vllm serve m "
+                '--speculative-config \'{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}\' '
+                '--reasoning-config \'{{"reasoning_parser":"deepseek_v4","reasoning_start_str":""}}\''
+            ),
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({"num_speculative_tokens": 5}))
+
+    payloads = [json.loads(tok) for tok in shlex.split(rendered) if tok.startswith("{")]
+    assert payloads == [
+        {"method": "mtp", "num_speculative_tokens": 5},
+        {"reasoning_parser": "deepseek_v4", "reasoning_start_str": ""},
+    ]
+
+
+def test_render_command_v1_odd_brace_runs_pair_away_from_placeholder():
+    """Odd-length brace runs keep the brace adjacent to the placeholder name.
+
+    ``{{{k}`` is a literal ``{`` then the placeholder; ``{k}}}`` is the
+    placeholder then a literal ``}``.  Pairing an odd ``}`` run left-to-right
+    instead would consume the placeholder's own closing brace.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-odd-braces",
+            "model": "m",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {"port": 8000},
+            "command": "vllm serve m --a {{{port} --b {port}}} --c {{{port}}}",
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert "--a {8000 --b 8000} --c {8000}" in rendered
+
+
+def test_render_command_v1_brace_escapes_without_placeholders_are_untouched():
+    """An escaped span with no placeholder inside still collapses to literal braces."""
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-json-no-placeholder",
+            "model": "m",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {"port": 8000},
+            "command": 'vllm serve m --port {port} --x \'{{"a": {{"b": 1}}}}\'',
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert '--x \'{"a": {"b": 1}}\'' in rendered
+
+
+def test_render_command_v1_unknown_placeholder_is_left_verbatim():
+    """An unresolvable placeholder is still put back as-is (vpd behavior preserved)."""
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-unknown",
+            "model": "m",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "defaults": {},
+            "command": "vllm serve m --x '{{\"n\":{nope}}}'",
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert "--x '{\"n\":{nope}}'" in rendered
 
 
 def test_render_command_does_not_collapse_braces_for_v2():
