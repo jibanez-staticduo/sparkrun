@@ -26,7 +26,11 @@
 #   * No-Ray is the default multi-node backend (matching upstream). `--ray`
 #     opts into Ray (-> -o distributed_executor_backend=ray, i.e. vllm-ray);
 #     `--no-ray` is accepted for compatibility (-> vllm-distributed, the
-#     default). The two are mutually exclusive and both are rejected with --solo.
+#     default). The two are mutually exclusive. In solo mode both are ignored
+#     with a note (upstream: `use_ray = args.ray and not is_solo`).
+#   * -v/--volume becomes `--executor-args "-v ..."`, which the docker executor
+#     shlex-splits back into the `docker run` argv. Like upstream, it applies to
+#     both solo and multi-node runs (unlike -p/--publish, which is solo-only).
 #
 # Hidden testing hook:
 #   RUN_RECIPE_DEBUG=1  -> print the assembled `sparkrun` argv to stderr and
@@ -83,6 +87,7 @@ Common options (mapped onto \`sparkrun run\`):
   --no-ray                      Default multi-node backend; accepted for compat (-> -o distributed_executor_backend=mp)
   -e, --env VAR=VAL             Container env var (repeatable)
   -p, --publish H:C             Publish port, solo only (repeatable)
+  -v, --volume LOCAL:CONTAINER  Bind-mount a volume (repeatable)
   --nccl-debug LEVEL            -> -e NCCL_DEBUG=LEVEL
   --dry-run                     Show the plan without launching
 
@@ -215,6 +220,8 @@ parse_args() {
                 consume_value "--nccl-debug"; ARGS+=(--executor-args "-e NCCL_DEBUG=${VAL}"); shift; [[ $DBL -eq 1 ]] && shift; continue ;;
             -p|--publish)
                 consume_value "--publish"; ARGS+=(--executor-args "-p ${VAL}"); HAVE_PUBLISH=1; shift; [[ $DBL -eq 1 ]] && shift; continue ;;
+            -v|--volume)
+                consume_value "--volume"; ARGS+=(--executor-args "-v ${VAL}"); shift; [[ $DBL -eq 1 ]] && shift; continue ;;
             --mem-limit-gb)
                 consume_value "--mem-limit-gb"; ARGS+=(--memory-limit "${VAL}G"); shift; [[ $DBL -eq 1 ]] && shift; continue ;;
             --shm-size-gb)
@@ -225,9 +232,12 @@ parse_args() {
                 consume_value "--pids-limit"; ARGS+=(--executor-args "--pids-limit ${VAL}"); shift; [[ $DBL -eq 1 ]] && shift; continue ;;
 
             # ----- boolean / mode flags -----
+            # --ray/--no-ray are recorded, not emitted: solo suppresses both and
+            # may appear after them on the command line, so the backend override
+            # is resolved in main() once the whole argv has been seen.
             --solo)            SOLO=1; ARGS+=(--solo); shift; continue ;;
-            --ray)             RAY=1; ARGS+=(-o distributed_executor_backend=ray); shift; continue ;;
-            --no-ray)          NO_RAY=1; ARGS+=(-o distributed_executor_backend=mp); shift; continue ;;
+            --ray)             RAY=1; shift; continue ;;
+            --no-ray)          NO_RAY=1; shift; continue ;;
             -d|--daemon)       DAEMON=1; shift; continue ;;
             --dry-run)         ARGS+=(--dry-run); shift; continue ;;
             --non-privileged)  ARGS+=(-o privileged=false); shift; continue ;;
@@ -250,6 +260,8 @@ parse_args() {
             -j)                unsupported "-j" "no in-container build step under sparkrun." ;;
             --keep-entrypoint) unsupported "--keep-entrypoint" "sparkrun manages the container entrypoint." ;;
             --no-cache-dirs)   unsupported "--no-cache-dirs" "sparkrun manages cache mounts." ;;
+            --earlyoom)        unsupported "--earlyoom" "sparkrun runs the server as the container foreground process; there is no earlyoom supervisor to substitute." ;;
+            --earlyoom-args)   unsupported "--earlyoom-args" "sparkrun runs the server as the container foreground process; there is no earlyoom supervisor to substitute." ;;
 
             # ----- unknown options -----
             -*) die "unknown option: ${arg} (run \`sparkrun run --help\` for native options)" ;;
@@ -327,11 +339,18 @@ main() {
     if [[ $RAY -eq 1 && $NO_RAY -eq 1 ]]; then
         die "--ray and --no-ray are mutually exclusive."
     fi
-    if [[ $SOLO -eq 1 && ( $RAY -eq 1 || $NO_RAY -eq 1 ) ]]; then
-        die "--ray/--no-ray are incompatible with --solo or a single-node configuration."
-    fi
     if [[ $HAVE_PUBLISH -eq 1 && $SOLO -eq 0 ]]; then
         die "-p/--publish is only supported in solo mode; add --solo or drop the port mapping."
+    fi
+
+    # Ray selection. Upstream computes `use_ray = args.ray and not is_solo`, so
+    # solo silently drops the backend choice rather than erroring; match that.
+    if [[ $SOLO -eq 1 && ( $RAY -eq 1 || $NO_RAY -eq 1 ) ]]; then
+        err "${PROG}: note: --ray/--no-ray are ignored in solo mode (a single node needs no distributed backend)."
+    elif [[ $RAY -eq 1 ]]; then
+        ARGS+=(-o distributed_executor_backend=ray)
+    elif [[ $NO_RAY -eq 1 ]]; then
+        ARGS+=(-o distributed_executor_backend=mp)
     fi
 
     # Solo defaults tensor_parallel=1 unless the user set --tp.

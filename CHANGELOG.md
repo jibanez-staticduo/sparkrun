@@ -6,6 +6,28 @@ follows semantic versioning.
 
 For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md).
 
+## [Unreleased]
+
+### Added
+
+- `run-recipe.sh` shim: `-v/--volume LOCAL:CONTAINER` (repeatable), matching
+  spark-vllm-docker upstream. It maps to `--executor-args "-v ..."`, which the
+  docker executor shlex-splits back into the `docker run` argv. As upstream, it
+  applies to both solo and multi-node runs (unlike `-p/--publish`, solo-only).
+- `tests/test_run_recipe_shim.py` — argv-mapping coverage for the shim, driven
+  through its `RUN_RECIPE_DEBUG=1` hook.
+
+### Changed
+
+- `run-recipe.sh` shim: `--ray`/`--no-ray` combined with `--solo` now warn and
+  are ignored instead of erroring, matching upstream's
+  `use_ray = args.ray and not is_solo`. The flags are recorded during parsing
+  and resolved afterwards, so a trailing `--solo` suppresses them too.
+- `run-recipe.sh` shim: `--earlyoom` / `--earlyoom-args` are now rejected with
+  the standard "not supported" pointer rather than a bare "unknown option"
+  error. sparkrun runs the server as the container foreground process, so there
+  is no earlyoom supervisor to substitute.
+
 ## [0.3.0] — 2026-07-30
 
 The largest release since 0.1: multiplatform foundations, a console-free
