@@ -12,7 +12,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from vpd.legacy.arguments import arg_substitute
+from sparkrun.utils.text import render_template
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,15 @@ def build_hook_context(
 def render_hook_command(cmd: str, context: dict[str, str]) -> str:
     """Render ``{key}`` placeholders in a hook command string.
 
-    Uses the same ``arg_substitute`` used for recipe command rendering.
+    Uses the same brace-masking renderer as recipe command rendering, so a
+    placeholder inside a JSON payload resolves here too — a hook like
+    ``curl -d '{"model":"{model}"}'`` otherwise reached the shell with a
+    literal ``{model}``, because vpd's regex matched from the opening brace
+    of the JSON object through the placeholder's closing brace and restored
+    the whole span verbatim.
+
+    Hook commands are not v1 recipe templates, so ``{{`` is left as two
+    literal braces rather than collapsed.
 
     Args:
         cmd: Command string with ``{key}`` placeholders.
@@ -89,12 +97,7 @@ def render_hook_command(cmd: str, context: dict[str, str]) -> str:
     Returns:
         Rendered command string.
     """
-    rendered = cmd
-    last = None
-    while last != rendered:
-        last = rendered
-        rendered = arg_substitute(rendered, context)
-    return rendered
+    return render_template(cmd, context)
 
 
 def render_hook_commands(

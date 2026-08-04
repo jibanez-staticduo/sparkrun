@@ -593,6 +593,86 @@ def test_render_command_v1_unknown_placeholder_is_left_verbatim():
     assert "--x '{\"n\":{nope}}'" in rendered
 
 
+def test_render_command_v2_substitutes_placeholder_inside_bare_json():
+    """A v2 recipe may write JSON with plain braces and a placeholder inside.
+
+    v2 has no ``{{`` escaping convention — ``RECIPES.md`` documents only
+    ``{key}`` — so a JSON-valued flag is written with single braces.  vpd's
+    regex matches from the JSON's opening brace through the placeholder's
+    closing brace, so the placeholder was left unsubstituted and the runtime
+    received a literal ``{num_speculative_tokens}``.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v2-json",
+            "model": "m",
+            "runtime": "vllm",
+            "defaults": {"port": 8000, "num_speculative_tokens": 2},
+            "command": 'vllm serve m --port {port} --speculative-config \'{"method":"mtp","n":{num_speculative_tokens}}\'',
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert '--speculative-config \'{"method":"mtp","n":2}\'' in rendered
+    assert "{num_speculative_tokens}" not in rendered
+
+
+def test_render_command_v2_nested_bare_json_placeholder():
+    """Nesting depth doesn't matter — only the placeholder is touched."""
+    recipe = Recipe.from_dict(
+        {
+            "name": "v2-nested",
+            "model": "m",
+            "runtime": "vllm",
+            "defaults": {"n": 1},
+            "command": 'vllm serve m --c \'{"a":{"b":{n}}}\'',
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert '--c \'{"a":{"b":1}}\'' in rendered
+
+
+def test_render_command_v2_json_without_placeholders_untouched():
+    """A v2 JSON blob that resolves to nothing passes through unchanged."""
+    recipe = Recipe.from_dict(
+        {
+            "name": "v2-plain-json",
+            "model": "m",
+            "runtime": "vllm",
+            "defaults": {"port": 8000},
+            "command": "vllm serve m --port {port} --c '{\"canvas_length\": 256}'",
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert "--c '{\"canvas_length\": 256}'" in rendered
+
+
+def test_render_command_terminates_on_self_growing_default(caplog):
+    """A default whose value contains itself must not hang the render.
+
+    ``a: "x{a}"`` renders ``x{a}`` -> ``xx{a}`` -> ... and never reaches a
+    fixpoint, so an unbounded loop wedges the process with no output.
+    """
+    import logging
+
+    recipe = Recipe.from_dict(
+        {
+            "name": "cyclic",
+            "model": "m",
+            "runtime": "vllm",
+            "defaults": {"a": "x{a}"},
+            "command": "echo {a}",
+        }
+    )
+    with caplog.at_level(logging.WARNING, logger="sparkrun.utils.text"):
+        rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert rendered.endswith("{a}")
+    assert "did not stabilize" in caplog.text
+
+
 def test_render_command_does_not_collapse_braces_for_v2():
     """v2 recipes are unaffected by the v1 brace-escape collapse."""
     recipe = Recipe.from_dict(
