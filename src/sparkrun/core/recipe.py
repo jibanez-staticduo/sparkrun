@@ -1127,6 +1127,26 @@ class Recipe:
             # a per-element dtype, so they have no bytes_per_element entry.
             if kd is not None and kv_bytes_per_element(str(kd)) is None and not is_mla_kv_layout(str(kd)):
                 issues.append("metadata.kv_dtype %r is not a recognized dtype" % kd)
+            # MLA architecture fields. These are documented as user-overridable
+            # and are coerced with int() in estimate_vram, so an unchecked bad
+            # value surfaces as a traceback from `recipe show --json` — or, on
+            # the launch path, as a debug-level log and a silently dropped
+            # memory claim, which skips the fit check altogether.
+            for _key in ("kv_lora_rank", "qk_rope_head_dim", "index_head_dim"):
+                _val = self.metadata.get(_key)
+                if _val is None:
+                    continue
+                if isinstance(_val, bool) or not isinstance(_val, int) or _val <= 0:
+                    issues.append("metadata.%s %r must be a positive integer" % (_key, _val))
+            cr = self.metadata.get("compress_ratios")
+            if cr is not None:
+                if not isinstance(cr, list) or not cr:
+                    issues.append("metadata.compress_ratios %r must be a non-empty list of integers" % cr)
+                elif any(isinstance(r, bool) or not isinstance(r, int) for r in cr):
+                    issues.append("metadata.compress_ratios must contain only integers")
+            mt = self.metadata.get("model_type")
+            if mt is not None and not isinstance(mt, str):
+                issues.append("metadata.model_type %r must be a string" % mt)
             mq = self.metadata.get("quantization")
             if mq is not None:
                 _KNOWN_QUANT_METHODS = {
@@ -1209,6 +1229,7 @@ class Recipe:
             fetch_model_config,
             fetch_safetensors_params,
             fetch_safetensors_size,
+            is_mla_kv_layout,
             parse_param_count,
         )
         from sparkrun.models.quantization import (
@@ -1226,7 +1247,16 @@ class Recipe:
         model_dtype = normalize_dtype(str(_raw_dtype)) if _raw_dtype else None
         model_params_raw = self.metadata.get("model_params")
         _raw_kv = self.metadata.get("kv_dtype")
-        kv_dtype = normalize_dtype(str(_raw_kv)) if _raw_kv else None
+        # An explicit CLI kv_cache_dtype override always wins over a metadata
+        # value, which may be an auto-write from a previous estimate on this
+        # object.  Without this, a value frozen into metadata on call one
+        # shadows a different override passed on call two — a frozen MLA slot
+        # layout vs generic KV dtype is a ~10x switch.
+        _cli_kv = (cli_overrides or {}).get("kv_cache_dtype")
+        if _cli_kv and str(_cli_kv) not in ("auto", ""):
+            kv_dtype = str(_cli_kv)
+        else:
+            kv_dtype = normalize_dtype(str(_raw_kv)) if _raw_kv else None
         num_layers = self.metadata.get("num_layers")
         num_kv_heads = self.metadata.get("num_kv_heads")
         head_dim = self.metadata.get("head_dim")
@@ -1242,67 +1272,84 @@ class Recipe:
         _storage_dtype: str | None = None  # raw torch_dtype before quant override
         effective_recipe_quant: str | None = None  # recipe-level quantization override
 
-        # Auto-detect from HF if fields are missing and model is specified
-        if auto_detect and self.model:
-            needs_detection = (model_vram is None and (not model_dtype or model_params_raw is None)) or (
-                kv_vram_per_token is None and (not num_layers or not num_kv_heads or not head_dim)
+        # Auto-detect from HF if fields are missing and model is specified.
+        needs_detection = (model_vram is None and (not model_dtype or model_params_raw is None)) or (
+            kv_vram_per_token is None and (not num_layers or not num_kv_heads or not head_dim)
+        )
+        # Even with kv_vram_per_token pinned we must still learn whether the
+        # model is MLA.  The override replaces the KV *sizing* (the user
+        # supplies the exact bytes-per-token), but the *sharding rule* only
+        # depends on the architecture: an MLA latent is replicated across TP
+        # ranks (divided by PP only), an ordinary KV cache shards by TP*PP.
+        # Defaulting to the ordinary rule silently TP-divides the override of a
+        # DeepSeek model, which under-claims memory and lets the scheduler
+        # over-commit a placement.  This cannot be short-circuited by pinned
+        # architecture: pinning num_layers/num_kv_heads/head_dim is exactly how
+        # a user suppresses detection, and they may not have pinned the MLA
+        # markers while delegating KV sizing.  Detection is cheap and
+        # write-back stops it recurring, so always run it here.
+        needs_detection = needs_detection or (
+            kv_vram_per_token is not None
+            and not is_mla_kv_layout(str(kv_dtype or ""))
+            and not (kv_lora_rank or qk_rope_head_dim)
+            and not self.metadata.get("model_type")
+        )
+        if auto_detect and self.model and needs_detection:
+            hf_config = fetch_model_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
+            hf_quant_config = fetch_hf_quant_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
+
+            # Resolve quantization from all sources (works even without hf_config for GGUF)
+            recipe_quant_meta = self.metadata.get("quantization")
+            recipe_quant_default = config.get("quantization")
+            effective_recipe_quant = recipe_quant_meta or (str(recipe_quant_default) if recipe_quant_default else None)
+            quant_info = resolve_quantization(
+                hf_config=hf_config,
+                hf_quant_config=hf_quant_config,
+                recipe_quant=effective_recipe_quant,
+                model_id=self.model,
             )
-            if needs_detection:
-                hf_config = fetch_model_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
-                hf_quant_config = fetch_hf_quant_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
 
-                # Resolve quantization from all sources (works even without hf_config for GGUF)
-                recipe_quant_meta = self.metadata.get("quantization")
-                recipe_quant_default = config.get("quantization")
-                effective_recipe_quant = recipe_quant_meta or (str(recipe_quant_default) if recipe_quant_default else None)
-                quant_info = resolve_quantization(
-                    hf_config=hf_config,
-                    hf_quant_config=hf_quant_config,
-                    recipe_quant=effective_recipe_quant,
-                    model_id=self.model,
-                )
+            if hf_config:
+                hf_info = extract_model_info(hf_config)
 
-                if hf_config:
-                    hf_info = extract_model_info(hf_config)
+                # use quant_config to capture on disk storage as quantized if it exists
+                # but otherwise fall back to the model dtype
+                _storage_dtype = hf_info.get("quant_dtype") or hf_info.get("model_dtype")
 
-                    # use quant_config to capture on disk storage as quantized if it exists
-                    # but otherwise fall back to the model dtype
-                    _storage_dtype = hf_info.get("quant_dtype") or hf_info.get("model_dtype")
-
-                    # Fill in missing fields (metadata takes precedence)
-                    if not model_dtype:
-                        if quant_info:
-                            model_dtype = quant_info.weight_dtype
-                        else:
-                            model_dtype = _storage_dtype
-                    if not num_layers:
-                        num_layers = hf_info.get("num_layers")
-                    if not num_kv_heads:
-                        num_kv_heads = hf_info.get("num_kv_heads")
-                    if not head_dim:
-                        head_dim = hf_info.get("head_dim")
-
-                    # MLA architectures (DeepSeek V2/V3/V4): the KV cache holds
-                    # a compressed latent per token per layer, so it is sized
-                    # from these rather than num_kv_heads * head_dim.
-                    if not kv_lora_rank:
-                        kv_lora_rank = hf_info.get("kv_lora_rank")
-                    if not qk_rope_head_dim:
-                        qk_rope_head_dim = hf_info.get("qk_rope_head_dim")
-                    if not compress_ratios:
-                        compress_ratios = hf_info.get("compress_ratios")
-                    if not model_type:
-                        model_type = hf_info.get("model_type")
-                    if not index_head_dim:
-                        index_head_dim = hf_info.get("index_head_dim")
-
-                    # Use kv_cache_quant from hf_quant_config to inform kv_dtype
-                    if not kv_dtype and quant_info and quant_info.kv_cache_quant:
-                        kv_dtype = quant_info.kv_cache_quant
-                else:
-                    # No HF config (e.g. GGUF models) — still use quant_info if available
-                    if not model_dtype and quant_info:
+                # Fill in missing fields (metadata takes precedence)
+                if not model_dtype:
+                    if quant_info:
                         model_dtype = quant_info.weight_dtype
+                    else:
+                        model_dtype = _storage_dtype
+                if not num_layers:
+                    num_layers = hf_info.get("num_layers")
+                if not num_kv_heads:
+                    num_kv_heads = hf_info.get("num_kv_heads")
+                if not head_dim:
+                    head_dim = hf_info.get("head_dim")
+
+                # MLA architectures (DeepSeek V2/V3/V4): the KV cache holds
+                # a compressed latent per token per layer, so it is sized
+                # from these rather than num_kv_heads * head_dim.
+                if not kv_lora_rank:
+                    kv_lora_rank = hf_info.get("kv_lora_rank")
+                if not qk_rope_head_dim:
+                    qk_rope_head_dim = hf_info.get("qk_rope_head_dim")
+                if not compress_ratios:
+                    compress_ratios = hf_info.get("compress_ratios")
+                if not model_type:
+                    model_type = hf_info.get("model_type")
+                if not index_head_dim:
+                    index_head_dim = hf_info.get("index_head_dim")
+
+                # Use kv_cache_quant from hf_quant_config to inform kv_dtype
+                if not kv_dtype and quant_info and quant_info.kv_cache_quant:
+                    kv_dtype = quant_info.kv_cache_quant
+            else:
+                # No HF config (e.g. GGUF models) — still use quant_info if available
+                if not model_dtype and quant_info:
+                    model_dtype = quant_info.weight_dtype
 
         # Parse model_params
         model_params = parse_param_count(model_params_raw) if model_params_raw is not None else None
@@ -1362,7 +1409,7 @@ class Recipe:
         pp_val = config.get("pipeline_parallel")
         pipeline_parallel = int(pp_val) if pp_val is not None else 1
 
-        # Check for kv_cache_dtype in defaults (runtime-specific)
+        # Check for kv_cache_dtype in defaults (runtime-specific).
         if not kv_dtype:
             kv_cache_default = config.get("kv_cache_dtype")
             if kv_cache_default and str(kv_cache_default) != "auto":
@@ -1417,7 +1464,12 @@ class Recipe:
             self.metadata["quantization"] = quant_info.method
         if quant_info and quant_info.bits and "quant_bits" not in self.metadata:
             self.metadata["quant_bits"] = quant_info.bits
-        if kv_dtype:
+        # Persist the resolved dtype so benchmark export and telemetry (which
+        # read only metadata) record the KV cache configuration that actually
+        # ran.  The read side now prefers a fresh cli override over this
+        # metadata value, so persisting it cannot shadow a later override the
+        # way it did before.
+        if kv_dtype and "kv_dtype" not in self.metadata:
             self.metadata["kv_dtype"] = normalize_dtype(str(kv_dtype))
         # MLA architecture fields.  A non-MLA model leaves these unset on every
         # call, which re-derives the same (correct) non-MLA verdict.

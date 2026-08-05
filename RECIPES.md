@@ -151,13 +151,18 @@ Two consequences worth knowing when reading an estimate:
   also keeps a sliding-window cache and V3.2 a sparse-indexer cache (roughly 132 bytes per token per layer); neither
   is sized. Whichever apply are named in a warning on the estimate.
 
-Use `kv_vram_per_token` to override the whole calculation if a runtime's real footprint differs.
+Use `kv_vram_per_token` to override the whole calculation if a runtime's real footprint differs. Note it follows
+the same sharding rule: on an MLA model the override is divided by pipeline parallelism only, not by `--tp`, so
+the figure you supply is one rank's replicated latent cache rather than a cluster-wide total.
 
-> **Pinning architecture metadata on an MLA model.** Setting `num_layers`, `num_kv_heads` and `head_dim` in
-> `metadata` suppresses the HuggingFace config fetch, so MLA can no longer be auto-detected and the estimate falls
-> back to the generic formula — for DeepSeek-V3 that reads 122 GB instead of 2.1 GB at 32k context. Pin
-> `qk_rope_head_dim` (and `kv_lora_rank`, unless `head_dim` already holds the latent) alongside them, or name an
-> `*_ds_mla` layout in `kv_dtype`; any one of those signals is enough.
+> **Pinning architecture metadata on an MLA model.** Pinning `num_layers`, `num_kv_heads` and `head_dim` *together
+> with* `model_dtype` (or `model_vram`) suppresses the HuggingFace config fetch — all of them are needed; pinning the
+> three architecture fields alone still leaves `model_dtype` missing, which keeps detection running. Once the fetch is
+> suppressed, MLA can no longer be auto-detected and the estimate falls back to the generic formula: for DeepSeek-V3,
+> 122 GB instead of 2.1 GB at 32k context. Pin `qk_rope_head_dim` (and `kv_lora_rank`, unless `head_dim` already holds
+> the whole cached width) alongside them, or name an `*_ds_mla` layout in `kv_dtype`; any one of those signals is
+> enough. Pinning `qk_rope_head_dim` on its own is accepted but warns, since it cannot distinguish a compressed-latent
+> cache from an ordinary one.
 
 ### Benchmark
 

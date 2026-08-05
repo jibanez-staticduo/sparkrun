@@ -18,7 +18,10 @@ from sparkrun.models.vram import (
     mla_kv_bytes_per_token,
     mla_latent_dim,
     parse_param_count,
+    reconcile_compress_ratios,
 )
+
+_MLA_KEYS = frozenset({"kv_lora_rank", "qk_rope_head_dim", "compress_ratios", "index_head_dim"})
 
 
 class TestParseParamCount:
@@ -1324,3 +1327,318 @@ class TestAuxiliaryCacheWarning:
         info = extract_model_info(deepseek_v3_config)
         assert "index_head_dim" not in info
         assert self._estimate(info).warnings == []
+
+
+class TestReconcileCompressRatios:
+    """`compress_ratios` is indexed by layer upstream, not summed wholesale.
+
+    DeepSeek-V4-Flash ships 46 entries for 43 layers (the extras cover MTP /
+    non-standard layers), so the list length legitimately exceeds the layer
+    count and trimming must be silent in that case — but a short list, or a
+    trimmed tail holding real compressed layers, changes the estimate and has
+    to be surfaced.
+    """
+
+    def test_exact_length_is_untouched(self):
+        ratios, note = reconcile_compress_ratios([4] * 43, 43)
+        assert len(ratios) == 43
+        assert note is None
+
+    def test_trailing_padding_is_trimmed_silently(self, deepseek_v4_config):
+        """The real V4 shape: 46 entries, 43 layers, trailing zeros."""
+        ratios, note = reconcile_compress_ratios(deepseek_v4_config["compress_ratios"], 43)
+        assert len(ratios) == 43
+        assert note is None
+
+    def test_real_v4_estimate_is_unchanged_and_quiet(self, deepseek_v4_config):
+        info = extract_model_info(deepseek_v4_config)
+        est = estimate_vram(
+            model_vram=340.0,
+            kv_dtype="nvfp4_ds_mla",
+            max_model_len=1_048_576,
+            num_layers=info["num_layers"],
+            compress_ratios=info["compress_ratios"],
+            model_type=info["model_type"],
+            index_head_dim=info.get("index_head_dim"),
+        )
+        assert est.kv_cache_per_token_bytes == pytest.approx(3157.25)
+        assert not any("compress_ratios lists" in w for w in est.warnings)
+
+    def test_short_list_is_reported(self):
+        ratios, note = reconcile_compress_ratios([4] * 10, 61)
+        assert len(ratios) == 10  # nothing to trim; we cannot invent the rest
+        assert note is not None and "the remainder is unsized" in note
+
+    def test_trimmed_tail_with_real_layers_is_reported(self):
+        ratios, note = reconcile_compress_ratios([4] * 43 + [4, 128], 43)
+        assert len(ratios) == 43
+        assert note is not None and "beyond the layer count were ignored" in note
+
+    def test_note_surfaces_as_an_estimate_warning(self):
+        est = estimate_vram(
+            model_vram=10.0,
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=61,
+            compress_ratios=[4] * 10,
+            model_type="deepseek_v4",
+            max_model_len=4096,
+        )
+        assert any("compress_ratios lists 10 layers" in w for w in est.warnings), est.warnings
+
+    def test_no_num_layers_means_no_reconciliation(self):
+        ratios, note = reconcile_compress_ratios([4, 128], None)
+        assert list(ratios) == [4, 128]
+        assert note is None
+
+
+class TestKvVramPerTokenOverrideSharding:
+    """The override follows the same replication rule as a computed MLA estimate.
+
+    `is_mla` is resolved before the override branch and drives `kv_shard_factor`
+    for it too, so an MLA recipe's hand-calibrated per-token figure is divided
+    by PP alone. That is the correct behaviour — the latent is replicated — but
+    it is a contract change from the pre-MLA code, so pin it.
+    """
+
+    _BASE = dict(model_vram=100.0, kv_vram_per_token=1e-5, max_model_len=100_000)
+
+    def test_non_mla_override_is_divided_by_tp_and_pp(self):
+        est = estimate_vram(**self._BASE, tensor_parallel=4, pipeline_parallel=2)
+        assert not est.kv_cache_replicated
+        assert est.total_per_gpu_gb == pytest.approx(100.0 / 8 + (1e-5 * 100_000) / 8)
+
+    def test_mla_override_is_divided_by_pp_only(self):
+        est = estimate_vram(**self._BASE, tensor_parallel=4, pipeline_parallel=2, kv_lora_rank=512, qk_rope_head_dim=64)
+        assert est.mla and est.kv_cache_replicated
+        # Weights still shard by TP*PP; the KV override does not shard by TP.
+        assert est.total_per_gpu_gb == pytest.approx(100.0 / 8 + (1e-5 * 100_000) / 2)
+
+    def test_mla_layout_alone_also_replicates_the_override(self):
+        est = estimate_vram(**self._BASE, tensor_parallel=4, kv_dtype="nvfp4_ds_mla")
+        assert est.kv_cache_replicated
+        assert est.total_per_gpu_gb == pytest.approx(100.0 / 4 + 1e-5 * 100_000)
+
+    def test_override_still_beats_computed_mla_sizing(self, deepseek_v4_config):
+        """The override wins outright — no MLA arithmetic is performed."""
+        info = extract_model_info(deepseek_v4_config)
+        est = estimate_vram(
+            model_vram=340.0,
+            kv_vram_per_token=1e-6,
+            max_model_len=1_048_576,
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=info["num_layers"],
+            compress_ratios=info["compress_ratios"],
+            model_type=info["model_type"],
+        )
+        assert est.kv_cache_total_gb == pytest.approx(1e-6 * 1_048_576)
+
+
+class TestNestedMlaConfigs:
+    """Multimodal wrappers hide the text architecture in a nested sub-config.
+
+    Two ways MLA was lost: `model_type` was read only from the top level (so a
+    wrapper took the 656 B fallback instead of V4's 584 B envelope), and the
+    nested scan was gated on the *core* architecture keys — a wrapper complete
+    for those never had its nested MLA markers read at all.
+    """
+
+    def _wrapper(self, inner, **top):
+        return {"model_type": "deepseek_vl_v2", "text_config": inner, **top}
+
+    def test_nested_mla_found_when_top_level_is_incomplete(self, deepseek_v4_config):
+        info = extract_model_info(self._wrapper(deepseek_v4_config))
+        assert info["model_type"] == "deepseek_v4"
+        assert info["kv_lora_rank"] == 448
+        assert info["compress_ratios"] == deepseek_v4_config["compress_ratios"]
+
+    def test_nested_mla_found_when_top_level_is_complete(self, deepseek_v4_config):
+        """The regression case: core keys present up top, MLA markers only below."""
+        info = extract_model_info(
+            self._wrapper(
+                deepseek_v4_config,
+                torch_dtype="bfloat16",
+                num_hidden_layers=43,
+                num_attention_heads=64,
+                num_key_value_heads=1,
+                hidden_size=4096,
+                head_dim=512,
+            )
+        )
+        assert info["model_type"] == "deepseek_v4"
+        assert not _MLA_KEYS.isdisjoint(info)
+
+    def test_nested_wrapper_sizes_to_the_v4_envelope(self, deepseek_v4_config):
+        """End-to-end: the wrapper must not fall back to the 656 B default."""
+        info = extract_model_info(self._wrapper(deepseek_v4_config))
+        got = mla_kv_bytes_per_token(
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=info["num_layers"],
+            compress_ratios=info["compress_ratios"],
+            model_type=info["model_type"],
+        )
+        assert got == pytest.approx(3157.25)
+
+    def test_wrapper_model_type_kept_when_nested_is_not_mla(self):
+        """An ordinary multimodal model keeps the wrapper's model_type."""
+        info = extract_model_info(
+            {
+                "model_type": "qwen2_vl",
+                "text_config": {
+                    "model_type": "qwen2",
+                    "torch_dtype": "bfloat16",
+                    "num_hidden_layers": 28,
+                    "num_attention_heads": 28,
+                    "num_key_value_heads": 4,
+                    "hidden_size": 3584,
+                },
+            }
+        )
+        assert info["model_type"] == "qwen2_vl"
+        assert info["num_layers"] == 28
+        assert _MLA_KEYS.isdisjoint(info)
+
+    def test_flat_configs_are_unaffected(self, deepseek_v4_config, deepseek_v3_config):
+        assert extract_model_info(deepseek_v4_config)["model_type"] == "deepseek_v4"
+        assert extract_model_info(deepseek_v4_config)["kv_lora_rank"] == 448
+        assert extract_model_info(deepseek_v3_config)["model_type"] == "deepseek_v3"
+        assert extract_model_info(deepseek_v3_config)["kv_lora_rank"] == 512
+
+
+class TestWeakMlaSignalIsFlagged:
+    """`qk_rope_head_dim` alone triggers MLA — say so rather than tighten it.
+
+    Every shipping DeepSeek/Kimi config resolves a latent (naming kv_lora_rank,
+    or being V4-shaped), so the weak path is unreachable from auto-detection
+    and only arises from hand-pinned metadata. Requiring corroboration would
+    cost that ergonomic for a hypothetical model; warning keeps it while making
+    the assumption visible — and the assumption matters, because sizing a
+    non-MLA model this way drops `2 * num_kv_heads` and under-estimates.
+    """
+
+    _MSG = "inferred from qk_rope_head_dim alone"
+
+    def test_pinned_qk_rope_alone_warns(self):
+        est = estimate_vram(model_vram=10.0, num_layers=32, num_kv_heads=8, head_dim=128, qk_rope_head_dim=64, max_model_len=4096)
+        assert est.mla
+        assert any(self._MSG in w for w in est.warnings), est.warnings
+
+    def test_kv_lora_rank_alone_warns_about_the_tail(self):
+        """The mirror image: kv_lora_rank alone silently drops the RoPE tail."""
+        est = estimate_vram(model_vram=10.0, num_layers=61, kv_lora_rank=512, kv_dtype="bfloat16", max_model_len=4096)
+        assert est.mla
+        assert any("RoPE tail" in w and "kv_lora_rank" in w for w in est.warnings), est.warnings
+        # And it genuinely under-estimates: tail omitted.
+        assert est.kv_cache_per_token_bytes == 61 * 512 * 2.0
+
+    def test_both_markers_warn_never(self):
+        est = estimate_vram(model_vram=10.0, num_layers=61, kv_lora_rank=512, qk_rope_head_dim=64, kv_dtype="bfloat16", max_model_len=4096)
+        assert not any(self._MSG in w for w in est.warnings)
+        assert not any("RoPE tail" in w for w in est.warnings)
+
+    def test_explicit_latent_does_not_warn(self):
+        est = estimate_vram(model_vram=10.0, num_layers=61, kv_lora_rank=512, qk_rope_head_dim=64, max_model_len=4096)
+        assert not any(self._MSG in w for w in est.warnings)
+
+    def test_ds_mla_layout_does_not_warn(self):
+        est = estimate_vram(model_vram=10.0, kv_dtype="nvfp4_ds_mla", num_layers=43, max_model_len=4096)
+        assert not any(self._MSG in w for w in est.warnings)
+
+    @pytest.mark.parametrize("fixture_name", ["deepseek_v4_config", "deepseek_v3_config", "deepseek_v32_config"])
+    def test_auto_detected_configs_never_warn(self, request, fixture_name):
+        """Auto-detection always resolves a latent, so this must stay quiet."""
+        info = extract_model_info(request.getfixturevalue(fixture_name))
+        est = estimate_vram(
+            model_vram=340.0,
+            kv_dtype="fp8_ds_mla",
+            max_model_len=32768,
+            num_layers=info["num_layers"],
+            num_kv_heads=info.get("num_kv_heads"),
+            head_dim=info.get("head_dim"),
+            kv_lora_rank=info.get("kv_lora_rank"),
+            qk_rope_head_dim=info.get("qk_rope_head_dim"),
+            compress_ratios=info.get("compress_ratios"),
+            model_type=info.get("model_type"),
+            index_head_dim=info.get("index_head_dim"),
+        )
+        assert not any(self._MSG in w for w in est.warnings), est.warnings
+
+    def test_the_underestimate_it_guards_against(self):
+        """Documents the magnitude: a GQA shape sized as MLA reads ~10x low."""
+        gqa = estimate_vram(model_vram=10.0, num_layers=32, num_kv_heads=8, head_dim=128, max_model_len=4096)
+        as_mla = estimate_vram(model_vram=10.0, num_layers=32, num_kv_heads=8, head_dim=128, qk_rope_head_dim=64, max_model_len=4096)
+        assert gqa.kv_cache_per_token_bytes == 2.0 * 32 * 8 * 128 * 2.0
+        assert as_mla.kv_cache_per_token_bytes < gqa.kv_cache_per_token_bytes / 10
+
+
+class TestMlaAloneLayoutOnNonMlaModel:
+    """An `*_ds_mla` layout is authoritative MLA even with no architectural marker.
+
+    That is only safe when the model genuinely is MLA. Forced onto a non-MLA
+    model it sizes the latent instead of the real attention heads — an order of
+    magnitude under-estimate in the OOM direction.
+    """
+
+    _MSG = "forces MLA sizing but the model has no MLA architecture markers"
+
+    def test_non_mla_model_warns(self):
+        est = estimate_vram(model_vram=60.0, num_layers=64, num_kv_heads=8, head_dim=128, kv_dtype="nvfp4_ds_mla", max_model_len=32768)
+        assert est.mla
+        assert any(self._MSG in w for w in est.warnings), est.warnings
+
+    def test_mla_model_does_not_warn(self, deepseek_v4_config):
+        est = estimate_vram(
+            model_vram=340.0,
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=43,
+            kv_lora_rank=448,
+            qk_rope_head_dim=64,
+            max_model_len=32768,
+            index_head_dim=128,
+        )
+        assert not any(self._MSG in w for w in est.warnings)
+
+    def test_v4_config_does_not_warn(self, deepseek_v4_config):
+        """Auto-detected V4 carries kv_lora_rank, so no spurious warning."""
+        info = extract_model_info(deepseek_v4_config)
+        est = estimate_vram(
+            model_vram=340.0,
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=info["num_layers"],
+            kv_lora_rank=info["kv_lora_rank"],
+            qk_rope_head_dim=info["qk_rope_head_dim"],
+            max_model_len=32768,
+            index_head_dim=info.get("index_head_dim"),
+        )
+        assert not any(self._MSG in w for w in est.warnings)
+
+
+class TestShortCompressRatiosSizesAvailableLayersWithWarning:
+    """A ratio list shorter than num_layers sizes what it covers and warns.
+
+    Returning None for a short list serialized to 0.0 GB of KV at the placement
+    boundary (total_per_gpu_gb is what the scheduler reads), which *also* passes
+    the fit check and is strictly worse than sizing the layers the list does
+    cover. So a short list sizes those layers and surfaces the gap as a warning,
+    matching reconcile_compress_ratios' contract.
+    """
+
+    def test_short_list_sizes_the_available_layers(self):
+        # 10 layers at ratio 4 -> 10 * 584/4 = 1460
+        got = mla_kv_bytes_per_token(kv_dtype="nvfp4_ds_mla", num_layers=61, compress_ratios=[4] * 10, model_type="deepseek_v4")
+        assert got == pytest.approx(10 * 584 / 4)
+
+    def test_exact_and_long_lists_size_normally(self):
+        assert mla_kv_bytes_per_token(
+            kv_dtype="nvfp4_ds_mla", num_layers=43, compress_ratios=[4] * 43, model_type="deepseek_v4"
+        ) == pytest.approx(43 * 584 / 4)
+        real = [0, 0] + [4, 128] * 20 + [4, 0, 0, 0]
+        assert mla_kv_bytes_per_token(
+            kv_dtype="nvfp4_ds_mla", num_layers=43, compress_ratios=real, model_type="deepseek_v4"
+        ) == pytest.approx(3157.25)
+
+    def test_estimate_sizes_and_warns_for_the_short_list(self):
+        est = estimate_vram(
+            model_vram=10.0, kv_dtype="nvfp4_ds_mla", num_layers=61, compress_ratios=[4] * 10, model_type="deepseek_v4", max_model_len=4096
+        )
+        assert est.kv_cache_per_token_bytes == pytest.approx(10 * 584 / 4)
+        assert any("compress_ratios lists 10 layers" in w for w in est.warnings), est.warnings
