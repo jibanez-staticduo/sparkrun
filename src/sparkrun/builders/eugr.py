@@ -32,21 +32,39 @@ EUGR_BUILD_INDEX_CACHE_NAME = "eugr-vllm-build-index.json"
 # GHCR image names for standard eugr nightly variants
 GHCR_EUGR_NIGHTLY = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly"
 GHCR_EUGR_NIGHTLY_TF5 = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5"
+GHCR_EUGR_NIGHTLY_B12X = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x"
 
 DOCKER_EUGR_NIGHTLY_SHORT = "eugr/spark-vllm:latest"
 DOCKER_EUGR_NIGHTLY = f"docker.io/{DOCKER_EUGR_NIGHTLY_SHORT}"
 
+# build-and-copy.sh's PREBUILT_B12X_RUNNER_IMAGE — the prebuilt image the b12x
+# preset pulls upstream. Our GHCR nightly-b12x is the sparkrun-side equivalent.
+DOCKER_EUGR_B12X_SHORT = "eugr/spark-vllm-b12x:latest"
+DOCKER_EUGR_B12X = f"docker.io/{DOCKER_EUGR_B12X_SHORT}"
+
 # GHCR package paths (without registry prefix) for API calls
 GHCR_EUGR_PKG = "spark-arena/dgx-vllm-eugr-nightly"
 GHCR_EUGR_PKG_TF5 = "spark-arena/dgx-vllm-eugr-nightly-tf5"
+GHCR_EUGR_PKG_B12X = "spark-arena/dgx-vllm-eugr-nightly-b12x"
 
-# Local image names produced by prepare_image() for nightly builds
+# ``variant`` values used by build-index.json entries, keyed by GHCR image; an
+# image not listed here is the plain "nightly" variant.
+_BUILD_INDEX_VARIANTS = {
+    GHCR_EUGR_NIGHTLY_TF5: "nightly-tf5",
+    GHCR_EUGR_NIGHTLY_B12X: "nightly-b12x",
+}
+
+# Local image names produced by prepare_image() for nightly builds. b12x keeps its
+# own tag (as upstream's default ``vllm-node-b12x`` does) so a b12x source build
+# can't overwrite the standard nightly's local image.
 LOCAL_EUGR_NIGHTLY = "sparkrun-eugr-vllm"
 LOCAL_EUGR_NIGHTLY_TF5 = "sparkrun-eugr-vllm-tf5"
+LOCAL_EUGR_NIGHTLY_B12X = "sparkrun-eugr-vllm-b12x"
 
 # Fully-qualified ":latest" refs for the GHCR nightly variants.
 GHCR_EUGR_NIGHTLY_LATEST = GHCR_EUGR_NIGHTLY + ":latest"
 GHCR_EUGR_NIGHTLY_TF5_LATEST = GHCR_EUGR_NIGHTLY_TF5 + ":latest"
+GHCR_EUGR_NIGHTLY_B12X_LATEST = GHCR_EUGR_NIGHTLY_B12X + ":latest"
 
 # ":latest" image refs recognized as eugr nightly sentinels. Following eugr's
 # pull-first switch, sparkrun PULLS our authoritative GHCR nightly
@@ -64,15 +82,32 @@ EUGR_NIGHTLY_LATEST_SENTINELS = (
     DOCKER_EUGR_NIGHTLY,
 )
 
+# The b12x peers of the above: a recipe naming the b12x prebuilt image is asking
+# for the b12x variant just as ``--exp-b12x`` in build_args does, so the image
+# itself selects the variant and resolves to OUR b12x nightly.
+EUGR_B12X_LATEST_SENTINELS = (
+    GHCR_EUGR_NIGHTLY_B12X_LATEST,
+    DOCKER_EUGR_B12X_SHORT,
+    DOCKER_EUGR_B12X,
+)
+
 USE_WHEELS_BUILD_ARG = "--use-wheels"
+
+# build-and-copy.sh's b12x preset selector. Upstream it swaps in the b12x vLLM
+# fork/ref and Torch family and points PREBUILT_RUNNER_IMAGE at the b12x prebuilt
+# image; it does NOT set CUSTOM_BUILD_REQUESTED, so on its own the script still
+# pulls. sparkrun mirrors that: the flag selects the b12x variant on both the pull
+# and build paths and is forwarded verbatim like every other script flag.
+B12X_BUILD_ARGS = frozenset({"--exp-b12x", "--experimental-b12x"})
 
 # build_args that do NOT trigger a build. These mirror the flags that leave
 # build-and-copy.sh's CUSTOM_BUILD_REQUESTED false, so the script still pulls the
-# prebuilt runner. Only the deprecated ``--tf5`` family qualifies — every other
-# flag (``--use-wheels``, ``--rebuild-vllm``, ``--rebuild-flashinfer``,
-# ``--vllm-ref``, ``--exp-mxfp4``, ``--force-*-download``, ``--apply-*-pr`` …)
-# requests a wheels/custom build and is forwarded verbatim to the script.
-_PULL_COMPATIBLE_BUILD_ARGS = frozenset({"--tf5", "--pre-tf", "--pre-transformers"})
+# prebuilt runner: the deprecated ``--tf5`` family and the ``--exp-b12x`` preset
+# (which only picks *which* prebuilt image is pulled). Every other flag
+# (``--use-wheels``, ``--rebuild-vllm``, ``--rebuild-flashinfer``, ``--vllm-ref``,
+# ``--exp-mxfp4``, ``--force-*-download``, ``--apply-*-pr`` …) requests a
+# wheels/custom build.
+_PULL_COMPATIBLE_BUILD_ARGS = frozenset({"--tf5", "--pre-tf", "--pre-transformers"}) | B12X_BUILD_ARGS
 
 
 def _wants_build(build_args: list[str]) -> bool:
@@ -84,6 +119,11 @@ def _wants_build(build_args: list[str]) -> bool:
     fine — the presence of the flag itself already forces the build.
     """
     return any(a not in _PULL_COMPATIBLE_BUILD_ARGS for a in build_args)
+
+
+def _wants_b12x(build_args: list[str]) -> bool:
+    """Return True when *build_args* select build-and-copy.sh's b12x preset."""
+    return any(a in B12X_BUILD_ARGS for a in build_args)
 
 
 # Build cache file name (stored under cache_dir)
@@ -106,7 +146,8 @@ _CACHEABLE_BUILD_ARGS: list[list[str]] = [[], ["--tf5"], [USE_WHEELS_BUILD_ARG]]
 
 # Flags dropped when computing a build's cache identity: ``--cleanup`` is
 # unconditional hygiene and ``--tf5`` is a deprecated no-op (the tag it would set
-# is always overridden by ``-t``), so neither changes the produced image.
+# is always overridden by ``-t``), so neither changes the produced image. The b12x
+# selector is NOT dropped — it changes the vLLM fork the image is built from.
 _CACHE_IGNORED_BUILD_ARGS = frozenset({"--cleanup", "--tf5"})
 
 
@@ -397,6 +438,16 @@ class EugrBuilder(BuilderPlugin):
         # built via `build-and-copy.sh` the legacy way.
         wants_build = _wants_build(build_args)
 
+        # `--exp-b12x` / `--experimental-b12x` selects build-and-copy.sh's b12x
+        # preset. It doesn't set CUSTOM_BUILD_REQUESTED upstream (so it pulls on its
+        # own — see `_PULL_COMPATIBLE_BUILD_ARGS`), and it swaps the *variant* on
+        # both paths: our b12x nightly when pulling, the b12x local tag when a
+        # custom build flag alongside it does request a build. Naming the b12x
+        # prebuilt image selects the variant just as the flag does.
+        wants_b12x = _wants_b12x(build_args) or image.strip() in EUGR_B12X_LATEST_SENTINELS
+        nightly_latest = GHCR_EUGR_NIGHTLY_B12X_LATEST if wants_b12x else GHCR_EUGR_NIGHTLY_LATEST
+        local_nightly = LOCAL_EUGR_NIGHTLY_B12X if wants_b12x else LOCAL_EUGR_NIGHTLY
+
         def _image_present(img: str) -> bool:
             if delegated:
                 return self._image_exists_on_host(img, head, ssh_kwargs)
@@ -406,18 +457,19 @@ class EugrBuilder(BuilderPlugin):
 
         # Recognized nightly ":latest" sentinels map to our canonical names — the
         # sparkrun-prefixed local tag when building, our GHCR nightly when pulling.
-        # tf5 and non-tf5 nightlies are identical now, so both map the same way.
-        if use_sentinel_image and image.strip() in EUGR_NIGHTLY_LATEST_SENTINELS:
+        # tf5 and non-tf5 nightlies are identical now, so both map the same way;
+        # b12x keeps its own pair of names.
+        if use_sentinel_image and image.strip() in EUGR_NIGHTLY_LATEST_SENTINELS + EUGR_B12X_LATEST_SENTINELS:
             if wants_build:
-                logger.info("Mapped eugr nightly image '%s' to local build '%s'", image.strip(), LOCAL_EUGR_NIGHTLY)
-                image = LOCAL_EUGR_NIGHTLY
+                logger.info("Mapped eugr nightly image '%s' to local build '%s'", image.strip(), local_nightly)
+                image = local_nightly
             else:
                 logger.info(
                     "Mapped eugr nightly image '%s' to pullable '%s' (add --use-wheels to build_args to build from wheels)",
                     image.strip(),
-                    GHCR_EUGR_NIGHTLY_LATEST,
+                    nightly_latest,
                 )
-                image = GHCR_EUGR_NIGHTLY_LATEST
+                image = nightly_latest
 
         is_pullable = any(image.startswith(prefix) for prefix in PULLABLE_REGISTRY_PREFIXES)
 
@@ -454,9 +506,9 @@ class EugrBuilder(BuilderPlugin):
                 logger.info(
                     "image '%s' not available; substituting our nightly '%s' (add --use-wheels to build_args to build from wheels)",
                     image,
-                    GHCR_EUGR_NIGHTLY_LATEST,
+                    nightly_latest,
                 )
-                image = GHCR_EUGR_NIGHTLY_LATEST
+                image = nightly_latest
                 if force_rebuild:
                     self._force_pull_image(image, head if delegated else None, ssh_kwargs if delegated else None, dry_run=dry_run)
             needs_build = False
@@ -492,10 +544,11 @@ class EugrBuilder(BuilderPlugin):
 
         # Build image if needed
         if needs_build:
-            # Forward the recipe's build_args verbatim (so `--use-wheels` actually
-            # reaches build-and-copy.sh) plus the `--cleanup` hygiene flag. The cache
-            # identity uses the normalized args (`_cache_build_args`) so `--cleanup`
-            # and the deprecated `--tf5` don't cause spurious cache misses.
+            # Forward the recipe's build_args verbatim (so `--use-wheels` and
+            # `--exp-b12x` actually reach build-and-copy.sh) plus the `--cleanup`
+            # hygiene flag. The cache identity uses the normalized args
+            # (`_cache_build_args`) so `--cleanup` and the deprecated `--tf5` don't
+            # cause spurious cache misses.
             effective_build_args = list(build_args)
             if "--cleanup" not in effective_build_args:
                 effective_build_args.append("--cleanup")
@@ -634,6 +687,19 @@ class EugrBuilder(BuilderPlugin):
         """
         build_args = recipe.runtime_config.get("build_args", [])
 
+        # Match by local image name or GHCR :latest reference
+        img_stripped = container_image.split(":")[0].strip()
+
+        # b12x is a preset variant, identified by the selector or by the image name
+        # it resolved to. Like the standard variants it is only resolvable while no
+        # *other* custom build flag is in play (the b12x selectors alone leave
+        # `_wants_build` False, mirroring the script's CUSTOM_BUILD_REQUESTED).
+        if _wants_b12x(build_args) or img_stripped in (LOCAL_EUGR_NIGHTLY_B12X, GHCR_EUGR_NIGHTLY_B12X):
+            if _wants_build(build_args):
+                logger.debug("Custom build_args %r — skipping long-term resolution", build_args)
+                return None, None
+            return GHCR_EUGR_NIGHTLY_B12X, GHCR_EUGR_PKG_B12X
+
         # Only resolve standard variants
         is_tf5 = build_args == ["--tf5"] or ("-tf5" in container_image)
         is_plain = not build_args
@@ -641,9 +707,6 @@ class EugrBuilder(BuilderPlugin):
         if not (is_tf5 or is_plain):
             logger.debug("Custom build_args %r — skipping long-term resolution", build_args)
             return None, None
-
-        # Match by local image name or GHCR :latest reference
-        img_stripped = container_image.split(":")[0].strip()
 
         if is_tf5 or img_stripped in (LOCAL_EUGR_NIGHTLY_TF5, GHCR_EUGR_NIGHTLY_TF5):
             return GHCR_EUGR_NIGHTLY_TF5, GHCR_EUGR_PKG_TF5
@@ -665,7 +728,7 @@ class EugrBuilder(BuilderPlugin):
         from sparkrun.builders._ghcr import fetch_build_index
 
         # Determine variant suffix for filtering index entries
-        variant = "nightly-tf5" if ghcr_image == GHCR_EUGR_NIGHTLY_TF5 else "nightly"
+        variant = _BUILD_INDEX_VARIANTS.get(ghcr_image, "nightly")
 
         # Resolve cache dir for index caching
         cache_dir = None

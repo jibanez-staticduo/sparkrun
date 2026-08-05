@@ -569,13 +569,23 @@ builds from wheels when `build_args` request it**. A build is requested when `bu
 - Any other non-pullable eugr image (e.g. a v1 `container: vllm-node`) is reused if already present,
   otherwise substituted with our nightly and pulled — eugr no longer builds it implicitly.
 - `--rebuild` force-pulls a fresh copy.
+- `--exp-b12x` (alias `--experimental-b12x`) selects the b12x preset. Like upstream — where it swaps
+  the vLLM fork/ref and Torch family and points `PREBUILT_RUNNER_IMAGE` at `eugr/spark-vllm-b12x`
+  *without* setting `CUSTOM_BUILD_REQUESTED` — it does not trigger a build on its own: the sentinel
+  resolves to `ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:latest` and is pulled. Naming a b12x
+  prebuilt image (ours, or `eugr/spark-vllm-b12x:latest`) selects the variant the same way.
 
 **Build path (`--use-wheels` or a custom build flag):**
 
-- The nightly sentinels build locally as `sparkrun-eugr-vllm`; other images build under their own name.
-- `build_args` are forwarded verbatim to `build-and-copy.sh` (so `--use-wheels`, `--vllm-ref`, etc. take
-  effect). The build cache is honored for the standard `--use-wheels` build; `--rebuild` forces a
-  from-scratch rebuild.
+- The nightly sentinels build locally as `sparkrun-eugr-vllm` (or `sparkrun-eugr-vllm-b12x` when
+  `--exp-b12x` is present, mirroring upstream's `vllm-node-b12x` default tag, so a b12x source build
+  can't overwrite the standard nightly); other images build under their own name.
+- `build_args` are forwarded verbatim to `build-and-copy.sh` (so `--use-wheels`, `--vllm-ref`,
+  `--exp-b12x`, etc. take effect). The build cache is honored for the standard `--use-wheels` build;
+  `--rebuild` forces a from-scratch rebuild.
+- Flag incompatibilities are the script's to enforce — e.g. `--exp-b12x --use-wheels` is rejected
+  upstream (b12x vLLM wheels aren't published) and surfaces as a build failure rather than being
+  second-guessed here.
 
 Set `defaults.builders.eugr.use_sentinel_image: false` in `~/.config/sparkrun/config.yaml` to opt out of
 pull-first entirely: images are used verbatim and a missing one is built via `build-and-copy.sh`.

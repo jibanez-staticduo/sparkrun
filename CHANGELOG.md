@@ -16,6 +16,16 @@ For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NO
   applies to both solo and multi-node runs (unlike `-p/--publish`, solo-only).
 - `tests/test_run_recipe_shim.py` — argv-mapping coverage for the shim, driven
   through its `RUN_RECIPE_DEBUG=1` hook.
+- eugr builder: support for `build-and-copy.sh`'s `--exp-b12x` /
+  `--experimental-b12x` preset. As upstream, it does not set
+  `CUSTOM_BUILD_REQUESTED`, so on its own it only changes *which* prebuilt image
+  is pulled: a nightly `:latest` sentinel (or a missing non-pullable eugr image)
+  resolves to `ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:latest` — sparkrun's
+  mirror of upstream's `eugr/spark-vllm-b12x:latest` — instead of the standard
+  nightly. Naming a b12x prebuilt image selects the variant the same way. With a
+  custom build flag alongside it the build runs under the `sparkrun-eugr-vllm-b12x`
+  local tag (upstream tags `vllm-node-b12x`) and the flag is forwarded verbatim.
+  Long-term image pinning resolves against the `nightly-b12x` variant.
 
 ### Changed
 
