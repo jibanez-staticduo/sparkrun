@@ -2,7 +2,7 @@
 # Run: python scripts/update-versions.py             to sync all files
 # Run: python scripts/update-versions.py --check     to verify (CI-friendly)
 
-sparkrun: 0.3.1
+sparkrun: 0.3.2
 sparkrun-cc-plugin: 0.0.4
 sparkrun-openclaw-plugin: 0.0.1
 
@@ -22,7 +22,7 @@ ci:
   # Pinned, not floating: a bare `scitrera-repo-tools` picks up the newest
   # release, so an unrelated generator change would surface as CI drift on
   # whatever PR happened to run next. Bump deliberately.
-  repo_tools_source: "scitrera-repo-tools==0.1.21"
+  repo_tools_source: "scitrera-repo-tools==0.1.22"
   test_branches: [ main, develop ]
   # Cut a GitHub release on every version tag, with the built sdist + wheel
   # attached and notes generated from the commits since the previous tag.

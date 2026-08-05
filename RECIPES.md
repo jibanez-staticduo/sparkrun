@@ -230,6 +230,29 @@ command: |
 - Trailing spaces after backslash continuations (`\ \n`) are auto-fixed
 - The runtime may auto-append flags (e.g. `--served-model-name`) if the template omits them
 
+### Literal braces (JSON-valued flags)
+
+**Write literal braces plainly. No escaping.** A `{...}` span containing another brace can't be a placeholder, so JSON
+passes through untouched — and a placeholder nested inside it still resolves:
+
+```yaml
+command: |
+  vllm serve {model} \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}' \
+      --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+```
+
+This applies to `defaults` values as well as to the command template.
+
+> **Deprecated: doubled braces.** v1 (eugr) recipes escape a literal brace by doubling it (`'{{"a":1}}'`). sparkrun
+> still honors that — a doubled brace collapses to one, so a v1 command pasted into a v2 recipe works rather than
+> shipping `{{...}}` to the runtime — but it logs a deprecation warning outside v1 and **will not be supported in v3**.
+> Do not write new recipes this way. The convention is detected from `{{` and then applies to the whole template, so a
+> template mixing both spellings collapses the `}}` that merely closes a nested plain-JSON object.
+
+Lifecycle hooks (`pre_exec` / `post_exec` / `post_commands`) render `{key}` and pass plain JSON through identically,
+but never collapse `{{` — a hook body is shell, where a doubled brace may be meant literally.
+
 **When to use templates:** full control over flags, ordering, runtime-specific features not in the flag map. **When to
 omit:** standard configs where the runtime's `generate_command()` is sufficient.
 
@@ -569,13 +592,23 @@ builds from wheels when `build_args` request it**. A build is requested when `bu
 - Any other non-pullable eugr image (e.g. a v1 `container: vllm-node`) is reused if already present,
   otherwise substituted with our nightly and pulled — eugr no longer builds it implicitly.
 - `--rebuild` force-pulls a fresh copy.
+- `--exp-b12x` (alias `--experimental-b12x`) selects the b12x preset. Like upstream — where it swaps
+  the vLLM fork/ref and Torch family and points `PREBUILT_RUNNER_IMAGE` at `eugr/spark-vllm-b12x`
+  *without* setting `CUSTOM_BUILD_REQUESTED` — it does not trigger a build on its own: the sentinel
+  resolves to `ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:latest` and is pulled. Naming a b12x
+  prebuilt image (ours, or `eugr/spark-vllm-b12x:latest`) selects the variant the same way.
 
 **Build path (`--use-wheels` or a custom build flag):**
 
-- The nightly sentinels build locally as `sparkrun-eugr-vllm`; other images build under their own name.
-- `build_args` are forwarded verbatim to `build-and-copy.sh` (so `--use-wheels`, `--vllm-ref`, etc. take
-  effect). The build cache is honored for the standard `--use-wheels` build; `--rebuild` forces a
-  from-scratch rebuild.
+- The nightly sentinels build locally as `sparkrun-eugr-vllm` (or `sparkrun-eugr-vllm-b12x` when
+  `--exp-b12x` is present, mirroring upstream's `vllm-node-b12x` default tag, so a b12x source build
+  can't overwrite the standard nightly); other images build under their own name.
+- `build_args` are forwarded verbatim to `build-and-copy.sh` (so `--use-wheels`, `--vllm-ref`,
+  `--exp-b12x`, etc. take effect). The build cache is honored for the standard `--use-wheels` build;
+  `--rebuild` forces a from-scratch rebuild.
+- Flag incompatibilities are the script's to enforce — e.g. `--exp-b12x --use-wheels` is rejected
+  upstream (b12x vLLM wheels aren't published) and surfaces as a build failure rather than being
+  second-guessed here.
 
 Set `defaults.builders.eugr.use_sentinel_image: false` in `~/.config/sparkrun/config.yaml` to opt out of
 pull-first entirely: images are used verbatim and a missing one is built via `build-and-copy.sh`.

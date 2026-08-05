@@ -44,6 +44,66 @@ DEFAULT_MAX_PARALLEL_SSH = 20
 HEAD_DISTRIBUTE_MAX_PARALLEL = 4
 
 
+# Env kill-switch for the remote session guard (see
+# :func:`wrap_with_session_guard`).  The guard relies on ``ps`` and on sshd
+# exiting when the client goes away; set this to opt out on a host where that
+# doesn't hold, at the cost of orphaned work on a killed launch.
+NO_SESSION_GUARD_ENV = "SPARKRUN_NO_SESSION_GUARD"
+
+# Sentinel line in ``scripts/session_guard.sh`` replaced by the payload.
+_GUARD_PAYLOAD_SENTINEL = "__SPARKRUN_PAYLOAD__"
+
+
+def session_guard_disabled() -> bool:
+    """True when the session guard is switched off via the environment."""
+    return os.environ.get(NO_SESSION_GUARD_ENV, "").strip().lower() not in ("", "0", "false", "no")
+
+
+def wrap_with_session_guard(script: str) -> str:
+    """Wrap *script* so it dies with its SSH session.
+
+    Remote payloads run via ``ssh <host> bash -s``, i.e. **without a PTY**.  On
+    disconnect sshd's session process exits without signalling its child (the
+    SIGHUP-on-disconnect path is PTY-only), so a killed ``sparkrun`` on the
+    control node leaves the payload running on the remote host — invisible from
+    the control node, holding HF cache locks, consuming WAN, and stacking across
+    kill-and-retry cycles.
+
+    The wrapper backgrounds *script* in its own process group and polls its own
+    parent PID; when the session dies the shell is reparented (to init/systemd)
+    and the payload's whole process group is TERMed, then KILLed.  It is
+    transparent otherwise: stdout, stderr and the exit code pass through
+    unchanged.
+
+    Opt-in per call site (see the ``session_guard`` argument on
+    :func:`run_remote_script` and friends) — it is meant for long-running,
+    resource-consuming work (model downloads, image pulls, head→worker
+    fan-outs), not for short status probes where an orphan is harmless.
+
+    Returns *script* unchanged when :data:`NO_SESSION_GUARD_ENV` is set.
+    """
+    if session_guard_disabled():
+        logger.debug("Session guard disabled via %s", NO_SESSION_GUARD_ENV)
+        return script
+
+    from sparkrun.scripts import read_script
+
+    guard = read_script("session_guard.sh")
+    # Splice on the sentinel *line*, not a substring: the guard's own header
+    # comment names the token, and a substring replace would splice the payload
+    # into that comment instead.
+    lines = guard.splitlines()
+    try:
+        at = next(i for i, line in enumerate(lines) if line.strip() == _GUARD_PAYLOAD_SENTINEL)
+    except StopIteration:  # pragma: no cover — would mean a corrupt install
+        logger.error("session_guard.sh is missing its payload sentinel; running unguarded")
+        return script
+    # The payload is spliced in verbatim; the explicit newline keeps a payload
+    # without a trailing one from running into the subshell's closing paren.
+    lines[at : at + 1] = (script.rstrip("\n") + "\n").splitlines()
+    return "\n".join(lines) + "\n"
+
+
 def resolve_parallel_cap(n: int, cap: int | None = None) -> int:
     """Return the worker count for a fan-out over *n* items.
 
@@ -269,6 +329,7 @@ def run_remote_script(
     dry_run: bool = False,
     quiet: bool = False,
     allow_local: bool = False,
+    session_guard: bool = False,
 ) -> RemoteResult:
     """Execute a script on a remote host via stdin piping.
 
@@ -288,6 +349,10 @@ def run_remote_script(
         allow_local: Run the script directly (no SSH) when *host* is this
             machine — see :func:`run_remote_scripts_parallel` for why this
             is opt-in.
+        session_guard: Wrap the script so it dies with its SSH session — see
+            :func:`wrap_with_session_guard`.  Opt-in, for long-running work
+            that must not be orphaned by a killed launch.  Ignored on the
+            local-dispatch path, which has no SSH session to lose.
 
     Returns:
         RemoteResult with returncode, stdout, stderr.
@@ -300,6 +365,10 @@ def run_remote_script(
     if allow_local and should_run_locally(host, ssh_user):
         logger.debug("  Dispatching locally (no SSH) for: %s", host)
         return replace(run_local_script(script, timeout=timeout), host=host)
+
+    if session_guard:
+        script = wrap_with_session_guard(script)
+        script_lines = script.count("\n")
 
     cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
     cmd.extend(["bash", "-s"])
@@ -330,6 +399,7 @@ def run_remote_script_streaming(
     timeout: int | None = None,
     dry_run: bool = False,
     quiet: bool = False,
+    session_guard: bool = False,
 ) -> RemoteResult:
     """Execute a script on a remote host with real-time stdout/stderr.
 
@@ -351,6 +421,8 @@ def run_remote_script_streaming(
         timeout: Overall execution timeout in seconds.
         dry_run: If True, log the script but don't execute.
         quiet: If True, capture output instead of streaming to terminal.
+        session_guard: Wrap the script so it dies with its SSH session — see
+            :func:`wrap_with_session_guard`.
 
     Returns:
         RemoteResult with returncode (stdout/stderr are empty when
@@ -359,6 +431,9 @@ def run_remote_script_streaming(
     if dry_run:
         logger.info("[dry-run] Would execute (streaming) on %s (%d bytes)", host, len(script))
         return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
+
+    if session_guard:
+        script = wrap_with_session_guard(script)
 
     cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
     cmd.extend(["bash", "-s"])
@@ -660,6 +735,7 @@ def run_remote_scripts_parallel(
     quiet: bool = False,
     max_workers: int | None = None,
     allow_local: bool = False,
+    session_guard: bool = False,
 ) -> list[RemoteResult]:
     """Execute the same script on multiple hosts in parallel using threads.
 
@@ -683,6 +759,9 @@ def run_remote_scripts_parallel(
             (status discovery, hardware probes, teardown) pass ``True``
             so they work on a host without self-SSH configured.  Results
             are re-keyed to the caller's host string either way.
+        session_guard: Wrap the script so it dies with its SSH session — see
+            :func:`wrap_with_session_guard`.  Applies to the SSH-dispatched
+            hosts only; a locally-dispatched host has no session to lose.
 
     Returns:
         List of RemoteResult, one per host (order not guaranteed).
@@ -707,6 +786,7 @@ def run_remote_scripts_parallel(
             timeout=timeout,
             dry_run=dry_run,
             quiet=quiet,
+            session_guard=session_guard,
         )
 
     t0 = time.monotonic()

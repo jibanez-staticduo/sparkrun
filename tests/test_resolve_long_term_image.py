@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
 
 from sparkrun.builders.base import BuilderPlugin
 from sparkrun.builders.eugr import (
     EugrBuilder,
     GHCR_EUGR_NIGHTLY,
+    GHCR_EUGR_NIGHTLY_B12X,
     GHCR_EUGR_NIGHTLY_TF5,
     GHCR_EUGR_PKG,
+    GHCR_EUGR_PKG_B12X,
     GHCR_EUGR_PKG_TF5,
 )
 from sparkrun.core.recipe import Recipe
@@ -85,6 +88,33 @@ class TestResolveGhcrTarget:
         builder = EugrBuilder()
         recipe = _make_recipe()
         ghcr, pkg = builder._resolve_ghcr_target("totally-custom-image", recipe)
+        assert ghcr is None
+        assert pkg is None
+
+    def test_b12x_build_args_resolve_b12x(self):
+        """The b12x selector identifies the variant even before the image is remapped."""
+        builder = EugrBuilder()
+        recipe = _make_recipe(runtime_config={"build_args": ["--exp-b12x"]})
+        ghcr, pkg = builder._resolve_ghcr_target("ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest", recipe)
+        assert ghcr == GHCR_EUGR_NIGHTLY_B12X
+        assert pkg == GHCR_EUGR_PKG_B12X
+
+    @pytest.mark.parametrize(
+        "image",
+        ["ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:latest", "sparkrun-eugr-vllm-b12x"],
+    )
+    def test_b12x_image_resolves_b12x(self, image):
+        builder = EugrBuilder()
+        recipe = _make_recipe()
+        ghcr, pkg = builder._resolve_ghcr_target(image, recipe)
+        assert ghcr == GHCR_EUGR_NIGHTLY_B12X
+        assert pkg == GHCR_EUGR_PKG_B12X
+
+    def test_b12x_with_custom_build_flag_is_unresolvable(self):
+        """b12x plus a custom build flag is a bespoke build — not a published variant."""
+        builder = EugrBuilder()
+        recipe = _make_recipe(runtime_config={"build_args": ["--exp-b12x", "--rebuild-vllm"]})
+        ghcr, pkg = builder._resolve_ghcr_target("sparkrun-eugr-vllm-b12x", recipe)
         assert ghcr is None
         assert pkg is None
 

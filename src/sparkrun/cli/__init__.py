@@ -13,6 +13,7 @@ from ._common import (
     RUNTIME_NAME,
     _setup_logging,
     _get_context,
+    install_termination_handlers,
     dry_run_option,
     host_options,
     json_option,
@@ -65,6 +66,10 @@ def main(ctx, verbose, quiet):
         verbose = -1  # sentinel: WARNING+ only
     ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
+    # SIGTERM/SIGHUP unwind like Ctrl-C so a killed launch tears down its ssh
+    # children (and, through them, the remote session guard) instead of
+    # orphaning multi-GB work on the cluster.
+    install_termination_handlers()
 
 
 # Register command groups and commands
