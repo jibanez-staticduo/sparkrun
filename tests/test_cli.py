@@ -211,7 +211,32 @@ class TestListCommand:
 class TestSearchCommand:
     """Test the search command."""
 
-    def test_search_shows_recipes(self, runner):
+    @pytest.fixture
+    def cwd_recipe(self, tmp_path, monkeypatch):
+        """A working-directory recipe for search to find.
+
+        These tests used to search for "llama-cpp" and expect hits from the
+        *default registries* — i.e. they only passed if the machine could git
+        clone three GitHub repos and those repos still shipped a llama-cpp
+        recipe. The suite no longer touches the network (see conftest), so the
+        catalog has to be seeded locally.
+        """
+        (tmp_path / "cwd-llama-cpp.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "cwd-llama-cpp",
+                    "model": "unsloth/Qwen3-1.7B-GGUF:Q4_K_M",
+                    "runtime": "llama-cpp",
+                    # discover_cwd_recipes -> is_recipe_file requires container
+                    "container": "scitrera/dgx-spark-llama-cpp:latest",
+                    "description": "local recipe for search tests",
+                }
+            )
+        )
+        monkeypatch.chdir(tmp_path)
+        return tmp_path
+
+    def test_search_shows_recipes(self, runner, cwd_recipe):
         """Test that sparkrun search finds matching recipes."""
         result = runner.invoke(main, ["search", "llama-cpp"])
         assert result.exit_code == 0
@@ -224,7 +249,7 @@ class TestSearchCommand:
         assert result.exit_code == 0
         assert "No recipes found matching" in result.output
 
-    def test_search_json(self, runner):
+    def test_search_json(self, runner, cwd_recipe):
         """Test that sparkrun recipe search --json outputs a valid JSON list."""
         import json
 

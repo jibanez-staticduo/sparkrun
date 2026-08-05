@@ -9,6 +9,11 @@ import pytest
 import yaml
 
 from sparkrun.core.bootstrap import init_sparkrun
+from sparkrun.core.registry import RegistryManager
+
+#: Captured before ``isolate_stateful`` stubs it out, so the ``real_registry_git``
+#: opt-out fixture can hand the genuine implementation back.
+_REAL_CLONE_OR_PULL = RegistryManager._clone_or_pull
 
 
 @pytest.fixture(autouse=True)
@@ -47,11 +52,71 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(_config_module, "DEFAULT_CONFIG_DIR", tmp_path / "config", raising=False)
 
+    # Same treatment for the cache dir, and for the same reason -- but the
+    # stakes are higher here because the cache holds *live* state, not just
+    # preferences. Unpatched, ProxyEngine defaults its state_dir to
+    # DEFAULT_CACHE_DIR/"proxy", so `api.proxy.status()` in a test reads the
+    # developer's really-running proxy and `api.proxy.stop()` SIGTERMs it.
+    # Job metadata, pending-op lock files and cached remote recipes land in the
+    # real cache the same way.
+    # Keep the trailing "sparkrun" segment: the real cache is ~/.cache/sparkrun
+    # and callers derive subpaths from it, so tests that assert on the shape of
+    # a derived path (".../sparkrun/tuning/vllm") stay meaningful.
+    _cache = tmp_path / "cache" / "sparkrun"
+    monkeypatch.setattr(_config_module, "DEFAULT_CACHE_DIR", _cache, raising=False)
+    # Two modules bind the symbol at import time, so patching core.config alone
+    # does not reach them. Keep this list in sync with:
+    #   grep -rn '^from sparkrun.core.config import.*DEFAULT_CACHE_DIR' src/
+    import sparkrun.core.pending_ops as _pending_ops
+    import sparkrun.tuning._common as _tuning_common
+
+    monkeypatch.setattr(_pending_ops, "DEFAULT_CACHE_DIR", _cache, raising=False)
+    monkeypatch.setattr(_tuning_common, "DEFAULT_CACHE_DIR", _cache, raising=False)
+
+    # No network from the test suite. The sandboxed config dir never has a
+    # registries.yaml, so every RegistryManager falls into first-run bootstrap
+    # (_default_registries -> _init_defaults_from_manifests) and git-clones each
+    # BOOTSTRAP_REGISTRY_URLS entry. That was previously masked by the cache dir
+    # leaking out to the developer's real, already-populated
+    # ~/.cache/sparkrun/registries; with the cache sandboxed it becomes a full
+    # clone of three GitHub repos, and a single CLI test went from 1.4s to 6.6s.
+    # Emptying the list takes the documented offline path: discovery yields
+    # nothing and FALLBACK_DEFAULT_REGISTRIES supplies the defaults.
+    # Tests that exercise discovery set their own URLs or mock subprocess.run.
+    import sparkrun.core.registry as _registry_module
+
+    monkeypatch.setattr(_registry_module, "BOOTSTRAP_REGISTRY_URLS", [], raising=False)
+
+    # ...and no `git clone` / `git fetch` either. `_clone_or_pull` is the single
+    # choke point for every registry git operation (registry.py + core/mods.py);
+    # it is documented best-effort and already returns False on failure, so
+    # stubbing it takes a path callers handle. Profiling one CLI test showed
+    # 5.3s of its 5.9s inside `_sync_url` / `_clone_or_pull_single` -- real
+    # network round-trips, in a suite that is supposed to be hermetic.
+    monkeypatch.setattr(_registry_module.RegistryManager, "_clone_or_pull", lambda self, entry: False, raising=False)
+
     import sparkrun.core.bootstrap
 
     sparkrun.core.bootstrap._variables = None
     yield
     sparkrun.core.bootstrap._variables = None
+
+
+@pytest.fixture
+def real_registry_git(isolate_stateful, monkeypatch):
+    """Restore ``RegistryManager._clone_or_pull`` for tests that mock git themselves.
+
+    ``isolate_stateful`` stubs the method so no test can reach the network by
+    accident. Tests that assert on the git argv (``update`` calls clone/pull,
+    ``--`` before the URL) patch ``subprocess.run`` in their own body, so the
+    real implementation is hermetic for them — they just need it back.
+
+    Depends on ``isolate_stateful`` so the ordering is explicit: the stub is
+    installed first, this undoes it.
+    """
+    import sparkrun.core.registry as registry_module
+
+    monkeypatch.setattr(registry_module.RegistryManager, "_clone_or_pull", _REAL_CLONE_OR_PULL)
 
 
 @pytest.fixture

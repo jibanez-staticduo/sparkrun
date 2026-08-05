@@ -734,6 +734,31 @@ SAF's stateful root to `tmp_path`, preventing tests from touching `~/.config/spa
 All SSH/Docker operations in tests are mocked — no real hosts are needed. Common fixtures: `tmp_recipe_dir` (creates
 sample v1/v2 recipes), `cluster_dir`, `hosts_file`, `v` (initialized SAF Variables instance).
 
+**The suite is hermetic — it touches neither the developer's state nor the network.** Both properties are enforced in
+`isolate_stateful`, and both were once broken in ways that hid for a long time:
+
+| Guard                                                          | What it prevents                                                                                    |
+|----------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
+| `DEFAULT_CONFIG_DIR` → `tmp_path` (+ `STATEFUL_ROOT`)          | reading the developer's clusters / registries / default hosts                                        |
+| `DEFAULT_CACHE_DIR` → `tmp_path` (+ `pending_ops`, `tuning._common`, which bind it at import) | reading *live* state — `ProxyEngine` defaults `state_dir` to `DEFAULT_CACHE_DIR/proxy`, so a test would report on (and `stop()` would SIGTERM) a really-running proxy |
+| `BOOTSTRAP_REGISTRY_URLS` → `[]`                               | first-run manifest discovery git-cloning three GitHub repos                                          |
+| `RegistryManager._clone_or_pull` → stub                        | every other registry `git clone` / `fetch`                                                           |
+
+The last two are why the suite runs in ~70s rather than 30+ minutes: registry git was costing seconds *per test*, masked
+for years by the cache dir leaking out to an already-populated `~/.cache/sparkrun/registries`. Sandboxing the cache
+turned those pulls into full clones, which is how it surfaced.
+
+Consequences for writing tests:
+
+- **Never assume a registry recipe exists.** Recipes must be created locally — a flat `*.yaml` in a `monkeypatch.chdir`
+  target (needs `model` + `container` + a resolvable `runtime` to pass `is_recipe_file`), or a direct path passed to a
+  command (`find_recipe` resolves paths before registries).
+- Tests that assert on **git argv** take the `real_registry_git` fixture, which restores the real `_clone_or_pull`;
+  they stay hermetic by mocking `subprocess.run` themselves.
+- Tests that exercise **manifest discovery** supply their own URLs (`bootstrap_urls` in `test_registry.py`) and mock
+  `_discover_manifest_entries`.
+- Assert against `<module>.DEFAULT_CACHE_DIR` rather than an import-time copy, which would be the real path.
+
 Test files cover: benchmarking, bootstrap, CLI commands, CLI recipe integration, cluster manager, config, distribution,
 Docker command generation, GGUF handling, host resolution, InfiniBand, networking, orchestration primitives, recipes,
 registry (including manifest discovery, fallback merging, shared clones, and reserved name enforcement), runtimes,

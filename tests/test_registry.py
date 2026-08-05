@@ -51,6 +51,22 @@ def mgr(reg_dirs):
 
 
 @pytest.fixture
+def bootstrap_urls(monkeypatch) -> list[str]:
+    """Give manifest discovery a deterministic two-URL list.
+
+    conftest empties ``BOOTSTRAP_REGISTRY_URLS`` so that no test git-clones the
+    real default registries. Tests that exercise the discovery loop itself
+    supply their own URLs and mock the per-URL ``_discover_manifest_entries``,
+    which is what makes them hermetic.
+    """
+    from sparkrun.core import registry as reg_module
+
+    urls = ["https://example.com/r1", "https://example.com/r2"]
+    monkeypatch.setattr(reg_module, "BOOTSTRAP_REGISTRY_URLS", urls)
+    return urls
+
+
+@pytest.fixture
 def sample_entry() -> RegistryEntry:
     """A sample registry entry for testing."""
     return RegistryEntry(
@@ -356,7 +372,7 @@ class TestRegistryCache:
 class TestRegistryUpdate:
     """Test registry update (git clone/pull) operations."""
 
-    def test_update_calls_clone_for_new(self, mgr, sample_entry):
+    def test_update_calls_clone_for_new(self, mgr, sample_entry, real_registry_git):
         """Test that update clones a new registry."""
         mgr._save_registries([sample_entry])
         with mock.patch("subprocess.run") as mock_run:
@@ -366,7 +382,7 @@ class TestRegistryUpdate:
             calls = mock_run.call_args_list
             assert any("clone" in str(c) for c in calls)
 
-    def test_update_calls_pull_for_existing(self, mgr, sample_entry):
+    def test_update_calls_pull_for_existing(self, mgr, sample_entry, real_registry_git):
         """Test that update pulls an existing registry."""
         mgr._save_registries([sample_entry])
         # Create fake .git dir to simulate existing clone
@@ -380,7 +396,7 @@ class TestRegistryUpdate:
             calls = mock_run.call_args_list
             assert any("pull" in str(c) for c in calls)
 
-    def test_update_all_registries(self, mgr, sample_entry):
+    def test_update_all_registries(self, mgr, sample_entry, real_registry_git):
         """Test that update() with no name updates all enabled registries."""
         second = RegistryEntry(
             name="second",
@@ -1714,7 +1730,7 @@ class TestDiscoverManifestEntries:
 class TestInitDefaultsFromManifests:
     """Test _init_defaults_from_manifests bulk-save flow."""
 
-    def test_returns_entries_without_saving_or_calling_add_registry(self, mgr):
+    def test_returns_entries_without_saving_or_calling_add_registry(self, mgr, bootstrap_urls):
         """Entries are returned without saving or calling add_registry (no re-entrancy)."""
         entries_url1 = [
             RegistryEntry(name="m1", url="https://example.com/r1", subpath="recipes"),
@@ -1770,7 +1786,7 @@ class TestInitDefaultsFromManifests:
         assert len(result) == 1
         assert result[0].name == "good-reg"
 
-    def test_deduplicates_by_name(self, mgr):
+    def test_deduplicates_by_name(self, mgr, bootstrap_urls):
         """Duplicate names across URLs are deduplicated (first wins)."""
         entries_url1 = [
             RegistryEntry(name="shared-name", url="https://example.com/r1", subpath="from-r1"),
@@ -1804,7 +1820,7 @@ class TestInitDefaultsFromManifests:
         # No file should have been saved
         assert not mgr._registries_path.exists()
 
-    def test_no_re_entrancy_on_first_run(self, reg_dirs):
+    def test_no_re_entrancy_on_first_run(self, reg_dirs, bootstrap_urls):
         """Full integration: first-run path does not re-enter _load_registries via add_registry."""
         config, cache = reg_dirs
         mgr = RegistryManager(config, cache)
@@ -2029,7 +2045,7 @@ class TestValidateGitUrl:
         with pytest.raises(ValueError, match="must not start with"):
             validate_git_url("--upload-pack=evil /tmp/target")
 
-    def test_clone_subprocess_args_contain_double_dash(self, mgr, sample_entry):
+    def test_clone_subprocess_args_contain_double_dash(self, mgr, sample_entry, real_registry_git):
         """Confirm that git clone subprocess calls include '--' before the URL."""
         mgr._save_registries([sample_entry])
         with mock.patch("subprocess.run") as mock_run:
