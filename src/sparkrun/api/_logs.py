@@ -150,12 +150,169 @@ def logs(
         is_solo=len(target_hosts) <= 1,
         scope=scope,
     )
+
+    ssh_kwargs = build_ssh_kwargs(config) if config else {}
+
+    # Liveness precheck: check ALL nodes (not just the head log source) —
+    # in a multi-node job the head may have crashed while workers are still
+    # running, and the user should still be able to read logs from surviving
+    # nodes.  Uses ``executor.query_status`` (one parallel SSH sweep) — the
+    # same source of truth as ``api.status`` and ``check_job_running``.
+    # See ``_verify_log_source_alive`` for the full decision tree.
+    all_sources = (
+        sources
+        if scope == SCOPE_ALL
+        else runtime.log_sources(
+            cluster_id,
+            target_hosts,
+            is_solo=len(target_hosts) <= 1,
+            scope=SCOPE_ALL,
+        )
+    )
+    _verify_log_source_alive(executor, all_sources, ssh_kwargs, cluster_id, cache_dir, scope=scope)
+
     return read_log_sources(
         executor,
         sources,
         follow=follow,
         tail=tail,
-        ssh_kwargs=build_ssh_kwargs(config) if config else {},
+        ssh_kwargs=ssh_kwargs,
+    )
+
+
+def _verify_log_source_alive(
+    executor, sources, ssh_kwargs: dict, cluster_id: str, cache_dir: str | None, *, scope: str = SCOPE_HEAD
+) -> None:
+    """Raise :class:`JobNotFound` if the workload isn't running.
+
+    Uses :meth:`Executor.query_status` — the same source of truth as
+    ``api.status``, ``check_job_running``, and the monitor TUI — to do
+    one parallel SSH sweep across all hosts, rather than probing each
+    source sequentially.
+
+    Three outcomes:
+
+    1. **Head alive** (container in the status snapshot) → proceed.
+    2. **Head dead, some workers alive** → raise with a pointer to
+       ``--all-sources`` so the user can read from surviving nodes.
+       With ``scope=SCOPE_ALL`` the reader can handle this, so proceed.
+    3. **All sources dead** (none in the snapshot) → follow-up
+       ``docker ps -a`` on the head distinguishes **stopped-but-exists**
+       (preserve metadata, investigation hints) from **fully removed**
+       (clean up stale metadata).  The status API uses ``docker ps``
+       (running only), so it can't make this distinction itself.
+
+    Best-effort: if the status query fails or a host is unreachable
+    (in ``ClusterStatus.errors``), the precheck is skipped so a network
+    blip never causes a false "not running" verdict.
+    """
+    if not sources:
+        return
+    from sparkrun.orchestration.primitives import run_command_on_host
+
+    head = sources[0]
+
+    # One parallel SSH sweep via the status API — same source of truth
+    # as `api.status`, `check_job_running`, and the monitor TUI.
+    all_hosts = list(dict.fromkeys(s.host for s in sources))
+    try:
+        snapshot = executor.query_status(all_hosts, ssh_kwargs=ssh_kwargs)
+    except Exception:  # noqa: BLE001 — best-effort; let log reader surface its own error
+        return
+
+    def _container_status(host: str, container_name: str) -> bool | None:
+        """True if running, False if confirmed absent, None if host unreachable."""
+        occ = snapshot.for_host(host)
+        if occ is None:
+            return None  # host in errors / unreachable → inconclusive
+        for w in occ.workloads:
+            if w.cluster_id == cluster_id:
+                for c in w.containers:
+                    if c.name == container_name:
+                        return True
+                # Cluster_id present but this container not listed —
+                # could be a different container (head vs worker) or
+                # the executor didn't populate `containers`.  Check
+                # workload presence as a fallback: if the cluster_id
+                # has *any* workload on this host, the container might
+                # be running under a name we don't recognize.
+                if not w.containers:
+                    return True  # containers not populated → assume alive
+        return False  # host reachable, container not in snapshot
+
+    head_status = _container_status(head.host, head.container)
+    if head_status is None:
+        return  # inconclusive → skip precheck
+    if head_status:
+        return  # head is alive → proceed normally
+
+    # Head is confirmed dead.  Check workers — if any are still alive,
+    # point the user at ``--all-sources`` rather than letting the reader
+    # fail on the dead head container with a raw docker error.
+    alive_worker_hosts = []
+    for source in sources[1:]:
+        status = _container_status(source.host, source.container)
+        if status is None:
+            return  # inconclusive → skip precheck
+        if status:
+            alive_worker_hosts.append(source.host)
+
+    if alive_worker_hosts:
+        # With ``--all-sources`` the reader can read from the surviving
+        # workers, so proceed.  With the default (head-only) scope the
+        # reader would fail on the dead head container — raise a helpful
+        # error pointing at ``--all-sources`` instead.
+        if scope == SCOPE_ALL:
+            return
+        raise JobNotFound(
+            "Workload %s is partially running — the head container on %s has stopped, "
+            "but worker containers are still alive on %s.\n"
+            "Try `sparkrun logs %s --all-sources` to read from surviving nodes, "
+            "or `sparkrun stop %s` to clean up." % (cluster_id, head.host, ", ".join(alive_worker_hosts), cluster_id, cluster_id)
+        )
+
+    # Every source is confirmed dead (none in the status snapshot).
+    # Determine whether the head container still exists (stopped) or is
+    # fully gone.  The status API uses ``docker ps`` (running only), so
+    # it can't make this distinction — a follow-up ``docker ps -a`` is
+    # the only way.
+    #
+    # Only rc=0 is actionable: empty stdout = gone, non-empty = stopped.
+    # Any other rc (255 SSH failure, 127 docker missing, -1 timeout) is
+    # inconclusive — assume the container exists (safer: preserves
+    # metadata for investigation rather than deleting it on a network blip).
+    exists_cmd = "docker ps -a --filter name=^%s$ --format '{{.ID}}'" % head.container
+    try:
+        exists_result = run_command_on_host(head.host, exists_cmd, ssh_kwargs=ssh_kwargs, timeout=10, quiet=True)
+        if exists_result.returncode == 0:
+            container_exists = bool(exists_result.stdout.strip())
+        else:
+            container_exists = True  # inconclusive → preserve metadata
+    except Exception:  # noqa: BLE001 — if the follow-up fails, assume stopped (safer for investigation)
+        container_exists = True
+
+    if container_exists:
+        raise JobNotFound(
+            "Workload %s is not currently running on %s (container %r has stopped).\n"
+            "The job metadata has been preserved so you can investigate:\n"
+            "  docker logs %s       # check why it stopped\n"
+            "  docker inspect %s    # exit code, OOM-killed, etc.\n"
+            "Run `sparkrun stop %s` to clean up when ready."
+            % (cluster_id, head.host, head.container, head.container, head.container, cluster_id)
+        )
+
+    # Container is fully gone — metadata is stale.  Remove it so
+    # ``logs <TAB>`` stops suggesting this dead workload.
+    try:
+        from sparkrun.orchestration.job_metadata import remove_job_metadata
+
+        remove_job_metadata(cluster_id, cache_dir=cache_dir)
+    except Exception:
+        logger.debug("Failed to remove stale metadata for %s", cluster_id, exc_info=True)
+
+    raise JobNotFound(
+        "Workload %s is not currently running on %s (container %r no longer exists).\n"
+        "The stale job metadata has been removed. Run `sparkrun status` to see running workloads." % (cluster_id, head.host, head.container)
     )
 
 
