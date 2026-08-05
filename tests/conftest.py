@@ -297,3 +297,30 @@ def log_sources_spy(monkeypatch):
 
     monkeypatch.setattr("sparkrun.orchestration.logs.print_log_sources", _capture)
     return calls
+
+
+@pytest.fixture
+def deepseek_v4_config() -> dict[str, Any]:
+    """Return an abridged DeepSeek-V4-Flash-0731 ``config.json``.
+
+    Carries the fields the VRAM estimator reads for a Multi-head Latent
+    Attention model: ``head_dim`` holds the compressed latent (V2/V3 name it
+    ``kv_lora_rank`` instead), and ``compress_ratios`` gives 21 layers at ratio
+    4 and 20 at ratio 128.  The ratio-0 layers are sliding-window and hold no
+    latent cache.
+
+    Returns:
+        Dictionary of HuggingFace config fields.
+    """
+    return {
+        "model_type": "deepseek_v4",
+        "torch_dtype": "bfloat16",
+        "num_hidden_layers": 43,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "hidden_size": 4096,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
+        "sliding_window": 128,
+        "compress_ratios": [0, 0] + [4, 128] * 20 + [4, 0, 0, 0],
+    }

@@ -1406,14 +1406,12 @@ class TestRecipeMetadata:
         est = recipe.estimate_vram(auto_detect=False)
         assert est.kv_dtype == "fp8"
 
-    def test_estimate_vram_nvfp4_ds_mla_from_defaults(self):
+    def test_estimate_vram_nvfp4_ds_mla_from_defaults(self, deepseek_v4_config):
         """kv_cache_dtype: nvfp4_ds_mla plus an auto-detected MLA config sizes the latent cache.
 
         The generic 2 * layers * kv_heads * head_dim formula reads 86 GB for this
         model at 1M context, which would refuse any placement; MLA reads ~3 GB.
         """
-        from tests.test_vram import DEEPSEEK_V4_CONFIG
-
         recipe = Recipe.from_dict(
             {
                 "name": "Test",
@@ -1423,7 +1421,7 @@ class TestRecipeMetadata:
             }
         )
         with (
-            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=DEEPSEEK_V4_CONFIG),
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=deepseek_v4_config),
             mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
         ):
             est = recipe.estimate_vram()

@@ -19,21 +19,6 @@ from sparkrun.models.vram import (
     parse_param_count,
 )
 
-# DeepSeek-V4-Flash-0731 config.json (abridged to the fields the estimator reads).
-# 21 layers at compress_ratio 4, 20 at 128; ratio-0 layers are sliding-window.
-DEEPSEEK_V4_CONFIG = {
-    "model_type": "deepseek_v4",
-    "torch_dtype": "bfloat16",
-    "num_hidden_layers": 43,
-    "num_attention_heads": 64,
-    "num_key_value_heads": 1,
-    "hidden_size": 4096,
-    "head_dim": 512,
-    "qk_rope_head_dim": 64,
-    "sliding_window": 128,
-    "compress_ratios": [0, 0] + [4, 128] * 20 + [4, 0, 0, 0],
-}
-
 
 class TestParseParamCount:
     """Test parameter count parsing from various formats."""
@@ -987,20 +972,20 @@ class TestMlaKvLayout:
         """Without compress_ratios every layer stores one 656-byte slot per token."""
         assert mla_kv_bytes_per_token(kv_dtype="fp8_ds_mla", num_layers=61) == 61 * 656
 
-    def test_deepseek_v4_uses_584_byte_envelope(self):
+    def test_deepseek_v4_uses_584_byte_envelope(self, deepseek_v4_config):
         # 21 layers at ratio 4 + 20 at ratio 128; ratio-0 layers are excluded.
         expected = 21 * (584 / 4) + 20 * (584 / 128)
         got = mla_kv_bytes_per_token(
             kv_dtype="nvfp4_ds_mla",
             num_layers=43,
-            compress_ratios=DEEPSEEK_V4_CONFIG["compress_ratios"],
+            compress_ratios=deepseek_v4_config["compress_ratios"],
             model_type="deepseek_v4",
         )
         assert got == pytest.approx(expected)
         assert got == pytest.approx(3157.25)
 
-    def test_fp8_and_nvfp4_share_the_v4_envelope(self):
-        kwargs = dict(num_layers=43, compress_ratios=DEEPSEEK_V4_CONFIG["compress_ratios"], model_type="deepseek_v4")
+    def test_fp8_and_nvfp4_share_the_v4_envelope(self, deepseek_v4_config):
+        kwargs = dict(num_layers=43, compress_ratios=deepseek_v4_config["compress_ratios"], model_type="deepseek_v4")
         assert mla_kv_bytes_per_token(kv_dtype="fp8_ds_mla", **kwargs) == mla_kv_bytes_per_token(kv_dtype="nvfp4_ds_mla", **kwargs)
 
     def test_generic_mla_sizes_from_latent(self):
@@ -1016,8 +1001,8 @@ class TestMlaKvLayout:
 class TestMlaEstimateVram:
     """End-to-end MLA sizing through estimate_vram()."""
 
-    def _v4_kwargs(self, **overrides):
-        info = extract_model_info(DEEPSEEK_V4_CONFIG)
+    def _v4_kwargs(self, config, **overrides):
+        info = extract_model_info(config)
         kwargs = dict(
             model_vram=340.0,
             num_layers=info["num_layers"],
@@ -1033,7 +1018,7 @@ class TestMlaEstimateVram:
         kwargs.update(overrides)
         return kwargs
 
-    def test_nvfp4_ds_mla_replaces_the_bf16_mha_estimate(self):
+    def test_nvfp4_ds_mla_replaces_the_bf16_mha_estimate(self, deepseek_v4_config):
         """The generic 2*L*heads*head_dim formula reads 86 GB; MLA is ~3 GB."""
         generic = estimate_vram(
             model_vram=340.0,
@@ -1045,27 +1030,27 @@ class TestMlaEstimateVram:
         assert generic.kv_cache_total_gb == pytest.approx(86.0, abs=0.1)
         assert not generic.mla
 
-        est = estimate_vram(**self._v4_kwargs())
+        est = estimate_vram(**self._v4_kwargs(deepseek_v4_config))
         assert est.mla
         assert est.kv_cache_per_token_bytes == pytest.approx(3157.25)
         assert est.kv_cache_total_gb == pytest.approx(3.08, abs=0.01)
 
-    def test_kv_cache_is_replicated_across_tensor_parallel_ranks(self):
+    def test_kv_cache_is_replicated_across_tensor_parallel_ranks(self, deepseek_v4_config):
         """MLA's latent has no head dim to shard, so TP does not shrink the KV cache."""
-        tp1 = estimate_vram(**self._v4_kwargs(tensor_parallel=1))
-        tp2 = estimate_vram(**self._v4_kwargs(tensor_parallel=2))
+        tp1 = estimate_vram(**self._v4_kwargs(deepseek_v4_config, tensor_parallel=1))
+        tp2 = estimate_vram(**self._v4_kwargs(deepseek_v4_config, tensor_parallel=2))
         assert tp2.kv_cache_replicated
         # Weights halve, KV does not.
         assert tp2.total_per_gpu_gb == pytest.approx(tp1.model_weights_gb / 2 + tp1.kv_cache_total_gb)
 
-    def test_pipeline_parallel_still_splits_the_kv_cache(self):
+    def test_pipeline_parallel_still_splits_the_kv_cache(self, deepseek_v4_config):
         """Layers — and therefore their latent caches — do split across PP stages."""
-        pp1 = estimate_vram(**self._v4_kwargs(pipeline_parallel=1))
-        pp2 = estimate_vram(**self._v4_kwargs(pipeline_parallel=2))
+        pp1 = estimate_vram(**self._v4_kwargs(deepseek_v4_config, pipeline_parallel=1))
+        pp2 = estimate_vram(**self._v4_kwargs(deepseek_v4_config, pipeline_parallel=2))
         assert pp2.total_per_gpu_gb == pytest.approx(pp1.model_weights_gb / 2 + pp1.kv_cache_total_gb / 2)
 
-    def test_warns_that_auxiliary_caches_are_excluded(self):
-        est = estimate_vram(**self._v4_kwargs())
+    def test_warns_that_auxiliary_caches_are_excluded(self, deepseek_v4_config):
+        est = estimate_vram(**self._v4_kwargs(deepseek_v4_config))
         assert any("sliding-window" in w for w in est.warnings)
 
     def test_mla_layout_alone_is_enough(self):
@@ -1074,8 +1059,8 @@ class TestMlaEstimateVram:
         assert est.mla
         assert est.kv_cache_per_token_bytes == 43 * 656
 
-    def test_kv_vram_per_token_override_still_wins(self):
-        est = estimate_vram(**self._v4_kwargs(kv_vram_per_token=1e-6))
+    def test_kv_vram_per_token_override_still_wins(self, deepseek_v4_config):
+        est = estimate_vram(**self._v4_kwargs(deepseek_v4_config, kv_vram_per_token=1e-6))
         assert est.kv_cache_total_gb == pytest.approx(1e-6 * 1_048_576)
 
     def test_unsizable_mla_degrades_with_a_warning(self):
@@ -1087,8 +1072,8 @@ class TestMlaEstimateVram:
 class TestExtractModelInfoMla:
     """MLA architecture fields pulled out of a HuggingFace config."""
 
-    def test_deepseek_v4(self):
-        info = extract_model_info(DEEPSEEK_V4_CONFIG)
+    def test_deepseek_v4(self, deepseek_v4_config):
+        info = extract_model_info(deepseek_v4_config)
         assert info["model_type"] == "deepseek_v4"
         assert info["qk_rope_head_dim"] == 64
         # V4 carries the latent dim in head_dim rather than kv_lora_rank.
