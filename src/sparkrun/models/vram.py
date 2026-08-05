@@ -223,6 +223,35 @@ def is_mla_kv_layout(kv_dtype: str) -> bool:
     return kv_dtype.lower().strip().replace("-", "_") in _MLA_SLOT_BYTES
 
 
+def mla_latent_dim(*, kv_lora_rank: int | None = None, head_dim: int | None = None, qk_rope_head_dim: int | None = None) -> int | None:
+    """Resolve the non-RoPE part of an MLA model's cached width.
+
+    The two DeepSeek generations spell the same quantity differently, and the
+    difference is easy to double-count:
+
+    - **V2/V3** name the latent ``kv_lora_rank`` and cache ``qk_rope_head_dim``
+      *in addition* to it — 512 + 64 = 576 elements for DeepSeek-V3.
+    - **V4** has no ``kv_lora_rank``.  Its ``head_dim`` is the *whole* cached
+      width, with the RoPE tail carved out of it: upstream vLLM computes
+      ``nope_head_dim = head_dim - qk_rope_head_dim`` (512 − 64 = 448) and
+      documents the slot as "448B NoPE + 128B RoPE + 8B fp8 scale = 584B".
+
+    Returning the NoPE width for both shapes lets callers add the tail exactly
+    once, so V4 sizes to ``head_dim`` rather than ``head_dim + qk_rope_head_dim``.
+
+    Returns:
+        The NoPE width in elements, or ``None`` when it can't be resolved.
+    """
+    if kv_lora_rank:
+        return int(kv_lora_rank)
+    if not head_dim:
+        return None
+    # V4 shape: head_dim already contains the tail, so carve it back out.
+    if qk_rope_head_dim and head_dim > qk_rope_head_dim:
+        return int(head_dim) - int(qk_rope_head_dim)
+    return int(head_dim)
+
+
 def mla_kv_bytes_per_token(
     *,
     kv_dtype: str,
@@ -271,7 +300,12 @@ def mla_kv_bytes_per_token(
         per_layer = (kv_lora_rank + (qk_rope_head_dim or 0)) * bpe
 
     if compress_ratios:
-        return sum(per_layer / r for r in compress_ratios if r and r > 1)
+        total = sum(per_layer / r for r in compress_ratios if r and r > 1)
+        # Every entry was <= 1, so no layer contributes a latent cache.  That
+        # is 0 bytes, not "0 GB of KV needed" — a zero estimate passes every
+        # fit check, so the workload would be placed with no KV headroom and
+        # OOM at runtime.  Report it as unsizable and let the caller warn.
+        return total or None
     if not num_layers:
         return None
     return per_layer * num_layers
@@ -649,10 +683,15 @@ def _extract_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     # the marker: these models cache one compressed latent per token per layer,
     # so the KV cache must be sized from the latent dim rather than from
     # num_kv_heads * head_dim.  V2/V3 name the latent ``kv_lora_rank``; V4
-    # carries it in ``head_dim`` instead.
+    # folds it into ``head_dim`` together with the RoPE tail — see
+    # :func:`mla_latent_dim`, which normalizes both shapes to the NoPE width.
     if "qk_rope_head_dim" in cfg:
         info["qk_rope_head_dim"] = cfg["qk_rope_head_dim"]
-        latent = cfg.get("kv_lora_rank") or info.get("head_dim")
+        latent = mla_latent_dim(
+            kv_lora_rank=cfg.get("kv_lora_rank"),
+            head_dim=info.get("head_dim"),
+            qk_rope_head_dim=cfg["qk_rope_head_dim"],
+        )
         if latent:
             info["kv_lora_rank"] = latent
 
@@ -660,6 +699,12 @@ def _extract_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     ratios = cfg.get("compress_ratios")
     if isinstance(ratios, list):
         info["compress_ratios"] = ratios
+
+    # DeepSeek sparse attention (V3.2 / V4) keeps a second, separate indexer
+    # cache alongside the latent.  We don't size it, but its presence is what
+    # makes the estimate a floor rather than a total.
+    if "index_head_dim" in cfg:
+        info["index_head_dim"] = cfg["index_head_dim"]
 
     return info
 
@@ -732,6 +777,7 @@ def estimate_vram(
     qk_rope_head_dim: int | None = None,
     compress_ratios: Sequence[int] | None = None,
     model_type: str | None = None,
+    index_head_dim: int | None = None,
 ) -> VRAMEstimate:
     """Estimate VRAM usage for an inference workload.
 
@@ -757,6 +803,8 @@ def estimate_vram(
         compress_ratios: DeepSeek V4 per-layer KV cache compression ratios.
         model_type: HuggingFace ``model_type``; selects the MLA slot layout
             (e.g. ``deepseek_v4``).
+        index_head_dim: DeepSeek sparse-attention indexer width. Not sized, but
+            its presence means the MLA estimate is a floor, which is warned about.
 
     Returns:
         VRAMEstimate with per-GPU totals and any warnings.
@@ -792,10 +840,10 @@ def estimate_vram(
     # MLA-specific KV layout named by the recipe (fp8_ds_mla / nvfp4_ds_mla).
     is_mla = bool(kv_lora_rank or qk_rope_head_dim) or is_mla_kv_layout(kv_dtype)
 
-    # Mirrors _extract_from_config: V2/V3 name the latent kv_lora_rank, V4
-    # carries it in head_dim.  Lets a recipe that pins head_dim + qk_rope_head_dim
-    # in metadata get MLA sizing without naming kv_lora_rank separately.
-    mla_latent = kv_lora_rank or (head_dim if qk_rope_head_dim else None)
+    # Same normalization _extract_from_config applies, so a recipe that pins
+    # head_dim + qk_rope_head_dim in metadata gets MLA sizing without naming
+    # kv_lora_rank separately — and gets the same width either way.
+    mla_latent = mla_latent_dim(kv_lora_rank=kv_lora_rank, head_dim=head_dim, qk_rope_head_dim=qk_rope_head_dim)
 
     if kv_vram_per_token is not None:
         # Direct override: user provides GB per token
@@ -813,13 +861,36 @@ def estimate_vram(
         )
         if kv_cache_per_token_bytes is None:
             is_mla = False
-            warnings.append("Cannot size MLA KV cache for dtype %r; KV cache estimate unavailable" % kv_dtype)
+            # Name the actual reason: blaming the dtype unconditionally is
+            # misleading when the real gap is a missing latent dim, a missing
+            # layer count, or a compress_ratios list with nothing above 1.
+            if compress_ratios and not any(r and r > 1 for r in compress_ratios):
+                reason = "no compress_ratios entry above 1, so no layer holds a latent cache"
+            elif not is_mla_kv_layout(kv_dtype) and not mla_latent:
+                reason = "no kv_lora_rank/head_dim to size the compressed latent from"
+            elif not is_mla_kv_layout(kv_dtype) and kv_bytes_per_element(kv_dtype) is None:
+                reason = "unknown KV cache dtype %r" % kv_dtype
+            elif not num_layers:
+                reason = "num_layers unavailable"
+            else:
+                reason = "insufficient architecture info"
+            warnings.append("Cannot size MLA KV cache (%s); KV cache estimate unavailable" % reason)
         else:
             if max_model_len:
                 kv_cache_total_gb = kv_cache_per_token_bytes * max_model_len / (1024**3)
-            if compress_ratios:
+            # Name the auxiliary caches this estimate leaves out, so the number
+            # is understood as a floor.  Keying this on compress_ratios alone
+            # would silently skip DeepSeek V3.2, which has a sparse indexer but
+            # no per-layer compression.
+            excluded = []
+            if compress_ratios and any(not r or r <= 1 for r in compress_ratios):
+                excluded.append("sliding-window")
+            if index_head_dim:
+                excluded.append("sparse-indexer")
+            if excluded:
                 warnings.append(
-                    "MLA estimate covers the compressed latent cache only; sliding-window and sparse-indexer caches are not included"
+                    "MLA estimate covers the compressed latent cache only; the %s cache%s not included"
+                    % (" and ".join(excluded), "s are" if len(excluded) > 1 else " is")
                 )
     elif num_layers and num_kv_heads and head_dim:
         kv_bpe = kv_bytes_per_element(kv_dtype)

@@ -3228,3 +3228,129 @@ class TestRecipeSerialization:
         restored = Recipe._deserialize(original.__getstate__())
         restored.resolve({"distributed_executor_backend": "ray"})
         assert restored.runtime == "vllm-ray"
+
+
+class TestEstimateVramIdempotency:
+    """`Recipe.estimate_vram()` must return the same answer on every call.
+
+    The method writes auto-detected architecture back into ``self.metadata`` so
+    later calls skip the HuggingFace fetch.  Any field read on the way in but
+    not written back is silently lost on call two — and a single ``sparkrun
+    run`` estimates three times on one Recipe (host resolution, the displayed
+    banner, then the scheduling pass inside ``api.run`` that builds the
+    placement's ``ResourceRequest``).
+    """
+
+    def _estimate_repeatedly(self, recipe, hf_config, times=3):
+        """Call estimate_vram *times* on one object; return results + fetch count."""
+        with (
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=hf_config) as fetch,
+            mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_size", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_params", return_value=None),
+        ):
+            results = [recipe.estimate_vram() for _ in range(times)]
+        return results, fetch.call_count
+
+    @staticmethod
+    def _signature(est):
+        return (est.mla, est.kv_cache_per_token_bytes, est.kv_cache_total_gb, est.total_per_gpu_gb)
+
+    def test_fixed_slot_mla_is_stable(self, deepseek_v4_config):
+        """V4 + nvfp4_ds_mla: kv_dtype survives the write-back, but model_type and
+        compress_ratios did not — so a regression here keeps mla=True while
+        silently falling back to 43 x 656 B/token."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0},
+                "defaults": {"max_model_len": 1048576, "kv_cache_dtype": "nvfp4_ds_mla", "tensor_parallel": 2},
+            }
+        )
+        results, fetches = self._estimate_repeatedly(recipe, deepseek_v4_config)
+
+        assert all(e.mla for e in results)
+        assert {self._signature(e) for e in results} == {self._signature(results[0])}
+        assert results[0].kv_cache_per_token_bytes == pytest.approx(3157.25)
+        # The write-back exists to avoid re-fetching; it must still do that.
+        assert fetches == 1
+
+    def test_generic_dtype_mla_is_stable(self, deepseek_v3_config):
+        """DeepSeek-V3 with an ordinary KV dtype: losing kv_lora_rank drops MLA
+        entirely and reverts to the 2 * layers * kv_heads * head_dim formula."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V3",
+                "metadata": {"model_vram": 350.0},
+                "defaults": {"max_model_len": 32768, "tensor_parallel": 4},
+            }
+        )
+        results, fetches = self._estimate_repeatedly(recipe, deepseek_v3_config)
+
+        assert all(e.mla for e in results)
+        assert {self._signature(e) for e in results} == {self._signature(results[0])}
+        assert results[0].kv_cache_per_token_bytes == 70_272
+        assert fetches == 1
+
+    def test_non_mla_model_is_stable(self):
+        """A model with no MLA markers re-derives the same non-MLA verdict."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "Qwen/Qwen3-32B",
+                "metadata": {"model_vram": 60.0},
+                "defaults": {"max_model_len": 32768, "tensor_parallel": 2},
+            }
+        )
+        hf_config = {
+            "model_type": "qwen3",
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 64,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "hidden_size": 5120,
+            "head_dim": 128,
+        }
+        results, fetches = self._estimate_repeatedly(recipe, hf_config)
+
+        assert not any(e.mla for e in results)
+        assert {self._signature(e) for e in results} == {self._signature(results[0])}
+        assert fetches == 1
+
+    def test_mla_fields_are_written_back(self, deepseek_v4_config):
+        """The four MLA fields must land in metadata, like the other detected ones."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0},
+                "defaults": {"max_model_len": 1048576, "kv_cache_dtype": "nvfp4_ds_mla"},
+            }
+        )
+        self._estimate_repeatedly(recipe, deepseek_v4_config, times=1)
+
+        # V4's NoPE width: head_dim (512) minus the RoPE tail (64).
+        assert recipe.metadata["kv_lora_rank"] == 448
+        assert recipe.metadata["qk_rope_head_dim"] == 64
+        assert recipe.metadata["model_type"] == "deepseek_v4"
+        assert recipe.metadata["compress_ratios"] == deepseek_v4_config["compress_ratios"]
+        assert recipe.metadata["index_head_dim"] == 128
+
+    def test_metadata_overrides_are_not_clobbered(self, deepseek_v4_config):
+        """An explicit metadata value outranks the detected one, on every call."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0, "model_type": "deepseek_v32"},
+                "defaults": {"max_model_len": 1048576, "kv_cache_dtype": "nvfp4_ds_mla"},
+            }
+        )
+        results, _ = self._estimate_repeatedly(recipe, deepseek_v4_config)
+
+        assert recipe.metadata["model_type"] == "deepseek_v32"
+        # deepseek_v32 is not in the V4 slot table, so it takes the 656 B fallback.
+        assert {self._signature(e) for e in results} == {self._signature(results[0])}
+        assert results[0].kv_cache_per_token_bytes == pytest.approx(656 * 5.40625)

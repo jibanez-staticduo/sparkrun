@@ -128,10 +128,16 @@ magnitude. sparkrun detects MLA from the HuggingFace config (`qk_rope_head_dim`,
 
 | Field               | Meaning                                                                                  |
 |---------------------|------------------------------------------------------------------------------------------|
-| `kv_lora_rank`      | Compressed-latent dimension. Its presence switches KV sizing to the MLA path.             |
+| `kv_lora_rank`      | Compressed-latent width, **excluding** the RoPE tail. Its presence switches KV sizing to the MLA path. |
 | `qk_rope_head_dim`  | RoPE tail cached alongside the latent.                                                    |
 | `compress_ratios`   | DeepSeek V4 per-layer cache compression; layers at ratio ≤ 1 are sliding-window layers.   |
 | `model_type`        | Selects the packed slot layout (e.g. `deepseek_v4`).                                      |
+| `index_head_dim`    | Sparse-attention indexer width. Not sized; its presence marks the estimate as a floor.     |
+
+The two generations spell the latent differently, and sparkrun normalizes them: V2/V3 name `kv_lora_rank` and cache
+the RoPE tail *in addition* to it (512 + 64 = 576 elements), while V4 has no `kv_lora_rank` and folds both into
+`head_dim` (512 total, of which 64 is the tail). Auto-detection reports the **NoPE width** for both — 512 for V3, 448
+for V4 — so the tail is added exactly once. Pin `kv_lora_rank` by hand only if you are giving the NoPE width.
 
 Runtimes that pack the latent, its block scales and the RoPE tail into a fixed-width uint8 slot are named through
 `kv_dtype` / `defaults.kv_cache_dtype`: `fp8_ds_mla` and `nvfp4_ds_mla` (656 bytes per token per layer; 584 on
@@ -141,8 +147,9 @@ Two consequences worth knowing when reading an estimate:
 
 - **The latent cache is replicated on every tensor-parallel rank** — it has no head dimension to shard — so raising
   `--tp` does not shrink it. Pipeline parallelism still splits it by layer.
-- For DeepSeek V4 the estimate covers the **latent cache only**. The sliding-window and sparse-indexer caches are
-  excluded and reported as a warning.
+- For sparse-attention models the estimate covers the **latent cache only**, so treat it as a floor. DeepSeek V4
+  also keeps a sliding-window cache and V3.2 a sparse-indexer cache (roughly 132 bytes per token per layer); neither
+  is sized. Whichever apply are named in a warning on the estimate.
 
 Use `kv_vram_per_token` to override the whole calculation if a runtime's real footprint differs.
 

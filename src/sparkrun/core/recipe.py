@@ -1237,6 +1237,7 @@ class Recipe:
         qk_rope_head_dim = self.metadata.get("qk_rope_head_dim")
         compress_ratios = self.metadata.get("compress_ratios")
         model_type = self.metadata.get("model_type")
+        index_head_dim = self.metadata.get("index_head_dim")
         quant_info: QuantizationInfo | None = None
         _storage_dtype: str | None = None  # raw torch_dtype before quant override
         effective_recipe_quant: str | None = None  # recipe-level quantization override
@@ -1292,6 +1293,8 @@ class Recipe:
                         compress_ratios = hf_info.get("compress_ratios")
                     if not model_type:
                         model_type = hf_info.get("model_type")
+                    if not index_head_dim:
+                        index_head_dim = hf_info.get("index_head_dim")
 
                     # Use kv_cache_quant from hf_quant_config to inform kv_dtype
                     if not kv_dtype and quant_info and quant_info.kv_cache_quant:
@@ -1387,10 +1390,19 @@ class Recipe:
             qk_rope_head_dim=int(qk_rope_head_dim) if qk_rope_head_dim is not None else None,
             compress_ratios=[int(r) for r in compress_ratios] if compress_ratios else None,
             model_type=str(model_type) if model_type else None,
+            index_head_dim=int(index_head_dim) if index_head_dim is not None else None,
         )
 
         # Write back auto-detected values so downstream consumers
         # (e.g. benchmark result export) can use them without re-fetching.
+        #
+        # This must stay complete: the written-back architecture fields satisfy
+        # ``needs_detection`` above, so anything omitted here is lost on the
+        # second call.  A single ``sparkrun run`` estimates three times on one
+        # Recipe (host resolution, the displayed banner, then the scheduling
+        # pass inside ``api.run``), and the last one feeds the placement's
+        # ``ResourceRequest`` — so a partial write-back silently reverts the
+        # estimate on the path that decides where ranks land.
         if model_dtype:
             self.metadata["model_dtype"] = normalize_dtype(str(model_dtype))
         if num_layers is not None and "num_layers" not in self.metadata:
@@ -1407,6 +1419,18 @@ class Recipe:
             self.metadata["quant_bits"] = quant_info.bits
         if kv_dtype:
             self.metadata["kv_dtype"] = normalize_dtype(str(kv_dtype))
+        # MLA architecture fields.  A non-MLA model leaves these unset on every
+        # call, which re-derives the same (correct) non-MLA verdict.
+        if kv_lora_rank is not None and "kv_lora_rank" not in self.metadata:
+            self.metadata["kv_lora_rank"] = int(kv_lora_rank)
+        if qk_rope_head_dim is not None and "qk_rope_head_dim" not in self.metadata:
+            self.metadata["qk_rope_head_dim"] = int(qk_rope_head_dim)
+        if compress_ratios and "compress_ratios" not in self.metadata:
+            self.metadata["compress_ratios"] = [int(r) for r in compress_ratios]
+        if model_type and "model_type" not in self.metadata:
+            self.metadata["model_type"] = str(model_type)
+        if index_head_dim is not None and "index_head_dim" not in self.metadata:
+            self.metadata["index_head_dim"] = int(index_head_dim)
 
         return result
 

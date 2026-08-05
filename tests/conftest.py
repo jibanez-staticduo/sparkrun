@@ -323,4 +323,61 @@ def deepseek_v4_config() -> dict[str, Any]:
         "qk_rope_head_dim": 64,
         "sliding_window": 128,
         "compress_ratios": [0, 0] + [4, 128] * 20 + [4, 0, 0, 0],
+        # Sparse attention: a second cache the estimator does not size.
+        "index_head_dim": 128,
+        "index_topk": 512,
+    }
+
+
+@pytest.fixture
+def deepseek_v3_config() -> dict[str, Any]:
+    """Return an abridged DeepSeek-V3 ``config.json``.
+
+    The other MLA shape: V2/V3 name the compressed latent ``kv_lora_rank``
+    explicitly and cache ``qk_rope_head_dim`` *in addition* to it, so the KV
+    width is ``512 + 64`` elements.  There is no top-level ``head_dim`` — it is
+    derived as ``hidden_size // num_attention_heads`` — and no
+    ``compress_ratios``.
+
+    Returns:
+        Dictionary of HuggingFace config fields.
+    """
+    return {
+        "model_type": "deepseek_v3",
+        "torch_dtype": "bfloat16",
+        "num_hidden_layers": 61,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "hidden_size": 7168,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+    }
+
+
+@pytest.fixture
+def deepseek_v32_config() -> dict[str, Any]:
+    """Return an abridged DeepSeek-V3.2-Exp ``config.json``.
+
+    The shape that exposed the auxiliary-cache warning gap: sparse attention
+    (``index_head_dim``) with **no** ``compress_ratios``, so a warning keyed on
+    per-layer compression alone would never fire for it — even though its
+    indexer cache is a full KV peer worth roughly 132 B per token per layer.
+
+    Returns:
+        Dictionary of HuggingFace config fields.
+    """
+    return {
+        "model_type": "deepseek_v32",
+        "torch_dtype": "bfloat16",
+        "num_hidden_layers": 61,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "hidden_size": 7168,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "index_head_dim": 128,
+        "index_n_heads": 64,
+        "index_topk": 2048,
     }

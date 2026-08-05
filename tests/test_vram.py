@@ -16,6 +16,7 @@ from sparkrun.models.vram import (
     is_mla_kv_layout,
     kv_bytes_per_element,
     mla_kv_bytes_per_token,
+    mla_latent_dim,
     parse_param_count,
 )
 
@@ -1076,8 +1077,12 @@ class TestExtractModelInfoMla:
         info = extract_model_info(deepseek_v4_config)
         assert info["model_type"] == "deepseek_v4"
         assert info["qk_rope_head_dim"] == 64
-        # V4 carries the latent dim in head_dim rather than kv_lora_rank.
-        assert info["kv_lora_rank"] == 512
+        # V4 has no kv_lora_rank: head_dim (512) is the whole cached width with
+        # the RoPE tail carved out of it, so the NoPE part is 512 - 64 = 448.
+        assert info["kv_lora_rank"] == 448
+        # The contract that matters: NoPE + RoPE reconstructs head_dim exactly,
+        # so the tail is counted once.
+        assert info["kv_lora_rank"] + info["qk_rope_head_dim"] == deepseek_v4_config["head_dim"]
         assert info["compress_ratios"][:4] == [0, 0, 4, 128]
 
     def test_deepseek_v3_uses_kv_lora_rank(self):
@@ -1104,7 +1109,11 @@ class TestMlaDetectionSignals:
     """Each independent signal that should select MLA sizing."""
 
     def test_qk_rope_head_dim_with_pinned_head_dim(self):
-        """A recipe pinning head_dim + qk_rope_head_dim skips HF detection but still gets MLA sizing."""
+        """A recipe pinning head_dim + qk_rope_head_dim skips HF detection but still gets MLA sizing.
+
+        V4 shape: head_dim is the full cached width, so the per-layer footprint
+        is ``head_dim * bytes`` — the RoPE tail must not be added on top.
+        """
         est = estimate_vram(
             model_vram=340.0,
             num_layers=43,
@@ -1114,7 +1123,7 @@ class TestMlaDetectionSignals:
             max_model_len=32768,
         )
         assert est.mla
-        assert est.kv_cache_per_token_bytes == 43 * (512 + 64) * 2.0
+        assert est.kv_cache_per_token_bytes == 43 * 512 * 2.0
 
     def test_kv_lora_rank_alone(self):
         est = estimate_vram(model_vram=340.0, num_layers=61, kv_lora_rank=512, qk_rope_head_dim=64, max_model_len=32768)
@@ -1128,3 +1137,190 @@ class TestMlaDetectionSignals:
         assert not est.mla
         assert not est.kv_cache_replicated
         assert est.kv_cache_per_token_bytes == 2.0 * 64 * 8 * 128 * 2.0
+
+
+class TestMlaLatentDim:
+    """The V2/V3 vs V4 asymmetry that makes the RoPE tail easy to double-count.
+
+    Upstream vLLM sizes V4's MLA cache from ``head_dim`` directly (documented as
+    "448B NoPE + 128B RoPE + 8B fp8 scale = 584B"), but sizes V3.2's from
+    ``kv_lora_rank + qk_rope_head_dim`` (head_size=576).  Normalizing both to
+    the NoPE width lets one formula add the tail exactly once.
+    """
+
+    def test_v3_shape_uses_kv_lora_rank_verbatim(self):
+        """V2/V3 cache the RoPE tail *in addition* to the named latent."""
+        assert mla_latent_dim(kv_lora_rank=512, qk_rope_head_dim=64) == 512
+
+    def test_v4_shape_carves_the_tail_out_of_head_dim(self):
+        """V4 has no kv_lora_rank; head_dim is the whole width."""
+        assert mla_latent_dim(head_dim=512, qk_rope_head_dim=64) == 448
+
+    def test_explicit_kv_lora_rank_wins_over_head_dim(self):
+        """When a config carries both, the named latent is authoritative."""
+        assert mla_latent_dim(kv_lora_rank=512, head_dim=56, qk_rope_head_dim=64) == 512
+
+    def test_degenerate_head_dim_is_not_carved(self):
+        """A head_dim at or below the tail width would go zero/negative."""
+        assert mla_latent_dim(head_dim=64, qk_rope_head_dim=64) == 64
+        assert mla_latent_dim(head_dim=32, qk_rope_head_dim=64) == 32
+
+    def test_unresolvable(self):
+        assert mla_latent_dim(qk_rope_head_dim=64) is None
+        assert mla_latent_dim() is None
+
+    def test_v4_width_matches_upstream_slot_geometry(self, deepseek_v4_config):
+        """End-to-end: the generic-dtype V4 estimate must equal head_dim * bytes.
+
+        Upstream's fp8 slot decomposes as 448 NoPE + 64 RoPE = 512 elements, so
+        a bf16 KV cache is 512 * 2 = 1024 B per token per layer before
+        compression.  Summed over the compressed layers that is 5,536 B/token —
+        adding the tail twice gives 6,228 (+12.5%).
+        """
+        info = extract_model_info(deepseek_v4_config)
+        got = mla_kv_bytes_per_token(
+            kv_dtype="bfloat16",
+            num_layers=info["num_layers"],
+            kv_lora_rank=info["kv_lora_rank"],
+            qk_rope_head_dim=info["qk_rope_head_dim"],
+            compress_ratios=info["compress_ratios"],
+            model_type=info["model_type"],
+        )
+        multiplier = 21 / 4 + 20 / 128  # 5.40625
+        assert got == pytest.approx(512 * 2.0 * multiplier)
+        assert got == pytest.approx(5536.0)
+
+    def test_fixed_slot_path_is_unaffected_by_the_latent(self, deepseek_v4_config):
+        """*_ds_mla short-circuits on the slot table before the latent is read."""
+        kwargs = dict(
+            num_layers=43,
+            compress_ratios=deepseek_v4_config["compress_ratios"],
+            model_type="deepseek_v4",
+            qk_rope_head_dim=64,
+        )
+        assert mla_kv_bytes_per_token(kv_dtype="nvfp4_ds_mla", kv_lora_rank=448, **kwargs) == pytest.approx(3157.25)
+        assert mla_kv_bytes_per_token(kv_dtype="nvfp4_ds_mla", kv_lora_rank=99999, **kwargs) == pytest.approx(3157.25)
+
+
+class TestDegenerateCompressRatios:
+    """A ratio list with nothing above 1 must not read as "0 GB of KV needed".
+
+    ``sum()`` over an empty generator is ``0``, which is not ``None`` — so the
+    unsizable guard would be skipped, ``kv_cache_total_gb`` would be 0.0, and
+    the falsy checks downstream would suppress the per-GPU KV and the context
+    budget too.  A zero claim passes every fit check, so the scheduler places a
+    workload that then OOMs — the one failure mode here that is worse than a
+    refused placement.
+    """
+
+    @pytest.mark.parametrize(
+        "ratios",
+        [
+            pytest.param([0] * 43, id="all-zero"),
+            pytest.param([1] * 43, id="all-one"),
+            pytest.param([0, 1, 0, 1, 1, 0], id="mixed-at-or-below-one"),
+            pytest.param([-4, 0, 1], id="negative"),
+        ],
+    )
+    def test_unsizable_rather_than_zero(self, ratios):
+        assert (
+            mla_kv_bytes_per_token(
+                kv_dtype="nvfp4_ds_mla",
+                num_layers=len(ratios),
+                compress_ratios=ratios,
+                model_type="deepseek_v4",
+            )
+            is None
+        )
+
+    def test_estimate_reports_it_instead_of_claiming_zero(self):
+        est = estimate_vram(
+            model_vram=340.0,
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=43,
+            compress_ratios=[0] * 43,
+            model_type="deepseek_v4",
+            max_model_len=1_048_576,
+        )
+        assert est.kv_cache_total_gb is None
+        assert est.kv_cache_per_token_bytes is None
+        assert not est.mla
+        assert any("Cannot size MLA KV cache" in w for w in est.warnings)
+
+    def test_one_compressed_layer_is_enough(self):
+        """The guard must not swallow a genuinely small but non-zero cache."""
+        got = mla_kv_bytes_per_token(
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=43,
+            compress_ratios=[0] * 42 + [128],
+            model_type="deepseek_v4",
+        )
+        assert got == pytest.approx(584 / 128)
+
+
+class TestUnsizableMlaWarningNamesTheCause:
+    """The warning must name the actual gap, not blame the dtype every time."""
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            pytest.param(
+                dict(kv_dtype="nvfp4_ds_mla", num_layers=43, compress_ratios=[0] * 43, model_type="deepseek_v4"),
+                "compress_ratios",
+                id="degenerate-ratios",
+            ),
+            pytest.param(dict(kv_dtype="bfloat16", num_layers=61, qk_rope_head_dim=64), "kv_lora_rank", id="no-latent"),
+            pytest.param(dict(kv_dtype="bogus_dtype", num_layers=61, kv_lora_rank=512), "unknown KV cache dtype", id="bad-dtype"),
+            pytest.param(dict(kv_dtype="fp8_ds_mla"), "num_layers", id="no-layers"),
+        ],
+    )
+    def test_reason_is_specific(self, kwargs, expected):
+        est = estimate_vram(model_vram=10.0, max_model_len=4096, **kwargs)
+        assert est.kv_cache_total_gb is None
+        assert any(expected in w for w in est.warnings), est.warnings
+
+
+class TestAuxiliaryCacheWarning:
+    """The estimate is a floor for sparse-attention models; say so.
+
+    Keying the warning on ``compress_ratios`` misses DeepSeek V3.2, which has a
+    sparse indexer but no per-layer compression — an under-estimate of roughly
+    20% delivered with no caveat at all.
+    """
+
+    def _estimate(self, info, **overrides):
+        kwargs = dict(
+            model_vram=340.0,
+            kv_dtype="fp8_ds_mla",
+            max_model_len=32768,
+            num_layers=info.get("num_layers"),
+            num_kv_heads=info.get("num_kv_heads"),
+            head_dim=info.get("head_dim"),
+            kv_lora_rank=info.get("kv_lora_rank"),
+            qk_rope_head_dim=info.get("qk_rope_head_dim"),
+            compress_ratios=info.get("compress_ratios"),
+            model_type=info.get("model_type"),
+            index_head_dim=info.get("index_head_dim"),
+        )
+        kwargs.update(overrides)
+        return estimate_vram(**kwargs)
+
+    def test_v32_warns_about_the_sparse_indexer(self, deepseek_v32_config):
+        info = extract_model_info(deepseek_v32_config)
+        assert info["index_head_dim"] == 128
+        warnings = self._estimate(info).warnings
+        assert any("sparse-indexer" in w for w in warnings), warnings
+        # V3.2 has no sliding-window cache, so the wording must not claim one.
+        assert not any("sliding-window" in w for w in warnings)
+
+    def test_v4_warns_about_both(self, deepseek_v4_config):
+        info = extract_model_info(deepseek_v4_config)
+        warnings = self._estimate(info, kv_dtype="nvfp4_ds_mla").warnings
+        assert any("sliding-window" in w and "sparse-indexer" in w for w in warnings), warnings
+        assert any("caches are not included" in w for w in warnings), warnings
+
+    def test_plain_mla_gets_no_spurious_warning(self, deepseek_v3_config):
+        """DeepSeek-V3 has no auxiliary cache — the estimate is complete."""
+        info = extract_model_info(deepseek_v3_config)
+        assert "index_head_dim" not in info
+        assert self._estimate(info).warnings == []
