@@ -68,7 +68,9 @@ def registry_list(ctx, show_disabled, only_show_visible, output_json, config_pat
     has_benchmarks = any(r.benchmark_subpath for r in display_registries)
 
     # Table header
-    header = f"{'Name':<25} {'URL':<45} {'Enabled':<9} {'Visible':<9} {'Trusted':<9}"
+    # "Stemless" is `visible`: whether a bare recipe stem resolves against this
+    # registry. A stemless=no registry is still reachable as @registry/name.
+    header = f"{'Name':<25} {'URL':<45} {'Enabled':<9} {'Stemless':<9} {'Trusted':<9}"
     sep_width = 98
     if has_tuning:
         header += f" {'Tuning':<8}"
@@ -297,7 +299,7 @@ def registry_show(ctx, name, config_path=None):
     if entry.description:
         click.echo("Description: %s" % entry.description)
     click.echo("Enabled:     %s" % ("yes" if entry.enabled else "no"))
-    click.echo("Visible:     %s" % ("yes" if entry.visible else "no"))
+    click.echo("Stemless:    %s" % ("yes" if entry.visible else "no"))
     click.echo("Trusted:     %s" % ("yes" if entry.trusted else "no"))
     if entry.tuning_subpath:
         click.echo("Tuning:      %s" % entry.tuning_subpath)
