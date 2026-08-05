@@ -128,6 +128,23 @@ class ExecutorConfig:
     For all non-NVIDIA values, ``gpus`` is ignored.
     """
 
+    gpu_access_mode: str = "cdi"
+    """How an NVIDIA GPU request is spelled on the container command line.
+
+    - ``"cdi"`` (default): Container Device Interface —
+      ``--device nvidia.com/gpu=<id>``.  Portable (Docker >= 25) and
+      *required* on daemons that reject ``--gpus`` (e.g. Thunder Compute),
+      but it depends on a valid, non-stale ``/etc/cdi/nvidia.yaml``.
+    - ``"gpus"``: the classic nvidia-container-runtime flag,
+      ``--gpus <gpus>``.
+
+    Resolved through the normal executor chain, so it can be pinned per
+    recipe / cluster / config; the platform tier
+    (:meth:`~sparkrun.platforms.base.HardwarePlatformPlugin.default_executor_config`)
+    supplies the per-hardware default — DGX Spark pins ``"gpus"``.  Only the
+    Docker executor consumes it (``gpus`` itself is what Local/K8s read).
+    """
+
     # Executor selector.  ``"docker"`` (default) uses
     # :class:`DockerExecutor`; ``"local"`` opts into the experimental
     # :class:`LocalExecutor` that runs the serve command as a native
@@ -178,7 +195,7 @@ class ExecutorConfig:
                 kwargs[key] = ext_parse_bool(v)
 
         # Plain (non-nullable) string fields — only forward when present.
-        for key in ("gpus", "ipc", "shm_size", "network"):
+        for key in ("gpus", "gpu_access_mode", "ipc", "shm_size", "network"):
             v = chain.get(key)
             if v is not None:
                 kwargs[key] = str(v)

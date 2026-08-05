@@ -34,20 +34,55 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _nvidia_gpu_args(gpus: str | None) -> list[str]:
-    """Request NVIDIA GPUs via CDI (Container Device Interface).
+#: ``gpu_access_mode`` — request GPUs via the Container Device Interface,
+#: ``--device nvidia.com/gpu=<id>``.
+GPU_ACCESS_CDI = "cdi"
 
-    Emits ``--device nvidia.com/gpu=<id>``.  CDI is the modern, portable path
-    (Docker >= 25): it works on DGX Spark (``nvidia-ctk`` auto-registers the
-    devices) and is *required* on environments whose custom docker rejects
-    ``--gpus`` (e.g. Thunder Compute).  Maps the legacy ``gpus`` value —
-    ``"all"`` → ``nvidia.com/gpu=all``; ``"device=0,1"`` / ``"0,1"`` → one
-    ``--device`` per id.
+#: ``gpu_access_mode`` — request GPUs via the classic nvidia-container-runtime
+#: flag, ``--gpus <spec>``.
+GPU_ACCESS_GPUS = "gpus"
+
+GPU_ACCESS_MODES = frozenset({GPU_ACCESS_CDI, GPU_ACCESS_GPUS})
+
+#: Used when ``gpu_access_mode`` is unset or unrecognised.  CDI is the portable
+#: choice and the only one some daemons accept (see :func:`_nvidia_gpu_args`);
+#: hardware that prefers ``--gpus`` says so at the platform tier.
+GPU_ACCESS_DEFAULT = GPU_ACCESS_CDI
+
+
+def _nvidia_gpu_args(gpus: str | None, mode: str | None = None) -> list[str]:
+    """Emit the NVIDIA GPU request flags for *gpus* in the given access *mode*.
+
+    Two spellings exist and neither works everywhere:
+
+    - :data:`GPU_ACCESS_CDI` — ``--device nvidia.com/gpu=<id>`` (Container
+      Device Interface).  The modern, portable path (Docker >= 25) and
+      *required* on environments whose custom docker rejects ``--gpus`` (e.g.
+      Thunder Compute).  It depends on a present, non-stale
+      ``/etc/cdi/nvidia.yaml`` — a versioned driver upgrade leaves the spec
+      pointing at paths that no longer exist and containers then fail to start,
+      which is why some GB10 hosts do better on the classic flag.
+    - :data:`GPU_ACCESS_GPUS` — ``--gpus <spec>``, the nvidia-container-runtime
+      flag.  Passes the value straight through.
+
+    Maps the ``gpus`` value for CDI — ``"all"`` → ``nvidia.com/gpu=all``;
+    ``"device=0,1"`` / ``"0,1"`` → one ``--device`` per id.
     """
     # Falsy gpus (None / "") means "no GPU request" — preserve that (byte-identical
     # to the legacy `if cfg.gpus:` guard) rather than forcing all GPUs.
     if not gpus:
         return []
+    resolved = (mode or GPU_ACCESS_DEFAULT).strip().lower()
+    if resolved not in GPU_ACCESS_MODES:
+        logger.warning(
+            "DockerExecutor: unknown gpu_access_mode %r — falling back to %r. Known: %s",
+            mode,
+            GPU_ACCESS_DEFAULT,
+            sorted(GPU_ACCESS_MODES),
+        )
+        resolved = GPU_ACCESS_DEFAULT
+    if resolved == GPU_ACCESS_GPUS:
+        return ["--gpus", quote(gpus)]
     spec = gpus.strip().strip('"')
     if not spec or spec == "all":
         return ["--device", "nvidia.com/gpu=all"]
@@ -129,6 +164,7 @@ DOCKER_DEFAULTS = {
     "restart_policy": None,
     "privileged": True,
     "gpus": "all",
+    "gpu_access_mode": GPU_ACCESS_DEFAULT,
     "ipc": "host",
     "shm_size": "32gb",
     "network": "host",
@@ -193,7 +229,9 @@ class DockerExecutor(Executor):
     def _accelerator_opts(self) -> list[str]:
         """Emit accelerator device flags based on ``config.accelerator_vendor``.
 
-        - ``None`` (default) or ``"nvidia"`` → CDI (``--device nvidia.com/gpu=…``).
+        - ``None`` (default) or ``"nvidia"`` → the GPU request spelled per
+          ``config.gpu_access_mode`` (CDI ``--device nvidia.com/gpu=…`` or
+          classic ``--gpus``).
         - ``"amd"`` → ROCm device + render-group flags.
         - ``"intel"`` → Intel Gaudi device flag.
         - ``"apple"`` / ``"cpu"`` → no device flag.  Apple MLX cannot
@@ -204,7 +242,7 @@ class DockerExecutor(Executor):
         vendor = (cfg.accelerator_vendor or "").lower()
 
         if not vendor or vendor == "nvidia":
-            return _nvidia_gpu_args(cfg.gpus)
+            return _nvidia_gpu_args(cfg.gpus, cfg.gpu_access_mode)
         if vendor == "amd":
             return [
                 "--device",

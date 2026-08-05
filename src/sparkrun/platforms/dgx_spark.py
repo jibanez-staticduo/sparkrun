@@ -39,6 +39,38 @@ _DGX_SPARK_RUNTIME_FLAGS: dict[str, dict[str, object]] = {
 }
 
 
+# Per-runtime container env defaults for GB10, keyed by runtime **family**
+# first (``get_family()``: ``"vllm"`` covers vllm-ray / vllm-distributed /
+# eugr-vllm) with exact ``runtime_name`` keys taking precedence.  Applied as the
+# lowest env tier, so a cluster / recipe / ``-e`` override always wins.
+#
+# ``expandable_segments`` lets PyTorch's caching allocator grow a segment in
+# place instead of reserving fixed-size blocks, which cuts the fragmentation
+# that GB10's unified memory makes expensive — the GPU's pool is shared with the
+# CPU/OS, so reserved-but-unused blocks are not free.  vLLM and SGLang are the
+# torch-allocator-bound runtimes; llama.cpp / TRT-LLM manage their own memory
+# and are deliberately left alone.
+_TORCH_EXPANDABLE_SEGMENTS = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+
+_DGX_SPARK_RUNTIME_ENV: dict[str, dict[str, str]] = {
+    "vllm": _TORCH_EXPANDABLE_SEGMENTS,
+    "sglang": _TORCH_EXPANDABLE_SEGMENTS,
+}
+
+
+# Per-executor config defaults for GB10.  DGX Spark pins the docker executor
+# back to the classic ``--gpus`` flag: CDI (``--device nvidia.com/gpu=all``) is
+# the portable default elsewhere, but on GB10 it depends on an
+# ``/etc/cdi/nvidia.yaml`` that goes stale across driver upgrades (the spec pins
+# versioned absolute paths), and a stale spec fails ``docker run`` outright.
+# ``--gpus`` resolves through the container runtime at launch instead, so it
+# survives driver churn.  Override per cluster/recipe/config with
+# ``executor_config.gpu_access_mode: cdi``.
+_DGX_SPARK_EXECUTOR_CONFIG: dict[str, dict[str, object]] = {
+    "docker": {"gpu_access_mode": "gpus"},
+}
+
+
 class DgxSparkPlatform(HardwarePlatformPlugin):
     """NVIDIA DGX Spark (GB10, ConnectX-7 RoCEv2 fabric)."""
 
@@ -58,10 +90,33 @@ class DgxSparkPlatform(HardwarePlatformPlugin):
     def default_image(self, runtime_name: str) -> str | None:
         return _DGX_SPARK_DEFAULTS.get(runtime_name)
 
+    def default_executor_config(self, executor_name: str) -> dict[str, object]:
+        """GB10 executor defaults (docker requests GPUs via ``--gpus``)."""
+        return dict(_DGX_SPARK_EXECUTOR_CONFIG.get(executor_name, {}))
+
     def default_runtime_flags(self, runtime_name: str, accelerator: AcceleratorSpec) -> dict[str, object]:
         """GB10 recipe-flag defaults (e.g. ``mmap: False`` for llama.cpp)."""
         if accelerator.vendor == "nvidia" and accelerator.model == "gb10":
             return dict(_DGX_SPARK_RUNTIME_FLAGS.get(runtime_name, {}))
+        return {}
+
+    def default_env(
+        self,
+        runtime_name: str,
+        accelerator: AcceleratorSpec,
+        *,
+        runtime_family: str | None = None,
+    ) -> dict[str, str]:
+        """GB10 container env defaults (torch expandable segments for vLLM/SGLang).
+
+        An exact ``runtime_name`` entry wins over the family entry, so a single
+        variant can opt out or differ without disturbing the rest of its family.
+        """
+        if not (accelerator.vendor == "nvidia" and accelerator.model == "gb10"):
+            return {}
+        for key in (runtime_name, runtime_family):
+            if key and key in _DGX_SPARK_RUNTIME_ENV:
+                return dict(_DGX_SPARK_RUNTIME_ENV[key])
         return {}
 
     def default_max_gpu_memory_utilization(self, accelerator: AcceleratorSpec) -> float | None:

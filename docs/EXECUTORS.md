@@ -22,8 +22,13 @@ point. It layers (highest priority first):
    auto_user=)`. Docker reads these here; Local/K8s ignore.
 6. **Runtime executor-config defaults** — `runtime.default_executor_config()` (`{}` by default; runtimes can set overridable executor defaults).
 7. **`SparkrunConfig`** — `config.default_executor` + `config.executor_config`.
-8. **Per-executor defaults** — `cls.default_config()` (e.g. `DOCKER_DEFAULTS`).
-9. **Dataclass field defaults** — `ExecutorConfig` declares the floor.
+8. **Platform** — `platform.default_executor_config(<name>)` for the platform
+   resolved from the launching host's hardware (`host_hardware=`, the head
+   node's). Hardware-conditional container plumbing that should still lose to
+   anything the user wrote — e.g. DGX Spark pins `gpu_access_mode: gpus`.
+   Dropped entirely when no hardware is threaded (naming / teardown / log paths).
+9. **Per-executor defaults** — `cls.default_config()` (e.g. `DOCKER_DEFAULTS`).
+10. **Dataclass field defaults** — `ExecutorConfig` declares the floor.
 
 A selector that is unknown — or names a real executor whose feature flag is
 off — raises `ExecutorUnavailableError` naming the flag to enable. Resolution
@@ -74,7 +79,8 @@ lists. Falsy values fall through to the dataclass defaults.
 | `auto_remove`         | bool        | Docker              | `True`        | Adds `--rm`. Force-flipped to `False` when `restart_policy` is set.                            |
 | `restart_policy`      | str?        | Docker              | `None`        | Docker `--restart` value.                                                                      |
 | `privileged`          | bool        | Docker              | `True`        | Off in rootless mode.                                                                          |
-| `gpus`                | str         | Docker, Local, K8s  | `"all"`       | Docker emits `--gpus`. Local translates `device=0,2` → `CUDA_VISIBLE_DEVICES`. K8s extracts a count for `nvidia.com/gpu`. |
+| `gpus`                | str         | Docker, Local, K8s  | `"all"`       | The GPU spec. Docker spells it per `gpu_access_mode`. Local translates `device=0,2` → `CUDA_VISIBLE_DEVICES`. K8s extracts a count for `nvidia.com/gpu`. |
+| `gpu_access_mode`     | str         | Docker              | `"cdi"`       | `cdi` → `--device nvidia.com/gpu=<id>`; `gpus` → `--gpus <gpus>`. Platform-defaulted (DGX Spark pins `gpus`). |
 | `ipc`                 | str         | Docker              | `"host"`      | `--ipc=host`. K8s drops.                                                                       |
 | `shm_size`            | str         | Docker              | `"25gb"`      | `--shm-size`. K8s drops.                                                                       |
 | `network`             | str         | Docker              | `"host"`      | `--network`. K8s drops.                                                                        |
@@ -126,10 +132,41 @@ lists. Falsy values fall through to the dataclass defaults.
 
 | Vendor      | Flags                                                              |
 |-------------|--------------------------------------------------------------------|
-| `nvidia`/None | `--gpus <gpus>`                                                  |
+| `nvidia`/None | per `gpu_access_mode` — see below                                |
 | `amd`         | `--device /dev/kfd --device /dev/dri --group-add video`           |
 | `intel`       | `--device /dev/accel`                                             |
 | `apple`/`cpu` | (none — route to a non-Docker executor)                           |
+
+### NVIDIA GPU access mode
+
+There are two ways to ask Docker for NVIDIA GPUs and neither works everywhere,
+so `gpu_access_mode` selects between them:
+
+| Mode           | Flags for `gpus: all`          | Flags for `gpus: device=0,1`                                       |
+|----------------|--------------------------------|---------------------------------------------------------------------|
+| `cdi` (default) | `--device nvidia.com/gpu=all` | `--device nvidia.com/gpu=0 --device nvidia.com/gpu=1`               |
+| `gpus`          | `--gpus all`                  | `--gpus device=0,1` (value passed through verbatim)                 |
+
+A falsy `gpus` still means "no GPU request" in both modes. An unrecognised mode
+warns and falls back to `cdi`.
+
+CDI (Container Device Interface, Docker >= 25) is the portable path and is
+*required* on daemons that reject `--gpus` (e.g. Thunder Compute), but it
+depends on a present, non-stale `/etc/cdi/nvidia.yaml` — the spec pins versioned
+absolute paths, so a driver upgrade can leave it dangling and containers then
+fail to start (`sparkrun setup check` flags this). `--gpus` resolves through the
+container runtime at launch instead.
+
+The default comes from the resolved hardware platform
+(`HardwarePlatformPlugin.default_executor_config("docker")`), which sits just
+above `DOCKER_DEFAULTS` in the chain: **DGX Spark / GB10 pins `gpus`**, every
+other platform inherits `cdi`. Override anywhere higher — recipe, cluster, or
+`config.yaml`:
+
+```yaml
+executor_config:
+  gpu_access_mode: cdi
+```
 
 ## `LocalExecutor` (experimental)
 

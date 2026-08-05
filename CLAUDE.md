@@ -151,6 +151,27 @@ stay in-process (not SAF-scanned) because their resolution is **order-sensitive*
 (most-specific `matches()` first) — transports, which select by exact name, moved
 onto SAF; platforms did not.
 
+**Platform default tiers.** A platform publishes hardware-conditional defaults
+through five hooks, each folded in at a different layer so anything the user
+wrote always wins:
+
+| Hook                                   | Scope                        | Folded in by                                              |
+|----------------------------------------|------------------------------|-----------------------------------------------------------|
+| `default_image(runtime)`               | container image              | `RuntimePlugin.default_image_for()`                        |
+| `default_runtime_flags(runtime, accel)`| recipe `defaults` (serve flags) | `launcher.apply_platform_runtime_flag_defaults` (`setdefault`) |
+| `default_env(runtime, accel, family=)` | container env                | `launcher.resolve_platform_env_defaults` (lowest env tier) |
+| `default_executor_config(executor)`    | `ExecutorConfig`             | `executor.resolve_executor(host_hardware=…)`, layer 9      |
+| `default_max_gpu_memory_utilization`   | usable-memory cap            | `core.limits`                                              |
+
+All are keyed off the **head host's** hardware — one image / serve command /
+executor is built per launch, so a representative host is the right scope.
+`default_env` receives the runtime *family* (`get_family()`, e.g. `"vllm"` for
+vllm-ray / vllm-distributed / eugr-vllm) alongside the exact name, so a platform
+can target a family without enumerating variants; exact name wins over family.
+Today DGX Spark uses this for `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+on vllm/sglang and `gpu_access_mode: gpus` (classic `--gpus` rather than CDI,
+whose `/etc/cdi/nvidia.yaml` goes stale across driver upgrades).
+
 ### External Plugins (`core/external_plugins.py`)
 
 Out-of-tree plugins (private executors, transports, runtimes, …) load from

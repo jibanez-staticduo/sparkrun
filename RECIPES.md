@@ -92,6 +92,21 @@ On DGX Spark (1 GPU per node), `tensor_parallel: N` = N hosts.
 > references there resolve at launch time from that file only, never from
 > `os.environ`, so secrets stay out of both the recipe and the cluster YAML.
 
+**Container env tiers** (highest priority first):
+
+1. Recipe `env` — including `-o env.FOO=bar` on the CLI, which is written into it.
+2. Cluster `env` / `env_file`.
+3. **Platform** — `HardwarePlatformPlugin.default_env(runtime_name, accelerator,
+   runtime_family=…)`, targeted at platform × runtime × accelerator. Today
+   DGX Spark (GB10) sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for
+   the `vllm` and `sglang` families, which reduces allocator fragmentation on
+   GB10's unified memory. Runtimes that manage their own memory (llama.cpp,
+   TRT-LLM) are untargeted. Because this is a *tier* rather than a default
+   written into the recipe, you can override it with any value — including an
+   empty one (`-o env.PYTORCH_CUDA_ALLOC_CONF=`).
+
+Below all of these sit the runtime's own `get_common_env()` / cluster env.
+
 ### Metadata
 
 Informational fields for VRAM estimation, display, and search. Not passed to runtime.
@@ -357,7 +372,8 @@ executor_config:
 | `auto_remove`    | bool   | `true`      | `--rm`         | Remove container on exit                                                                                            |
 | `restart_policy` | string | `null`      | `--restart`    | `always`, `unless-stopped`, `on-failure:N`. **Mutually exclusive with `auto_remove`** — forces `auto_remove: false` |
 | `privileged`     | bool   | `true`      | `--privileged` | Privileged mode                                                                                                     |
-| `gpus`           | string | `"all"`     | `--gpus`       | GPU device spec                                                                                                     |
+| `gpus`           | string | `"all"`     | (see below)    | GPU device spec (`all`, `device=0,1`)                                                                               |
+| `gpu_access_mode`| string | platform    | `--device` / `--gpus` | How the GPU request is spelled: `cdi` → `--device nvidia.com/gpu=<id>`, `gpus` → `--gpus <gpus>`. Defaults per hardware platform (DGX Spark/GB10 → `gpus`, everything else → `cdi`) |
 | `ipc`            | string | `"host"`    | `--ipc`        | IPC namespace                                                                                                       |
 | `shm_size`       | string | `"10.24gb"` | `--shm-size`   | Shared memory size                                                                                                  |
 | `network`        | string | `"host"`    | `--network`    | Network mode                                                                                                        |
