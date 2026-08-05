@@ -304,6 +304,15 @@ class RuntimePlugin(Plugin):
            (1-GPU-per-host topologies).
         3. *head_ip* as final fallback (unit-test / solo paths).
 
+        Every source must already speak the selected *init* network — the
+        returned value is advertised to remote workers as a rendezvous
+        address, so a cluster-config identifier like ``127.0.0.1`` points
+        each worker at its own loopback.  ``head_ip`` and ``hosts`` are
+        resolved by ``_cluster_ops.resolve_hosts_for_init`` +
+        ``_init_network.select_init_network``; ``placement``, which the
+        scheduler emits with raw cluster-config hosts, must be passed
+        through ``_init_network.remap_placement_addresses`` first.
+
         Args:
             head_ip: The cluster head node IP.
             node_rank: Global rank for this node.
