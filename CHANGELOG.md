@@ -6,6 +6,38 @@ follows semantic versioning.
 
 For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md).
 
+## [Unreleased]
+
+### Added
+
+- `run-recipe.sh` shim: `-v/--volume LOCAL:CONTAINER` (repeatable), matching
+  spark-vllm-docker upstream. It maps to `--executor-args "-v ..."`, which the
+  docker executor shlex-splits back into the `docker run` argv. As upstream, it
+  applies to both solo and multi-node runs (unlike `-p/--publish`, solo-only).
+- `tests/test_run_recipe_shim.py` — argv-mapping coverage for the shim, driven
+  through its `RUN_RECIPE_DEBUG=1` hook.
+- eugr builder: support for `build-and-copy.sh`'s `--exp-b12x` /
+  `--experimental-b12x` preset. As upstream, it does not set
+  `CUSTOM_BUILD_REQUESTED`, so on its own it only changes *which* prebuilt image
+  is pulled: a nightly `:latest` sentinel (or a missing non-pullable eugr image)
+  resolves to `ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:latest` — sparkrun's
+  mirror of upstream's `eugr/spark-vllm-b12x:latest` — instead of the standard
+  nightly. Naming a b12x prebuilt image selects the variant the same way. With a
+  custom build flag alongside it the build runs under the `sparkrun-eugr-vllm-b12x`
+  local tag (upstream tags `vllm-node-b12x`) and the flag is forwarded verbatim.
+  Long-term image pinning resolves against the `nightly-b12x` variant.
+
+### Changed
+
+- `run-recipe.sh` shim: `--ray`/`--no-ray` combined with `--solo` now warn and
+  are ignored instead of erroring, matching upstream's
+  `use_ray = args.ray and not is_solo`. The flags are recorded during parsing
+  and resolved afterwards, so a trailing `--solo` suppresses them too.
+- `run-recipe.sh` shim: `--earlyoom` / `--earlyoom-args` are now rejected with
+  the standard "not supported" pointer rather than a bare "unknown option"
+  error. sparkrun runs the server as the container foreground process, so there
+  is no earlyoom supervisor to substitute.
+
 ## [0.3.0] — 2026-07-30
 
 The largest release since 0.1: multiplatform foundations, a console-free

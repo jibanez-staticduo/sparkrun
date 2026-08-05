@@ -175,6 +175,11 @@ def sync_resource_to_hosts(
 ) -> list[str]:
     """Run a sync script on all hosts in parallel and return failures.
 
+    The script runs under the session guard
+    (:func:`~sparkrun.orchestration.ssh.wrap_with_session_guard`): every caller
+    here is a model download or image pull, which must not keep running on the
+    hosts after the launch that started it was killed.
+
     Args:
         script: Pre-formatted bash script to execute on each host.
         hosts: Target hostnames or IPs.
@@ -192,6 +197,7 @@ def sync_resource_to_hosts(
         ssh_user=ssh_user,
         ssh_key=ssh_key,
         dry_run=dry_run,
+        session_guard=True,
     )
 
     failed = [r.host for r in results if not r.success]

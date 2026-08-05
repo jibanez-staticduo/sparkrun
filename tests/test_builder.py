@@ -622,6 +622,153 @@ class TestEugrPrepareImage:
         assert result == "eugr/spark-vllm:latest"
 
 
+class TestEugrB12x:
+    """`--exp-b12x` / `--experimental-b12x` — build-and-copy.sh's b12x preset.
+
+    Upstream the flag swaps the vLLM fork/ref + Torch family and points
+    PREBUILT_RUNNER_IMAGE at ``eugr/spark-vllm-b12x:latest``, without setting
+    CUSTOM_BUILD_REQUESTED — so on its own it still *pulls*. sparkrun mirrors that:
+    the variant applies to both the pulled nightly and the local build tag, and the
+    flag is forwarded to the script like any other.
+    """
+
+    B12X_LATEST = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:latest"
+
+    @staticmethod
+    def _config(tmp_path):
+        config = mock.Mock()
+        config.cache_dir = tmp_path
+        config.get_defaults_builder = mock.Mock(return_value={})
+        return config
+
+    @pytest.mark.parametrize("flag", ["--exp-b12x", "--experimental-b12x"])
+    @pytest.mark.parametrize(
+        "sentinel_image",
+        [
+            "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest",
+            "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5:latest",
+            "eugr/spark-vllm:latest",
+            "docker.io/eugr/spark-vllm:latest",
+        ],
+    )
+    def test_sentinel_maps_to_b12x_nightly(self, eugr_builder_with_repo, tmp_path, sentinel_image, flag):
+        """Both spellings redirect every sentinel to the b12x nightly — pulled, never built."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": sentinel_image,
+                "runtime_config": {"build_args": [flag]},
+            }
+        )
+
+        with mock.patch.object(builder, "ensure_repo") as mock_ensure:
+            with mock.patch("sparkrun.builders.eugr._run_build_capturing") as mock_build:
+                with mock.patch.object(builder, "_verify_image_imports") as mock_verify:
+                    result = builder.prepare_image(sentinel_image, recipe, ["10.0.0.1"], config=self._config(tmp_path))
+
+        assert result == self.B12X_LATEST
+        mock_ensure.assert_not_called()
+        mock_build.assert_not_called()
+        mock_verify.assert_not_called()
+
+    def test_missing_non_pullable_image_substitutes_b12x(self, eugr_builder_with_repo, tmp_path):
+        """The pull-first substitution for a missing eugr image honors the b12x selector."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": "vllm-node",
+                "runtime_config": {"build_args": ["--exp-b12x"]},
+            }
+        )
+
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
+            with mock.patch.object(builder, "ensure_repo") as mock_ensure:
+                with mock.patch("sparkrun.builders.eugr._run_build_capturing") as mock_build:
+                    result = builder.prepare_image("vllm-node", recipe, ["10.0.0.1"], config=self._config(tmp_path))
+
+        assert result == self.B12X_LATEST
+        mock_ensure.assert_not_called()
+        mock_build.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "extra_flag",
+        [
+            "--rebuild-vllm",
+            # Upstream rejects this pairing (b12x vLLM wheels aren't published);
+            # sparkrun forwards both flags and lets the script own that verdict.
+            "--use-wheels",
+        ],
+    )
+    def test_b12x_build_uses_b12x_local_tag_and_forwards_flag(self, eugr_builder_with_repo, tmp_path, extra_flag):
+        """With a custom build flag alongside it, b12x builds under its own local tag.
+
+        `--exp-b12x` is a real build-and-copy.sh flag — it must reach the script argv
+        (it selects the fork/ref the image is built from), and the result must not
+        overwrite the standard nightly's local tag.
+        """
+        builder, repo_dir = eugr_builder_with_repo
+        sentinel = "ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest"
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": sentinel,
+                "runtime_config": {"build_args": ["--exp-b12x", extra_flag]},
+            }
+        )
+
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
+            with mock.patch.object(builder, "ensure_repo", return_value=repo_dir):
+                with mock.patch("sparkrun.builders.eugr._run_build_capturing", return_value=(0, "")) as mock_build:
+                    with mock.patch.object(builder, "_can_skip_build", return_value=False):
+                        with mock.patch.object(builder, "_verify_image_imports"):
+                            with mock.patch.object(builder, "_save_build_metadata"):
+                                result = builder.prepare_image(sentinel, recipe, ["10.0.0.1"], config=self._config(tmp_path))
+
+        assert result == "sparkrun-eugr-vllm-b12x"
+        cmd = mock_build.call_args[0][0]
+        assert "--exp-b12x" in cmd
+        assert extra_flag in cmd
+        assert "sparkrun-eugr-vllm-b12x" in cmd
+
+    @pytest.mark.parametrize(
+        "b12x_image",
+        [
+            "ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:latest",
+            # build-and-copy.sh's PREBUILT_B12X_RUNNER_IMAGE, short and qualified.
+            "eugr/spark-vllm-b12x:latest",
+            "docker.io/eugr/spark-vllm-b12x:latest",
+        ],
+    )
+    def test_b12x_image_selects_the_variant_without_the_flag(self, eugr_builder_with_repo, tmp_path, b12x_image):
+        """Naming a b12x prebuilt image resolves to our b12x nightly, flag or not."""
+        builder, repo_dir = eugr_builder_with_repo
+        recipe = Recipe.from_dict(
+            {
+                "name": "test",
+                "model": "some/model",
+                "runtime": "eugr-vllm",
+                "container": b12x_image,
+            }
+        )
+
+        with mock.patch("sparkrun.containers.registry.image_exists_locally", return_value=False):
+            with mock.patch.object(builder, "ensure_repo") as mock_ensure:
+                with mock.patch("sparkrun.builders.eugr._run_build_capturing") as mock_build:
+                    result = builder.prepare_image(b12x_image, recipe, ["10.0.0.1"], config=self._config(tmp_path))
+
+        assert result == self.B12X_LATEST
+        mock_ensure.assert_not_called()
+        mock_build.assert_not_called()
+
+
 class TestEugrRebuild:
     """`builder_config.rebuild` — force a fresh image (rebuild or fresh pull)."""
 

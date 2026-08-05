@@ -13,10 +13,10 @@ from typing import Any, TYPE_CHECKING, Optional
 import yaml
 
 from vpd.next.util import read_yaml
-from vpd.legacy.arguments import arg_substitute
 from scitrera_app_framework.api import Variables, EnvPlacement
 
 from sparkrun.core.layout import RecipeLayout
+from sparkrun.utils.text import mask_non_placeholder_braces, render_template, unmask_braces, uses_brace_escapes
 
 if TYPE_CHECKING:
     from sparkrun.core.registry import RegistryManager
@@ -29,14 +29,6 @@ logger = logging.getLogger(__name__)
 # an escaped space — a common YAML editing mistake that silently breaks
 # multi-line commands.
 _TRAILING_SPACE_CONTINUATION_RE = re.compile(r"\\ +\n")
-
-# v1 brace-escape masking (see _mask_brace_escapes).  The sentinels are control
-# characters YAML 1.2 forbids in scalar content, so they cannot collide with
-# anything a recipe or an override value can legitimately carry.
-_LBRACE_SENTINEL = "\x00"
-_RBRACE_SENTINEL = "\x01"
-_LBRACE_RUN_RE = re.compile(r"\{+")
-_RBRACE_RUN_RE = re.compile(r"\}+")
 
 _RAY_BACKEND_RE = re.compile(r"--distributed-executor-backend\s+ray\b")
 _CMD_VLLM_RE = re.compile(r"^vllm\s+serve\b")
@@ -204,11 +196,11 @@ class DistributionConfig:
 
         for entry in self.models.entries:
             if isinstance(entry, DistributionModelEntry):
-                entry.name = arg_substitute(entry.name, config_chain)
+                entry.name = render_template(entry.name, config_chain)
 
         for entry in self.containers.entries:
             if isinstance(entry, DistributionContainerEntry):
-                entry.name = arg_substitute(entry.name, config_chain)
+                entry.name = render_template(entry.name, config_chain)
 
         return self
 
@@ -347,53 +339,39 @@ def _resolve_runtime_from_command_hint(recipe: Recipe) -> None:
 def _collapse_brace_escapes(value: str) -> str:
     """Collapse vpd-style brace escapes (``{{`` -> ``{``, ``}}`` -> ``}``).
 
-    v1 (eugr) recipes double their braces so a literal ``{`` survives vpd
+    Recipes double their braces so a literal ``{`` survives vpd
     ``{placeholder}`` substitution — e.g. a JSON-valued flag written as
     ``--diffusion-config '{{"canvas_length": 256}}'``.  Once substitution has
     run, the doubled braces are collapsed back to single braces, matching
     eugr's own ``run-recipe.sh``.
 
+    A value not written in that convention is returned untouched.  Collapsing
+    unconditionally would rewrite the ``}}`` that merely closes nested plain
+    JSON (``{"a":{"b":1}}``), dropping a brace from a value that was already
+    correct.
+
     Used for *values* (recipe defaults), which are never placeholder templates
     themselves.  Command templates go through :func:`_mask_brace_escapes` /
     :func:`_unmask_brace_escapes` instead, which survive substitution.
     """
+    if not uses_brace_escapes(value):
+        return value
     return value.replace("{{", "{").replace("}}", "}")
 
 
 def _mask_brace_escapes(value: str) -> str:
-    """Replace v1 ``{{``/``}}`` escapes with sentinels so substitution can't see them.
+    """Hide ``{{``/``}}`` escapes (and other literal braces) from substitution.
 
-    Collapsing escapes *after* substitution is not enough: vpd's placeholder
-    regex is ``\\{(.*?)\\}``, so the leading brace of a ``{{`` escape opens a
-    match that runs to the first ``}`` — swallowing any placeholder nested
-    inside the escaped span.  ``'{{"n":{tokens}}}'`` therefore matches as one
-    bogus key and ``{tokens}`` is never substituted.  Masking first leaves the
-    escaped braces invisible to the regex, so only real placeholders match.
-
-    Brace runs are paired from the side away from the placeholder name, which
-    is what disambiguates an odd-length run:
-
-    - ``{`` runs pair left-to-right, so ``{{{k}`` is a literal ``{`` followed
-      by the placeholder ``{k}``.
-    - ``}`` runs pair right-to-left, so ``{k}}}`` is the placeholder ``{k}``
-      followed by a literal ``}`` (the DeepSeek ``--speculative-config`` shape,
-      where a placeholder ends a JSON object).
+    Thin wrapper over :func:`sparkrun.utils.text.mask_non_placeholder_braces`,
+    which is shared with lifecycle-hook rendering so both paths treat braces
+    identically.  See that function for the scan rules.
     """
-
-    def _mask_open(m: re.Match) -> str:
-        pairs, odd = divmod(len(m.group()), 2)
-        return _LBRACE_SENTINEL * pairs + "{" * odd
-
-    def _mask_close(m: re.Match) -> str:
-        pairs, odd = divmod(len(m.group()), 2)
-        return "}" * odd + _RBRACE_SENTINEL * pairs
-
-    return _RBRACE_RUN_RE.sub(_mask_close, _LBRACE_RUN_RE.sub(_mask_open, value))
+    return mask_non_placeholder_braces(value, escapes=True)
 
 
 def _unmask_brace_escapes(value: str) -> str:
-    """Restore :func:`_mask_brace_escapes` sentinels as single literal braces."""
-    return value.replace(_LBRACE_SENTINEL, "{").replace(_RBRACE_SENTINEL, "}")
+    """Restore :func:`_mask_brace_escapes` sentinels as literal braces."""
+    return unmask_braces(value)
 
 
 def _resolve_v1_migration(recipe: Recipe) -> None:
@@ -403,11 +381,34 @@ def _resolve_v1_migration(recipe: Recipe) -> None:
     if recipe.runtime in ("vllm", ""):
         if not recipe.builder:
             recipe.builder = "eugr"
-        # v1 recipes may escape literal braces as '{{'/'}}' in defaults values
-        # (e.g. a JSON-valued flag default).  Collapse them for string values
-        # only; non-string defaults (numeric port, max_num_seqs,
-        # gpu_memory_utilization, ...) are passed through untouched.
-        recipe.defaults = {k: (_collapse_brace_escapes(v) if isinstance(v, str) else v) for k, v in recipe.defaults.items()}
+
+
+def _resolve_brace_escapes(recipe: Recipe) -> None:
+    """Collapse ``{{``/``}}`` escapes in defaults values, for every recipe version.
+
+    A recipe may escape literal braces in a *value* as well as in the command
+    template (e.g. a JSON-valued flag supplied as a default).  Collapse them
+    for string values only; non-string defaults (numeric port, max_num_seqs,
+    gpu_memory_utilization, ...) are passed through untouched — the regression
+    behind the ``'int' object has no attribute 'replace'`` crash in issue #213.
+
+    Gated on the *value* rather than on ``recipe_version``, matching
+    :meth:`Recipe.render_command`.  This previously lived inside
+    ``_resolve_v1_migration``, so it reached only v1 recipes whose runtime was
+    vllm — a v2 (or v1 sglang) recipe leaked ``{{...}}`` into the rendered
+    command, one layer below the same bug the command template had.
+    """
+    escaped = sorted(k for k, v in recipe.defaults.items() if isinstance(v, str) and uses_brace_escapes(v))
+    if escaped and recipe.recipe_version != "1":
+        logger.warning(
+            "Recipe '%s' declares recipe_version '%s' but these defaults use the v1 doubled-brace escape "
+            "('{{' / '}}'): %s. Write literal braces plainly instead. The escape is honored for now but will not "
+            "be supported by v3 recipes.",
+            recipe.name,
+            recipe.recipe_version,
+            ", ".join(escaped),
+        )
+    recipe.defaults = {k: (_collapse_brace_escapes(v) if isinstance(v, str) else v) for k, v in recipe.defaults.items()}
 
 
 def _resolve_eugr_signals(recipe: Recipe) -> None:
@@ -444,6 +445,7 @@ def _resolve_vllm_variant(recipe: Recipe) -> None:
 _RECIPE_RESOLVERS = [
     _resolve_runtime_from_command_hint,
     _resolve_v1_migration,
+    _resolve_brace_escapes,
     _resolve_eugr_signals,
     _resolve_vllm_variant,
 ]
@@ -1057,26 +1059,36 @@ class Recipe:
 
         rendered = self.command.strip()
 
-        # v1 (eugr) recipes escape literal braces as '{{'/'}}' so they survive
-        # the {placeholder} substitution below (e.g. JSON-valued flags like
-        # --diffusion-config '{{...}}').  Mask them to sentinels *first* so the
-        # escaped braces are invisible to vpd's placeholder regex — otherwise
-        # an escaped span swallows any placeholder nested inside it — then
-        # restore them as single literal braces once substitution is done, so
-        # the runtime receives valid JSON rather than doubled braces.
-        escaped = self.recipe_version == "1"
-        if escaped:
-            rendered = _mask_brace_escapes(rendered)
+        # Literal braces are masked to sentinels *first* so they are invisible
+        # to vpd's placeholder regex — otherwise a JSON-valued flag swallows any
+        # placeholder nested inside it — then restored once substitution is
+        # done, so the runtime receives valid JSON.  Substitution iterates to
+        # resolve nested references.
+        #
+        # Escape mode is read off the *template*, not the recipe version.  It
+        # used to be `recipe_version == "1"`, so a v1 command pasted into a v2
+        # recipe emitted literal '{{...}}' to the runtime — a launch that dies
+        # on the serve command after the model has downloaded, with an error
+        # naming neither sparkrun nor the recipe.  Forcing escapes on for every
+        # version is *not* the fix: '}}' closes nested plain JSON
+        # ('{"a":{"b":1}}') as often as it escapes one brace, so it would
+        # silently eat a closing brace from the idiomatic v2 spelling.  '{{' is
+        # the disambiguator (see utils.text.uses_brace_escapes).
+        escapes = uses_brace_escapes(rendered)
+        if escapes and self.recipe_version != "1":
+            logger.warning(
+                "Recipe '%s' declares recipe_version '%s' but its command template uses the doubled-brace escape "
+                "('{{' / '}}'), which is the v1 convention — usually a command pasted from a v1 recipe. Write literal "
+                "braces plainly instead ('--flag '%s''); a placeholder nested inside JSON still resolves. The escape "
+                "is honored for now but will not be supported by v3 recipes.",
+                self.name,
+                self.recipe_version,
+                '{"key": "value"}',
+            )
 
-        # Use vpd arg_substitute for {placeholder} replacement
-        # Iterate to handle nested substitutions
-        last = None
-        while last != rendered:
-            last = rendered
-            rendered = arg_substitute(rendered, config_chain)
-
-        if escaped:
-            rendered = _unmask_brace_escapes(rendered)
+        # Hook templates deliberately stay unescaped (see
+        # sparkrun.orchestration.hooks.render_hook_command).
+        rendered = render_template(rendered, config_chain, escapes=escapes)
 
         # Fix trailing spaces after backslash line-continuations.
         # ``\<space><newline>`` → ``\<newline>``
