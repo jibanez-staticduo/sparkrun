@@ -156,6 +156,68 @@ def test_v1_migration_preserves_non_string_defaults():
     assert r2.defaults["diffusion_config"] == '{"canvas_length": 256}'
 
 
+def test_defaults_brace_escapes_collapse_for_v2():
+    """The defaults collapse is not gated on recipe version either.
+
+    It used to live inside ``_resolve_v1_migration``, so a v2 recipe supplying
+    a JSON-valued flag as a *default* leaked ``{{...}}`` into the rendered
+    command — the same failure as the command template, one layer down.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v2-defaults",
+            "model": "m",
+            "runtime": "vllm",
+            "defaults": {"spec": '{{"a":1}}', "port": 8000},
+            "command": "vllm serve m --spec '{spec}'",
+        }
+    )
+
+    assert recipe.defaults["spec"] == '{"a":1}'
+    assert recipe.defaults["port"] == 8000  # non-strings still pass through
+    assert "--spec '{\"a\":1}'" in recipe.render_command(recipe.build_config_chain({}))
+
+
+def test_defaults_plain_nested_json_is_not_collapsed():
+    """A default already written with plain braces is left alone.
+
+    ``.replace("}}", "}")`` fires on any doubled closer, so collapsing
+    unconditionally would drop the outer brace of nested JSON that was correct
+    to begin with.
+    """
+    for version in ("1", "2"):
+        recipe = Recipe.from_dict(
+            {
+                "name": f"v{version}-plain-defaults",
+                "model": "m",
+                "recipe_version": version,
+                "runtime": "vllm",
+                "defaults": {"spec": '{"a":{"b":1}}'},
+            }
+        )
+
+        assert recipe.defaults["spec"] == '{"a":{"b":1}}', version
+
+
+def test_defaults_brace_escapes_collapse_for_non_vllm_runtime():
+    """The collapse no longer depends on the runtime being vllm.
+
+    ``_resolve_v1_migration`` only reached the collapse when the runtime was
+    ``vllm`` or empty, so a v1 sglang recipe kept its doubled braces.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-sglang",
+            "model": "m",
+            "recipe_version": "1",
+            "runtime": "sglang",
+            "defaults": {"spec": '{{"a":1}}'},
+        }
+    )
+
+    assert recipe.defaults["spec"] == '{"a":1}'
+
+
 def test_recipe_from_dict(sample_v2_recipe_data: dict[str, Any]):
     """Create a recipe from a dict and verify all fields are correctly set.
 
@@ -596,8 +658,7 @@ def test_render_command_v1_unknown_placeholder_is_left_verbatim():
 def test_render_command_v2_substitutes_placeholder_inside_bare_json():
     """A v2 recipe may write JSON with plain braces and a placeholder inside.
 
-    v2 has no ``{{`` escaping convention — ``RECIPES.md`` documents only
-    ``{key}`` — so a JSON-valued flag is written with single braces.  vpd's
+    Plain braces are the idiomatic v2 spelling — no escaping needed.  vpd's
     regex matches from the JSON's opening brace through the placeholder's
     closing brace, so the placeholder was left unsubstituted and the runtime
     received a literal ``{num_speculative_tokens}``.
@@ -615,6 +676,31 @@ def test_render_command_v2_substitutes_placeholder_inside_bare_json():
 
     assert '--speculative-config \'{"method":"mtp","n":2}\'' in rendered
     assert "{num_speculative_tokens}" not in rendered
+
+
+def test_render_command_nested_plain_json_survives_escape_capable_render():
+    """A trailing ``}}`` that merely closes nested JSON must not be collapsed.
+
+    This is why escape mode is detected from ``{{`` rather than forced on for
+    every recipe: ``'{"a":{"b":1}}'`` ends in ``}}`` exactly like an escaped
+    span does, so a blanket collapse silently eats the outer closing brace and
+    hands the runtime unparseable JSON.
+    """
+    for version in ("1", "2"):
+        recipe = Recipe.from_dict(
+            {
+                "name": f"v{version}-nested-plain",
+                "model": "m",
+                "recipe_version": version,
+                "runtime": "vllm",
+                "defaults": {"n": 1},
+                "command": 'vllm serve m --c \'{"a":{"b":{n}}}\'',
+            }
+        )
+        rendered = recipe.render_command(recipe.build_config_chain({}))
+
+        payload = next(tok for tok in shlex.split(rendered) if tok.startswith("{"))
+        assert json.loads(payload) == {"a": {"b": 1}}, version
 
 
 def test_render_command_v2_nested_bare_json_placeholder():
@@ -673,8 +759,12 @@ def test_render_command_terminates_on_self_growing_default(caplog):
     assert "did not stabilize" in caplog.text
 
 
-def test_render_command_does_not_collapse_braces_for_v2():
-    """v2 recipes are unaffected by the v1 brace-escape collapse."""
+def test_render_command_collapses_braces_for_v2():
+    """The ``{{``/``}}`` escape collapses for v2 too, not just v1.
+
+    Collapsing used to be gated on ``recipe_version == "1"``, so a v1 command
+    pasted into a v2 recipe emitted doubled braces to the runtime.
+    """
     recipe = Recipe.from_dict(
         {
             "name": "v2",
@@ -685,7 +775,102 @@ def test_render_command_does_not_collapse_braces_for_v2():
     )
     rendered = recipe.render_command(recipe.build_config_chain({}))
 
-    assert "{{literal}}" in rendered
+    assert "--x '{literal}'" in rendered
+    assert "{{" not in rendered
+
+
+def test_render_command_v2_escapes_log_deprecation_warning(caplog):
+    """Using the v1 doubled-brace escape outside v1 warns that v3 will drop it."""
+    import logging
+
+    recipe = Recipe.from_dict(
+        {
+            "name": "v2-escaped",
+            "model": "m",
+            "runtime": "vllm",
+            "command": "vllm serve m --x '{{\"a\":1}}'",
+        }
+    )
+    with caplog.at_level(logging.WARNING, logger="sparkrun.core.recipe"):
+        rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    assert "--x '{\"a\":1}'" in rendered
+    assert "doubled-brace escape" in caplog.text
+    assert "v3" in caplog.text
+
+
+def test_render_command_v1_escapes_do_not_warn(caplog):
+    """v1 is the convention's home — using it there is not deprecated."""
+    import logging
+
+    recipe = Recipe.from_dict(
+        {
+            "name": "v1-escaped",
+            "model": "m",
+            "recipe_version": "1",
+            "runtime": "vllm",
+            "command": "vllm serve m --x '{{\"a\":1}}'",
+        }
+    )
+    with caplog.at_level(logging.WARNING, logger="sparkrun.core.recipe"):
+        recipe.render_command(recipe.build_config_chain({}))
+
+    assert "doubled-brace escape" not in caplog.text
+
+
+def test_render_command_plain_json_does_not_warn(caplog):
+    """The idiomatic plain-brace spelling is not the escape convention."""
+    import logging
+
+    recipe = Recipe.from_dict(
+        {
+            "name": "v2-plain",
+            "model": "m",
+            "runtime": "vllm",
+            "command": 'vllm serve m --x \'{"a":{"b":1}}\'',
+        }
+    )
+    with caplog.at_level(logging.WARNING, logger="sparkrun.core.recipe"):
+        recipe.render_command(recipe.build_config_chain({}))
+
+    assert "doubled-brace escape" not in caplog.text
+
+
+def test_render_command_v2_pasted_v1_json_flags_parse():
+    """A v2 recipe carrying v1-style doubled-brace JSON flags renders valid JSON.
+
+    Regression for the arena ``deepseek-v4-flash-0731`` recipe: declared
+    ``recipe_version: "2"`` with its command copied from the v1 eugr recipe, so
+    every JSON-valued flag reached vLLM as ``'{{...}}'`` and
+    ``--compilation-config`` died with ``Invalid JSON: key must be a string``.
+    The failure surfaced only after the 167 GB model had downloaded.
+
+    The plain-brace flag in the same command must be unaffected — the two
+    spellings converge rather than one breaking the other.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "v2-pasted-v1",
+            "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "recipe_version": "2",
+            "runtime": "vllm",
+            "defaults": {"num_speculative_tokens": 5},
+            "command": (
+                "vllm serve m "
+                '--reasoning-config \'{"reasoning_parser":"deepseek_v4"}\' '
+                '--compilation-config \'{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}\' '
+                '--speculative-config \'{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens}}}\''
+            ),
+        }
+    )
+    rendered = recipe.render_command(recipe.build_config_chain({}))
+
+    payloads = [json.loads(tok) for tok in shlex.split(rendered) if tok.startswith("{")]
+    assert payloads == [
+        {"reasoning_parser": "deepseek_v4"},
+        {"cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"]},
+        {"method": "dspark", "num_speculative_tokens": 5},
+    ]
 
 
 def test_render_command_fixes_trailing_space_continuations():

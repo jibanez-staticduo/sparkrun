@@ -87,8 +87,11 @@ def render_hook_command(cmd: str, context: dict[str, str]) -> str:
     of the JSON object through the placeholder's closing brace and restored
     the whole span verbatim.
 
-    Hook commands are not v1 recipe templates, so ``{{`` is left as two
-    literal braces rather than collapsed.
+    Unlike a recipe command, ``{{`` is left as two literal braces rather than
+    collapsed to one: a hook body is arbitrary shell, where a doubled brace is
+    plausibly meant literally (bash brace expansion, an ``awk`` program), and
+    nothing here needs the escape — a JSON payload can be written with plain
+    braces because the mask already keeps it away from vpd's regex.
 
     Args:
         cmd: Command string with ``{key}`` placeholders.

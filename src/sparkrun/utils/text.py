@@ -26,6 +26,21 @@ _PLACEHOLDER_SPAN_RE = re.compile(r"\{[^{}]*\}")
 _MAX_SUBSTITUTION_PASSES = 10
 
 
+def uses_brace_escapes(value: str) -> bool:
+    """Whether *value* is written in the doubled-brace escape convention.
+
+    ``{{`` is the marker, and it is a reliable one: a ``{`` immediately
+    followed by another ``{`` cannot occur in JSON (an object key must be a
+    string), so a doubled *opening* brace is only ever a deliberate escape.
+
+    A doubled *closing* brace carries no such signal — ``}}`` ends any nested
+    JSON object (``{"a":{"b":1}}``) just as often as it escapes one literal
+    brace — which is why the convention has to be read off the opening brace
+    and applied to the whole string, rather than decided per ``}}``.
+    """
+    return "{{" in value
+
+
 def mask_non_placeholder_braces(value: str, *, escapes: bool) -> str:
     """Hide every brace that is not part of a ``{key}`` placeholder.
 
@@ -37,17 +52,17 @@ def mask_non_placeholder_braces(value: str, *, escapes: bool) -> str:
 
     Scanning left to right, each position is one of:
 
-    - ``{{`` / ``}}`` — a brace escape.  With *escapes* (v1 recipes) it masks
-      to a **single** sentinel, so it restores as one literal brace; without,
-      it masks to **two**, so the doubled braces survive untouched.  Either way
-      the braces are invisible to vpd, so an escaped span can no longer eat the
-      placeholder inside it.
+    - ``{{`` / ``}}`` — a brace escape.  With *escapes* (recipe commands) it
+      masks to a **single** sentinel, so it restores as one literal brace;
+      without (hook commands), it masks to **two**, so the doubled braces
+      survive untouched.  Either way the braces are invisible to vpd, so an
+      escaped span can no longer eat the placeholder inside it.
     - ``{key}`` — a placeholder, passed through for vpd to resolve.
     - a lone ``{`` or ``}`` — literal, masked so it cannot open a bogus span.
 
     Args:
         value: Template string.
-        escapes: Treat ``{{``/``}}`` as v1 escapes that collapse to one brace.
+        escapes: Treat ``{{``/``}}`` as escapes that collapse to one brace.
 
     Returns:
         The masked string; pair with :func:`unmask_braces`.
@@ -103,7 +118,7 @@ def render_template(value: str, values: Any, *, escapes: bool = False, max_passe
         value: Template string.
         values: Anything with a one-argument ``.get(key)`` — a ``dict`` or a
             SAF ``Variables`` config chain.
-        escapes: Treat ``{{``/``}}`` as v1 escapes collapsing to one brace.
+        escapes: Treat ``{{``/``}}`` as escapes collapsing to one brace.
         max_passes: Substitution passes before giving up.
 
     Returns:

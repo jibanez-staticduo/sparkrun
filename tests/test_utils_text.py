@@ -11,7 +11,38 @@ import logging
 
 import pytest
 
-from sparkrun.utils.text import mask_non_placeholder_braces, render_template, unmask_braces
+from sparkrun.utils.text import mask_non_placeholder_braces, render_template, unmask_braces, uses_brace_escapes
+
+
+class TestUsesBraceEscapes:
+    """The convention is read off ``{{``, which plain JSON cannot produce."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{{"a": 1}}',
+            '{{"method":"mtp","n":{n}}}',
+            "{{{k}",
+        ],
+    )
+    def test_doubled_open_is_the_marker(self, text):
+        assert uses_brace_escapes(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "no braces here",
+            "{key}",
+            '{"a": 1}',
+            # The whole point: a trailing '}}' is ordinary nested JSON, never
+            # on its own evidence of escaping.
+            '{"a":{"b":2}}',
+            '{"a":{"b":{"c":3}}}',
+            "awk '{print $1}'",
+        ],
+    )
+    def test_doubled_close_alone_is_not(self, text):
+        assert uses_brace_escapes(text) is False
 
 
 class TestMaskRoundTrip:
@@ -78,9 +109,9 @@ class TestRenderTemplate:
     def test_placeholder_inside_bare_json(self):
         """A placeholder nested in single-brace JSON resolves.
 
-        This is the v2/hook shape: no ``{{`` escaping, just JSON with a
-        placeholder inside it.  vpd alone matches from the JSON's opening brace
-        through the placeholder's closing brace and restores the span verbatim.
+        The unescaped shape: no ``{{``, just JSON with a placeholder inside it.
+        vpd alone matches from the JSON's opening brace through the
+        placeholder's closing brace and restores the span verbatim.
         """
         assert render_template('{"method":"mtp","n":{n}}', {"n": 2}) == '{"method":"mtp","n":2}'
 
@@ -88,7 +119,7 @@ class TestRenderTemplate:
         assert render_template('{"a":{"b":{n}}}', {"n": 1}) == '{"a":{"b":1}}'
 
     def test_placeholder_inside_escaped_json(self):
-        """The v1 shape: escapes collapse, inner placeholder resolves."""
+        """The escaped shape: escapes collapse, inner placeholder resolves."""
         rendered = render_template('{{"method":"mtp","n":{n}}}', {"n": 1}, escapes=True)
 
         assert rendered == '{"method":"mtp","n":1}'

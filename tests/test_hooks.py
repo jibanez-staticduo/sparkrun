@@ -158,7 +158,12 @@ class TestRenderHookCommand:
         assert render_hook_command(cmd, {"model": "llama-7b"}) == cmd
 
     def test_render_doubled_braces_preserved(self):
-        """Hook commands are not v1 templates — ``{{`` stays two braces."""
+        """Hooks keep ``{{`` as two braces even though recipe commands collapse it.
+
+        A hook body is arbitrary shell, where a doubled brace is plausibly
+        meant literally (brace expansion, an ``awk`` program), and the mask
+        already lets a JSON payload use plain braces.
+        """
         assert render_hook_command("echo '{{keep}}'", {"keep": "X"}) == "echo '{{keep}}'"
 
     def test_render_terminates_on_self_growing_value(self):
