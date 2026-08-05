@@ -295,6 +295,15 @@ BOOTSTRAP_REGISTRY_URLS = [
     "https://github.com/spark-arena/community-recipe-registry.git",
 ]
 
+# Shared by the shipped default and the URL migration, so a migrated config and
+# a fresh install describe the ``eugr`` registry identically.
+EUGR_REGISTRY_DESCRIPTION = "Official mirror of eugr/spark-vllm-docker recipes and mods"
+
+# Prior description shipped alongside the pre-mirror upstream URL. The migration
+# refreshes a description only when it still matches this exactly, so a user who
+# edited theirs keeps it.
+_LEGACY_EUGR_DESCRIPTION = "Official eugr/spark-vllm-docker repo recipes"
+
 
 FALLBACK_DEFAULT_REGISTRIES = [
     RegistryEntry(
@@ -319,9 +328,14 @@ FALLBACK_DEFAULT_REGISTRIES = [
     ),
     RegistryEntry(
         name="eugr",
-        url="https://github.com/eugr/spark-vllm-docker",
+        # Our mirror of eugr/spark-vllm-docker's recipes+mods, not the upstream
+        # repo itself: the upstream repo is primarily a container build whose
+        # recipes are a small corner of it, and mirroring lets the registry
+        # carry its own .sparkrun/registry.yaml.  Existing configs pointing at
+        # the upstream URL are rewritten by MIGRATED_REGISTRY_URLS.
+        url="https://github.com/spark-arena/eugr-recipes",
         subpath="recipes",
-        description="Official eugr/spark-vllm-docker repo recipes",
+        description=EUGR_REGISTRY_DESCRIPTION,
         mods_subpath="mods",
         visible=True,
         trusted=True,
@@ -382,10 +396,29 @@ def _default_trusted_urls() -> set[str]:
 
 # List of git URLs for registries that have been superseded and should be cleaned up.
 # Comparison strips trailing .git from entry URLs before matching.
+#
+# A URL listed here is **removed** from the user's config, taking its recipes
+# with it.  When a registry *moves* rather than dies, list it in
+# :data:`MIGRATED_REGISTRY_URLS` instead — that rewrites the entry in place and
+# keeps the user's per-entry state (enabled/visible/trust).
 DEPRECATED_REGISTRIES: list[str] = [
     "https://github.com/scitrera/oss-spark-run",
-    # 'https://github.com/eugr/spark-vllm-docker',
+    # NOT the old eugr URL: it moved, it wasn't retired. See MIGRATED_REGISTRY_URLS.
 ]
+
+# Git URLs that have **moved**, mapped old -> new.  Applied as a one-time
+# rewrite of the user's ``registries.yaml`` on load, so an existing install
+# follows the move instead of pinning to the old repo forever.
+#
+# Keys and values are compared/stored via :func:`_normalize_registry_url`, so a
+# ``.git`` suffix or trailing slash on either side still matches.
+#
+# The ``eugr`` recipes moved from eugr's container-build repo to our mirror of
+# its ``recipes/`` + ``mods/`` trees.  The layout (``recipes``/``mods``
+# subpaths) is identical on both sides, so only the URL needs rewriting.
+MIGRATED_REGISTRY_URLS: dict[str, str] = {
+    "https://github.com/eugr/spark-vllm-docker": "https://github.com/spark-arena/eugr-recipes",
+}
 
 # Reserved name prefixes — only URLs from allowed GitHub orgs may use these.
 # This prevents third-party registries from impersonating official sources.
@@ -907,6 +940,54 @@ class RegistryManager:
         logger.info("Migrated registries.yaml to per-registry trust model")
         return entries
 
+    @staticmethod
+    def _migrate_registry_urls(entries: list[RegistryEntry]) -> bool:
+        """Rewrite entries whose URL appears in :data:`MIGRATED_REGISTRY_URLS`.
+
+        A moved registry keeps the user's own choices — name, subpaths,
+        ``enabled``/``visible`` — and follows the repo to its new home.
+        Without this an existing install would keep pulling the old repo
+        indefinitely, since nothing re-reads the shipped default URL once
+        ``registries.yaml`` exists.
+
+        **Trust is re-asserted from the shipped default** when the new URL is
+        one we ship as ``trusted=True``.  The one-shot backfill in
+        :meth:`_migrate_trust_field` only ever runs against a pre-trust file,
+        so a registry that became a trusted default *after* that file was
+        written is stuck untrusted forever — which is exactly the ``eugr``
+        case, and would leave its mods prompting on every launch.  Moving the
+        registry to a repo we publish is the natural point to apply the
+        default.
+
+        The tradeoff: ``_save_registries`` omits ``trusted: false``, so an
+        explicit ``registry untrust`` is indistinguishable on disk from "never
+        granted", and a user who had untrusted a now-moved default gets it
+        re-granted once.  Re-run ``sparkrun registry untrust <name>`` to
+        restore it; the move only happens once.
+
+        The ``eugr`` description is refreshed too, but only when it still
+        matches the string that shipped alongside the old URL, so a
+        user-customized description survives.
+
+        Returns:
+            True when at least one entry changed (the caller persists).
+        """
+        changed = False
+        trusted_urls = _default_trusted_urls()
+        for entry in entries:
+            new_url = MIGRATED_REGISTRY_URLS.get(_normalize_registry_url(entry.url))
+            if not new_url or _normalize_registry_url(entry.url) == _normalize_registry_url(new_url):
+                continue
+            logger.info("Registry %r moved: %s -> %s", entry.name, entry.url, new_url)
+            entry.url = new_url
+            if entry.description == _LEGACY_EUGR_DESCRIPTION:
+                entry.description = EUGR_REGISTRY_DESCRIPTION
+            if not entry.trusted and _normalize_registry_url(new_url) in trusted_urls:
+                logger.info("Registry %r ships trusted; applying that default after the move", entry.name)
+                entry.trusted = True
+            changed = True
+        return changed
+
     def _load_registries(self) -> list[RegistryEntry]:
         """Load registries from YAML configuration.
 
@@ -925,6 +1006,14 @@ class RegistryManager:
 
         try:
             entries = self._load_registries_from_file()
+
+            # Follow moved registries BEFORE anything else inspects the URL.
+            # Ordering is load-bearing for the trust backfill below: it marks an
+            # entry trusted by matching its URL against `_default_trusted_urls()`,
+            # which holds the *new* URLs — a pre-trust config still carrying an
+            # old URL would otherwise be backfilled as untrusted.
+            urls_migrated = self._migrate_registry_urls(entries)
+
             # Filter out any entries whose URL matches a deprecated registry
             filtered = []
             for entry in entries:
@@ -937,7 +1026,10 @@ class RegistryManager:
                 else:
                     filtered.append(entry)
             if needs_migration:
+                # Persists as part of the trust migration; no second write.
                 self._migrate_trust_field(filtered)
+            elif urls_migrated:
+                self._save_registries(filtered)
             return filtered
         except Exception as e:
             logger.warning("Failed to load registries.yaml: %s", e)
@@ -1128,6 +1220,13 @@ class RegistryManager:
         cache_dir = self._cache_dir(entry.name)
         git_env = self._git_env()
 
+        # A cached clone is keyed by registry *name*, but its `origin` is the
+        # URL it was cloned from. If the entry's URL has since changed (a
+        # MIGRATED_REGISTRY_URLS rewrite, or a hand-edited registries.yaml),
+        # the `git fetch origin` below would silently keep pulling the old
+        # repo. Drop the stale cache so the fresh-clone path runs.
+        self._drop_cache_if_url_changed(entry)
+
         try:
             if (cache_dir / ".git").exists():
                 # Update existing repository
@@ -1235,6 +1334,68 @@ class RegistryManager:
             logger.debug("Failed to sync registry %s: %s", entry.name, e)
             return False
 
+        return True
+
+    def _drop_cache_if_url_changed(self, entry: RegistryEntry) -> bool:
+        """Remove ``entry``'s cached clone when it came from a different URL.
+
+        The per-registry cache dir is keyed by name, so a registry that changes
+        URL keeps a checkout of the *old* repo whose ``origin`` still points
+        there.  ``_clone_or_pull_single`` fetches from ``origin``, so without
+        this the new URL would never actually be pulled.
+
+        Best-effort: an unreadable or remote-less cache is left alone rather
+        than deleted, since a failed sync is recoverable and a wrong delete is
+        not.  The cache dir may be a link into a shared clone (several
+        registries on one URL), so unlink rather than delete *through* it.
+
+        Returns:
+            True when a stale cache was dropped.
+        """
+        cache_dir = self._cache_dir(entry.name)
+        if not (cache_dir / ".git").exists():
+            return False
+
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cache_dir), "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=self._git_env(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("Could not read origin for registry %s: %s", entry.name, e)
+            return False
+
+        if result.returncode != 0 or not isinstance(result.stdout, str):
+            # No origin remote, or output we can't read. "Can't tell" is not
+            # "changed" — a failed sync is recoverable, a wrong delete isn't.
+            logger.debug("Registry %s cache has no readable origin; leaving it alone", entry.name)
+            return False
+
+        cached_url = _normalize_registry_url(result.stdout.strip())
+        if cached_url == _normalize_registry_url(entry.url):
+            return False
+
+        logger.info(
+            "Registry %r cache was cloned from %s but is now %s; re-cloning",
+            entry.name,
+            cached_url,
+            entry.url,
+        )
+        try:
+            if is_dir_link(cache_dir):
+                remove_dir_link(cache_dir)
+            else:
+                import shutil
+
+                shutil.rmtree(cache_dir)
+        except OSError as e:
+            logger.warning("Could not remove stale cache for registry %s: %s", entry.name, e)
+            return False
         return True
 
     def _clone_or_pull(self, entry: RegistryEntry) -> bool:
