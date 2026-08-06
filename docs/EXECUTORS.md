@@ -154,8 +154,15 @@ CDI (Container Device Interface, Docker >= 25) is the portable path and is
 *required* on daemons that reject `--gpus` (e.g. Thunder Compute), but it
 depends on a present, non-stale `/etc/cdi/nvidia.yaml` — the spec pins versioned
 absolute paths, so a driver upgrade can leave it dangling and containers then
-fail to start (`sparkrun setup check` flags this). `--gpus` resolves through the
-container runtime at launch instead.
+fail to start. `--gpus` resolves through the container runtime at launch instead.
+
+`sparkrun setup check` reports on the spec at a severity that follows this
+setting: it resolves each host's effective `gpu_access_mode` through the real
+executor chain, so a missing spec is a **FAIL** only for a cluster that would
+actually read it. Under `gpus` the finding drops to **SKIP** (it doesn't count
+as a gap or affect the exit code) while still naming the staleness, because it
+becomes real the moment the mode changes. A mode that can't be resolved fails
+safe to "CDI required".
 
 The default comes from the resolved hardware platform
 (`HardwarePlatformPlugin.default_executor_config("docker")`), which sits just
