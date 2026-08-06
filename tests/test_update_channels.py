@@ -136,12 +136,12 @@ def test_describe_change_stable_updated():
 
 def test_describe_change_git_same_commit():
     msg = describe_change("beta", ("0.2.40", "abcdef123456"), ("0.2.40", "abcdef123456"))
-    assert "already on the latest commit" in msg and "gabcdef1" in msg
+    assert "already on the latest commit" in msg and "(abcdef1)" in msg
 
 
 def test_describe_change_git_new_commit():
     msg = describe_change("alpha", ("0.3.0", "aaaaaaa1"), ("0.3.0", "bbbbbbb2"))
-    assert "-> gbbbbbbb" in msg
+    assert msg == "sparkrun alpha updated: commit aaaaaaa -> bbbbbbb"
 
 
 # --- CLI integration ---
