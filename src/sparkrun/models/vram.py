@@ -882,7 +882,10 @@ def estimate_vram(
     Args:
         model_params: Total parameter count.
         model_dtype: Weight dtype (e.g. "float16", "int4", "fp8").
-        kv_dtype: KV cache dtype (default: "bfloat16").
+        kv_dtype: KV cache dtype. ``None`` means "unset" — the estimator falls
+            back to ``"bfloat16"`` for computation but leaves ``VRAMEstimate.kv_dtype``
+            as ``None`` so display code can distinguish an explicit dtype from a
+            defaulted one (issue #248).
         num_layers: Number of transformer layers.
         num_kv_heads: Number of KV attention heads.
         head_dim: Dimension per attention head.
@@ -910,7 +913,13 @@ def estimate_vram(
         VRAMEstimate with per-GPU totals and any warnings.
     """
     warnings: list[str] = []
-    kv_dtype = kv_dtype or "bfloat16"
+    # Apply the bfloat16 fallback only at computation sites, not on the value
+    # returned in VRAMEstimate.kv_dtype.  Keeping the original (possibly None)
+    # lets the CLI formatter distinguish an explicit dtype from a defaulted one
+    # and show "bfloat16 (default)" — without this, the fallback was baked into
+    # est.kv_dtype itself and the display code's (default) branch never fired
+    # (issue #248).
+    kv_dtype_effective = kv_dtype or "bfloat16"
     tp = max(tensor_parallel, 1)
     pp = max(pipeline_parallel, 1)
     shard_factor = tp * pp
@@ -943,7 +952,7 @@ def estimate_vram(
     # delegates KV *sizing* to the user, but the *sharding rule* still needs the
     # architecture — and a user who pins model_type: deepseek_v4 is declaring
     # it, so the client and the sizing decision must agree.
-    is_mla = bool(kv_lora_rank or qk_rope_head_dim) or is_mla_kv_layout(kv_dtype) or _is_mla_model_type(model_type)
+    is_mla = bool(kv_lora_rank or qk_rope_head_dim) or is_mla_kv_layout(kv_dtype_effective) or _is_mla_model_type(model_type)
 
     # Same normalization _extract_from_config applies, so a recipe that pins
     # head_dim + qk_rope_head_dim in metadata gets MLA sizing without naming
@@ -956,7 +965,7 @@ def estimate_vram(
     # metadata — and there it is worth flagging, because sizing a non-MLA model
     # this way drops the 2 * num_kv_heads factor and *under*-estimates, which
     # OOMs at runtime rather than refusing the placement.
-    if is_mla and not kv_lora_rank and qk_rope_head_dim and not is_mla_kv_layout(kv_dtype):
+    if is_mla and not kv_lora_rank and qk_rope_head_dim and not is_mla_kv_layout(kv_dtype_effective):
         warnings.append(
             "MLA sizing inferred from qk_rope_head_dim alone, using head_dim as the cached width; "
             "pin metadata.kv_lora_rank (or kv_vram_per_token) if this model does not use a compressed KV cache"
@@ -967,7 +976,7 @@ def estimate_vram(
     # for DeepSeek-V3 (62,464 vs 70,272), again in the OOM direction.  Same
     # reachability: auto-detection always pairs the fields, so this is a
     # hand-pinned-metadata footgun.
-    elif is_mla and kv_lora_rank and not qk_rope_head_dim and not is_mla_kv_layout(kv_dtype):
+    elif is_mla and kv_lora_rank and not qk_rope_head_dim and not is_mla_kv_layout(kv_dtype_effective):
         warnings.append(
             "MLA sizing inferred from kv_lora_rank alone; the RoPE tail (qk_rope_head_dim) is not counted. "
             "Pin metadata.qk_rope_head_dim if this model caches the tail alongside the latent"
@@ -977,10 +986,10 @@ def estimate_vram(
     # which sizes the latent instead of the real heads and *under*-estimates by
     # ~170x (Qwen3-32B: 656 B/layer/token vs ~113 KB).  Reachable only by an
     # explicit `kv_dtype: nvfp4_ds_mla` on such a model; worth a loud warning.
-    elif is_mla and is_mla_kv_layout(kv_dtype) and not (kv_lora_rank or qk_rope_head_dim):
+    elif is_mla and is_mla_kv_layout(kv_dtype_effective) and not (kv_lora_rank or qk_rope_head_dim):
         warnings.append(
             "KV layout %r forces MLA sizing but the model has no MLA architecture markers; "
-            "this under-estimates a non-MLA model. Pin metadata.kv_lora_rank or remove the layout" % kv_dtype
+            "this under-estimates a non-MLA model. Pin metadata.kv_lora_rank or remove the layout" % kv_dtype_effective
         )
 
     if kv_vram_per_token is not None:
@@ -993,7 +1002,7 @@ def estimate_vram(
             kv_cache_total_gb = kv_vram_per_token * max_model_len
     elif is_mla:
         kv_cache_per_token_bytes = mla_kv_bytes_per_token(
-            kv_dtype=kv_dtype,
+            kv_dtype=kv_dtype_effective,
             num_layers=num_layers,
             kv_lora_rank=mla_latent,
             qk_rope_head_dim=qk_rope_head_dim,
@@ -1009,10 +1018,10 @@ def estimate_vram(
                 reason = "no compress_ratios entry above 1, so no layer holds a latent cache"
             elif compress_ratios and num_layers and len(compress_ratios) < num_layers and any(r and r > 1 for r in compress_ratios):
                 reason = "compress_ratios lists %d layers but the model has %d" % (len(compress_ratios), num_layers)
-            elif not is_mla_kv_layout(kv_dtype) and not mla_latent:
+            elif not is_mla_kv_layout(kv_dtype_effective) and not mla_latent:
                 reason = "no kv_lora_rank/head_dim to size the compressed latent from"
-            elif not is_mla_kv_layout(kv_dtype) and kv_bytes_per_element(kv_dtype) is None:
-                reason = "unknown KV cache dtype %r" % kv_dtype
+            elif not is_mla_kv_layout(kv_dtype_effective) and kv_bytes_per_element(kv_dtype_effective) is None:
+                reason = "unknown KV cache dtype %r" % kv_dtype_effective
             elif not num_layers:
                 reason = "num_layers unavailable"
             else:
@@ -1039,14 +1048,14 @@ def estimate_vram(
                     % (" and ".join(excluded), "s are" if len(excluded) > 1 else " is")
                 )
     elif num_layers and num_kv_heads and head_dim:
-        kv_bpe = kv_bytes_per_element(kv_dtype)
+        kv_bpe = kv_bytes_per_element(kv_dtype_effective)
         if kv_bpe is not None:
             # Per token: 2 (K+V) * num_layers * num_kv_heads * head_dim * bytes
             kv_cache_per_token_bytes = 2.0 * num_layers * num_kv_heads * head_dim * kv_bpe
             if max_model_len:
                 kv_cache_total_gb = kv_cache_per_token_bytes * max_model_len / (1024**3)
         else:
-            warnings.append("Unknown KV cache dtype %r" % kv_dtype)
+            warnings.append("Unknown KV cache dtype %r" % kv_dtype_effective)
     else:
         missing = []
         if not num_layers:

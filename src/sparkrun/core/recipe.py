@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 _TRAILING_SPACE_CONTINUATION_RE = re.compile(r"\\ +\n")
 
 _RAY_BACKEND_RE = re.compile(r"--distributed-executor-backend\s+ray\b")
+# --kv-cache-dtype (vllm/sglang/atlas: --kv-cache-dtype) or tokenary (--kvcache-dtype),
+# space- or =-separated. Captured so a recipe that sets the flag only inside the
+# free-form command: template is still picked up by the VRAM estimator (issue #248).
+_KV_CACHE_DTYPE_FLAG_RE = re.compile(r"--kv-?cache-dtype[=\s]+(\S+)", re.IGNORECASE)
 _CMD_VLLM_RE = re.compile(r"^vllm\s+serve\b")
 _CMD_SGLANG_RE = re.compile(r"^(?:sglang\s+serve|python3?\s+-m\s+sglang\.launch_server)\b")
 _CMD_LLAMA_CPP_RE = re.compile(r"^llama-server\b")
@@ -308,6 +312,28 @@ def _sort_dict_by_patterns(data: dict[str, Any], patterns: list[str]) -> dict[st
         ordered[k] = data[k]
 
     return ordered
+
+
+def extract_kv_cache_dtype_from_command(command: str | None) -> str | None:
+    """Extract a ``--kv-cache-dtype`` value from a free-form command template.
+
+    Recipes sometimes set the KV cache dtype only inside ``command:`` rather
+    than in ``defaults.kv_cache_dtype`` or ``metadata.kv_dtype``.  Without
+    parsing it, the VRAM estimator silently falls back to ``bfloat16`` and
+    (for MLA models using ``fp8_ds_mla`` / ``nvfp4_ds_mla``) sizes the KV cache
+    with the wrong formula — a ~10x over-estimate (issue #248).
+
+    Returns the first match's value (``"auto"`` treated as absent), or ``None``.
+    """
+    if not command:
+        return None
+    m = _KV_CACHE_DTYPE_FLAG_RE.search(command)
+    if not m:
+        return None
+    value = m.group(1)
+    if value.lower() in ("auto", ""):
+        return None
+    return value
 
 
 def _resolve_runtime_from_command_hint(recipe: Recipe) -> None:
@@ -1415,6 +1441,19 @@ class Recipe:
             if kv_cache_default and str(kv_cache_default) != "auto":
                 kv_dtype = str(kv_cache_default)
 
+        # Last resort: parse --kv-cache-dtype out of the free-form command
+        # template.  Recipes that set the flag only in command: (rather than
+        # in defaults) would otherwise silently fall back to bfloat16 — for
+        # MLA models using fp8_ds_mla / nvfp4_ds_mla that's a ~10x KV-cache
+        # over-estimate (issue #248).  Warn so the user knows the estimate
+        # depends on a command-template parse and is encouraged to pin the
+        # value in defaults/metadata instead.
+        _kv_from_command: str | None = None
+        if not kv_dtype:
+            _kv_from_command = extract_kv_cache_dtype_from_command(self.command)
+            if _kv_from_command:
+                kv_dtype = _kv_from_command
+
         # GPU memory utilization (runtime budget fraction)
         gpu_mem_val = config.get("gpu_memory_utilization")
         gpu_memory_utilization = float(gpu_mem_val) if gpu_mem_val is not None else None
@@ -1439,6 +1478,11 @@ class Recipe:
             model_type=str(model_type) if model_type else None,
             index_head_dim=int(index_head_dim) if index_head_dim is not None else None,
         )
+        if _kv_from_command:
+            result.warnings.append(
+                "kv_cache_dtype %r inferred from command: template; pin it in "
+                "defaults.kv_cache_dtype or metadata.kv_dtype for a stable estimate" % _kv_from_command
+            )
 
         # Write back auto-detected values so downstream consumers
         # (e.g. benchmark result export) can use them without re-fetching.

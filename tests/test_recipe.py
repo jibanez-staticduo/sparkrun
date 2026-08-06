@@ -1003,6 +1003,25 @@ def test_recipe_get_default():
     assert recipe.get_default("nonexistent", "fallback") == "fallback"
 
 
+def test_extract_kv_cache_dtype_from_command():
+    """The command-template parser picks up --kv-cache-dtype in space and equals forms."""
+    from sparkrun.core.recipe import extract_kv_cache_dtype_from_command
+
+    # Space-separated
+    assert extract_kv_cache_dtype_from_command("vllm serve {model} --kv-cache-dtype fp8_ds_mla --port 8000") == "fp8_ds_mla"
+    # Equals-separated
+    assert extract_kv_cache_dtype_from_command("vllm serve {model} --kv-cache-dtype=fp8 --port 8000") == "fp8"
+    # tokenary's --kvcache-dtype (no dash between kv and cache)
+    assert extract_kv_cache_dtype_from_command("tokenary --m {model} --kvcache-dtype nvfp4") == "nvfp4"
+    # auto is treated as absent
+    assert extract_kv_cache_dtype_from_command("vllm serve {model} --kv-cache-dtype auto") is None
+    # No flag present
+    assert extract_kv_cache_dtype_from_command("vllm serve {model} --port 8000") is None
+    # None / empty
+    assert extract_kv_cache_dtype_from_command(None) is None
+    assert extract_kv_cache_dtype_from_command("") is None
+
+
 def test_recipe_load_nonexistent_file():
     """Verify that Recipe.load() raises RecipeError for non-existent files.
 
@@ -1405,6 +1424,127 @@ class TestRecipeMetadata:
         )
         est = recipe.estimate_vram(auto_detect=False)
         assert est.kv_dtype == "fp8"
+
+    def test_estimate_vram_kv_dtype_from_command_template(self):
+        """--kv-cache-dtype in command: is parsed when no defaults/metadata value exists.
+
+        Issue #248: the flag was silently ignored, falling back to bfloat16 and
+        doubling the KV cache estimate for MLA models using fp8_ds_mla.
+        """
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096},
+                "command": "vllm serve {model} --kv-cache-dtype fp8 --max-model-len {max_model_len}",
+            }
+        )
+        est = recipe.estimate_vram(auto_detect=False)
+        assert est.kv_dtype == "fp8"
+        # The estimate should match an explicit fp8 kv_dtype
+        assert est.kv_cache_per_token_bytes == pytest.approx(2.0 * 32 * 32 * 128 * 1)
+        # A warning should fire so the user knows it was inferred from the template
+        assert any("inferred from command" in w for w in est.warnings)
+
+    def test_estimate_vram_kv_dtype_from_command_equals_form(self):
+        """--kv-cache-dtype=fp8 (equals form) is also parsed from command:."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096},
+                "command": "vllm serve {model} --kv-cache-dtype=fp8 --max-model-len {max_model_len}",
+            }
+        )
+        est = recipe.estimate_vram(auto_detect=False)
+        assert est.kv_dtype == "fp8"
+
+    def test_estimate_vram_kv_dtype_command_ignored_when_defaults_present(self):
+        """When defaults.kv_cache_dtype is set, command: parsing is skipped (no warning)."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096, "kv_cache_dtype": "fp8"},
+                "command": "vllm serve {model} --kv-cache-dtype bfloat16",
+            }
+        )
+        est = recipe.estimate_vram(auto_detect=False)
+        # defaults wins over command:
+        assert est.kv_dtype == "fp8"
+        # no "inferred from command" warning since defaults provided the value
+        assert not any("inferred from command" in w for w in est.warnings)
+
+    def test_estimate_vram_kv_dtype_command_auto_is_ignored(self):
+        """--kv-cache-dtype auto in command: is treated as absent (no dtype inferred)."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096},
+                "command": "vllm serve {model} --kv-cache-dtype auto --max-model-len {max_model_len}",
+            }
+        )
+        est = recipe.estimate_vram(auto_detect=False)
+        # auto is treated as absent — est.kv_dtype stays None (defaulted to bfloat16)
+        assert est.kv_dtype is None
+        # no "inferred from command" warning
+        assert not any("inferred from command" in w for w in est.warnings)
+
+    def test_estimate_vram_kv_dtype_from_command_writeback_idempotent(self):
+        """The command-inferred dtype is written back to metadata so the second call doesn't re-parse."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096},
+                "command": "vllm serve {model} --kv-cache-dtype fp8 --max-model-len {max_model_len}",
+            }
+        )
+        est1 = recipe.estimate_vram(auto_detect=False)
+        assert est1.kv_dtype == "fp8"
+        assert any("inferred from command" in w for w in est1.warnings)
+        # metadata was written back
+        assert recipe.metadata["kv_dtype"] == "fp8"
+        # second call: metadata provides the value, no command parsing, no warning
+        est2 = recipe.estimate_vram(auto_detect=False)
+        assert est2.kv_dtype == "fp8"
+        assert not any("inferred from command" in w for w in est2.warnings)
 
     def test_estimate_vram_nvfp4_ds_mla_from_defaults(self, deepseek_v4_config):
         """kv_cache_dtype: nvfp4_ds_mla plus an auto-detected MLA config sizes the latent cache.

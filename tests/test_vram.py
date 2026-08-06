@@ -365,7 +365,10 @@ class TestEstimateVram:
         est_big = estimate_vram(model_vram=150.0, tensor_parallel=1)
         assert est_big.fits_dgx_spark is False
 
-    def test_default_kv_dtype_is_bfloat16(self):
+    def test_default_kv_dtype_is_none(self):
+        """When no kv_dtype is passed, the estimate uses bfloat16 for computation but
+        leaves est.kv_dtype as None so display code can show "bfloat16 (default)".
+        """
         est = estimate_vram(
             model_params=7_000_000_000,
             model_dtype="float16",
@@ -374,7 +377,23 @@ class TestEstimateVram:
             head_dim=128,
             max_model_len=4096,
         )
-        assert est.kv_dtype == "bfloat16"
+        # est.kv_dtype is None (not "bfloat16") so the formatter's (default) branch fires
+        assert est.kv_dtype is None
+        # but the KV cache was still sized with bfloat16 (2 bytes)
+        assert est.kv_cache_per_token_bytes == 2.0 * 32 * 32 * 128 * 2
+
+    def test_explicit_kv_dtype_is_preserved(self):
+        """An explicit kv_dtype is preserved on the estimate."""
+        est = estimate_vram(
+            model_params=7_000_000_000,
+            model_dtype="float16",
+            kv_dtype="fp8",
+            num_layers=32,
+            num_kv_heads=32,
+            head_dim=128,
+            max_model_len=4096,
+        )
+        assert est.kv_dtype == "fp8"
 
     def test_gpu_memory_utilization_budget(self):
         """gpu_memory_utilization should compute usable memory and available KV."""

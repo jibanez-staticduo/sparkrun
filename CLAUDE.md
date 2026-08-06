@@ -604,6 +604,10 @@ Before launching, sparkrun can pre-sync models and container images from the con
   The MLA latent cache is **replicated across TP ranks**, so only pipeline parallelism divides it.
   `Recipe.estimate_vram()` writes every detected field back into `metadata`, which is what lets later calls skip the
   HF fetch — so anything read on the way in must also be written back, or it is silently lost on the second call.
+  `kv_cache_dtype` is resolved CLI → metadata → HF quant config → `defaults.kv_cache_dtype` → `--kv-cache-dtype`
+  parsed from the `command:` template (last resort, with a warning). When no dtype is resolved, the estimator
+  computes with `bfloat16` but leaves `VRAMEstimate.kv_dtype` as `None` so the CLI formatter can show
+  `bfloat16 (default)` rather than silently reporting a guessed value.
 
 ### Kernel Tuning (`tuning/`)
 

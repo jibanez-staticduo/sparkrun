@@ -119,6 +119,13 @@ sparkrun auto-detects `model_params`, `model_dtype`, `num_layers`, `num_kv_heads
 contains `kv_cache_quant_algo`, it is used to set `kv_dtype` if not already specified. Metadata values always take
 precedence over auto-detected values.
 
+The `kv_cache_dtype` is resolved in priority order: CLI override → `metadata.kv_dtype` → HuggingFace quant config →
+`defaults.kv_cache_dtype` → `--kv-cache-dtype` parsed from the `command:` template (last resort, with a warning).
+When the dtype is resolved from the command template, it is written back to `metadata.kv_dtype` so subsequent
+estimates are stable. When no dtype is resolved at all, the estimator defaults to `bfloat16` for computation but
+leaves `VRAMEstimate.kv_dtype` as `None` so the CLI can display `bfloat16 (default)` rather than silently reporting
+a guessed value.
+
 #### Multi-head Latent Attention (DeepSeek)
 
 MLA models cache one *compressed latent* per token per layer instead of a K and V entry per attention head, so the
