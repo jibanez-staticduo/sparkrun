@@ -94,7 +94,16 @@ On DGX Spark (1 GPU per node), `tensor_parallel: N` = N hosts.
 
 **Container env tiers** (highest priority first):
 
-1. Recipe `env` — including `-o env.FOO=bar` on the CLI, which is written into it.
+1. Recipe `env` — including both CLI forms, which are written into it:
+   - `-e KEY=VALUE` / `--env KEY=VALUE` (repeatable) — value used **verbatim**.
+     Hidden from `--help` unless `SPARKRUN_ADVANCED=1`.
+   - `-o env.KEY=VALUE` — the generic override path, so the value goes through
+     `coerce_value`: `-o env.X=true` arrives as `True`, not `true`. Prefer `-e`
+     for anything a runtime parses itself.
+
+   Both split on the **first** `=` only (`-e ALLOC=expandable_segments:True` is
+   safe), and `-e KEY=` sets an empty value — the way to blank out a platform or
+   cluster default. `-e` wins if a key is given both ways.
 2. Cluster `env` / `env_file`.
 3. **Platform** — `HardwarePlatformPlugin.default_env(runtime_name, accelerator,
    runtime_family=…)`, targeted at platform × runtime × accelerator. Today

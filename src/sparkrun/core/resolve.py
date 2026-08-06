@@ -94,6 +94,39 @@ def apply_recipe_overrides(
     return recipe, overrides
 
 
+def apply_env_overrides(recipe, env_pairs) -> dict[str, str]:
+    """Apply ``KEY=VALUE`` container-env overrides to *recipe*.
+
+    The peer of ``-o env.KEY=VALUE`` (handled inside
+    :func:`apply_recipe_overrides`) for the direct ``-e/--env`` form, with one
+    deliberate difference: values are taken **verbatim**. The ``-o`` path routes
+    through ``coerce_value``, which turns ``-o env.X=true`` into the string
+    ``"True"`` — right for a serve flag, wrong for an env var a runtime parses
+    itself.
+
+    Only the first ``=`` splits, so ``FOO=a=b`` and
+    ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` survive intact, and
+    ``FOO=`` sets an empty value (the way to blank out a lower-tier default).
+
+    Pure logic: no console I/O. Malformed entries raise ``ValueError``; the CLI
+    wrapper translates that into a ``UsageError``.
+
+    Returns the mapping that was applied (for logging / testing).
+    """
+    applied: dict[str, str] = {}
+    for pair in env_pairs or ():
+        if "=" not in pair:
+            raise ValueError("--env must be KEY=VALUE, got: %s" % pair)
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        if not key:
+            raise ValueError("--env has empty key: %s" % pair)
+        applied[key] = value
+    if recipe is not None and applied:
+        recipe.env.update(applied)
+    return applied
+
+
 def load_recipe(
     config: "SparkrunConfig",
     recipe_name: str,
