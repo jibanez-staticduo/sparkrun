@@ -356,7 +356,7 @@ occupancy-aware one without launching something.
 
 ### `--ensure` ("is this workload already up?")
 
-`--ensure` matches on the launch **intent** (recipe + parallelism + port) via
+`--ensure` matches on the launch **intent** (see below) via
 `api.find_running_intent(intent_id, hosts) -> IntentMatch | None`, never on a
 cluster_id. A cluster_id encodes *placement* as well as intent, so the old
 `derive_cluster_id(recipe, host_list)` lookup could only match a job the greedy
@@ -377,6 +377,39 @@ scheduler had put on exactly the host set being asked about — under an
   honors `RunOptions.ensure` after planning and returns a `RunResult` with
   `already_running=True`, `launch_result=None`, describing the *pre-existing*
   deployment. Both go through `find_running_intent`.
+
+### Workload identity — intent vs. fingerprint
+
+Three different questions, two digests. Getting them confused is destructive,
+because a matching intent is `api.run`'s licence to **destroy**:
+
+| Question | Key | Consumers |
+|----------|-----|-----------|
+| Which served endpoint is this? | `generate_intent_id` | `stop` / `logs` / `status` / `--ensure` |
+| May I replace that? | `generate_intent_id` | occupancy exclusion + eviction |
+| Is this *exactly* this configuration? | `derive_recipe_fingerprint` | benchmark identity, provenance |
+
+`generate_intent_id` hashes runtime + model + **container** + port +
+served-model-name + non-default parallelism. The container image is in there
+because the intent is the destroy key: two recipes serving the same model on
+the same port through different images (a stable build and a nightly) are
+workloads a user runs side by side, and while the image was excluded, launching
+the second silently evicted the first (observed live on a 4-host cluster).
+`--image` writes through to `recipe.container`, so overrides are covered.
+
+It stays narrow otherwise — serve arguments are **not** hashed — because
+`stop` / `logs` / `--ensure` recompute it from the recipe without the flags the
+user typed at launch. Three reasons not to widen it to the fingerprint:
+
+1. Discovery breaks: `run r --gpu-mem 0.9` then `stop r` would not match.
+2. Eviction stops working for the common relaunch (tweak one flag → a
+   different intent → the old deployment is never replaced and keeps the GPUs).
+3. The fingerprint is not stable across the launch boundary:
+   `launch_inference` calls `apply_platform_runtime_flag_defaults`, which
+   `setdefault`s platform flags into `recipe.defaults` keyed off the **head
+   host's** hardware — so the config chain it hashes differs before vs. after
+   launch, and is placement-dependent. Fine as a provenance digest derived once
+   and threaded down; unusable as a lookup key.
 
 ### Status Discovery ("what's running where?")
 
