@@ -12,7 +12,7 @@ import copy
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from sparkrun.core.backend_select import BackendBundle
@@ -490,6 +490,13 @@ def launch_inference(
     # post_launch_lifecycle).  CLI flag --trust + local/official-registry
     # recipes set this to True via resolve_recipe_trust().
     trust: bool = False,
+    # Called once, immediately before the runtime starts containers — after
+    # every step that can fail cheaply (distribution, model download, tuning)
+    # has succeeded.  ``sparkrun.api.run`` uses it to evict the deployments
+    # this launch supersedes, so an interrupted or failed launch cannot tear
+    # down a running workload it never got close to replacing.  Not called on
+    # ``dry_run``.
+    before_start: "Callable[[], None] | None" = None,
 ) -> LaunchResult:
     """Launch an inference workload.
 
@@ -1024,6 +1031,14 @@ def launch_inference(
 
         _rt_display = RUNTIME_DISPLAY.get(runtime.runtime_name, runtime.runtime_name)
         p.phase(5, "Launching %s runtime" % _rt_display)
+
+    # Last point before containers start.  Everything that can fail slowly and
+    # cheaply — image distribution, model download, tuning sync — is behind us,
+    # so a caller can safely tear down the deployment this launch replaces.
+    # Doing it any earlier means an interrupted `sparkrun run` leaves the
+    # cluster with neither the old workload nor the new one.
+    if before_start is not None and not dry_run:
+        before_start()
 
     # Build runtime.run() kwargs — include runtime-specific options only
     # when they were explicitly provided.

@@ -298,7 +298,18 @@ deciding and starts acting:
 | Function | Does | Returns |
 |----------|------|---------|
 | `api.plan(options)` | resolve recipe/cluster/runtime, `prepare_transport`, one `api.status` sweep, **one** `api.schedule`, compose intent/token/cluster_id | `RunPlan` |
-| `api.run(options, plan=…)` | evict superseded deployments, `launch_inference`, build result | `RunResult` |
+| `api.run(options, plan=…)` | `launch_inference` (evicting superseded deployments just before containers start), build result | `RunResult` |
+
+**Eviction timing is load-bearing.** `_evict_superseded_deployments` tears down
+a *serving* workload, so it runs from `launch_inference`'s `before_start` hook
+— fired at phase 5, after image distribution, model download and tuning sync
+have all succeeded — not at the top of `api.run`. Those steps take minutes and
+are routinely interrupted; evicting up front meant a `sparkrun run` killed with
+Ctrl-C during distribution left the cluster with *neither* the old deployment
+nor the new one. `api.run` passes `before_start=None` under `--dry-run` (the
+launcher guards too, so a dry run stays read-only regardless). The experimental
+k8s path returns before `launch_inference` and so evicts explicitly, without
+that guarantee.
 
 `run(options)` with no plan plans internally, so the split is invisible to
 callers that render nothing. It exists for the ones that don't: **anything that

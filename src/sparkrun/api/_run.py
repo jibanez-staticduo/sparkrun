@@ -301,7 +301,16 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None, plan: Run
     # It is a no-op on the deterministic (greedy) path, where the relaunch
     # reuses the prior cluster_id and the runtime's step-1 cleanup already
     # removes those containers by name.
-    if not options.dry_run:
+    #
+    # Deferred to ``launch_inference``'s ``before_start`` hook rather than run
+    # here: this tears down a *serving* workload, and everything between here
+    # and the container start — image distribution, a multi-hundred-GB model
+    # download, tuning sync — can take minutes and fail or be interrupted.
+    # Evicting up front meant a `sparkrun run` killed with Ctrl-C during
+    # distribution left the cluster with neither the old deployment nor the
+    # new one.  By the time the hook fires, the only remaining step is
+    # starting containers.
+    def _evict_before_start() -> None:
         _evict_superseded_deployments(
             intent_id=intent_id,
             cluster_id_for_launch=cluster_id_for_launch,
@@ -332,6 +341,14 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None, plan: Run
             _executor_name = None
         if _executor_name == "k8s":
             from sparkrun.api._run_k8s import run_k8s
+
+            # This path returns without going through ``launch_inference``, so
+            # it never reaches the ``before_start`` hook — evict here to keep
+            # replace-my-own-deployment semantics.  It does not get the SSH
+            # path's "only after distribution succeeded" guarantee; the k8s
+            # launcher owns its own image/volume staging.
+            if not options.dry_run:
+                _evict_before_start()
 
             return run_k8s(
                 options,
@@ -383,6 +400,9 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None, plan: Run
         "recipe_ref": options.recipe_ref,
         "preserve_model_perms": options.preserve_model_perms,
         "skip_model_fan_out": options.skip_model_fan_out,
+        # ``None`` under --dry-run: the launcher also guards, but a dry run
+        # must not depend on a callee honouring the contract to stay read-only.
+        "before_start": None if options.dry_run else _evict_before_start,
     }
 
     # 5. Launch.
