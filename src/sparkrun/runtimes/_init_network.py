@@ -95,6 +95,60 @@ def select_init_network(ctx: ClusterContext, candidates: InitNetworkCandidates) 
     return management
 
 
+def init_address_map(cluster_hosts: Sequence[str], selection: InitNetworkSelection) -> dict[str, str]:
+    """Map each cluster host identifier to the init address chosen for it.
+
+    ``selection.hosts`` is positionally aligned with the cluster's host
+    list — both the loopback substitution (``resolve_hosts_for_init``)
+    and the IB substitution (:func:`_build_ib_selection`) preserve order
+    and length — so the mapping is a positional zip.  A length mismatch
+    means the selection was not derived from *cluster_hosts*; the
+    identity map is returned rather than a silently skewed one.
+    """
+    if len(cluster_hosts) != len(selection.hosts):
+        logger.debug(
+            "  Init address map skipped: %d cluster host(s) vs %d selected address(es)",
+            len(cluster_hosts),
+            len(selection.hosts),
+        )
+        return {host: host for host in cluster_hosts}
+    return dict(zip(cluster_hosts, selection.hosts))
+
+
+def remap_placement_addresses(placement, addr_map: Mapping[str, str]):
+    """Return *placement* with every host replaced by its init address.
+
+    The scheduler's ``RankAssignment`` carries *cluster-config* host
+    identifiers — ``127.0.0.1`` for the control machine's own node, a
+    short DNS name, a management IP on a network a worker may not share.
+    Those identifiers are correct for SSH (they are how sparkrun reaches
+    the host) but wrong as a rendezvous address handed to a *worker*:
+    ``--master-addr 127.0.0.1`` points every worker at its own loopback.
+
+    :func:`select_init_network` already resolves the routable address
+    set, but ``RuntimePlugin._resolve_master_addr`` consults *placement*
+    ahead of the resolved host list (placement is the only source that
+    is correct for multi-rank-per-host topologies).  Remapping here keeps
+    that precedence while making the selected init network authoritative
+    for both sources.
+
+    The result is an address-only view: use it for emitting rendezvous
+    addresses into serve commands, never for SSH targeting.
+    """
+    if placement is None:
+        return None
+    if all(host == addr_map.get(host, host) for host in placement.hosts_used):
+        return placement
+
+    from dataclasses import replace
+
+    return replace(
+        placement,
+        by_rank=tuple(replace(slot, host=addr_map.get(slot.host, slot.host)) for slot in placement.by_rank),
+        hosts_used=tuple(addr_map.get(host, host) for host in placement.hosts_used),
+    )
+
+
 def workers_can_reach(ctx: ClusterContext, target_ip: str) -> bool:
     """Return whether every worker host can reach *target_ip*."""
     if ctx.dry_run or not ctx.worker_hosts:

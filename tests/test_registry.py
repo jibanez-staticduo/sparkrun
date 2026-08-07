@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -9,13 +10,17 @@ import pytest
 import yaml
 
 from sparkrun.core.registry import (
+    DEPRECATED_REGISTRIES,
+    EUGR_REGISTRY_DESCRIPTION,
     EXTERNAL_RESERVED_NAMES,
     FALLBACK_DEFAULT_REGISTRIES,
+    MIGRATED_REGISTRY_URLS,
     RESERVED_NAME_PREFIXES,
     RegistryEntry,
     RegistryError,
     RegistryManager,
     _get_git_org,
+    _normalize_registry_url,
     validate_registry_name,
     is_dir_link,
     link_directory,
@@ -43,6 +48,22 @@ def mgr(reg_dirs):
     m = RegistryManager(config, cache)
     m._manifest_discovery_attempted = True  # skip network calls in tests
     return m
+
+
+@pytest.fixture
+def bootstrap_urls(monkeypatch) -> list[str]:
+    """Give manifest discovery a deterministic two-URL list.
+
+    conftest empties ``BOOTSTRAP_REGISTRY_URLS`` so that no test git-clones the
+    real default registries. Tests that exercise the discovery loop itself
+    supply their own URLs and mock the per-URL ``_discover_manifest_entries``,
+    which is what makes them hermetic.
+    """
+    from sparkrun.core import registry as reg_module
+
+    urls = ["https://example.com/r1", "https://example.com/r2"]
+    monkeypatch.setattr(reg_module, "BOOTSTRAP_REGISTRY_URLS", urls)
+    return urls
 
 
 @pytest.fixture
@@ -168,9 +189,54 @@ class TestDefaultRegistries:
         assert len(FALLBACK_DEFAULT_REGISTRIES) >= 3
         eugr = FALLBACK_DEFAULT_REGISTRIES[2]
         assert eugr.name == "eugr"
-        assert "eugr/spark-vllm-docker" in eugr.url
+        # Our mirror, not eugr's container-build repo (which the *builder*
+        # still clones — see sparkrun.builders.eugr.EUGR_REPO_URL).
+        assert "spark-arena/eugr-recipes" in eugr.url
+        assert eugr.subpath == "recipes"
+        assert eugr.mods_subpath == "mods"
         assert eugr.enabled is True
         assert eugr.visible is True
+        assert eugr.trusted is True
+
+    def test_eugr_default_url_is_the_migration_target(self):
+        """The shipped eugr URL must be what MIGRATED_REGISTRY_URLS points at.
+
+        Otherwise a migrated config and a fresh install would disagree, and the
+        migrated one would never converge.
+        """
+        eugr = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "eugr")
+        target = MIGRATED_REGISTRY_URLS["https://github.com/eugr/spark-vllm-docker"]
+        assert _normalize_registry_url(eugr.url) == _normalize_registry_url(target)
+
+    def test_eugr_builder_still_clones_the_upstream_build_repo(self):
+        """The two "eugr" URLs are different things and must stay that way.
+
+        - The *registry* is a mirror of upstream's ``recipes/`` + ``mods/``.
+        - The *builder* clones upstream's container build (Dockerfile,
+          ``build-and-copy.sh``, wheels) — none of which the mirror carries.
+
+        Repointing the builder at the mirror would break every v1 recipe that
+        actually builds (``--use-wheels`` and friends), so migrating the
+        registry URL must not drag the builder along with it.
+        """
+        from sparkrun.builders.eugr import EUGR_REPO_URL
+
+        eugr_registry = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "eugr")
+        assert _normalize_registry_url(EUGR_REPO_URL) == "https://github.com/eugr/spark-vllm-docker"
+        assert _normalize_registry_url(EUGR_REPO_URL) != _normalize_registry_url(eugr_registry.url)
+        # And the builder URL must never be swept up by the registry migration.
+        assert _normalize_registry_url(EUGR_REPO_URL) in MIGRATED_REGISTRY_URLS
+        assert "spark-arena" not in EUGR_REPO_URL
+
+    def test_old_eugr_url_is_migrated_not_deprecated(self):
+        """The old eugr URL must not be in DEPRECATED_REGISTRIES.
+
+        Listing it there would *delete* the user's registry instead of moving
+        it, silently taking every @eugr recipe with it.
+        """
+        old = "https://github.com/eugr/spark-vllm-docker"
+        assert old in MIGRATED_REGISTRY_URLS
+        assert not any(_normalize_registry_url(u) == _normalize_registry_url(old) for u in DEPRECATED_REGISTRIES)
 
     def test_seven_default_registries(self):
         """Test that there are exactly seven default registries."""
@@ -306,7 +372,7 @@ class TestRegistryCache:
 class TestRegistryUpdate:
     """Test registry update (git clone/pull) operations."""
 
-    def test_update_calls_clone_for_new(self, mgr, sample_entry):
+    def test_update_calls_clone_for_new(self, mgr, sample_entry, real_registry_git):
         """Test that update clones a new registry."""
         mgr._save_registries([sample_entry])
         with mock.patch("subprocess.run") as mock_run:
@@ -316,7 +382,7 @@ class TestRegistryUpdate:
             calls = mock_run.call_args_list
             assert any("clone" in str(c) for c in calls)
 
-    def test_update_calls_pull_for_existing(self, mgr, sample_entry):
+    def test_update_calls_pull_for_existing(self, mgr, sample_entry, real_registry_git):
         """Test that update pulls an existing registry."""
         mgr._save_registries([sample_entry])
         # Create fake .git dir to simulate existing clone
@@ -330,7 +396,7 @@ class TestRegistryUpdate:
             calls = mock_run.call_args_list
             assert any("pull" in str(c) for c in calls)
 
-    def test_update_all_registries(self, mgr, sample_entry):
+    def test_update_all_registries(self, mgr, sample_entry, real_registry_git):
         """Test that update() with no name updates all enabled registries."""
         second = RegistryEntry(
             name="second",
@@ -1664,7 +1730,7 @@ class TestDiscoverManifestEntries:
 class TestInitDefaultsFromManifests:
     """Test _init_defaults_from_manifests bulk-save flow."""
 
-    def test_returns_entries_without_saving_or_calling_add_registry(self, mgr):
+    def test_returns_entries_without_saving_or_calling_add_registry(self, mgr, bootstrap_urls):
         """Entries are returned without saving or calling add_registry (no re-entrancy)."""
         entries_url1 = [
             RegistryEntry(name="m1", url="https://example.com/r1", subpath="recipes"),
@@ -1720,7 +1786,7 @@ class TestInitDefaultsFromManifests:
         assert len(result) == 1
         assert result[0].name == "good-reg"
 
-    def test_deduplicates_by_name(self, mgr):
+    def test_deduplicates_by_name(self, mgr, bootstrap_urls):
         """Duplicate names across URLs are deduplicated (first wins)."""
         entries_url1 = [
             RegistryEntry(name="shared-name", url="https://example.com/r1", subpath="from-r1"),
@@ -1754,7 +1820,7 @@ class TestInitDefaultsFromManifests:
         # No file should have been saved
         assert not mgr._registries_path.exists()
 
-    def test_no_re_entrancy_on_first_run(self, reg_dirs):
+    def test_no_re_entrancy_on_first_run(self, reg_dirs, bootstrap_urls):
         """Full integration: first-run path does not re-enter _load_registries via add_registry."""
         config, cache = reg_dirs
         mgr = RegistryManager(config, cache)
@@ -1979,7 +2045,7 @@ class TestValidateGitUrl:
         with pytest.raises(ValueError, match="must not start with"):
             validate_git_url("--upload-pack=evil /tmp/target")
 
-    def test_clone_subprocess_args_contain_double_dash(self, mgr, sample_entry):
+    def test_clone_subprocess_args_contain_double_dash(self, mgr, sample_entry, real_registry_git):
         """Confirm that git clone subprocess calls include '--' before the URL."""
         mgr._save_registries([sample_entry])
         with mock.patch("subprocess.run") as mock_run:
@@ -2018,3 +2084,189 @@ class TestValidateGitUrl:
         """add_registry_from_url must raise RegistryError for http:// URLs."""
         with pytest.raises(RegistryError, match="Invalid registry URL"):
             mgr.add_registry_from_url("http://insecure.example.com/repo.git")
+
+
+class TestMigratedRegistryUrls:
+    """A registry that *moved* is rewritten in place, not dropped or re-added."""
+
+    OLD_URL = "https://github.com/eugr/spark-vllm-docker"
+    NEW_URL = "https://github.com/spark-arena/eugr-recipes"
+
+    @staticmethod
+    def _write(mgr, entries: list[dict]):
+        with open(mgr._registries_path, "w") as f:
+            yaml.dump({"registries": entries}, f)
+
+    def _write_eugr(self, mgr, **overrides):
+        entry = {
+            "name": "eugr",
+            "url": self.OLD_URL,
+            "subpath": "recipes",
+            "description": "Official eugr/spark-vllm-docker repo recipes",
+            "mods_subpath": "mods",
+            "trusted": True,
+        }
+        entry.update(overrides)
+        self._write(mgr, [entry])
+
+    def test_old_url_is_rewritten(self, mgr):
+        self._write_eugr(mgr)
+        eugr = next(e for e in mgr._load_registries() if e.name == "eugr")
+        assert _normalize_registry_url(eugr.url) == _normalize_registry_url(self.NEW_URL)
+
+    def test_rewrite_is_persisted(self, mgr):
+        self._write_eugr(mgr)
+        mgr._load_registries()
+        with open(mgr._registries_path) as f:
+            raw = yaml.safe_load(f)
+        assert _normalize_registry_url(raw["registries"][0]["url"]) == _normalize_registry_url(self.NEW_URL)
+
+    def test_rewrite_matches_dot_git_and_trailing_slash(self, mgr):
+        """The stored URL may carry .git or a trailing slash; both must match."""
+        for spelling in (self.OLD_URL + ".git", self.OLD_URL + "/"):
+            self._write_eugr(mgr, url=spelling)
+            eugr = next(e for e in mgr._load_registries() if e.name == "eugr")
+            assert _normalize_registry_url(eugr.url) == _normalize_registry_url(self.NEW_URL), spelling
+
+    def test_user_state_survives_the_move(self, mgr):
+        """Name, subpaths and enabled/visible choices are the user's, not ours.
+
+        (Trust is the deliberate exception — see
+        ``test_move_applies_the_shipped_default_trust``.)
+        """
+        self._write_eugr(mgr, enabled=False, visible=False, subpath="recipes")
+        eugr = next(e for e in mgr._load_registries() if e.name == "eugr")
+        assert eugr.enabled is False
+        assert eugr.visible is False
+        assert eugr.subpath == "recipes"
+        assert eugr.mods_subpath == "mods"
+
+    def test_move_applies_the_shipped_default_trust(self, mgr):
+        """An untrusted eugr entry becomes trusted when it follows the move.
+
+        The one-shot backfill in ``_migrate_trust_field`` only runs against a
+        pre-trust registries.yaml, so an entry written before eugr became a
+        trusted default is stuck untrusted forever — and its mods (pre_exec
+        hooks) would prompt on every launch. The move re-applies the default.
+        """
+        self._write_eugr(mgr, trusted=False)
+        assert next(e for e in mgr._load_registries() if e.name == "eugr").trusted is True
+
+    def test_move_applies_default_trust_when_the_key_is_absent(self, mgr):
+        """`_save_registries` omits `trusted: false`, so absent is the common case."""
+        self._write(mgr, [{"name": "eugr", "url": self.OLD_URL, "subpath": "recipes", "trusted": True}])
+        # Sanity: an already-trusted entry stays trusted (no revoke on move).
+        assert next(e for e in mgr._load_registries() if e.name == "eugr").trusted is True
+
+        self._write(mgr, [{"name": "eugr", "url": self.OLD_URL, "subpath": "recipes"}])
+        assert next(e for e in mgr._load_registries() if e.name == "eugr").trusted is True
+
+    def test_move_does_not_grant_trust_to_untrusted_defaults(self, mgr):
+        """Only registries we ship as trusted get the grant — not every move."""
+        untrusted_target = "https://github.com/someone/not-a-default"
+        with mock.patch.dict(
+            "sparkrun.core.registry.MIGRATED_REGISTRY_URLS",
+            {"https://github.com/old/thing": untrusted_target},
+            clear=True,
+        ):
+            self._write(mgr, [{"name": "thing", "url": "https://github.com/old/thing", "subpath": "recipes"}])
+            entry = next(e for e in mgr._load_registries() if e.name == "thing")
+        assert entry.url == untrusted_target
+        assert entry.trusted is False
+
+    def test_default_description_is_refreshed(self, mgr):
+        self._write_eugr(mgr)
+        eugr = next(e for e in mgr._load_registries() if e.name == "eugr")
+        assert eugr.description == EUGR_REGISTRY_DESCRIPTION
+
+    def test_custom_description_is_preserved(self, mgr):
+        self._write_eugr(mgr, description="my notes about this registry")
+        eugr = next(e for e in mgr._load_registries() if e.name == "eugr")
+        assert eugr.description == "my notes about this registry"
+
+    def test_registry_is_not_dropped(self, mgr):
+        """Regression guard: migrating must not behave like DEPRECATED_REGISTRIES."""
+        self._write_eugr(mgr)
+        assert any(e.name == "eugr" for e in mgr._load_registries())
+
+    def test_migration_is_idempotent(self, mgr):
+        self._write_eugr(mgr)
+        mgr._load_registries()
+        first = mgr._registries_path.read_text()
+        mgr._load_registries()
+        assert mgr._registries_path.read_text() == first
+
+    def test_unrelated_registries_untouched(self, mgr):
+        self._write(
+            mgr,
+            [
+                {"name": "mine", "url": "https://github.com/me/recipes", "subpath": "recipes"},
+                {"name": "eugr", "url": self.OLD_URL, "subpath": "recipes"},
+            ],
+        )
+        by_name = {e.name: e for e in mgr._load_registries()}
+        assert by_name["mine"].url == "https://github.com/me/recipes"
+        assert _normalize_registry_url(by_name["eugr"].url) == _normalize_registry_url(self.NEW_URL)
+
+    def test_legacy_config_migrates_url_before_trust(self, mgr):
+        """Ordering guard.
+
+        A pre-trust registries.yaml (no `trusted` key anywhere) gets its trust
+        backfilled by matching URLs against the shipped defaults. Those defaults
+        hold the NEW url, so the URL rewrite has to happen first — otherwise the
+        entry is backfilled untrusted and eugr mods start prompting.
+        """
+        self._write(mgr, [{"name": "eugr", "url": self.OLD_URL, "subpath": "recipes"}])
+        eugr = next(e for e in mgr._load_registries() if e.name == "eugr")
+        assert _normalize_registry_url(eugr.url) == _normalize_registry_url(self.NEW_URL)
+        assert eugr.trusted is True
+
+
+class TestStaleCacheOnUrlChange:
+    """A cached clone from the old URL must not survive the move."""
+
+    @staticmethod
+    def _make_clone(path: Path, origin: str):
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
+
+    def test_cache_dropped_when_origin_differs(self, mgr, reg_dirs):
+        _, cache = reg_dirs
+        self._make_clone(cache / "eugr", "https://github.com/eugr/spark-vllm-docker")
+        entry = RegistryEntry(name="eugr", url="https://github.com/spark-arena/eugr-recipes", subpath="recipes")
+        assert mgr._drop_cache_if_url_changed(entry) is True
+        assert not (cache / "eugr").exists()
+
+    def test_cache_kept_when_origin_matches(self, mgr, reg_dirs):
+        _, cache = reg_dirs
+        url = "https://github.com/spark-arena/eugr-recipes"
+        self._make_clone(cache / "eugr", url)
+        entry = RegistryEntry(name="eugr", url=url, subpath="recipes")
+        assert mgr._drop_cache_if_url_changed(entry) is False
+        assert (cache / "eugr" / ".git").exists()
+
+    def test_dot_git_suffix_is_not_a_difference(self, mgr, reg_dirs):
+        """`.git` on one side only must not trigger a pointless re-clone."""
+        _, cache = reg_dirs
+        self._make_clone(cache / "eugr", "https://github.com/spark-arena/eugr-recipes.git")
+        entry = RegistryEntry(name="eugr", url="https://github.com/spark-arena/eugr-recipes", subpath="recipes")
+        assert mgr._drop_cache_if_url_changed(entry) is False
+        assert (cache / "eugr" / ".git").exists()
+
+    def test_missing_cache_is_a_noop(self, mgr):
+        entry = RegistryEntry(name="nope", url="https://github.com/spark-arena/eugr-recipes", subpath="recipes")
+        assert mgr._drop_cache_if_url_changed(entry) is False
+
+    def test_link_into_shared_clone_is_unlinked_not_deleted_through(self, mgr, reg_dirs):
+        """The cache dir may be a link to a shared clone others still use."""
+        _, cache = reg_dirs
+        shared = cache / "_url_shared"
+        self._make_clone(shared, "https://github.com/eugr/spark-vllm-docker")
+        link_directory(cache / "eugr", shared)
+
+        entry = RegistryEntry(name="eugr", url="https://github.com/spark-arena/eugr-recipes", subpath="recipes")
+        assert mgr._drop_cache_if_url_changed(entry) is True
+        assert not (cache / "eugr").exists()
+        # The shared clone itself survives — another registry may still use it.
+        assert (shared / ".git").exists()

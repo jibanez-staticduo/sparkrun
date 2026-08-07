@@ -7,7 +7,11 @@ import pytest
 from sparkrun.core.backend_select import BackendBundle
 from sparkrun.core.cluster_manager import ClusterDefinition
 from sparkrun.core.hardware import AcceleratorSpec, HostHardware
-from sparkrun.core.launcher import apply_platform_runtime_flag_defaults, resolve_per_host_backends
+from sparkrun.core.launcher import (
+    apply_platform_runtime_flag_defaults,
+    resolve_per_host_backends,
+    resolve_platform_env_defaults,
+)
 from sparkrun.core.recipe import Recipe
 from sparkrun.orchestration.collectives import NcclBackend, RcclBackend
 
@@ -86,6 +90,77 @@ def test_platform_flag_defaults_non_gb10_noop():
     applied = apply_platform_runtime_flag_defaults(recipe, "llama-cpp", _amd_hw())
     assert applied == {}
     assert "mmap" not in recipe.defaults
+
+
+# ---------------------------------------------------------------------------
+# Platform/runtime container env defaults (GB10 torch expandable segments)
+# ---------------------------------------------------------------------------
+
+
+class _StubRuntimeForEnv:
+    def __init__(self, runtime_name: str, family: str | None = None):
+        self.runtime_name = runtime_name
+        self._family = family or runtime_name
+
+    def get_family(self) -> str:
+        return self._family
+
+
+_EXPANDABLE = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+
+
+@pytest.mark.parametrize(
+    "runtime_name,family",
+    [
+        ("vllm-ray", "vllm"),
+        ("vllm-distributed", "vllm"),
+        ("eugr-vllm", "vllm"),  # family match — variant is never enumerated
+        ("sglang", "sglang"),
+    ],
+)
+def test_platform_env_defaults_for_torch_runtimes_on_gb10(runtime_name, family):
+    got = resolve_platform_env_defaults(_StubRuntimeForEnv(runtime_name, family), _nvidia_hw())
+    assert got == _EXPANDABLE
+
+
+@pytest.mark.parametrize("runtime_name", ["llama-cpp", "trtllm", "modular-max"])
+def test_platform_env_defaults_skips_non_torch_runtimes(runtime_name):
+    """Runtimes that manage their own memory get no allocator env."""
+    assert resolve_platform_env_defaults(_StubRuntimeForEnv(runtime_name), _nvidia_hw()) == {}
+
+
+def test_platform_env_defaults_non_gb10_noop():
+    """A non-GB10 NVIDIA host is served by the generic platform — no env."""
+    h100 = HostHardware(accelerators=[AcceleratorSpec(vendor="nvidia", model="h100")])
+    assert resolve_platform_env_defaults(_StubRuntimeForEnv("vllm-ray", "vllm"), h100) == {}
+
+
+def test_platform_env_defaults_unclaimed_hardware_noop():
+    assert resolve_platform_env_defaults(_StubRuntimeForEnv("vllm-ray", "vllm"), _amd_hw()) == {}
+
+
+def test_platform_env_defaults_no_hardware_noop():
+    assert resolve_platform_env_defaults(_StubRuntimeForEnv("vllm-ray", "vllm"), None) == {}
+    assert resolve_platform_env_defaults(_StubRuntimeForEnv("vllm-ray", "vllm"), HostHardware()) == {}
+
+
+def test_platform_env_defaults_platform_error_is_swallowed(monkeypatch):
+    """A misbehaving platform hook contributes nothing rather than failing the launch."""
+    from sparkrun.platforms.dgx_spark import DgxSparkPlatform
+
+    def _raise(self, runtime_name, accelerator, *, runtime_family=None):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(DgxSparkPlatform, "default_env", _raise)
+    assert resolve_platform_env_defaults(_StubRuntimeForEnv("vllm-ray", "vllm"), _nvidia_hw()) == {}
+
+
+def test_platform_env_defaults_returns_a_copy():
+    """Callers must not be able to mutate the platform's table via the result."""
+    runtime = _StubRuntimeForEnv("sglang", "sglang")
+    got = resolve_platform_env_defaults(runtime, _nvidia_hw())
+    got["PYTORCH_CUDA_ALLOC_CONF"] = "mutated"
+    assert resolve_platform_env_defaults(runtime, _nvidia_hw()) == _EXPANDABLE
 
 
 def test_platform_flag_defaults_then_command_emits_no_mmap():

@@ -856,7 +856,12 @@ def run_native_cluster(
     resolved_hosts = resolve_hosts_for_init(ctx, head_ip)
 
     # Do full reachability check to ensure that the head IP is reachable from all hosts.
-    from sparkrun.runtimes._init_network import InitNetworkCandidates, select_init_network
+    from sparkrun.runtimes._init_network import (
+        InitNetworkCandidates,
+        init_address_map,
+        remap_placement_addresses,
+        select_init_network,
+    )
 
     init_selection = select_init_network(
         ctx,
@@ -864,6 +869,14 @@ def run_native_cluster(
     )
     head_ip = init_selection.head_ip
     resolved_hosts = list(init_selection.hosts)
+
+    # The scheduler's placement still carries cluster-config host identifiers
+    # (``127.0.0.1`` for the control machine's own node).  Runtimes resolve
+    # ``--master-addr`` from placement *before* the resolved host list, so the
+    # placement handed to command generation must speak the selected init
+    # network too — otherwise workers are told to rendezvous on their own
+    # loopback.  Address-only view: never used for SSH targeting.
+    init_placement = remap_placement_addresses(ctx.placement, init_address_map(ctx.hosts, init_selection))
 
     # When init falls back to the fabric, the management/default-route
     # interface is the one that is unreachable — re-pin the per-host comm env
@@ -905,7 +918,7 @@ def run_native_cluster(
         init_port=init_port,
         skip_keys=skip_keys,
         hosts=resolved_hosts,
-        placement=ctx.placement,
+        placement=init_placement,
     )
     logger.info("Serve command (head, rank 0):")
     for line in head_command.strip().splitlines():
@@ -1047,7 +1060,7 @@ def run_native_cluster(
                     init_port=init_port,
                     skip_keys=skip_keys,
                     hosts=resolved_hosts,
-                    placement=ctx.placement,
+                    placement=init_placement,
                 )
                 worker_container = all_nodes[rank][2]
                 worker_sparkrun_labels = executor.workload_labels_for_cluster(

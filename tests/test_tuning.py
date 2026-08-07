@@ -46,9 +46,17 @@ class TestGetSglangTuningDir:
         assert isinstance(d, Path)
         assert str(d).endswith("sparkrun/tuning/sglang")
 
-    def test_is_under_home(self):
+    def test_is_under_the_cache_root(self):
+        """The tuning dir hangs off DEFAULT_CACHE_DIR, wherever that points.
+
+        Was ``startswith(Path.home())`` — which only held because the cache dir
+        leaked out to the real ``~/.cache/sparkrun`` during tests. Asserting
+        against the configured root tests the actual contract.
+        """
+        import sparkrun.tuning._common as tuning_common
+
         d = get_sglang_tuning_dir()
-        assert str(d).startswith(str(Path.home()))
+        assert str(d).startswith(str(tuning_common.DEFAULT_CACHE_DIR))
 
 
 class TestGetSglangTuningVolumes:
@@ -436,9 +444,12 @@ class TestGetVllmTuningDir:
         assert isinstance(d, Path)
         assert str(d).endswith("sparkrun/tuning/vllm")
 
-    def test_is_under_home(self):
+    def test_is_under_the_cache_root(self):
+        """See :meth:`TestGetSglangTuningDir.test_is_under_the_cache_root`."""
+        import sparkrun.tuning._common as tuning_common
+
         d = get_vllm_tuning_dir()
-        assert str(d).startswith(str(Path.home()))
+        assert str(d).startswith(str(tuning_common.DEFAULT_CACHE_DIR))
 
 
 class TestGetVllmTuningVolumes:

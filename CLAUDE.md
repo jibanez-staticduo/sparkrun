@@ -151,6 +151,27 @@ stay in-process (not SAF-scanned) because their resolution is **order-sensitive*
 (most-specific `matches()` first) — transports, which select by exact name, moved
 onto SAF; platforms did not.
 
+**Platform default tiers.** A platform publishes hardware-conditional defaults
+through five hooks, each folded in at a different layer so anything the user
+wrote always wins:
+
+| Hook                                   | Scope                        | Folded in by                                              |
+|----------------------------------------|------------------------------|-----------------------------------------------------------|
+| `default_image(runtime)`               | container image              | `RuntimePlugin.default_image_for()`                        |
+| `default_runtime_flags(runtime, accel)`| recipe `defaults` (serve flags) | `launcher.apply_platform_runtime_flag_defaults` (`setdefault`) |
+| `default_env(runtime, accel, family=)` | container env                | `launcher.resolve_platform_env_defaults` (lowest env tier) |
+| `default_executor_config(executor)`    | `ExecutorConfig`             | `executor.resolve_executor(host_hardware=…)`, layer 9      |
+| `default_max_gpu_memory_utilization`   | usable-memory cap            | `core.limits`                                              |
+
+All are keyed off the **head host's** hardware — one image / serve command /
+executor is built per launch, so a representative host is the right scope.
+`default_env` receives the runtime *family* (`get_family()`, e.g. `"vllm"` for
+vllm-ray / vllm-distributed / eugr-vllm) alongside the exact name, so a platform
+can target a family without enumerating variants; exact name wins over family.
+Today DGX Spark uses this for `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+on vllm/sglang and `gpu_access_mode: gpus` (classic `--gpus` rather than CDI,
+whose `/etc/cdi/nvidia.yaml` goes stale across driver upgrades).
+
 ### External Plugins (`core/external_plugins.py`)
 
 Out-of-tree plugins (private executors, transports, runtimes, …) load from
@@ -712,6 +733,31 @@ SAF's stateful root to `tmp_path`, preventing tests from touching `~/.config/spa
 
 All SSH/Docker operations in tests are mocked — no real hosts are needed. Common fixtures: `tmp_recipe_dir` (creates
 sample v1/v2 recipes), `cluster_dir`, `hosts_file`, `v` (initialized SAF Variables instance).
+
+**The suite is hermetic — it touches neither the developer's state nor the network.** Both properties are enforced in
+`isolate_stateful`, and both were once broken in ways that hid for a long time:
+
+| Guard                                                          | What it prevents                                                                                    |
+|----------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
+| `DEFAULT_CONFIG_DIR` → `tmp_path` (+ `STATEFUL_ROOT`)          | reading the developer's clusters / registries / default hosts                                        |
+| `DEFAULT_CACHE_DIR` → `tmp_path` (+ `pending_ops`, `tuning._common`, which bind it at import) | reading *live* state — `ProxyEngine` defaults `state_dir` to `DEFAULT_CACHE_DIR/proxy`, so a test would report on (and `stop()` would SIGTERM) a really-running proxy |
+| `BOOTSTRAP_REGISTRY_URLS` → `[]`                               | first-run manifest discovery git-cloning three GitHub repos                                          |
+| `RegistryManager._clone_or_pull` → stub                        | every other registry `git clone` / `fetch`                                                           |
+
+The last two are why the suite runs in ~70s rather than 30+ minutes: registry git was costing seconds *per test*, masked
+for years by the cache dir leaking out to an already-populated `~/.cache/sparkrun/registries`. Sandboxing the cache
+turned those pulls into full clones, which is how it surfaced.
+
+Consequences for writing tests:
+
+- **Never assume a registry recipe exists.** Recipes must be created locally — a flat `*.yaml` in a `monkeypatch.chdir`
+  target (needs `model` + `container` + a resolvable `runtime` to pass `is_recipe_file`), or a direct path passed to a
+  command (`find_recipe` resolves paths before registries).
+- Tests that assert on **git argv** take the `real_registry_git` fixture, which restores the real `_clone_or_pull`;
+  they stay hermetic by mocking `subprocess.run` themselves.
+- Tests that exercise **manifest discovery** supply their own URLs (`bootstrap_urls` in `test_registry.py`) and mock
+  `_discover_manifest_entries`.
+- Assert against `<module>.DEFAULT_CACHE_DIR` rather than an import-time copy, which would be the real path.
 
 Test files cover: benchmarking, bootstrap, CLI commands, CLI recipe integration, cluster manager, config, distribution,
 Docker command generation, GGUF handling, host resolution, InfiniBand, networking, orchestration primitives, recipes,
