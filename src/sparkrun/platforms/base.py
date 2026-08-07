@@ -104,6 +104,25 @@ class HardwarePlatformPlugin(Plugin):
         """
         return None
 
+    def default_executor_config(self, executor_name: str) -> dict[str, object]:
+        """Platform-specific executor-config defaults for *executor_name*.
+
+        Returns a mapping of :class:`~sparkrun.orchestration.executor.ExecutorConfig`
+        keys that should apply on this platform.  Folded into the executor
+        resolution chain **below** ``config.executor_config`` and **above** the
+        executor's own ``default_config()``, so a recipe / cluster / user config
+        always wins while the platform still outranks the generic per-executor
+        default.
+
+        This is the platform tier for hardware-conditional container plumbing —
+        e.g. DGX Spark returns ``{"gpu_access_mode": "gpus"}`` for ``docker``
+        because CDI is fragile on GB10 hosts whose ``/etc/cdi/nvidia.yaml`` goes
+        stale across driver upgrades.
+
+        Base implementation returns ``{}`` (no platform-specific defaults).
+        """
+        return {}
+
     def default_runtime_flags(self, runtime_name: str, accelerator: AcceleratorSpec) -> dict[str, object]:
         """Platform/runtime/accelerator-specific recipe-flag defaults.
 
@@ -119,6 +138,38 @@ class HardwarePlatformPlugin(Plugin):
         memory.
 
         Base implementation returns ``{}`` (no platform-specific defaults).
+        """
+        return {}
+
+    def default_env(
+        self,
+        runtime_name: str,
+        accelerator: AcceleratorSpec,
+        *,
+        runtime_family: str | None = None,
+    ) -> dict[str, str]:
+        """Platform/runtime/accelerator-specific container env defaults.
+
+        The env-var peer of :meth:`default_runtime_flags`: same
+        platform × runtime × accelerator targeting, but the result is merged
+        into the container environment instead of the recipe's serve flags.
+        Use it for hardware tuning that a runtime reads from the environment
+        rather than the command line — e.g. DGX Spark sets
+        ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` for vLLM/SGLang on
+        GB10.
+
+        *runtime_family* is :meth:`~sparkrun.runtimes.base.RuntimePlugin.get_family`
+        (``"vllm"`` for ``vllm-ray`` / ``vllm-distributed`` / ``eugr-vllm``), so a
+        platform can target a whole family without enumerating every variant.
+        Implementations should let an exact *runtime_name* match win over the
+        family match.
+
+        The launcher folds the result in as the **lowest** env tier — under the
+        cluster's ``env_file``, the recipe's ``env``, and any ``-e`` CLI
+        override — so a platform default can always be overridden, including
+        with an empty value.
+
+        Base implementation returns ``{}`` (no platform-specific env).
         """
         return {}
 

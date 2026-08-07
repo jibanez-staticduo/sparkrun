@@ -110,6 +110,58 @@ def test_dgx_spark_runtime_flags_non_gb10_empty():
     assert DgxSparkPlatform().default_runtime_flags("llama-cpp", h100) == {}
 
 
+def test_dgx_spark_env_defaults_match_by_family():
+    """The table is family-keyed, so every vllm variant inherits without enumeration."""
+    p = DgxSparkPlatform()
+    want = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    assert p.default_env("vllm-ray", _gb10_accel(), runtime_family="vllm") == want
+    assert p.default_env("eugr-vllm", _gb10_accel(), runtime_family="vllm") == want
+    assert p.default_env("sglang", _gb10_accel(), runtime_family="sglang") == want
+
+
+def test_dgx_spark_env_defaults_family_omitted_falls_back_to_name():
+    """Callers that pass no family still match a runtime whose name IS the family."""
+    assert DgxSparkPlatform().default_env("sglang", _gb10_accel()) == {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    assert DgxSparkPlatform().default_env("vllm-ray", _gb10_accel()) == {}
+
+
+def test_dgx_spark_env_defaults_untargeted_runtime_empty():
+    assert DgxSparkPlatform().default_env("llama-cpp", _gb10_accel(), runtime_family="llama-cpp") == {}
+
+
+def test_dgx_spark_env_defaults_non_gb10_accelerator_empty():
+    h100 = AcceleratorSpec(vendor="nvidia", model="h100", memory_gb=80.0)
+    assert DgxSparkPlatform().default_env("vllm-ray", h100, runtime_family="vllm") == {}
+
+
+def test_base_platform_env_defaults_empty():
+    assert GenericNvidiaPlatform().default_env("vllm-ray", _gb10_accel(), runtime_family="vllm") == {}
+
+
+def test_dgx_spark_executor_config_pins_gpus_mode():
+    """GB10 requests GPUs with --gpus: CDI specs go stale across driver upgrades."""
+    assert DgxSparkPlatform().default_executor_config("docker") == {"gpu_access_mode": "gpus"}
+
+
+def test_dgx_spark_executor_config_other_executor_empty():
+    """The pin is docker-specific — local/k8s spell GPU access their own way."""
+    assert DgxSparkPlatform().default_executor_config("local") == {}
+    assert DgxSparkPlatform().default_executor_config("k8s") == {}
+
+
+def test_dgx_spark_executor_config_returns_a_copy():
+    """Callers must not be able to mutate the platform's default table."""
+    p = DgxSparkPlatform()
+    got = p.default_executor_config("docker")
+    got["gpu_access_mode"] = "cdi"
+    assert p.default_executor_config("docker") == {"gpu_access_mode": "gpus"}
+
+
+def test_generic_nvidia_executor_config_empty():
+    """Generic NVIDIA inherits the executor's own default (CDI)."""
+    assert GenericNvidiaPlatform().default_executor_config("docker") == {}
+
+
 def test_base_platform_runtime_flags_default_empty():
     """Generic NVIDIA platform publishes no per-runtime flag defaults."""
     assert GenericNvidiaPlatform().default_runtime_flags("llama-cpp", _gb10_accel()) == {}

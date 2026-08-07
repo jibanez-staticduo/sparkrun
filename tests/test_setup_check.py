@@ -228,13 +228,44 @@ def test_check_all_good_exits_zero(runner, v, patched_cluster_mgr):
 def test_check_reports_critical_gap_exits_one(runner, v, patched_cluster_mgr):
     patched_cluster_mgr.create("mylab", ["10.0.0.1"])
 
-    facts = dict(_FACTS_ALL_GOOD, CHECK_CDI_SPEC="0")
+    facts = dict(_FACTS_ALL_GOOD, CHECK_DOCKER_USABLE="0", CHECK_DOCKER_GROUP="0")
     with mock.patch("sparkrun.orchestration.ssh.run_remote_script") as mock_run:
         mock_run.return_value = RemoteResult("10.0.0.1", 0, _facts_kv(facts), "")
         result = runner.invoke(main, ["setup", "check", "--cluster", "mylab"])
 
     assert result.exit_code == 1
     assert "[FAIL]" in result.output
+    assert "critical gap" in result.output
+    assert "sparkrun setup docker-group" in result.output
+
+
+def test_check_missing_cdi_is_not_a_gap_when_cluster_uses_gpus_mode(runner, v, patched_cluster_mgr):
+    """A DGX Spark cluster requests GPUs with --gpus, so no CDI spec is needed.
+
+    Hardware defaults to DGX Spark when the cluster carries none (same fallback
+    the launcher uses), whose platform tier pins ``gpu_access_mode: gpus``.
+    """
+    patched_cluster_mgr.create("mylab", ["10.0.0.1"])
+
+    facts = dict(_FACTS_ALL_GOOD, CHECK_CDI_SPEC="0")
+    with mock.patch("sparkrun.orchestration.ssh.run_remote_script") as mock_run:
+        mock_run.return_value = RemoteResult("10.0.0.1", 0, _facts_kv(facts), "")
+        result = runner.invoke(main, ["setup", "check", "--cluster", "mylab"])
+
+    assert result.exit_code == 0
+    assert "No setup gaps found" in result.output
+
+
+def test_check_missing_cdi_is_critical_when_cluster_pins_cdi_mode(runner, v, patched_cluster_mgr):
+    """The same host fails the check once the cluster opts back into CDI."""
+    patched_cluster_mgr.create("mylab", ["10.0.0.1"], executor_config={"gpu_access_mode": "cdi"})
+
+    facts = dict(_FACTS_ALL_GOOD, CHECK_CDI_SPEC="0")
+    with mock.patch("sparkrun.orchestration.ssh.run_remote_script") as mock_run:
+        mock_run.return_value = RemoteResult("10.0.0.1", 0, _facts_kv(facts), "")
+        result = runner.invoke(main, ["setup", "check", "--cluster", "mylab"])
+
+    assert result.exit_code == 1
     assert "critical gap" in result.output
     assert "nvidia-ctk cdi generate" in result.output
 

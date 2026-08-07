@@ -28,6 +28,8 @@ from typing import Callable, TYPE_CHECKING
 
 import click
 
+from sparkrun.orchestration.executors.docker import GPU_ACCESS_CDI
+
 from .._common import host_options, json_option
 
 if TYPE_CHECKING:
@@ -65,10 +67,28 @@ class CheckContext:
     cluster_name: str | None
     multi_host: bool
 
+    gpu_access_modes: dict[str, str] = field(default_factory=dict)
+    """host -> the ``gpu_access_mode`` a launch on that host would resolve to.
+
+    Empty (or missing a host) when resolution failed; see :meth:`cdi_required`.
+    """
+
     @property
     def cluster_flag(self) -> str:
         """`` --cluster <name>`` suffix for guidance commands (empty if unknown)."""
         return " --cluster %s" % self.cluster_name if self.cluster_name else ""
+
+    def cdi_required(self, host: str) -> bool:
+        """Would a launch on *host* actually need a CDI spec?
+
+        Only when the resolved ``gpu_access_mode`` is ``cdi`` — a cluster that
+        requests GPUs with ``--gpus`` never reads ``/etc/cdi/nvidia.yaml``, so a
+        missing or stale spec is not a gap for it.
+
+        Fails **safe**: an unresolvable mode is treated as requiring CDI, which
+        is the historical behavior (a missing spec is a hard failure).
+        """
+        return self.gpu_access_modes.get(host, GPU_ACCESS_CDI) == GPU_ACCESS_CDI
 
 
 @dataclass
@@ -107,6 +127,10 @@ def _int_fact(facts: dict[str, str], key: str) -> int:
 #: string so the manual command can never drift from the wizard step that
 #: runs it.
 _CDI_REGENERATE = "sparkrun setup wizard%s (NVIDIA CDI step) — or: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"
+
+#: Why a CDI finding is reported at SKIP rather than FAIL/WARN. Shown verbatim
+#: in the detail so the reader knows it is a mode question, not a broken host.
+_CDI_UNUSED = "this cluster requests GPUs with --gpus (executor_config.gpu_access_mode); regenerate before switching to cdi"
 
 
 def _as_int(value: str | None) -> int:
@@ -183,30 +207,40 @@ def _check_cdi_spec(state: HostState, ctx: CheckContext) -> CheckItem:
         return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", SKIP, "no NVIDIA GPU detected")
     if not _truthy(facts, "CHECK_NVIDIA_CTK"):
         return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", SKIP, "requires nvidia-ctk (see above)")
+
+    # Severity is conditional on how this cluster actually asks for GPUs. With
+    # ``gpu_access_mode: gpus`` (the DGX Spark default) nothing reads the CDI
+    # spec, so its absence is not a gap — reporting FAIL would send the user to
+    # fix something that cannot affect their launches. The finding is still
+    # surfaced, at SKIP, because it becomes real the moment they switch modes.
+    required = ctx.cdi_required(state.host)
+
+    missing = _int_fact(facts, "CHECK_CDI_PATHS_MISSING")
+    checked = _int_fact(facts, "CHECK_CDI_PATHS_CHECKED")
+    stale = bool(checked and missing)
+
     if _truthy(facts, "CHECK_CDI_SPEC"):
         # Present, but possibly stale: the spec pins absolute driver-library
         # and device-node paths, and a driver upgrade moves them. Reported as
         # WARN rather than FAIL because a spec may legitimately reference an
         # optional path, and a false hard-failure on a working host is worse
         # than a prompt to regenerate.
-        missing = _int_fact(facts, "CHECK_CDI_PATHS_MISSING")
-        checked = _int_fact(facts, "CHECK_CDI_PATHS_CHECKED")
-        if checked and missing:
-            return CheckItem(
-                "cdi_spec",
-                "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)",
-                WARN,
-                "%d of %d referenced paths missing — spec looks stale (driver upgraded?)" % (missing, checked),
-                _CDI_REGENERATE % ctx.cluster_flag,
-            )
-        return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", OK)
-    return CheckItem(
-        "cdi_spec",
-        "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)",
-        FAIL,
-        "/etc/cdi/nvidia.yaml missing or empty",
-        _CDI_REGENERATE % ctx.cluster_flag,
-    )
+        if not stale:
+            return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", OK)
+        detail = "%d of %d referenced paths missing — spec looks stale (driver upgraded?)" % (missing, checked)
+        if required:
+            return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", WARN, detail, _CDI_REGENERATE % ctx.cluster_flag)
+        return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", SKIP, "%s — %s" % (detail, _CDI_UNUSED))
+
+    if required:
+        return CheckItem(
+            "cdi_spec",
+            "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)",
+            FAIL,
+            "/etc/cdi/nvidia.yaml missing or empty",
+            _CDI_REGENERATE % ctx.cluster_flag,
+        )
+    return CheckItem("cdi_spec", "NVIDIA CDI spec (/etc/cdi/nvidia.yaml)", SKIP, "not needed — %s" % _CDI_UNUSED)
 
 
 def _check_earlyoom(state: HostState, ctx: CheckContext) -> CheckItem:
@@ -377,6 +411,44 @@ def register(setup_group) -> None:
     group is defined there).
     """
 
+    def _resolve_gpu_access_modes(host_list, *, cluster_name, hosts, hosts_file, config) -> dict[str, str]:
+        """Map each host to the ``gpu_access_mode`` a launch on it would resolve to.
+
+        Runs the *real* executor resolution chain per host (the platform tier is
+        keyed off that host's hardware), so the check reports on the same value
+        the launch would use rather than re-deriving the rule. Mirrors the
+        launcher's fallback: with no cluster definition, hardware defaults to
+        DGX Spark.
+
+        Best-effort — any failure yields an empty/partial map and
+        :meth:`CheckContext.cdi_required` falls back to "CDI is required".
+        """
+        from sparkrun.core.hardware import default_dgx_spark_hardware
+        from sparkrun.orchestration.executor import resolve_executor
+
+        from .._common import _get_cluster_manager
+
+        modes: dict[str, str] = {}
+        cluster_def = None
+        try:
+            cluster_mgr = _get_cluster_manager()
+            # Same "which cluster" rule as resolve_cluster_config: an explicit
+            # --hosts/--hosts-file means the named cluster isn't the host source.
+            resolved = cluster_name or (cluster_mgr.get_default() if not (hosts or hosts_file) else None)
+            if resolved:
+                cluster_def = cluster_mgr.get(resolved)
+        except Exception:
+            logger.debug("Could not resolve cluster for gpu_access_mode", exc_info=True)
+
+        for host in host_list:
+            try:
+                hw = cluster_def.hardware_for(host) if cluster_def is not None else default_dgx_spark_hardware()
+                executor = resolve_executor(cluster=cluster_def, config=config, host_hardware=hw, rootless=False, auto_user=False)
+                modes[host] = executor.config.gpu_access_mode
+            except Exception:
+                logger.debug("Could not resolve gpu_access_mode for %s", host, exc_info=True)
+        return modes
+
     @setup_group.command("check")
     @host_options
     @json_option(help="Emit the full results as JSON")
@@ -410,7 +482,17 @@ def register(setup_group) -> None:
         host_list, user, ssh_kwargs = _resolve_setup_context(hosts, hosts_file, cluster_name, config, user=None)
 
         multi_host = len(host_list) > 1
-        check_ctx = CheckContext(cluster_name=cluster_name, multi_host=multi_host)
+        check_ctx = CheckContext(
+            cluster_name=cluster_name,
+            multi_host=multi_host,
+            gpu_access_modes=_resolve_gpu_access_modes(
+                host_list,
+                cluster_name=cluster_name,
+                hosts=hosts,
+                hosts_file=hosts_file,
+                config=config,
+            ),
+        )
 
         target = "cluster '%s'" % cluster_name if cluster_name else "%d host(s)" % len(host_list)
         click.echo("Setup check for %s (%d host(s))" % (target, len(host_list)))

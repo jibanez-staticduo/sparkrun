@@ -175,6 +175,14 @@ def _summarize_platforms(
     "Overrides the recipe's builder_config.rebuild setting.",
     hidden=HIDE_ADVANCED_OPTIONS,
 )
+@click.option(
+    "--env",
+    "-e",
+    "env_overrides",
+    multiple=True,
+    hidden=HIDE_ADVANCED_OPTIONS,
+    help="Set a container environment variable: -e KEY=VALUE (repeatable). Value is used verbatim, unlike -o env.KEY=VALUE.",
+)
 @click.option("--label", "labels_override", multiple=True, help="Set meta data on a container (e.g., --label com.example.key=value)")
 @click.option(
     "--executor-args",
@@ -219,6 +227,7 @@ def run(
     trust,
     scheduler_name,
     rebuild,
+    env_overrides,
     labels_override,
     options,
     executor_args,
@@ -242,6 +251,8 @@ def run(
       sparkrun run my-recipe.yaml --port 9000 --gpu-mem 0.8
 
       sparkrun run my-recipe.yaml -o attention_backend=triton -o max_model_len=4096
+
+      sparkrun run my-recipe.yaml -e VLLM_USE_V1=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     """
     from sparkrun.core.bootstrap import get_runtime
 
@@ -289,6 +300,17 @@ def run(
         port=port,
         served_model_name=served_model_name,
     )
+
+    # -e/--env lands in the same place as -o env.KEY=VALUE (recipe.env, the top
+    # container-env tier) but keeps the value verbatim. Applied after, so it
+    # wins if a key is given both ways.
+    if env_overrides:
+        from sparkrun.core.resolve import apply_env_overrides
+
+        try:
+            apply_env_overrides(recipe, env_overrides)
+        except ValueError as e:
+            raise click.UsageError(str(e)) from e
 
     # --rebuild/--no-rebuild is a builder-agnostic override carried in
     # builder_config so any builder (present or future) can honor it. Only

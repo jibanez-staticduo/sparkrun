@@ -17,6 +17,7 @@ import pytest
 from sparkrun.cli._setup._check import (
     FAIL,
     OK,
+    SKIP,
     WARN,
     CheckContext,
     HostState,
@@ -75,6 +76,56 @@ def test_missing_staleness_facts_do_not_invent_a_finding():
 def test_unparseable_counts_do_not_invent_a_finding():
     item = _check_cdi_spec(_state(CHECK_CDI_SPEC="1", CHECK_CDI_PATHS_CHECKED="?", CHECK_CDI_PATHS_MISSING="?"), _ctx())
     assert item.status == OK
+
+
+# ---------------------------------------------------------------------------
+# Severity is conditional on the cluster's resolved gpu_access_mode
+# ---------------------------------------------------------------------------
+
+
+def _gpus_ctx() -> CheckContext:
+    """A cluster that requests GPUs with ``--gpus`` — CDI is off its launch path."""
+    return CheckContext(cluster_name="mylab", multi_host=True, gpu_access_modes={"h1": "gpus"})
+
+
+def _cdi_ctx() -> CheckContext:
+    return CheckContext(cluster_name="mylab", multi_host=True, gpu_access_modes={"h1": "cdi"})
+
+
+def test_absent_spec_is_not_a_gap_when_gpus_mode():
+    """No FAIL for a mechanism this cluster never uses (the DGX Spark default)."""
+    item = _check_cdi_spec(_state(CHECK_CDI_SPEC="0"), _gpus_ctx())
+    assert item.status == SKIP
+    assert "not needed" in item.detail
+    assert "gpu_access_mode" in item.detail
+
+
+def test_stale_spec_is_not_a_gap_when_gpus_mode():
+    item = _check_cdi_spec(_state(CHECK_CDI_SPEC="1", CHECK_CDI_PATHS_CHECKED="12", CHECK_CDI_PATHS_MISSING="5"), _gpus_ctx())
+    assert item.status == SKIP
+    # The staleness itself is still reported — it becomes real on a mode switch.
+    assert "5 of 12" in item.detail
+    assert "switching to cdi" in item.detail
+
+
+def test_healthy_spec_is_ok_regardless_of_mode():
+    facts = dict(CHECK_CDI_SPEC="1", CHECK_CDI_PATHS_CHECKED="12", CHECK_CDI_PATHS_MISSING="0")
+    assert _check_cdi_spec(_state(**facts), _gpus_ctx()).status == OK
+    assert _check_cdi_spec(_state(**facts), _cdi_ctx()).status == OK
+
+
+def test_explicit_cdi_mode_keeps_the_hard_failure():
+    item = _check_cdi_spec(_state(CHECK_CDI_SPEC="0"), _cdi_ctx())
+    assert item.status == FAIL
+    assert "nvidia-ctk cdi generate" in item.guidance
+
+
+def test_unresolved_mode_fails_safe_to_requiring_cdi():
+    """An unknown host (resolution failed) keeps the historical severity."""
+    ctx = CheckContext(cluster_name="mylab", multi_host=True, gpu_access_modes={"other-host": "gpus"})
+    assert _check_cdi_spec(_state(CHECK_CDI_SPEC="0"), ctx).status == FAIL
+    assert ctx.cdi_required("h1") is True
+    assert ctx.cdi_required("other-host") is False
 
 
 # ---------------------------------------------------------------------------

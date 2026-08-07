@@ -9,8 +9,8 @@ from sparkrun.orchestration.executor import ExecutorConfig, accelerator_vendor_f
 from sparkrun.orchestration.executors.docker import DockerExecutor
 
 
-def _build_opts(vendor: str | None = None, gpus: str = "all") -> list[str]:
-    cfg = ExecutorConfig(accelerator_vendor=vendor, gpus=gpus, privileged=False, network="")
+def _build_opts(vendor: str | None = None, gpus: str = "all", mode: str = "cdi") -> list[str]:
+    cfg = ExecutorConfig(accelerator_vendor=vendor, gpus=gpus, gpu_access_mode=mode, privileged=False, network="")
     return DockerExecutor(cfg)._accelerator_opts()
 
 
@@ -41,6 +41,49 @@ def test_nvidia_with_custom_gpu_spec_maps_to_cdi():
 def test_default_with_empty_gpus_emits_nothing():
     """Empty gpus -> no device flag (preserved from the legacy behavior)."""
     assert _build_opts(vendor=None, gpus="") == []
+
+
+# --------------------------------------------------------------------------
+# gpu_access_mode — CDI vs the classic --gpus flag
+# --------------------------------------------------------------------------
+
+
+def test_gpus_mode_emits_legacy_flag():
+    """gpu_access_mode=gpus -> the classic --gpus <spec>."""
+    assert _build_opts(gpus="all", mode="gpus") == ["--gpus", "all"]
+
+
+def test_gpus_mode_passes_device_spec_through_verbatim():
+    """Unlike CDI, --gpus takes the spec as-is (no per-id expansion)."""
+    assert _build_opts(gpus="device=0,1", mode="gpus") == ["--gpus", "device=0,1"]
+
+
+def test_gpus_mode_with_empty_gpus_emits_nothing():
+    """Falsy gpus still means "no GPU request" in either mode."""
+    assert _build_opts(gpus="", mode="gpus") == []
+
+
+def test_unknown_gpu_access_mode_falls_back_to_cdi_with_warning(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        opts = _build_opts(gpus="all", mode="nvidia-docker2")
+    assert opts == ["--device", "nvidia.com/gpu=all"]
+    assert any("unknown gpu_access_mode" in rec.message for rec in caplog.records)
+
+
+def test_default_config_gpu_access_mode_is_cdi():
+    """DOCKER_DEFAULTS keeps CDI — hardware that wants --gpus says so at the platform tier."""
+    from sparkrun.orchestration.executors.docker import DOCKER_DEFAULTS
+
+    assert DOCKER_DEFAULTS["gpu_access_mode"] == "cdi"
+
+
+def test_run_cmd_gpus_mode_emits_legacy_flag():
+    cfg = ExecutorConfig(privileged=False, gpus="all", gpu_access_mode="gpus", network="")
+    cmd = DockerExecutor(cfg).run_cmd(image="img", container_name="test")
+    assert "--gpus all" in cmd
+    assert "nvidia.com/gpu" not in cmd
 
 
 # --------------------------------------------------------------------------

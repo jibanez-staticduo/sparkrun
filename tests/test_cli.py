@@ -211,7 +211,32 @@ class TestListCommand:
 class TestSearchCommand:
     """Test the search command."""
 
-    def test_search_shows_recipes(self, runner):
+    @pytest.fixture
+    def cwd_recipe(self, tmp_path, monkeypatch):
+        """A working-directory recipe for search to find.
+
+        These tests used to search for "llama-cpp" and expect hits from the
+        *default registries* — i.e. they only passed if the machine could git
+        clone three GitHub repos and those repos still shipped a llama-cpp
+        recipe. The suite no longer touches the network (see conftest), so the
+        catalog has to be seeded locally.
+        """
+        (tmp_path / "cwd-llama-cpp.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "cwd-llama-cpp",
+                    "model": "unsloth/Qwen3-1.7B-GGUF:Q4_K_M",
+                    "runtime": "llama-cpp",
+                    # discover_cwd_recipes -> is_recipe_file requires container
+                    "container": "scitrera/dgx-spark-llama-cpp:latest",
+                    "description": "local recipe for search tests",
+                }
+            )
+        )
+        monkeypatch.chdir(tmp_path)
+        return tmp_path
+
+    def test_search_shows_recipes(self, runner, cwd_recipe):
         """Test that sparkrun search finds matching recipes."""
         result = runner.invoke(main, ["search", "llama-cpp"])
         assert result.exit_code == 0
@@ -224,7 +249,7 @@ class TestSearchCommand:
         assert result.exit_code == 0
         assert "No recipes found matching" in result.output
 
-    def test_search_json(self, runner):
+    def test_search_json(self, runner, cwd_recipe):
         """Test that sparkrun recipe search --json outputs a valid JSON list."""
         import json
 
@@ -2498,6 +2523,19 @@ class TestOptionOverrides:
             assert call_kwargs["overrides"]["attention_backend"] == "triton"
             assert call_kwargs["overrides"]["max_model_len"] == 4096  # auto-coerced to int
 
+    def test_env_dot_option_reaches_container_env(self, runner, reset_bootstrap):
+        """-o env.KEY=VALUE lands in the container env, not in overrides."""
+        with mock.patch.object(SglangRuntime, "run", return_value=0) as mock_run:
+            result = runner.invoke(
+                main,
+                ["run", _TEST_RECIPE_NAME, "--solo", "--dry-run", "--hosts", "localhost", "-o", "env.MY_FLAG=hello"],
+            )
+
+            assert result.exit_code == 0
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["env"]["MY_FLAG"] == "hello"
+            assert "env.MY_FLAG" not in call_kwargs["overrides"]
+
     def test_dedicated_cli_param_overrides_option(self, runner, reset_bootstrap):
         """--port takes priority over -o port=XXXX."""
         with mock.patch.object(SglangRuntime, "run", return_value=0) as mock_run:
@@ -2669,6 +2707,80 @@ class TestOptionOverrides:
 
         assert result.exit_code != 0
         assert "must be key=value" in result.output
+
+
+class TestEnvOverrides:
+    """Test -e/--env container environment variables on `sparkrun run`."""
+
+    def _run_env(self, runner, *args):
+        """Invoke a dry run with *args* and return the env dict the runtime got."""
+        with mock.patch.object(SglangRuntime, "run", return_value=0) as mock_run:
+            result = runner.invoke(
+                main,
+                ["run", _TEST_RECIPE_NAME, "--solo", "--dry-run", "--hosts", "localhost", *args],
+            )
+            assert result.exit_code == 0, result.output
+            return mock_run.call_args.kwargs["env"]
+
+    def test_env_reaches_the_container(self, runner, reset_bootstrap):
+        env = self._run_env(runner, "-e", "MY_FLAG=hello")
+        assert env["MY_FLAG"] == "hello"
+
+    def test_env_is_repeatable(self, runner, reset_bootstrap):
+        env = self._run_env(runner, "-e", "A=1", "--env", "B=2")
+        assert env["A"] == "1"
+        assert env["B"] == "2"
+
+    def test_env_value_is_verbatim_unlike_the_o_form(self, runner, reset_bootstrap):
+        """The point of the flag: -o routes through coerce_value, -e does not.
+
+        A runtime that parses ``true`` itself must not receive Python's ``True``.
+        """
+        env = self._run_env(runner, "-e", "VIA_E=true", "-o", "env.VIA_O=true")
+        assert env["VIA_E"] == "true"
+        assert env["VIA_O"] == "True"
+
+    def test_only_the_first_equals_splits(self, runner, reset_bootstrap):
+        env = self._run_env(runner, "-e", "ALLOC=expandable_segments:True", "-e", "PAIR=a=b")
+        assert env["ALLOC"] == "expandable_segments:True"
+        assert env["PAIR"] == "a=b"
+
+    def test_empty_value_is_allowed(self, runner, reset_bootstrap):
+        """`-e KEY=` is how a lower-tier default (platform/cluster) gets blanked."""
+        assert self._run_env(runner, "-e", "BLANKED=")["BLANKED"] == ""
+
+    def test_env_wins_over_the_o_form_for_the_same_key(self, runner, reset_bootstrap):
+        env = self._run_env(runner, "-o", "env.CONFLICT=from-o", "-e", "CONFLICT=from-e")
+        assert env["CONFLICT"] == "from-e"
+
+    def test_malformed_env_is_a_usage_error(self, runner, reset_bootstrap):
+        result = runner.invoke(
+            main,
+            ["run", _TEST_RECIPE_NAME, "--solo", "--dry-run", "--hosts", "localhost", "-e", "NOEQUALS"],
+        )
+        assert result.exit_code != 0
+        assert "must be KEY=VALUE" in result.output
+
+    def test_empty_key_is_a_usage_error(self, runner, reset_bootstrap):
+        result = runner.invoke(
+            main,
+            ["run", _TEST_RECIPE_NAME, "--solo", "--dry-run", "--hosts", "localhost", "-e", "=orphan"],
+        )
+        assert result.exit_code != 0
+        assert "empty key" in result.output
+
+    def test_visibility_follows_the_advanced_flag(self, runner):
+        """Hidden from --help unless SPARKRUN_ADVANCED is set.
+
+        Read the constant rather than assuming: it is resolved at import time,
+        so a developer running the suite with SPARKRUN_ADVANCED=1 sees the
+        opposite and neither answer is a failure.
+        """
+        from sparkrun.cli._common import HIDE_ADVANCED_OPTIONS
+
+        result = runner.invoke(main, ["run", "--help"])
+        assert result.exit_code == 0
+        assert ("--env" in result.output) is not HIDE_ADVANCED_OPTIONS
 
 
 class TestFollowLogs:

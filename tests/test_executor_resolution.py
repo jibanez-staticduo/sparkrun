@@ -623,6 +623,83 @@ class TestClusterLayer:
         assert ex.config.shm_size == "100g"
 
 
+class TestPlatformLayer:
+    """``platform.default_executor_config(name)`` sits above the executor's own
+    defaults and below every user-facing layer.  Threaded via ``host_hardware``.
+    """
+
+    @staticmethod
+    def _gb10():
+        from sparkrun.core.hardware import default_dgx_spark_hardware
+
+        return default_dgx_spark_hardware()
+
+    @staticmethod
+    def _h100():
+        from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+
+        return HostHardware(accelerators=[AcceleratorSpec(vendor="nvidia", model="h100", memory_gb=80.0)])
+
+    def test_no_hardware_keeps_executor_default(self):
+        """Naming / teardown paths pass no hardware — the layer drops out."""
+        ex = resolve_executor(rootless=False, auto_user=False)
+        assert ex.config.gpu_access_mode == "cdi"
+
+    def test_dgx_spark_pins_gpus_mode(self):
+        ex = resolve_executor(host_hardware=self._gb10(), rootless=False, auto_user=False)
+        assert ex.config.gpu_access_mode == "gpus"
+
+    def test_generic_nvidia_inherits_cdi(self):
+        """Only DGX Spark opts out of CDI; other NVIDIA hosts keep the default."""
+        ex = resolve_executor(host_hardware=self._h100(), rootless=False, auto_user=False)
+        assert ex.config.gpu_access_mode == "cdi"
+
+    def test_recipe_overrides_platform(self):
+        ex = resolve_executor(
+            recipe=_FakeRecipe(executor_config={"gpu_access_mode": "cdi"}),
+            host_hardware=self._gb10(),
+            rootless=False,
+            auto_user=False,
+        )
+        assert ex.config.gpu_access_mode == "cdi"
+
+    def test_config_overrides_platform(self):
+        class _Cfg:
+            default_executor = None
+            executor_config = {"gpu_access_mode": "cdi"}
+
+        ex = resolve_executor(config=_Cfg(), host_hardware=self._gb10(), rootless=False, auto_user=False)
+        assert ex.config.gpu_access_mode == "cdi"
+
+    def test_platform_layer_is_executor_scoped(self):
+        """DGX Spark publishes docker defaults only — a different executor is untouched."""
+        ex = resolve_executor(
+            recipe=_FakeRecipe(executor="local"),
+            host_hardware=self._gb10(),
+            rootless=False,
+            auto_user=False,
+        )
+        assert ex.config.gpu_access_mode == "cdi"
+
+    def test_platform_error_is_swallowed(self, monkeypatch):
+        import sparkrun.platforms as platforms
+
+        def _raise(hw):
+            raise ValueError("boom")
+
+        monkeypatch.setattr(platforms, "resolve_platform", _raise)
+        ex = resolve_executor(host_hardware=self._gb10(), rootless=False, auto_user=False)
+        assert ex.config.gpu_access_mode == "cdi"
+
+    def test_unclaimed_hardware_contributes_nothing(self):
+        """A host no platform claims (AMD today) falls through to the executor default."""
+        from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+
+        hw = HostHardware(accelerators=[AcceleratorSpec(vendor="amd", model="mi300x")])
+        ex = resolve_executor(host_hardware=hw, rootless=False, auto_user=False)
+        assert ex.config.gpu_access_mode == "cdi"
+
+
 class TestBuilderEnvFileLayer:
     """A builder that produces a shell env_file auto-populates the executor's
     ``env_file`` — below an explicit recipe/CLI ``executor_config.env_file``

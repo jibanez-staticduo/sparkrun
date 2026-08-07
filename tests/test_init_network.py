@@ -2,11 +2,12 @@
 
 from unittest import mock
 
+from sparkrun.core.scheduler import RankAssignment, RankSlot
 from sparkrun.orchestration.comm_env import ClusterCommEnv
 from sparkrun.runtimes import _cluster_ops, _init_network
 
 
-def _make_ctx(hosts: list[str], *, dry_run: bool = False) -> _cluster_ops.ClusterContext:
+def _make_ctx(hosts: list[str], *, dry_run: bool = False, placement=None) -> _cluster_ops.ClusterContext:
     return _cluster_ops.ClusterContext(
         hosts=list(hosts),
         head_host=hosts[0],
@@ -19,6 +20,14 @@ def _make_ctx(hosts: list[str], *, dry_run: bool = False) -> _cluster_ops.Cluste
         image="test:image",
         dry_run=dry_run,
         config=None,
+        placement=placement,
+    )
+
+
+def _one_gpu_per_host_placement(hosts: list[str]) -> RankAssignment:
+    return RankAssignment(
+        by_rank=tuple(RankSlot(host=host, local_gpu=0) for host in hosts),
+        hosts_used=tuple(hosts),
     )
 
 
@@ -258,3 +267,147 @@ def test_launch_containers_parallel_applies_runtime_finalize_hook():
     runtime.finalize_host_comm_env.assert_called_once()
     assert captured["nccl_env"]["NODE_IP"] == "192.168.0.155"
     assert captured["nccl_env"]["VLLM_HOST_IP"] == "192.168.0.155"
+
+
+class TestPlacementInitAddresses:
+    """The scheduler's placement must speak the selected init network."""
+
+    def test_address_map_zips_cluster_hosts_to_selection(self):
+        """Given aligned lists, the map pairs each cluster host with its init address."""
+        selection = _init_network.InitNetworkSelection(
+            head_ip="10.113.145.138",
+            hosts=("10.113.145.138", "10.113.145.65"),
+            network="management",
+        )
+
+        assert _init_network.init_address_map(["127.0.0.1", "10.113.145.65"], selection) == {
+            "127.0.0.1": "10.113.145.138",
+            "10.113.145.65": "10.113.145.65",
+        }
+
+    def test_address_map_falls_back_to_identity_on_length_mismatch(self):
+        """A selection not derived from these hosts must not produce a skewed map."""
+        selection = _init_network.InitNetworkSelection(head_ip="10.0.0.1", hosts=("10.0.0.1",), network="management")
+
+        assert _init_network.init_address_map(["127.0.0.1", "node-2"], selection) == {
+            "127.0.0.1": "127.0.0.1",
+            "node-2": "node-2",
+        }
+
+    def test_remap_rewrites_loopback_rank_host(self):
+        """Given a loopback placement, the remapped view carries the routable head IP."""
+        placement = _one_gpu_per_host_placement(["127.0.0.1", "10.113.145.65"])
+
+        remapped = _init_network.remap_placement_addresses(
+            placement,
+            {"127.0.0.1": "10.113.145.138", "10.113.145.65": "10.113.145.65"},
+        )
+
+        assert remapped.host_for_rank(0) == "10.113.145.138"
+        assert remapped.host_for_rank(1) == "10.113.145.65"
+        assert remapped.hosts_used == ("10.113.145.138", "10.113.145.65")
+        # Source placement is untouched — it stays the SSH-addressable truth.
+        assert placement.host_for_rank(0) == "127.0.0.1"
+
+    def test_remap_preserves_slot_resources_and_multi_gpu_ranks(self):
+        """Per-rank GPU index and fractional claims survive the address rewrite."""
+        placement = RankAssignment(
+            by_rank=(
+                RankSlot(host="127.0.0.1", local_gpu=0, util_fraction=0.5, memory_gb=40.0),
+                RankSlot(host="127.0.0.1", local_gpu=1),
+            ),
+            hosts_used=("127.0.0.1",),
+        )
+
+        remapped = _init_network.remap_placement_addresses(placement, {"127.0.0.1": "10.0.0.1"})
+
+        assert [(s.host, s.local_gpu, s.util_fraction, s.memory_gb) for s in remapped.by_rank] == [
+            ("10.0.0.1", 0, 0.5, 40.0),
+            ("10.0.0.1", 1, 1.0, None),
+        ]
+
+    def test_remap_is_identity_when_no_host_changes(self):
+        """An all-routable placement is returned verbatim (no needless copy)."""
+        placement = _one_gpu_per_host_placement(["node-1", "node-2"])
+
+        assert _init_network.remap_placement_addresses(placement, {"node-1": "node-1", "node-2": "node-2"}) is placement
+
+    def test_remap_of_none_is_none(self):
+        """Callers that never scheduled keep their None placement."""
+        assert _init_network.remap_placement_addresses(None, {"a": "b"}) is None
+
+
+def test_native_cluster_remaps_loopback_placement_to_routable_head(monkeypatch):
+    """Given a 127.0.0.1 head, node commands must not receive a loopback placement.
+
+    Regression: ``_resolve_master_addr`` consults placement *before* the
+    resolved host list, so a cluster whose head is listed as ``127.0.0.1``
+    emitted ``--master-addr 127.0.0.1`` and every worker rendezvoused on
+    its own loopback — even though head-IP detection and the reachability
+    guard had both resolved the routable address.
+    """
+    hosts = ["127.0.0.1", "10.113.145.65"]
+    ctx = _make_ctx(hosts, placement=_one_gpu_per_host_placement(hosts))
+    monkeypatch.setattr(_cluster_ops, "cleanup_ranked_containers", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        _cluster_ops,
+        "detect_ib_with_ips",
+        lambda *_a, **_k: (ClusterCommEnv.empty(), {}, {}),
+    )
+    monkeypatch.setattr(_cluster_ops, "detect_head_ip", lambda _ctx: "10.113.145.138")
+    monkeypatch.setattr(_cluster_ops, "find_port", lambda _ctx, _host, port: port)
+    # Management head is reachable from the worker — the real-world case.
+    monkeypatch.setattr(_init_network, "workers_can_reach", lambda _ctx, _target: True)
+    monkeypatch.setattr(_cluster_ops, "launch_containers_parallel", lambda *_a, **_k: 1)
+
+    runtime = mock.MagicMock()
+    runtime._resolve_executor.return_value.node_container_name = lambda cid, rank: "%s_node_%d" % (cid, rank)
+    runtime.generate_node_command = mock.MagicMock(return_value="serve")
+    runtime.get_extra_docker_opts = lambda: []
+    runtime._print_cluster_banner = mock.MagicMock()
+
+    _cluster_ops.run_native_cluster(runtime=runtime, ctx=ctx)
+
+    call = runtime.generate_node_command.call_args
+    assert call.kwargs["head_ip"] == "10.113.145.138"
+    assert call.kwargs["hosts"] == ["10.113.145.138", "10.113.145.65"]
+    assert call.kwargs["placement"].host_for_rank(0) == "10.113.145.138"
+    # SSH targeting still uses the cluster-config identifiers.
+    assert ctx.hosts == ["127.0.0.1", "10.113.145.65"]
+
+
+def test_native_cluster_remaps_placement_onto_fabric_on_ib_fallback(monkeypatch):
+    """Given the IB fallback verdict, placement addresses follow the fabric too."""
+    hosts = ["node-1", "node-2"]
+    ctx = _make_ctx(hosts, placement=_one_gpu_per_host_placement(hosts))
+    monkeypatch.setattr(_cluster_ops, "cleanup_ranked_containers", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        _cluster_ops,
+        "detect_ib_with_ips",
+        lambda *_a, **_k: (
+            ClusterCommEnv.empty(),
+            {"node-1": "192.168.100.10", "node-2": "192.168.100.11"},
+            {"node-1": "cx0", "node-2": "cx0"},
+        ),
+    )
+    monkeypatch.setattr(_cluster_ops, "detect_head_ip", lambda _ctx: "192.168.128.10")
+    monkeypatch.setattr(
+        _cluster_ops,
+        "resolve_hosts_for_init",
+        lambda _ctx, _head_ip: ["192.168.128.10", "192.168.96.114"],
+    )
+    monkeypatch.setattr(_cluster_ops, "find_port", lambda _ctx, _host, port: port)
+    monkeypatch.setattr(_init_network, "workers_can_reach", lambda _ctx, target: target == "192.168.100.10")
+    monkeypatch.setattr(_cluster_ops, "launch_containers_parallel", lambda *_a, **_k: 1)
+
+    runtime = mock.MagicMock()
+    runtime._resolve_executor.return_value.node_container_name = lambda cid, rank: "%s_node_%d" % (cid, rank)
+    runtime.generate_node_command = mock.MagicMock(return_value="serve")
+    runtime.get_extra_docker_opts = lambda: []
+    runtime._print_cluster_banner = mock.MagicMock()
+
+    _cluster_ops.run_native_cluster(runtime=runtime, ctx=ctx)
+
+    call = runtime.generate_node_command.call_args
+    assert call.kwargs["placement"].host_for_rank(0) == "192.168.100.10"
+    assert call.kwargs["placement"].host_for_rank(1) == "192.168.100.11"

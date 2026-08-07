@@ -357,6 +357,40 @@ def apply_platform_runtime_flag_defaults(recipe: Recipe, runtime_name: str, host
     return applied
 
 
+def resolve_platform_env_defaults(runtime: RuntimePlugin, host_hardware) -> dict[str, str]:
+    """Return the platform's container-env defaults for *runtime*.
+
+    The env peer of :func:`apply_platform_runtime_flag_defaults`: resolves the
+    hardware platform for *host_hardware* and asks it for
+    :meth:`~sparkrun.platforms.base.HardwarePlatformPlugin.default_env`, passing
+    both the runtime's name and its family (``get_family()``) so a platform can
+    target one variant or a whole family (``"vllm"``).
+
+    Unlike the flag defaults this returns rather than mutates: env is merged as
+    a *tier* by the caller (below the cluster's env and the recipe's ``env``),
+    so a user can override a platform default with any value, including an
+    empty one — a ``setdefault`` into ``recipe.env`` could not express that.
+
+    Never raises: a platform whose hook misbehaves contributes nothing.
+    """
+    from sparkrun.platforms import resolve_platform
+
+    if host_hardware is None or not getattr(host_hardware, "accelerators", None):
+        return {}
+
+    platform = resolve_platform(host_hardware)
+    if platform is None:
+        return {}
+
+    accel = host_hardware.accelerators[0]
+    try:
+        env = platform.default_env(runtime.runtime_name, accel, runtime_family=runtime.get_family()) or {}
+    except Exception:
+        logger.debug("Platform %r default_env raised", getattr(platform, "platform_name", "?"), exc_info=True)
+        return {}
+    return {str(k): str(val) for k, val in env.items()}
+
+
 def resolve_per_host_backends(
     host_list: list[str],
     cluster=None,
@@ -1010,7 +1044,10 @@ def launch_inference(
     # Build executor via the unified resolution chain (single source of
     # truth shared with cli._stop_logs).  Order: CLI → recipe → runtime
     # → per-executor adjustments (Docker reads rootless/auto_user here)
-    # → SparkrunConfig → per-executor defaults → dataclass field defaults.
+    # → SparkrunConfig → platform → per-executor defaults → dataclass field
+    # defaults.  The head host's hardware supplies the platform tier (e.g. DGX
+    # Spark pinning docker's GPU request to --gpus rather than CDI); one
+    # executor is built per launch, so a representative host is the right scope.
     from sparkrun.orchestration.executor import resolve_executor
 
     executor = resolve_executor(
@@ -1021,17 +1058,24 @@ def launch_inference(
         cli_overrides=executor_config if isinstance(executor_config, dict) else None,
         rootless=rootless,
         auto_user=auto_user,
+        host_hardware=_head_hw,
         v=v,
     )
 
-    # Cluster-level container env (e.g. CONTAINER_* imported from a legacy
-    # spark-vllm-docker .env), resolved from the cluster's env_file.  Layered
-    # UNDER recipe env so recipe/CLI env values win.  Single chokepoint —
-    # covers solo and cluster mode, all runtimes and executors.
+    # Container env tiers, lowest first:
+    #   platform (hardware tuning, e.g. PYTORCH_CUDA_ALLOC_CONF on GB10)
+    #   < cluster env_file (e.g. CONTAINER_* imported from a legacy
+    #     spark-vllm-docker .env)
+    #   < recipe env (which already carries any -e CLI override).
+    # Single chokepoint — covers solo and cluster mode, all runtimes and
+    # executors.  Keyed off the head host, like the platform flag defaults.
+    platform_env = resolve_platform_env_defaults(runtime, _head_hw)
+    if platform_env:
+        logger.debug("Applied platform env defaults: %s", sorted(platform_env))
+    cluster_env = cluster.resolve_env() if (cluster is not None and getattr(cluster, "env", None)) else {}
     effective_env = recipe.env
-    if cluster is not None and getattr(cluster, "env", None):
-        cluster_env = cluster.resolve_env()
-        effective_env = {**cluster_env, **(recipe.env or {})}
+    if platform_env or cluster_env:
+        effective_env = {**platform_env, **cluster_env, **(recipe.env or {})}
 
     # Launch
     rc = runtime.run(

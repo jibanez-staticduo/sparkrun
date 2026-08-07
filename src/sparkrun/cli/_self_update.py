@@ -112,9 +112,9 @@ def describe_change(channel: str, old: tuple[str | None, str | None], new: tuple
         if new_commit is None:
             return "sparkrun %s updated (could not determine new commit)." % channel
         if old_commit == new_commit:
-            return "sparkrun %s is already on the latest commit (g%s)." % (channel, new_commit[:7])
-        old_disp = ("g%s" % old_commit[:7]) if old_commit else "unknown"
-        return "sparkrun %s updated: %s -> g%s" % (channel, old_disp, new_commit[:7])
+            return "sparkrun %s is already on the latest commit (%s)." % (channel, new_commit[:7])
+        old_disp = old_commit[:7] if old_commit else "unknown"
+        return "sparkrun %s updated: commit %s -> %s" % (channel, old_disp, new_commit[:7])
     # stable / PyPI
     if new_version is None:
         return "sparkrun updated (could not determine new version)."
