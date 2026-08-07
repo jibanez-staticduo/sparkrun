@@ -290,6 +290,83 @@ every `KeyboardInterrupt` state-preservation path already in the codebase runs).
 `SIGKILL` remains unreachable — it leaves the ssh client alive, the session
 healthy, and the guard correctly dormant.
 
+### Launch Placement (`api.plan` → `api.run`)
+
+A launch **decides once**. The launch path is split at the point where it stops
+deciding and starts acting:
+
+| Function | Does | Returns |
+|----------|------|---------|
+| `api.plan(options)` | resolve recipe/cluster/runtime, `prepare_transport`, one `api.status` sweep, **one** `api.schedule`, compose intent/token/cluster_id | `RunPlan` |
+| `api.run(options, plan=…)` | evict superseded deployments, `launch_inference`, build result | `RunResult` |
+
+`run(options)` with no plan plans internally, so the split is invisible to
+callers that render nothing. It exists for the ones that don't: **anything that
+shows the target hosts before launching must plan, render, then
+`run(options, plan=plan)`.**
+
+The alternative — schedule yourself, then pass the winners as `options.hosts` —
+is what the CLI and the benchmark flow used to do, and it is a trap: `RunOptions.hosts`
+is the *candidate* set, so narrowing it makes the display pass authoritative over
+placement and leaves `run` unable to reach any host the display pass discarded.
+That is how a `tp 2` launch on a 4-host `occupancy-sparse` cluster with 2 idle
+hosts died with *"cluster has insufficient free capacity for 2 node(s)"*: the CLI
+trimmed with the greedy default (it never forwarded the resolved scheduler), then
+`api.run` re-placed with `occupancy-sparse` over only the busy pair it had been
+handed.
+
+`RunPlan` therefore keeps **both** host sets. They are not interchangeable:
+
+- `candidate_hosts` — what placement could choose from. Feeds
+  `derive_placement_token_from_hosts` (the deterministic/greedy cluster_id) and
+  `_evict_superseded_deployments`, so that `stop` / `status` — which only know
+  the cluster's full host list — derive the same cluster_id the launch used.
+- `host_list` — what it chose. What actually runs.
+
+`sparkrun run` previously scheduled three times (trim, a statusless
+display-placement for the per-host VRAM fit table, then the launch) across two
+SSH occupancy sweeps. Both are now one. The fit table renders `plan.placement`,
+which is why it can no longer show every target as `[OK]` above the capacity
+error that rejected them. Regression tests: `tests/test_api_plan.py`,
+`tests/test_cli_run_single_placement.py`.
+
+`api/_hosts.py:resolve_effective_hosts()` remains the single placement authority
+underneath; `plan` is its one caller on the launch path.
+
+**Which scheduler is in effect** is reported by
+`core/scheduler.py:describe_effective_scheduler()` — the display peer of
+`resolve_scheduler_selector` (that returns the *selector*, `None` when nothing
+named one; this resolves it to the scheduler that would run, plus a `defaulted`
+flag). Used by `cluster show`, `cluster inspect`, and the `run` banner so none
+can disagree with the launch. A cluster predating the `scheduler` field stores
+`None` and silently resolves to greedy; `cluster show` previously printed
+nothing at all in that case, leaving no way to tell a greedy cluster from an
+occupancy-aware one without launching something.
+
+### `--ensure` ("is this workload already up?")
+
+`--ensure` matches on the launch **intent** (recipe + parallelism + port) via
+`api.find_running_intent(intent_id, hosts) -> IntentMatch | None`, never on a
+cluster_id. A cluster_id encodes *placement* as well as intent, so the old
+`derive_cluster_id(recipe, host_list)` lookup could only match a job the greedy
+scheduler had put on exactly the host set being asked about — under an
+`occupancy-*` scheduler (random placement token) it matched nothing, ever, and
+`--ensure` launched a duplicate on every invocation.
+
+- `core/cluster_status.py:workload_matches_intent()` is the shared predicate.
+  Placement subtracts its own intent's workloads from the occupancy snapshot
+  (`exclude_intent_id`) while `--ensure` looks for exactly those; the two must
+  agree or `--ensure` would decline to launch something placement had already
+  decided to replace.
+- Pass the cluster's **full** host list, not a placement subset — a deployment
+  that landed elsewhere still counts as running.
+- A failed status probe means "not running" and the launch proceeds. Refusing
+  to launch because we couldn't tell is the worse failure.
+- The CLI queries before planning (skip → no scheduling at all); `api.run`
+  honors `RunOptions.ensure` after planning and returns a `RunResult` with
+  `already_running=True`, `launch_result=None`, describing the *pre-existing*
+  deployment. Both go through `find_running_intent`.
+
 ### Status Discovery ("what's running where?")
 
 All workload-status discovery flows through **one source**, `api.status`, in two

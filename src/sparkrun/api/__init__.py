@@ -3,7 +3,7 @@
 This package is the contract that non-CLI Python callers (tests, third-
 party automation, the CLI itself) depend on.  Surfaces:
 
-- **Data models** — :class:`RunOptions`, :class:`RunResult`,
+- **Data models** — :class:`RunOptions`, :class:`RunPlan`, :class:`RunResult`,
   :class:`StopResult`, :class:`LogLine`, :class:`JobInfo`,
   :class:`RecipeSummary`, :class:`BenchmarkOptions`,
   :class:`BenchmarkResult`, :class:`ProgressEvent`, :class:`ResumeMode`.
@@ -15,7 +15,7 @@ party automation, the CLI itself) depend on.  Surfaces:
   :class:`NoResumableState`, :class:`CategoryNotFound`,
   :class:`AmbiguousCategoryError`,
   :class:`FrameworkCategoryMismatch`).
-- **Functions** — ``run``, ``stop``, ``logs``, ``status``,
+- **Functions** — ``plan``, ``run``, ``stop``, ``logs``, ``status``,
   ``schedule``, ``list_jobs``, ``search_recipes``, ``benchmark``
   (added incrementally in subsequent tasks; this module re-exports
   them as they land).
@@ -60,6 +60,7 @@ from sparkrun.api._errors import (
     TrustRejected,
 )
 from sparkrun.core.context import SparkrunContext
+from sparkrun.api._intent import IntentMatch, find_running_intent
 from sparkrun.api._jobs import list_jobs
 from sparkrun.api._logs import logs
 from sparkrun.api._models import (
@@ -68,12 +69,13 @@ from sparkrun.api._models import (
     LogSource,
     RecipeSummary,
     RunOptions,
+    RunPlan,
     RunResult,
     StopAllResult,
     StopResult,
 )
 from sparkrun.api._recipes import resolve_recipe_filter, search_recipes
-from sparkrun.api._run import run
+from sparkrun.api._run import plan, run
 from sparkrun.api._schedule import schedule
 from sparkrun.api._status import status, status_report
 from sparkrun.api._stop import stop
@@ -91,12 +93,14 @@ __all__ = [
     "default_sctx",
     # Data models
     "RunOptions",
+    "RunPlan",
     "RunResult",
     "StopResult",
     "StopAllResult",
     "LogLine",
     "LogSource",
     "JobInfo",
+    "IntentMatch",
     "RecipeSummary",
     # Benchmark data models
     "BenchmarkOptions",
@@ -120,6 +124,7 @@ __all__ = [
     "AmbiguousCategoryError",
     "FrameworkCategoryMismatch",
     # Functions
+    "plan",
     "run",
     "stop",
     "stop_all",
@@ -132,6 +137,7 @@ __all__ = [
     "live_monitor",
     "LiveMonitorSession",
     "list_jobs",
+    "find_running_intent",
     "search_recipes",
     "resolve_recipe_filter",
     "benchmark",

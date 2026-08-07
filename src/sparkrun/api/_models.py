@@ -62,8 +62,16 @@ class RunOptions:
     prompt interactively (CLI default), ``True`` = auto-trust,
     ``False`` = refuse to run untrusted hooks."""
     ensure: bool = False
-    """If True, return existing RunResult when an identical job is already
-    running rather than launching a duplicate."""
+    """If True, skip the launch when this workload is already serving.
+
+    "Already serving" is matched on the launch **intent** (recipe +
+    parallelism + port), not on a cluster_id — so it holds regardless of which
+    hosts the running deployment landed on or which scheduler placed it (see
+    :func:`sparkrun.api.find_running_intent`).  On a hit, ``run`` returns a
+    :class:`RunResult` with ``already_running=True`` describing the
+    *pre-existing* deployment.  A cluster that can't be queried counts as "not
+    running" — refusing to launch because a status probe failed is the worse
+    outcome."""
 
     # Scheduler selection.
     scheduler: str | None = None
@@ -132,6 +140,77 @@ class RunOptions:
 
 
 @dataclass(frozen=True)
+class RunPlan:
+    """Everything :func:`sparkrun.api.run` decides *before* it touches the cluster.
+
+    Produced by :func:`sparkrun.api.plan` and consumed by
+    :func:`sparkrun.api.run` via its ``plan=`` argument.  The split exists
+    because placement is not free and must not be computed twice: a caller
+    that needs to *show* the target hosts before launching (the CLI banner,
+    the desktop app's pre-launch preview) would otherwise have to run the
+    scheduler itself, narrow the host list, and hand the survivors to
+    ``run`` — which then re-schedules over that narrowed set and can no
+    longer reach the hosts the first pass discarded.  Planning once and
+    threading the result removes that whole failure mode: what is displayed
+    and what is launched are the same object.
+
+    Building a plan performs the cluster-facing work that placement needs —
+    transport preparation and one occupancy query — but changes no cluster
+    state.  It is safe to build a plan and never launch it.
+    """
+
+    recipe: "Recipe"
+    """Resolved recipe (runtime selection finalized, overrides applied)."""
+    runtime: Any
+    """Resolved :class:`~sparkrun.runtimes.base.RuntimePlugin`."""
+    cluster: "ClusterDefinition"
+    """Resolved cluster, after transport preparation.  For provider-backed
+    transports this carries the refreshed connection details, so ``run``
+    must reuse it rather than preparing again."""
+
+    candidate_hosts: tuple[str, ...]
+    """Every host placement was allowed to choose from.
+
+    Distinct from :attr:`host_list`, and both are load-bearing: the
+    deterministic (greedy) placement token and the superseded-deployment
+    sweep are derived from the *candidates*, so that ``stop`` / ``status``
+    — which only know the cluster's full host list — compute the same
+    cluster_id the launch used."""
+    host_list: tuple[str, ...]
+    """Hosts the workload will actually run on (the scheduler's
+    ``hosts_used``, after solo / ``max_nodes`` constraints)."""
+    is_solo: bool
+    """``True`` when the launch resolved to single-host mode."""
+    placement: "RankAssignment | None"
+    """Concrete rank → (host, GPU) assignment.  ``None`` in solo mode or
+    when the scheduler was bypassed (single host / no parallelism)."""
+    notes: tuple[str, ...] = ()
+    """Human-readable placement notes (e.g. ``"Note: 2 nodes required,
+    using 2 of 4 hosts"``).  The library never prints; renderers echo these
+    verbatim."""
+
+    scheduler_selector: str | None = None
+    """Scheduler name as selected (CLI → recipe → cluster).  ``None`` means
+    nothing in the chain named one and the default applies."""
+    scheduler: str = ""
+    """Resolved scheduler name — what actually produced :attr:`placement`."""
+    scheduler_defaulted: bool = False
+    """``True`` when :attr:`scheduler_selector` was ``None``, so callers can
+    surface the "consider occupancy-aware placement" hint."""
+
+    intent_id: str = ""
+    """Deterministic hex identifier for (recipe + parallelism + port)."""
+    placement_token: str = ""
+    """Token disambiguating this launch from other instances of the intent.
+    Derived from :attr:`candidate_hosts` under a deterministic scheduler,
+    random under a status-aware one."""
+    cluster_id: str = ""
+    """``sparkrun_<intent_id>_<placement_token>`` — the id the launch will
+    use, so a renderer can show it (and ``--ensure`` can look it up) before
+    anything starts."""
+
+
+@dataclass(frozen=True)
 class RunResult:
     """Outputs of a successful :func:`sparkrun.api.run`."""
 
@@ -181,6 +260,11 @@ class RunResult:
     """Random hex token disambiguating this specific launch from other
     instances of the same intent.  Empty string only when the caller
     supplied a non-canonical ``cluster_id_override``."""
+    already_running: bool = False
+    """``True`` when :attr:`RunOptions.ensure` found this intent already
+    serving, so nothing was launched.  :attr:`cluster_id` / :attr:`host_list`
+    then describe the **pre-existing** deployment, and
+    :attr:`launch_result` is ``None`` (there was no launch)."""
 
 
 # --------------------------------------------------------------------------

@@ -442,16 +442,10 @@ def _status_excluding_intent(status, intent_id: str):
     """
     import dataclasses
 
-    def _intent_of(cluster_id: str) -> str | None:
-        try:
-            from sparkrun.orchestration.job_metadata import parse_cluster_id
-
-            return parse_cluster_id(cluster_id)[0]
-        except Exception:
-            return None
+    from sparkrun.core.cluster_status import workload_matches_intent
 
     def _matches(w) -> bool:
-        return (w.intent_id == intent_id) or (_intent_of(w.cluster_id) == intent_id)
+        return workload_matches_intent(w, intent_id)
 
     new_hosts = []
     changed = False
