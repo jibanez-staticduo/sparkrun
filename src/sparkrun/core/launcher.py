@@ -281,6 +281,89 @@ def _verify_pre_placed_model(recipe, hosts, ssh_kwargs, *, runtime, cluster, con
         )
 
 
+def _verify_image_command_passthrough(
+    recipe,
+    image,
+    hosts,
+    ssh_kwargs,
+    *,
+    runtime,
+    cluster,
+    config,
+    executor_config,
+    rootless,
+    auto_user,
+    host_hardware,
+    v,
+) -> None:
+    """Fail fast when the image's ENTRYPOINT would swallow sparkrun's command.
+
+    sparkrun appends its launcher as CMD *arguments*, so an image whose
+    ENTRYPOINT consumes them (``ENTRYPOINT ["vllm","serve"]``) runs a different
+    program than intended — while the passthrough wrappers most NGC images ship
+    (``/opt/nvidia/nvidia_entrypoint.sh``, ending in ``exec "$@"``) are fine and
+    must be left alone.  Only a probe can tell them apart; see
+    :meth:`~sparkrun.orchestration.executors._base.Executor.verify_command_passthrough`.
+
+    Fails closed rather than auto-clearing the ENTRYPOINT.  The probe does
+    establish that clearing it *works*, but not that clearing it is *harmless* —
+    a consuming entrypoint may also perform setup the workload needs — so this
+    names both supported fixes and leaves the choice to the operator.
+
+    The executor is resolved with the same arguments the launch itself uses
+    below, so the probe container starts under the launch's own accelerator
+    flags (``host_hardware`` is what pins DGX Spark to ``--gpus`` over CDI).
+
+    Best-effort, matching :func:`_verify_pre_placed_model`: an unresolvable
+    executor, an unreachable host, or any probe error is skipped rather than
+    blocking.  Only a *confirmed* consuming entrypoint raises.
+    """
+    from sparkrun.core.recipe import RecipeError
+    from sparkrun.orchestration.executor import resolve_executor
+
+    if not image or not hosts:
+        return
+
+    try:
+        executor = resolve_executor(
+            recipe=recipe,
+            cluster=cluster,
+            runtime=runtime,
+            config=config,
+            cli_overrides=executor_config if isinstance(executor_config, dict) else None,
+            rootless=rootless,
+            auto_user=auto_user,
+            host_hardware=host_hardware,
+            v=v,
+        )
+    except Exception:
+        logger.debug("image entrypoint preflight: executor unresolvable; skipping probe", exc_info=True)
+        return
+
+    try:
+        probe = executor.verify_command_passthrough(image, hosts, ssh_kwargs=ssh_kwargs)
+    except Exception:
+        logger.debug("image entrypoint preflight: probe failed; skipping", exc_info=True)
+        return
+
+    if probe is None or not probe.consumes_command:
+        return
+
+    raise RecipeError(
+        "Container image %s declares ENTRYPOINT %s, which consumes the command sparkrun "
+        "appends rather than running it, so the workload would never start — the image's "
+        "own program parses sparkrun's launcher as its flags. Verified on %s: the same "
+        "command runs correctly once the entrypoint is cleared.\n"
+        "\n"
+        "Fix it in the recipe:\n"
+        "\n"
+        "    executor_config:\n"
+        '      entrypoint: ""\n'
+        "\n"
+        "or for a one-off run, pass:  -o entrypoint=''" % (image, probe.entrypoint or "(unknown)", probe.host)
+    )
+
+
 def resolve_effective_cache_dir(
     cache_dir: str | None,
     host_list: list[str],
@@ -889,6 +972,30 @@ def launch_inference(
             logger.debug("Could not resolve executor for image-skip decision; distributing image", exc_info=True)
             _skip_container = False
 
+        # Preflight: does this image actually run the command sparkrun appends?
+        # Runs from the distribution hook — i.e. once the image is resident on
+        # every target but *before* the model sync — because that is the only
+        # point where the image can be probed on the substrate and the launch
+        # has not yet paid for the long, routinely-interrupted transfer.
+        # Skipped on dry-run (no SSH) and for container-less executors.
+        def _probe_image_entrypoint() -> None:
+            if dry_run or _skip_container:
+                return
+            _verify_image_command_passthrough(
+                recipe,
+                container_image,
+                host_list,
+                ssh_kwargs,
+                runtime=runtime,
+                cluster=cluster,
+                config=config,
+                executor_config=executor_config,
+                rootless=rootless,
+                auto_user=auto_user,
+                host_hardware=_head_hw,
+                v=v,
+            )
+
         comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map = distribute_from_config(
             recipe,
             container_image,
@@ -906,6 +1013,7 @@ def launch_inference(
             prefs=_model_prefs,
             skip_model=_skip_model,
             skip_container=_skip_container,
+            after_container_sync=_probe_image_entrypoint,
         )
         # Re-save job metadata with IP maps from IB detection
         if not dry_run and (ib_ip_map or mgmt_ip_map):

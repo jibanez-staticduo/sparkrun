@@ -464,6 +464,41 @@ blocks — only a *confirmed*-missing path fails the launch. This is why an
 absolute-path model works from a **remote control machine** that isn't a cluster
 member: the check runs on the *targets*, not the control node.
 
+**ENTRYPOINT preflight** (`Executor.verify_command_passthrough(image, hosts, …)`)
+is the second write-path preflight: "will the command I append actually *run* on
+this image?" sparkrun always emits its launcher as CMD **arguments** (`docker run
+<image> bash -c <b64 cmd>`), so the image's ENTRYPOINT decides their fate — and
+the two idioms in wide use are indistinguishable by `docker image inspect`:
+a **passthrough** wrapper (`/opt/nvidia/nvidia_entrypoint.sh` → `exec "$@"`,
+inherited by nearly every NGC image, so this is the *common* case) versus a
+**consuming** one (`ENTRYPOINT ["vllm","serve"]`, which parses sparkrun's
+`bash -c …` as its own flags and never starts the workload). Warning on "non-empty
+ENTRYPOINT" would fire on every working image; auto-clearing would strip the NGC
+wrapper's setup from all of them.
+
+So the verdict is established *empirically* (`containers/entrypoint.py` +
+`scripts/image_entrypoint_probe.sh`): no ENTRYPOINT → `absent`, no container
+started; else run the real argv shape and look for a **computed** sentinel on
+stdout (computed because a consuming entrypoint typically echoes the argv it
+rejected — an echo can reproduce a literal token, never the evaluated one) →
+`pass`; else re-run with `--entrypoint ''` and only call it `fail` if *that*
+succeeds, so a stale CDI spec / absent GPU / missing bash degrades to `unknown`
+rather than a bogus verdict. That second run is also what lets the error claim
+the fix is *verified*.
+
+Wired via `distribute_from_config`'s `after_container_sync` hook — the image is
+resident everywhere but the long, interruptible model sync hasn't started — and
+`launcher._verify_image_command_passthrough` raises a `RecipeError` naming both
+fixes (`executor_config: {entrypoint: ""}` or `-o entrypoint=''`) rather than
+auto-clearing: the probe proves clearing *works*, not that it's *harmless*.
+`DockerExecutor` skips the probe entirely when `config.entrypoint is not None` —
+otherwise it would reject the very fix it recommends. One host is probed (the
+verdict is a property of the image; distribution already established it matches
+everywhere), ~0.7s for the passthrough case. Fail-open throughout; kill switch
+`SPARKRUN_NO_IMAGE_PROBE=1`. `entrypoint` is in `cli/_run.py`'s
+`_EXECUTOR_OVERRIDE_KEYS`, which is what makes `-o entrypoint=''` reach
+`ExecutorConfig` instead of the serve command.
+
 ### Live monitoring (telemetry + occupancy)
 
 Monitoring has a second axis alongside occupancy — **telemetry** (per-host/node

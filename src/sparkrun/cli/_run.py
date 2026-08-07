@@ -57,6 +57,12 @@ _EXECUTOR_OVERRIDE_KEYS = frozenset(
         "ulimit",
         "devices",
         "memory_limit",
+        # ``-o entrypoint=''`` clears a consuming image ENTRYPOINT (one that
+        # parses sparkrun's appended ``bash -c`` as its own flags) without
+        # having to fork a third-party recipe just to add two lines of
+        # executor_config.  Empty string is the meaningful value here and
+        # survives ``coerce_value``; see ExecutorConfig.entrypoint.
+        "entrypoint",
     }
 )
 

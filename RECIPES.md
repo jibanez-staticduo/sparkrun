@@ -402,6 +402,26 @@ executor_config:
   entrypoint: ""
 ```
 
+Or, for a one-off run without editing the recipe:
+
+```bash
+sparkrun run <recipe> -o entrypoint=''
+```
+
+**Which images need this.** sparkrun always appends its launcher as CMD *arguments*, so what an ENTRYPOINT does with
+them decides whether the workload starts at all — and the two idioms look identical to `docker image inspect`:
+
+| ENTRYPOINT | Behaviour | Needs `entrypoint: ""` |
+|---|---|---|
+| absent | the appended CMD *is* the argv | no |
+| `["/opt/nvidia/nvidia_entrypoint.sh"]` (and most NGC-derived images) | passthrough wrapper — does setup, then `exec "$@"` | **no** — clearing it *skips that setup* |
+| `["vllm","serve"]` | consuming — parses sparkrun's `bash -c …` as its own flags | **yes** |
+
+A consuming ENTRYPOINT fails in a way that points nowhere near the cause: the container's program rejects some flag it
+mis-parsed out of sparkrun's launcher, and the serve log dies with the container. sparkrun therefore probes the image
+during distribution (before the model sync) and refuses the launch with the fix above; see
+[docs/EXECUTORS.md](docs/EXECUTORS.md#entrypoint-preflight). Set `SPARKRUN_NO_IMAGE_PROBE=1` to skip the probe.
+
 ### LocalExecutor fields (experimental, `executor: local`)
 
 `LocalExecutor` runs the runtime's serve command as a native subprocess on the
