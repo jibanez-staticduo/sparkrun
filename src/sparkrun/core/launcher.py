@@ -1186,6 +1186,112 @@ def launch_inference(
     )
 
 
+@dataclass(frozen=True)
+class ServeReadiness:
+    """Outcome of waiting for a launched workload's head endpoint.
+
+    ``reason`` is empty when ready, else ``"port"`` (never started
+    listening / container exited) or ``"health"`` (listening but never
+    returned HTTP 200).
+    """
+
+    ready: bool
+    head_host: str
+    head_ip: str
+    port: int
+    container: str
+    reason: str = ""
+
+    @property
+    def health_url(self) -> str:
+        return "http://%s:%d/v1/models" % (self.head_ip, self.port)
+
+
+def wait_for_serve_ready(
+    result: LaunchResult,
+    *,
+    ssh_kwargs: dict | None = None,
+    dry_run: bool = False,
+    port_max_retries: int = 120,
+    port_retry_interval: int = 2,
+    health_max_retries: int = 120,
+    health_retry_interval: int = 5,
+) -> ServeReadiness:
+    """Wait for a detached launch's head endpoint to answer ``/v1/models``.
+
+    ``launch_inference(detached=True)`` returns once the *containers* are
+    up, which for a large model is minutes before the server accepts a
+    request.  Callers that need to act on a serving endpoint must wait
+    for it explicitly.
+
+    Two stages, and the order matters: an inference server refuses
+    connections outright until its engine has finished initializing, so
+    the entire startup is indistinguishable from a crash when probing
+    the URL alone.  :func:`wait_for_port` polls the head *host* for a
+    listening socket and aborts early if the head container has exited;
+    only then is :func:`wait_for_healthy`'s connection-refused-means-dead
+    heuristic sound.
+
+    Args:
+        result: The :class:`LaunchResult` to wait on.
+        ssh_kwargs: SSH parameters for probing the head host.
+        dry_run: Report ready without waiting.
+        port_max_retries: Port-poll attempts (``port_retry_interval`` apart).
+        port_retry_interval: Seconds between port polls.
+        health_max_retries: Health-poll attempts (``health_retry_interval`` apart).
+        health_retry_interval: Seconds between health polls.
+
+    Returns:
+        A :class:`ServeReadiness` describing the head endpoint and
+        whether it became ready.
+    """
+    from sparkrun.orchestration.docker import generate_container_name, generate_node_container_name
+    from sparkrun.orchestration.health import wait_for_healthy, wait_for_port
+    from sparkrun.orchestration.primitives import detect_host_ip
+    from sparkrun.utils import is_local_host
+
+    head_host = result.host_list[0] if result.host_list else "localhost"
+
+    if result.is_solo:
+        container = generate_container_name(result.cluster_id, "solo")
+    else:
+        container = generate_node_container_name(result.cluster_id, 0)
+
+    if is_local_host(head_host):
+        head_ip = "127.0.0.1"
+    else:
+        try:
+            head_ip = detect_host_ip(head_host, ssh_kwargs=ssh_kwargs, dry_run=dry_run)
+        except RuntimeError:
+            head_ip = head_host
+
+    port = result.serve_port
+    base = ServeReadiness(True, head_host, head_ip, port, container)
+    if dry_run:
+        return base
+
+    if not wait_for_port(
+        head_host,
+        port,
+        max_retries=port_max_retries,
+        retry_interval=port_retry_interval,
+        ssh_kwargs=ssh_kwargs,
+        dry_run=dry_run,
+        container_name=container,
+    ):
+        return ServeReadiness(False, head_host, head_ip, port, container, reason="port")
+
+    if not wait_for_healthy(
+        base.health_url,
+        max_retries=health_max_retries,
+        retry_interval=health_retry_interval,
+        dry_run=dry_run,
+    ):
+        return ServeReadiness(False, head_host, head_ip, port, container, reason="health")
+
+    return base
+
+
 def post_launch_lifecycle(
     result: LaunchResult,
     remote_cache_dir: str,
@@ -1219,10 +1325,7 @@ def post_launch_lifecycle(
         run_post_commands,
         run_post_exec,
     )
-    from sparkrun.orchestration.health import wait_for_healthy, wait_for_port
-    from sparkrun.orchestration.primitives import build_ssh_kwargs, detect_host_ip
-    from sparkrun.orchestration.docker import generate_container_name, generate_node_container_name
-    from sparkrun.utils import is_local_host
+    from sparkrun.orchestration.primitives import build_ssh_kwargs
 
     p = progress  # short alias
     if p:
@@ -1233,52 +1336,24 @@ def post_launch_lifecycle(
     host_list = result.host_list
     overrides = result.overrides
     config = result.config
-    is_solo = result.is_solo
 
-    head_host = host_list[0] if host_list else "localhost"
     _ssh_kw = build_ssh_kwargs(config)
 
-    # Determine head container name
-    if is_solo:
-        head_container = generate_container_name(result.cluster_id, "solo")
-    else:
-        head_container = generate_node_container_name(result.cluster_id, 0)
-
-    # Detect head IP for health checks
-    if is_local_host(head_host):
-        head_ip = "127.0.0.1"
-    else:
-        try:
-            head_ip = detect_host_ip(head_host, ssh_kwargs=_ssh_kw, dry_run=dry_run)
-        except RuntimeError:
-            head_ip = head_host
-
-    # Determine effective port
-    config_chain = recipe.build_config_chain(overrides)
-    effective_port = config_chain.get("port", 8000)
-
     click.echo("Waiting for server to become ready...")
-    if not dry_run:
-        # Wait for port to be listening
-        port_ready = wait_for_port(
-            head_host,
-            effective_port,
-            max_retries=120,
-            retry_interval=2,
-            ssh_kwargs=_ssh_kw,
-            dry_run=dry_run,
-            container_name=head_container,
-        )
-        if not port_ready:
-            click.echo("Error: Server port %d never became ready" % effective_port, err=True)
-            sys.exit(1)
+    readiness = wait_for_serve_ready(result, ssh_kwargs=_ssh_kw, dry_run=dry_run)
+    head_host = readiness.head_host
+    head_ip = readiness.head_ip
+    effective_port = readiness.port
+    head_container = readiness.container
 
-        # Wait for HTTP 200 on /v1/models
-        health_url = "http://%s:%s/v1/models" % (head_ip, effective_port)
-        healthy = wait_for_healthy(health_url, max_retries=120, retry_interval=5, dry_run=dry_run)
-        if not healthy:
-            click.echo("Error: Server health check never passed at %s" % health_url, err=True)
-            sys.exit(1)
+    if not readiness.ready:
+        if readiness.reason == "port":
+            click.echo("Error: Server port %d never became ready" % effective_port, err=True)
+        else:
+            click.echo("Error: Server health check never passed at %s" % readiness.health_url, err=True)
+        sys.exit(1)
+
+    config_chain = recipe.build_config_chain(overrides)
 
     # Build hook context with extended variables
     hook_context = build_hook_context(
