@@ -772,7 +772,19 @@ Before launching, sparkrun can pre-sync models and container images from the con
   `docker save | ssh docker load` (`containers/distribute.py`, `containers/sync.py`). Checks image IDs to skip hosts
   that already have the correct image.
 - **VRAM estimation** (`models/vram.py`): Estimates VRAM usage based on model parameter count, dtype, and quantization.
-  Supports HuggingFace model auto-detection to resolve parameter counts.
+  Supports HuggingFace model auto-detection to resolve parameter counts. KV cache sizing has two paths: the generic
+  `2 * layers * kv_heads * head_dim * bytes` formula, and an **MLA** path for DeepSeek architectures, which cache one
+  compressed latent per token per layer. MLA is selected by `kv_lora_rank` / `qk_rope_head_dim` in the HF config or by
+  a fixed-slot KV layout named in the recipe (`nvfp4_ds_mla` / `fp8_ds_mla`, sized from `_MLA_SLOT_BYTES` and DeepSeek
+  V4's per-layer `compress_ratios`). `mla_latent_dim()` normalizes the two config shapes — V2/V3 name the latent and
+  cache the RoPE tail on top of it, V4 folds both into `head_dim` — to the NoPE width, so the tail is counted once.
+  The MLA latent cache is **replicated across TP ranks**, so only pipeline parallelism divides it.
+  `Recipe.estimate_vram()` writes every detected field back into `metadata`, which is what lets later calls skip the
+  HF fetch — so anything read on the way in must also be written back, or it is silently lost on the second call.
+  `kv_cache_dtype` is resolved CLI → metadata → HF quant config → `defaults.kv_cache_dtype` → `--kv-cache-dtype`
+  parsed from the `command:` template (last resort, with a warning). When no dtype is resolved, the estimator
+  computes with `bfloat16` but leaves `VRAMEstimate.kv_dtype` as `None` so the CLI formatter can show
+  `bfloat16 (default)` rather than silently reporting a guessed value.
 
 ### Kernel Tuning (`tuning/`)
 
