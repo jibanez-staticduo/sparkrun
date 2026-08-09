@@ -309,8 +309,8 @@ def display_vram_estimate(
     if est.model_params:
         click.echo(f"  Model params:     {est.model_params:,}")
     click.echo(f"  KV cache dtype:   {est.kv_dtype or 'bfloat16 (default)'}")
-    if est.mla:
-        click.echo("  Architecture:     MLA (compressed latent KV cache)")
+    if est.kv_arch_label:
+        click.echo(f"  Architecture:     {est.kv_arch_label}")
     elif all([est.num_layers, est.num_kv_heads, est.head_dim]):
         click.echo(f"  Architecture:     {est.num_layers} layers, {est.num_kv_heads} KV heads, {est.head_dim} head_dim")
     click.echo(f"  Model weights:    {est.model_weights_gb:.2f} GB")

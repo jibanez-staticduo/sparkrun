@@ -6,6 +6,12 @@ from unittest import mock
 
 import pytest
 
+from sparkrun.models.kv import ArchInfo, arch_marker_names, is_valid_kv_dtype, resolve_kv_strategy
+from sparkrun.models.kv.mla import (
+    mla_kv_bytes_per_token,
+    mla_latent_dim,
+    reconcile_compress_ratios,
+)
 from sparkrun.models.vram import (
     _resolve_quant_dtype,
     bytes_per_element,
@@ -13,15 +19,21 @@ from sparkrun.models.vram import (
     extract_model_info,
     fetch_safetensors_params,
     fetch_safetensors_size,
-    is_mla_kv_layout,
     kv_bytes_per_element,
-    mla_kv_bytes_per_token,
-    mla_latent_dim,
     parse_param_count,
-    reconcile_compress_ratios,
 )
 
 _MLA_KEYS = frozenset({"kv_lora_rank", "qk_rope_head_dim", "compress_ratios", "index_head_dim"})
+
+
+def _arch_from(info: dict) -> dict:
+    """The architecture markers in an ``extract_model_info`` result, as ``arch=``.
+
+    Extraction and estimation agree on field names by construction — both are
+    keyed off :func:`arch_marker_names` — so handing one to the other needs no
+    per-architecture list.
+    """
+    return {k: v for k, v in info.items() if k in arch_marker_names()}
 
 
 class TestParseParamCount:
@@ -984,12 +996,27 @@ class TestKvBytesPerElement:
 class TestMlaKvLayout:
     """Fixed-width DeepSeek MLA KV slot layouts."""
 
+    def _claims(self, dtype: str) -> bool:
+        strategy, _ = resolve_kv_strategy(ArchInfo(kv_dtype=dtype))
+        return strategy.name == "mla"
+
     def test_recognized_layouts(self):
-        assert is_mla_kv_layout("nvfp4_ds_mla")
-        assert is_mla_kv_layout("fp8_ds_mla")
-        assert is_mla_kv_layout("nvfp4-ds-mla")  # hyphen spelling
-        assert not is_mla_kv_layout("bfloat16")
-        assert not is_mla_kv_layout("nvfp4")
+        assert self._claims("nvfp4_ds_mla")
+        assert self._claims("fp8_ds_mla")
+        assert self._claims("nvfp4-ds-mla")  # hyphen spelling
+        assert not self._claims("bfloat16")
+        assert not self._claims("nvfp4")
+
+    def test_packed_layouts_are_valid_kv_dtypes(self):
+        """They have no per-element width, so validation must ask the registry.
+
+        Without this a recipe naming ``kv_dtype: nvfp4_ds_mla`` fails validation
+        as an unrecognized dtype.
+        """
+        assert kv_bytes_per_element("nvfp4_ds_mla") is None
+        assert is_valid_kv_dtype("nvfp4_ds_mla")
+        assert is_valid_kv_dtype("bfloat16")
+        assert not is_valid_kv_dtype("bogus_dtype")
 
     def test_v3_style_656_byte_slot(self):
         """Without compress_ratios every layer stores one 656-byte slot per token."""
@@ -1031,9 +1058,7 @@ class TestMlaEstimateVram:
             num_layers=info["num_layers"],
             num_kv_heads=info["num_kv_heads"],
             head_dim=info["head_dim"],
-            kv_lora_rank=info.get("kv_lora_rank"),
-            qk_rope_head_dim=info.get("qk_rope_head_dim"),
-            compress_ratios=info.get("compress_ratios"),
+            arch=_arch_from(info),
             model_type=info.get("model_type"),
             max_model_len=1_048_576,
             kv_dtype="nvfp4_ds_mla",
@@ -1051,10 +1076,10 @@ class TestMlaEstimateVram:
             max_model_len=1_048_576,
         )
         assert generic.kv_cache_total_gb == pytest.approx(86.0, abs=0.1)
-        assert not generic.mla
+        assert generic.kv_arch != "mla"
 
         est = estimate_vram(**self._v4_kwargs(deepseek_v4_config))
-        assert est.mla
+        assert est.kv_arch == "mla"
         assert est.kv_cache_per_token_bytes == pytest.approx(3157.25)
         assert est.kv_cache_total_gb == pytest.approx(3.08, abs=0.01)
 
@@ -1079,7 +1104,7 @@ class TestMlaEstimateVram:
     def test_mla_layout_alone_is_enough(self):
         """A recipe naming nvfp4_ds_mla gets MLA sizing even with no architecture info."""
         est = estimate_vram(model_vram=340.0, kv_dtype="nvfp4_ds_mla", num_layers=43, max_model_len=131_072)
-        assert est.mla
+        assert est.kv_arch == "mla"
         assert est.kv_cache_per_token_bytes == 43 * 656
 
     def test_kv_vram_per_token_override_still_wins(self, deepseek_v4_config):
@@ -1087,7 +1112,7 @@ class TestMlaEstimateVram:
         assert est.kv_cache_total_gb == pytest.approx(1e-6 * 1_048_576)
 
     def test_unsizable_mla_degrades_with_a_warning(self):
-        est = estimate_vram(model_vram=10.0, kv_dtype="bfloat16", kv_lora_rank=512, max_model_len=4096)
+        est = estimate_vram(model_vram=10.0, kv_dtype="bfloat16", max_model_len=4096, arch={"kv_lora_rank": 512})
         assert est.kv_cache_total_gb is None
         assert any("MLA" in w for w in est.warnings)
 
@@ -1137,26 +1162,21 @@ class TestMlaDetectionSignals:
         is ``head_dim * bytes`` — the RoPE tail must not be added on top.
         """
         est = estimate_vram(
-            model_vram=340.0,
-            num_layers=43,
-            num_kv_heads=1,
-            head_dim=512,
-            qk_rope_head_dim=64,
-            max_model_len=32768,
+            model_vram=340.0, num_layers=43, num_kv_heads=1, head_dim=512, max_model_len=32768, arch={"qk_rope_head_dim": 64}
         )
-        assert est.mla
+        assert est.kv_arch == "mla"
         assert est.kv_cache_per_token_bytes == 43 * 512 * 2.0
 
     def test_kv_lora_rank_alone(self):
-        est = estimate_vram(model_vram=340.0, num_layers=61, kv_lora_rank=512, qk_rope_head_dim=64, max_model_len=32768)
-        assert est.mla
+        est = estimate_vram(model_vram=340.0, num_layers=61, max_model_len=32768, arch={"kv_lora_rank": 512, "qk_rope_head_dim": 64})
+        assert est.kv_arch == "mla"
         # DeepSeek's published figure for V3: ~70 KB per token.
         assert est.kv_cache_per_token_bytes == 70_272
 
     def test_non_mla_model_is_untouched(self):
         """Standard GQA sizing must not change for models with no MLA markers."""
         est = estimate_vram(model_vram=60.0, num_layers=64, num_kv_heads=8, head_dim=128, max_model_len=32768)
-        assert not est.mla
+        assert est.kv_arch != "mla"
         assert not est.kv_cache_replicated
         assert est.kv_cache_per_token_bytes == 2.0 * 64 * 8 * 128 * 2.0
 
@@ -1260,14 +1280,19 @@ class TestDegenerateCompressRatios:
             model_vram=340.0,
             kv_dtype="nvfp4_ds_mla",
             num_layers=43,
-            compress_ratios=[0] * 43,
             model_type="deepseek_v4",
             max_model_len=1_048_576,
+            arch={"compress_ratios": [0] * 43},
         )
         assert est.kv_cache_total_gb is None
         assert est.kv_cache_per_token_bytes is None
-        assert not est.mla
         assert any("Cannot size MLA KV cache" in w for w in est.warnings)
+        # Detection is independent of sizing: failing to size an MLA model does
+        # not make it a dense one.  Relabelling it would misreport the
+        # architecture to `to_dict()` (benchmark export) and the CLI, and flip
+        # the replication rule that a kv_vram_per_token override still needs.
+        assert est.kv_arch == "mla"
+        assert est.kv_cache_replicated
 
     def test_one_compressed_layer_is_enough(self):
         """The guard must not swallow a genuinely small but non-zero cache."""
@@ -1287,12 +1312,12 @@ class TestUnsizableMlaWarningNamesTheCause:
         ("kwargs", "expected"),
         [
             pytest.param(
-                dict(kv_dtype="nvfp4_ds_mla", num_layers=43, compress_ratios=[0] * 43, model_type="deepseek_v4"),
+                dict(kv_dtype="nvfp4_ds_mla", num_layers=43, arch={"compress_ratios": [0] * 43}, model_type="deepseek_v4"),
                 "compress_ratios",
                 id="degenerate-ratios",
             ),
-            pytest.param(dict(kv_dtype="bfloat16", num_layers=61, qk_rope_head_dim=64), "kv_lora_rank", id="no-latent"),
-            pytest.param(dict(kv_dtype="bogus_dtype", num_layers=61, kv_lora_rank=512), "unknown KV cache dtype", id="bad-dtype"),
+            pytest.param(dict(kv_dtype="bfloat16", num_layers=61, arch={"qk_rope_head_dim": 64}), "kv_lora_rank", id="no-latent"),
+            pytest.param(dict(kv_dtype="bogus_dtype", num_layers=61, arch={"kv_lora_rank": 512}), "unknown KV cache dtype", id="bad-dtype"),
             pytest.param(dict(kv_dtype="fp8_ds_mla"), "num_layers", id="no-layers"),
         ],
     )
@@ -1318,11 +1343,8 @@ class TestAuxiliaryCacheWarning:
             num_layers=info.get("num_layers"),
             num_kv_heads=info.get("num_kv_heads"),
             head_dim=info.get("head_dim"),
-            kv_lora_rank=info.get("kv_lora_rank"),
-            qk_rope_head_dim=info.get("qk_rope_head_dim"),
-            compress_ratios=info.get("compress_ratios"),
+            arch=_arch_from(info),
             model_type=info.get("model_type"),
-            index_head_dim=info.get("index_head_dim"),
         )
         kwargs.update(overrides)
         return estimate_vram(**kwargs)
@@ -1376,9 +1398,8 @@ class TestReconcileCompressRatios:
             kv_dtype="nvfp4_ds_mla",
             max_model_len=1_048_576,
             num_layers=info["num_layers"],
-            compress_ratios=info["compress_ratios"],
             model_type=info["model_type"],
-            index_head_dim=info.get("index_head_dim"),
+            arch={"compress_ratios": info["compress_ratios"], "index_head_dim": info.get("index_head_dim")},
         )
         assert est.kv_cache_per_token_bytes == pytest.approx(3157.25)
         assert not any("compress_ratios lists" in w for w in est.warnings)
@@ -1398,9 +1419,9 @@ class TestReconcileCompressRatios:
             model_vram=10.0,
             kv_dtype="nvfp4_ds_mla",
             num_layers=61,
-            compress_ratios=[4] * 10,
             model_type="deepseek_v4",
             max_model_len=4096,
+            arch={"compress_ratios": [4] * 10},
         )
         assert any("compress_ratios lists 10 layers" in w for w in est.warnings), est.warnings
 
@@ -1427,8 +1448,8 @@ class TestKvVramPerTokenOverrideSharding:
         assert est.total_per_gpu_gb == pytest.approx(100.0 / 8 + (1e-5 * 100_000) / 8)
 
     def test_mla_override_is_divided_by_pp_only(self):
-        est = estimate_vram(**self._BASE, tensor_parallel=4, pipeline_parallel=2, kv_lora_rank=512, qk_rope_head_dim=64)
-        assert est.mla and est.kv_cache_replicated
+        est = estimate_vram(**self._BASE, tensor_parallel=4, pipeline_parallel=2, arch={"kv_lora_rank": 512, "qk_rope_head_dim": 64})
+        assert est.kv_arch == "mla" and est.kv_cache_replicated
         # Weights still shard by TP*PP; the KV override does not shard by TP.
         assert est.total_per_gpu_gb == pytest.approx(100.0 / 8 + (1e-5 * 100_000) / 2)
 
@@ -1446,8 +1467,8 @@ class TestKvVramPerTokenOverrideSharding:
             max_model_len=1_048_576,
             kv_dtype="nvfp4_ds_mla",
             num_layers=info["num_layers"],
-            compress_ratios=info["compress_ratios"],
             model_type=info["model_type"],
+            arch={"compress_ratios": info["compress_ratios"]},
         )
         assert est.kv_cache_total_gb == pytest.approx(1e-6 * 1_048_576)
 
@@ -1537,25 +1558,27 @@ class TestWeakMlaSignalIsFlagged:
     _MSG = "inferred from qk_rope_head_dim alone"
 
     def test_pinned_qk_rope_alone_warns(self):
-        est = estimate_vram(model_vram=10.0, num_layers=32, num_kv_heads=8, head_dim=128, qk_rope_head_dim=64, max_model_len=4096)
-        assert est.mla
+        est = estimate_vram(model_vram=10.0, num_layers=32, num_kv_heads=8, head_dim=128, max_model_len=4096, arch={"qk_rope_head_dim": 64})
+        assert est.kv_arch == "mla"
         assert any(self._MSG in w for w in est.warnings), est.warnings
 
     def test_kv_lora_rank_alone_warns_about_the_tail(self):
         """The mirror image: kv_lora_rank alone silently drops the RoPE tail."""
-        est = estimate_vram(model_vram=10.0, num_layers=61, kv_lora_rank=512, kv_dtype="bfloat16", max_model_len=4096)
-        assert est.mla
+        est = estimate_vram(model_vram=10.0, num_layers=61, kv_dtype="bfloat16", max_model_len=4096, arch={"kv_lora_rank": 512})
+        assert est.kv_arch == "mla"
         assert any("RoPE tail" in w and "kv_lora_rank" in w for w in est.warnings), est.warnings
         # And it genuinely under-estimates: tail omitted.
         assert est.kv_cache_per_token_bytes == 61 * 512 * 2.0
 
     def test_both_markers_warn_never(self):
-        est = estimate_vram(model_vram=10.0, num_layers=61, kv_lora_rank=512, qk_rope_head_dim=64, kv_dtype="bfloat16", max_model_len=4096)
+        est = estimate_vram(
+            model_vram=10.0, num_layers=61, kv_dtype="bfloat16", max_model_len=4096, arch={"kv_lora_rank": 512, "qk_rope_head_dim": 64}
+        )
         assert not any(self._MSG in w for w in est.warnings)
         assert not any("RoPE tail" in w for w in est.warnings)
 
     def test_explicit_latent_does_not_warn(self):
-        est = estimate_vram(model_vram=10.0, num_layers=61, kv_lora_rank=512, qk_rope_head_dim=64, max_model_len=4096)
+        est = estimate_vram(model_vram=10.0, num_layers=61, max_model_len=4096, arch={"kv_lora_rank": 512, "qk_rope_head_dim": 64})
         assert not any(self._MSG in w for w in est.warnings)
 
     def test_ds_mla_layout_does_not_warn(self):
@@ -1573,18 +1596,22 @@ class TestWeakMlaSignalIsFlagged:
             num_layers=info["num_layers"],
             num_kv_heads=info.get("num_kv_heads"),
             head_dim=info.get("head_dim"),
-            kv_lora_rank=info.get("kv_lora_rank"),
-            qk_rope_head_dim=info.get("qk_rope_head_dim"),
-            compress_ratios=info.get("compress_ratios"),
             model_type=info.get("model_type"),
-            index_head_dim=info.get("index_head_dim"),
+            arch={
+                "kv_lora_rank": info.get("kv_lora_rank"),
+                "qk_rope_head_dim": info.get("qk_rope_head_dim"),
+                "compress_ratios": info.get("compress_ratios"),
+                "index_head_dim": info.get("index_head_dim"),
+            },
         )
         assert not any(self._MSG in w for w in est.warnings), est.warnings
 
     def test_the_underestimate_it_guards_against(self):
         """Documents the magnitude: a GQA shape sized as MLA reads ~10x low."""
         gqa = estimate_vram(model_vram=10.0, num_layers=32, num_kv_heads=8, head_dim=128, max_model_len=4096)
-        as_mla = estimate_vram(model_vram=10.0, num_layers=32, num_kv_heads=8, head_dim=128, qk_rope_head_dim=64, max_model_len=4096)
+        as_mla = estimate_vram(
+            model_vram=10.0, num_layers=32, num_kv_heads=8, head_dim=128, max_model_len=4096, arch={"qk_rope_head_dim": 64}
+        )
         assert gqa.kv_cache_per_token_bytes == 2.0 * 32 * 8 * 128 * 2.0
         assert as_mla.kv_cache_per_token_bytes < gqa.kv_cache_per_token_bytes / 10
 
@@ -1601,7 +1628,7 @@ class TestMlaAloneLayoutOnNonMlaModel:
 
     def test_non_mla_model_warns(self):
         est = estimate_vram(model_vram=60.0, num_layers=64, num_kv_heads=8, head_dim=128, kv_dtype="nvfp4_ds_mla", max_model_len=32768)
-        assert est.mla
+        assert est.kv_arch == "mla"
         assert any(self._MSG in w for w in est.warnings), est.warnings
 
     def test_mla_model_does_not_warn(self, deepseek_v4_config):
@@ -1609,10 +1636,8 @@ class TestMlaAloneLayoutOnNonMlaModel:
             model_vram=340.0,
             kv_dtype="nvfp4_ds_mla",
             num_layers=43,
-            kv_lora_rank=448,
-            qk_rope_head_dim=64,
             max_model_len=32768,
-            index_head_dim=128,
+            arch={"kv_lora_rank": 448, "qk_rope_head_dim": 64, "index_head_dim": 128},
         )
         assert not any(self._MSG in w for w in est.warnings)
 
@@ -1623,10 +1648,12 @@ class TestMlaAloneLayoutOnNonMlaModel:
             model_vram=340.0,
             kv_dtype="nvfp4_ds_mla",
             num_layers=info["num_layers"],
-            kv_lora_rank=info["kv_lora_rank"],
-            qk_rope_head_dim=info["qk_rope_head_dim"],
             max_model_len=32768,
-            index_head_dim=info.get("index_head_dim"),
+            arch={
+                "kv_lora_rank": info["kv_lora_rank"],
+                "qk_rope_head_dim": info["qk_rope_head_dim"],
+                "index_head_dim": info.get("index_head_dim"),
+            },
         )
         assert not any(self._MSG in w for w in est.warnings)
 
@@ -1657,7 +1684,12 @@ class TestShortCompressRatiosSizesAvailableLayersWithWarning:
 
     def test_estimate_sizes_and_warns_for_the_short_list(self):
         est = estimate_vram(
-            model_vram=10.0, kv_dtype="nvfp4_ds_mla", num_layers=61, compress_ratios=[4] * 10, model_type="deepseek_v4", max_model_len=4096
+            model_vram=10.0,
+            kv_dtype="nvfp4_ds_mla",
+            num_layers=61,
+            model_type="deepseek_v4",
+            max_model_len=4096,
+            arch={"compress_ratios": [4] * 10},
         )
         assert est.kv_cache_per_token_bytes == pytest.approx(10 * 584 / 4)
         assert any("compress_ratios lists 10 layers" in w for w in est.warnings), est.warnings

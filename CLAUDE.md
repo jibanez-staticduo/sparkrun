@@ -771,20 +771,50 @@ Before launching, sparkrun can pre-sync models and container images from the con
 - **Containers** (`containers/`): Pulls image locally (`containers/registry.py`), then streams via
   `docker save | ssh docker load` (`containers/distribute.py`, `containers/sync.py`). Checks image IDs to skip hosts
   that already have the correct image.
-- **VRAM estimation** (`models/vram.py`): Estimates VRAM usage based on model parameter count, dtype, and quantization.
-  Supports HuggingFace model auto-detection to resolve parameter counts. KV cache sizing has two paths: the generic
-  `2 * layers * kv_heads * head_dim * bytes` formula, and an **MLA** path for DeepSeek architectures, which cache one
-  compressed latent per token per layer. MLA is selected by `kv_lora_rank` / `qk_rope_head_dim` in the HF config or by
-  a fixed-slot KV layout named in the recipe (`nvfp4_ds_mla` / `fp8_ds_mla`, sized from `_MLA_SLOT_BYTES` and DeepSeek
-  V4's per-layer `compress_ratios`). `mla_latent_dim()` normalizes the two config shapes — V2/V3 name the latent and
-  cache the RoPE tail on top of it, V4 folds both into `head_dim` — to the NoPE width, so the tail is counted once.
-  The MLA latent cache is **replicated across TP ranks**, so only pipeline parallelism divides it.
+- **VRAM estimation** (`models/vram.py`): Model weights, the GPU memory budget, and the arithmetic that combines them
+  with a KV cache estimate. Supports HuggingFace model auto-detection to resolve parameter counts.
   `Recipe.estimate_vram()` writes every detected field back into `metadata`, which is what lets later calls skip the
-  HF fetch — so anything read on the way in must also be written back, or it is silently lost on the second call.
-  `kv_cache_dtype` is resolved CLI → metadata → HF quant config → `defaults.kv_cache_dtype` → `--kv-cache-dtype`
-  parsed from the `command:` template (last resort, with a warning). When no dtype is resolved, the estimator
-  computes with `bfloat16` but leaves `VRAMEstimate.kv_dtype` as `None` so the CLI formatter can show
-  `bfloat16 (default)` rather than silently reporting a guessed value.
+  HF fetch. `kv_cache_dtype` is resolved CLI → metadata → HF quant config → `defaults.kv_cache_dtype` →
+  `--kv-cache-dtype` parsed from the `command:` template (last resort, with a warning). When no dtype is resolved, the
+  estimator computes with `bfloat16` but leaves `VRAMEstimate.kv_dtype` as `None` so the CLI formatter can show
+  `bfloat16 (default)` rather than silently reporting a guessed value. Element widths live in the `models/dtypes.py`
+  leaf (weights and KV are separate tables — NVFP4's KV packing carries block scales its weight packing does not).
+
+#### KV Cache Sizing (`models/kv/`)
+
+Sizing the KV cache is architecture-specific, so it is a seam rather than a branch. `vram.py` names no attention
+architecture; it resolves a strategy and asks it. See `.slop/kv-cache-sizing-design.md` for the rationale.
+
+A `KVCacheStrategy` (`kv/_base.py`) answers three questions — *how big at length L* (`size`), *how big per token*
+(`KVSizing.per_token_bytes`, for display), and *how long fits in a budget* (`tokens_for_budget`). **Sizing is a total
+for a requested length, not a per-token figure multiplied out.** Per-token is the special case: it holds for dense and
+MLA but not for a sliding-window layer (caches `min(max_model_len, window)`) or a Mamba/SSM layer (state is per
+*sequence*). Making the total primitive is what keeps those addable.
+
+| Strategy | Module | Priority | Sizing |
+|----------|--------|----------|--------|
+| `mla`    | `kv/mla.py`   | 10   | DeepSeek V2/V3/V4 compressed latent — one latent per token per layer, **replicated across TP ranks** (only PP divides it). Selected by `kv_lora_rank`/`qk_rope_head_dim`, by an `*_ds_mla` packed layout in `kv_dtype`, or by a `deepseek_v*`/`kimiko*` `model_type`. `mla_latent_dim()` normalizes V2/V3 (latent + RoPE tail on top) and V4 (both folded into `head_dim`) to the NoPE width, so the tail counts once. |
+| `dense`  | `kv/dense.py` | 1000 | `2 * layers * kv_heads * head_dim * bytes`. Claims everything, so resolution always terminates. |
+
+Resolution is **order-sensitive** (most specific `detect()` first), which is why the registry is in-process rather
+than SAF — the `platforms/` precedent. Out-of-tree plugins call `register_kv_strategy()` from their `register(v)`
+hook.
+
+Two rules the seam exists to enforce:
+
+- **Detection is separate from sizing.** A strategy that recognises a model but cannot size it returns
+  `KVSizing(total_bytes=None, unsizable_reason=…)` — it does *not* fall through to dense, whose formula would
+  overestimate a latent cache by ~100x. `VRAMEstimate.kv_arch` therefore reports the detected architecture even when
+  the estimate is unavailable; relabelling it dense would misreport it to `to_dict()` (benchmark export) and flip the
+  replication rule a `kv_vram_per_token` override still depends on.
+- **A strategy *declares* the architecture fields it reads** (`ArchField`: canonical name, HF config keys, kind,
+  validation, docs). That declaration is the single source of truth for HF extraction (`extract_arch_fields`), recipe
+  `metadata` keys, their validation, and the post-estimate write-back — four sites that were four hand-maintained
+  copies of the same list, where omitting one silently reverted the estimate on the path that decides placement.
+  `estimate_vram(arch={...})` takes them as a mapping, never as per-architecture keyword arguments.
+
+`tests/test_kv_strategies.py` registers a sliding-window strategy at runtime and asserts it reaches extraction,
+estimation, recipe write-back and validation with **no core edit** — the executable form of that claim.
 
 ### Kernel Tuning (`tuning/`)
 

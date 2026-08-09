@@ -1140,7 +1140,8 @@ class Recipe:
 
         # Validate metadata if present
         if self.metadata:
-            from sparkrun.models.vram import parse_param_count, bytes_per_element, is_mla_kv_layout, kv_bytes_per_element
+            from sparkrun.models.kv import arch_fields, is_valid_kv_dtype
+            from sparkrun.models.vram import parse_param_count, bytes_per_element
 
             mp = self.metadata.get("model_params")
             if mp is not None and parse_param_count(mp) is None:
@@ -1149,27 +1150,20 @@ class Recipe:
             if md is not None and bytes_per_element(str(md)) is None:
                 issues.append("metadata.model_dtype %r is not a recognized dtype" % md)
             kd = self.metadata.get("kv_dtype")
-            # MLA layouts (nvfp4_ds_mla, fp8_ds_mla) are packed uint8 slots, not
-            # a per-element dtype, so they have no bytes_per_element entry.
-            if kd is not None and kv_bytes_per_element(str(kd)) is None and not is_mla_kv_layout(str(kd)):
+            # Accepts either a per-element dtype or a packed slot layout a KV
+            # strategy claims (nvfp4_ds_mla, ...), which is why this asks the
+            # registry rather than enumerating architectures here.
+            if kd is not None and not is_valid_kv_dtype(str(kd)):
                 issues.append("metadata.kv_dtype %r is not a recognized dtype" % kd)
-            # MLA architecture fields. These are documented as user-overridable
-            # and are coerced with int() in estimate_vram, so an unchecked bad
-            # value surfaces as a traceback from `recipe show --json` — or, on
-            # the launch path, as a debug-level log and a silently dropped
-            # memory claim, which skips the fit check altogether.
-            for _key in ("kv_lora_rank", "qk_rope_head_dim", "index_head_dim"):
-                _val = self.metadata.get(_key)
-                if _val is None:
-                    continue
-                if isinstance(_val, bool) or not isinstance(_val, int) or _val <= 0:
-                    issues.append("metadata.%s %r must be a positive integer" % (_key, _val))
-            cr = self.metadata.get("compress_ratios")
-            if cr is not None:
-                if not isinstance(cr, list) or not cr:
-                    issues.append("metadata.compress_ratios %r must be a non-empty list of integers" % cr)
-                elif any(isinstance(r, bool) or not isinstance(r, int) for r in cr):
-                    issues.append("metadata.compress_ratios must contain only integers")
+            # Architecture fields declared by the KV strategies. These are
+            # documented as user-overridable and are coerced in estimate_vram, so
+            # an unchecked bad value surfaces as a traceback from `recipe show
+            # --json` — or, on the launch path, as a debug-level log and a
+            # silently dropped memory claim, which skips the fit check.
+            for _field in arch_fields():
+                _issue = _field.validate(self.metadata.get(_field.name))
+                if _issue:
+                    issues.append(_issue)
             mt = self.metadata.get("model_type")
             if mt is not None and not isinstance(mt, str):
                 issues.append("metadata.model_type %r must be a string" % mt)
@@ -1248,6 +1242,7 @@ class Recipe:
         Returns:
             VRAMEstimate dataclass with estimation results.
         """
+        from sparkrun.models.kv import arch_fields, is_kv_layout
         from sparkrun.models.vram import (
             bytes_per_element,
             estimate_vram as _estimate_vram,
@@ -1255,7 +1250,6 @@ class Recipe:
             fetch_model_config,
             fetch_safetensors_params,
             fetch_safetensors_size,
-            is_mla_kv_layout,
             parse_param_count,
         )
         from sparkrun.models.quantization import (
@@ -1288,12 +1282,12 @@ class Recipe:
         head_dim = self.metadata.get("head_dim")
         model_vram = self.metadata.get("model_vram")
         kv_vram_per_token = self.metadata.get("kv_vram_per_token")
-        # MLA architecture fields — auto-detected below, overridable in metadata.
-        kv_lora_rank = self.metadata.get("kv_lora_rank")
-        qk_rope_head_dim = self.metadata.get("qk_rope_head_dim")
-        compress_ratios = self.metadata.get("compress_ratios")
         model_type = self.metadata.get("model_type")
-        index_head_dim = self.metadata.get("index_head_dim")
+        # Architecture fields declared by the KV strategies — auto-detected
+        # below, overridable in metadata.  Read as a sweep over the declaration
+        # rather than a hand-written list, so a new architecture's fields reach
+        # the estimator (and the write-back at the bottom) without an edit here.
+        arch_extra: dict[str, Any] = {f.name: self.metadata.get(f.name) for f in arch_fields()}
         quant_info: QuantizationInfo | None = None
         _storage_dtype: str | None = None  # raw torch_dtype before quant override
         effective_recipe_quant: str | None = None  # recipe-level quantization override
@@ -1302,23 +1296,28 @@ class Recipe:
         needs_detection = (model_vram is None and (not model_dtype or model_params_raw is None)) or (
             kv_vram_per_token is None and (not num_layers or not num_kv_heads or not head_dim)
         )
-        # Even with kv_vram_per_token pinned we must still learn whether the
-        # model is MLA.  The override replaces the KV *sizing* (the user
-        # supplies the exact bytes-per-token), but the *sharding rule* only
-        # depends on the architecture: an MLA latent is replicated across TP
+        # Even with kv_vram_per_token pinned we must still learn which KV
+        # architecture the model uses.  The override replaces the KV *sizing*
+        # (the user supplies the exact bytes-per-token), but the *sharding rule*
+        # only depends on the architecture: an MLA latent is replicated across TP
         # ranks (divided by PP only), an ordinary KV cache shards by TP*PP.
         # Defaulting to the ordinary rule silently TP-divides the override of a
         # DeepSeek model, which under-claims memory and lets the scheduler
         # over-commit a placement.  This cannot be short-circuited by pinned
         # architecture: pinning num_layers/num_kv_heads/head_dim is exactly how
-        # a user suppresses detection, and they may not have pinned the MLA
-        # markers while delegating KV sizing.  Detection is cheap and
-        # write-back stops it recurring, so always run it here.
+        # a user suppresses detection, and they may not have pinned the
+        # architecture markers while delegating KV sizing.  Detection is cheap
+        # and write-back stops it recurring, so always run it here.
+        #
+        # The three signals that identify an architecture without HF are asked
+        # for generically — a pinned marker any strategy declared, a packed KV
+        # layout any strategy claims, or a model_type (which this method writes
+        # back unconditionally, so its presence means detection already ran).
+        # Note this must not ask *which* strategy applies: dense is the answer
+        # for most models and is never a positive identification, so gating on
+        # it would refetch on every call forever.
         needs_detection = needs_detection or (
-            kv_vram_per_token is not None
-            and not is_mla_kv_layout(str(kv_dtype or ""))
-            and not (kv_lora_rank or qk_rope_head_dim)
-            and not self.metadata.get("model_type")
+            kv_vram_per_token is not None and not model_type and not any(arch_extra.values()) and not is_kv_layout(str(kv_dtype or ""))
         )
         if auto_detect and self.model and needs_detection:
             hf_config = fetch_model_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
@@ -1355,19 +1354,15 @@ class Recipe:
                 if not head_dim:
                     head_dim = hf_info.get("head_dim")
 
-                # MLA architectures (DeepSeek V2/V3/V4): the KV cache holds
-                # a compressed latent per token per layer, so it is sized
-                # from these rather than num_kv_heads * head_dim.
-                if not kv_lora_rank:
-                    kv_lora_rank = hf_info.get("kv_lora_rank")
-                if not qk_rope_head_dim:
-                    qk_rope_head_dim = hf_info.get("qk_rope_head_dim")
-                if not compress_ratios:
-                    compress_ratios = hf_info.get("compress_ratios")
+                # Architecture markers (MLA's compressed-latent dims, and
+                # whatever a future strategy declares).  extract_model_info
+                # returns them under the same names the strategies declare, so
+                # the fill-in is a sweep, not a per-field list.
+                for _name, _value in arch_extra.items():
+                    if not _value:
+                        arch_extra[_name] = hf_info.get(_name)
                 if not model_type:
                     model_type = hf_info.get("model_type")
-                if not index_head_dim:
-                    index_head_dim = hf_info.get("index_head_dim")
 
                 # Use kv_cache_quant from hf_quant_config to inform kv_dtype
                 if not kv_dtype and quant_info and quant_info.kv_cache_quant:
@@ -1472,11 +1467,8 @@ class Recipe:
             kv_vram_per_token=float(kv_vram_per_token) if kv_vram_per_token is not None else None,
             gpu_memory_utilization=gpu_memory_utilization,
             total_gpu_memory_gb=total_gpu_memory_gb,
-            kv_lora_rank=int(kv_lora_rank) if kv_lora_rank is not None else None,
-            qk_rope_head_dim=int(qk_rope_head_dim) if qk_rope_head_dim is not None else None,
-            compress_ratios=[int(r) for r in compress_ratios] if compress_ratios else None,
             model_type=str(model_type) if model_type else None,
-            index_head_dim=int(index_head_dim) if index_head_dim is not None else None,
+            arch={f.name: f.coerce(arch_extra[f.name]) for f in arch_fields() if arch_extra.get(f.name)},
         )
         if _kv_from_command:
             result.warnings.append(
@@ -1515,18 +1507,17 @@ class Recipe:
         # way it did before.
         if kv_dtype and "kv_dtype" not in self.metadata:
             self.metadata["kv_dtype"] = normalize_dtype(str(kv_dtype))
-        # MLA architecture fields.  A non-MLA model leaves these unset on every
-        # call, which re-derives the same (correct) non-MLA verdict.
-        if kv_lora_rank is not None and "kv_lora_rank" not in self.metadata:
-            self.metadata["kv_lora_rank"] = int(kv_lora_rank)
-        if qk_rope_head_dim is not None and "qk_rope_head_dim" not in self.metadata:
-            self.metadata["qk_rope_head_dim"] = int(qk_rope_head_dim)
-        if compress_ratios and "compress_ratios" not in self.metadata:
-            self.metadata["compress_ratios"] = [int(r) for r in compress_ratios]
         if model_type and "model_type" not in self.metadata:
             self.metadata["model_type"] = str(model_type)
-        if index_head_dim is not None and "index_head_dim" not in self.metadata:
-            self.metadata["index_head_dim"] = int(index_head_dim)
+        # Architecture markers.  A model whose architecture declares none of
+        # them leaves these unset on every call, which re-derives the same
+        # (correct) verdict.  Sweeping the declaration is what makes the
+        # completeness requirement above structural rather than a convention:
+        # a field cannot be read at the top and forgotten here.
+        for _field in arch_fields():
+            _value = arch_extra.get(_field.name)
+            if _value and _field.name not in self.metadata:
+                self.metadata[_field.name] = _field.coerce(_value)
 
         return result
 

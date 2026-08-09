@@ -1566,7 +1566,7 @@ class TestRecipeMetadata:
         ):
             est = recipe.estimate_vram()
 
-        assert est.mla
+        assert est.kv_arch == "mla"
         assert est.kv_dtype == "nvfp4_ds_mla"
         assert est.kv_cache_per_token_bytes == pytest.approx(3157.25)
         assert est.kv_cache_total_gb == pytest.approx(3.08, abs=0.01)
@@ -3394,7 +3394,7 @@ class TestEstimateVramIdempotency:
 
     @staticmethod
     def _signature(est):
-        return (est.mla, est.kv_cache_per_token_bytes, est.kv_cache_total_gb, est.total_per_gpu_gb)
+        return (est.kv_arch, est.kv_cache_per_token_bytes, est.kv_cache_total_gb, est.total_per_gpu_gb)
 
     def test_fixed_slot_mla_is_stable(self, deepseek_v4_config):
         """V4 + nvfp4_ds_mla on defaults: model_type and compress_ratios come from
@@ -3411,7 +3411,7 @@ class TestEstimateVramIdempotency:
         )
         results, fetches = self._estimate_repeatedly(recipe, deepseek_v4_config)
 
-        assert all(e.mla for e in results)
+        assert all(e.kv_arch == "mla" for e in results)
         assert {self._signature(e) for e in results} == {self._signature(results[0])}
         assert results[0].kv_cache_per_token_bytes == pytest.approx(3157.25)
         # The write-back exists to avoid re-fetching; it must still do that.
@@ -3430,7 +3430,7 @@ class TestEstimateVramIdempotency:
         )
         results, fetches = self._estimate_repeatedly(recipe, deepseek_v3_config)
 
-        assert all(e.mla for e in results)
+        assert all(e.kv_arch == "mla" for e in results)
         assert {self._signature(e) for e in results} == {self._signature(results[0])}
         assert results[0].kv_cache_per_token_bytes == 70_272
         assert fetches == 1
@@ -3456,7 +3456,7 @@ class TestEstimateVramIdempotency:
         }
         results, fetches = self._estimate_repeatedly(recipe, hf_config)
 
-        assert not any(e.mla for e in results)
+        assert not any(e.kv_arch == "mla" for e in results)
         assert {self._signature(e) for e in results} == {self._signature(results[0])}
         assert fetches == 1
 
@@ -3593,7 +3593,7 @@ class TestOverrideDoesNotSuppressMlaDetection:
         est, fetches = self._run(recipe, deepseek_v4_config)
         per_gpu_kv = est.total_per_gpu_gb - est.model_weights_gb / 8
         # KV override = 1e-5 * 100000 = 1.0 GB; /pp(2) = 0.5, not /(tp*pp)=0.125
-        assert est.mla
+        assert est.kv_arch == "mla"
         assert est.kv_cache_replicated
         assert per_gpu_kv == pytest.approx(0.5)
         assert fetches == 1
@@ -3615,7 +3615,7 @@ class TestOverrideDoesNotSuppressMlaDetection:
             }
         )
         est, fetches = self._run(recipe, deepseek_v4_config)
-        assert est.mla and est.kv_cache_replicated
+        assert est.kv_arch == "mla" and est.kv_cache_replicated
         assert fetches == 1
 
     def test_pinned_mla_markers_skip_the_fetch(self, deepseek_v4_config):
@@ -3651,7 +3651,7 @@ class TestOverrideDoesNotSuppressMlaDetection:
         )
         first, n1 = self._run(recipe, hf)
         second, n2 = self._run(recipe, hf)
-        assert not first.mla
+        assert first.kv_arch != "mla"
         assert n1 == 1 and n2 == 0  # model_type written back stops the refetch
         assert first.total_per_gpu_gb == second.total_per_gpu_gb
 
@@ -3696,7 +3696,7 @@ class TestPinnedModelTypeIsMla:
         )
         est, fetches = self._run(recipe, deepseek_v4_config)
         per_gpu_kv = est.total_per_gpu_gb - est.model_weights_gb / 8
-        assert est.mla and est.kv_cache_replicated
+        assert est.kv_arch == "mla" and est.kv_cache_replicated
         assert per_gpu_kv == pytest.approx(0.5)  # PP-only, not TP*PP (0.125)
         assert fetches == 0
 
@@ -3722,7 +3722,7 @@ class TestPinnedModelTypeIsMla:
                 "head_dim": 128,
             },
         )
-        assert not est.mla
+        assert est.kv_arch != "mla"
         per_gpu_kv = est.total_per_gpu_gb - est.model_weights_gb / 8
         assert per_gpu_kv == pytest.approx(1e-5 * 100000 / 8)  # /(tp*pp)
 
@@ -3737,7 +3737,7 @@ class TestPinnedModelTypeIsMla:
             }
         )
         est, fetches = self._run(recipe, deepseek_v4_config)
-        assert est.mla and est.kv_cache_replicated
+        assert est.kv_arch == "mla" and est.kv_cache_replicated
         assert fetches == 1
 
 
