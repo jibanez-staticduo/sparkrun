@@ -9,6 +9,7 @@ import sys
 from typing import TYPE_CHECKING, Any
 
 import click
+import click.shell_completion  # enables click.shell_completion.CompletionItem in helpers
 
 if TYPE_CHECKING:
     from sparkrun.core.context import SparkrunContext
@@ -866,11 +867,65 @@ def _is_cluster_id(value: str) -> str | None:
     return None
 
 
+def _describe_job(job) -> str:
+    """Render a one-line description for a :class:`~sparkrun.api.JobInfo`.
+
+    Used as the ``description`` on :class:`CompletionItem` instances so
+    shells that render it (zsh, fish) show recipe + runtime + hosts
+    alongside the cluster_id.
+    """
+    parts = []
+    if job.recipe:
+        parts.append(job.recipe)
+    if job.runtime:
+        parts.append(job.runtime)
+    if job.hosts:
+        parts.append("on " + ",".join(job.hosts))
+    return " ".join(parts) if parts else ""
+
+
+def _complete_cluster_ids(incomplete: str):
+    """Return :class:`CompletionItem` instances for cached workload cluster_ids.
+
+    Reads the local job metadata cache (``~/.cache/sparkrun/jobs/``) via
+    :func:`sparkrun.api.list_jobs` — no SSH round-trip, so it is fast
+    enough for interactive tab-completion (mirrors ``kubectl`` reading a
+    local cache rather than hitting the live API server).
+
+    Matching honours both the canonical ``sparkrun_<digest>`` form and
+    the bare ``<digest>`` short form (both accepted by
+    :func:`_is_cluster_id`), so ``628f…<TAB>`` and
+    ``sparkrun_628f…<TAB>`` both resolve.  The returned value is always
+    the full canonical form.
+    """
+    try:
+        from sparkrun import api
+
+        jobs = api.list_jobs()
+        items = []
+        for job in jobs:
+            cid = job.cluster_id
+            digest = cid.removeprefix("sparkrun_")
+            if not (cid.startswith(incomplete) or digest.startswith(incomplete)):
+                continue
+            items.append(
+                click.shell_completion.CompletionItem(
+                    cid,
+                    help=_describe_job(job),
+                )
+            )
+        return items
+    except Exception:  # noqa: BLE001 — completion must never crash; degrade to empty list
+        return []
+
+
 class TargetType(RecipeNameType):
     """Click parameter type that accepts either a recipe name or a cluster ID.
 
-    Tab completion delegates to RecipeNameType (only completes recipe names).
-    Cluster IDs (hex strings or sparkrun_ prefixed) pass through as-is.
+    Tab completion returns **running workload cluster_ids** first
+    (kubectl-style: complete the live thing you would ``logs``/``stop``),
+    falling back to recipe-name completion when no jobs are cached so an
+    empty cluster still lets the user address a workload by recipe.
     """
 
     name = "target"
@@ -879,6 +934,29 @@ class TargetType(RecipeNameType):
         if _is_cluster_id(value) is not None:
             return value
         return super().convert(value, param, ctx)
+
+    def shell_complete(self, ctx, param, incomplete):
+        """Complete cluster_ids of recently-launched workloads.
+
+        Mirrors ``kubectl logs <TAB>``: the user is addressing a running
+        workload, so we surface cluster_ids from the local job metadata
+        cache (``~/.cache/sparkrun/jobs/`` — instant, no SSH round-trip).
+        Each carries a description of recipe + runtime + hosts for shells
+        that render it (zsh, fish).  Falls back to recipe-name completion
+        when no jobs are cached so an empty cluster still lets the user
+        type a recipe name.
+        """
+        # If the input already looks like a path or @registry ref, defer to
+        # recipe/file completion — those are never cluster_ids.
+        if incomplete and (incomplete[0] in (".", "/", "~") or incomplete.startswith("@")):
+            return super().shell_complete(ctx, param, incomplete)
+
+        items = _complete_cluster_ids(incomplete)
+        if items:
+            return items
+        # No running jobs — fall back to recipe names so the user can still
+        # address a workload by recipe (logs/stop accept recipe names too).
+        return super().shell_complete(ctx, param, incomplete)
 
 
 TARGET = TargetType()
