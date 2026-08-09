@@ -6,6 +6,7 @@ from enum import Enum
 import json
 from pathlib import Path
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import yaml
@@ -286,7 +287,32 @@ def test_run_event_drops_mock_dimensions():
     assert event["scheduler"] is None
 
 
-def test_test_suite_telemetry_blocker_records_despite_emit_swallowing(monkeypatch):
+def test_telemetry_fails_closed_on_anything_but_a_real_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("SPARKRUN_NO_TELEMETRY", raising=False)
+
+    assert telemetry_enabled(SparkrunConfig(tmp_path / "config.yaml")) is True
+    assert telemetry_enabled(MagicMock()) is False
+    assert telemetry_enabled(SimpleNamespace(get=lambda key, default=None: None)) is False
+    assert telemetry_enabled(None) is False
+
+    # Forcing telemetry on must not resurrect a config we do not recognize.
+    monkeypatch.setenv("SPARKRUN_NO_TELEMETRY", "0")
+    assert telemetry_enabled(MagicMock()) is False
+
+
+def test_emit_sends_nothing_when_handed_a_mock_config(tmp_path, monkeypatch):
+    """The vector behind every event that reached the live collector."""
+    from sparkrun.telemetry import emit_benchmark_telemetry
+
+    attempts = install_telemetry_blocker(monkeypatch)
+    monkeypatch.delenv("SPARKRUN_NO_TELEMETRY", raising=False)
+
+    emit_benchmark_telemetry(MagicMock(), result=MagicMock(), options=MagicMock())
+
+    assert attempts == []
+
+
+def test_test_suite_telemetry_blocker_records_despite_emit_swallowing(tmp_path, monkeypatch):
     """The suite-wide guard must survive ``emit_*``'s blanket ``except Exception``.
 
     Raising from the patched ``urlopen`` alone would be logged at DEBUG and
@@ -297,11 +323,10 @@ def test_test_suite_telemetry_blocker_records_despite_emit_swallowing(monkeypatc
     from sparkrun.telemetry import emit_benchmark_telemetry
 
     attempts = install_telemetry_blocker(monkeypatch)
-    # A MagicMock config makes ``telemetry_enabled`` fail open -- the exact
-    # condition under which the real leaks were sent.
     monkeypatch.delenv("SPARKRUN_NO_TELEMETRY", raising=False)
 
-    emit_benchmark_telemetry(MagicMock(), result=MagicMock(), options=MagicMock())
+    # A real config on the enabled path -- a mock one no longer sends at all.
+    emit_benchmark_telemetry(SparkrunConfig(tmp_path / "config.yaml"), result=MagicMock(), options=MagicMock())
 
     assert len(attempts) == 1, "the blocker must record the send emit_* swallowed"
 
