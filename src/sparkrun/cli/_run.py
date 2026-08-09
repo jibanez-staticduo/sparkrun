@@ -29,14 +29,42 @@ from ._common import (
     _simplify_recipe_ref,
     dry_run_option,
     host_options,
+    _render_capacity_diagnostics,
     recipe_override_options,
     resolve_cluster_config,
-    resolve_effective_hosts_for_recipe,
     with_host_context,
     HIDE_ADVANCED_OPTIONS,
 )
 
 logger = logging.getLogger(__name__)
+
+#: ``-o key=value`` keys that configure the *executor* rather than the serve
+#: command.  They are lifted out of ``overrides`` into ``executor_config``
+#: before placement, so the intent id the CLI derives matches the one
+#: ``api.run`` derives from the same (already-stripped) override dict.
+_EXECUTOR_OVERRIDE_KEYS = frozenset(
+    {
+        "auto_remove",
+        "restart_policy",
+        "privileged",
+        "gpus",
+        "ipc",
+        "shm_size",
+        "network",
+        "user",
+        "security_opt",
+        "cap_add",
+        "ulimit",
+        "devices",
+        "memory_limit",
+        # ``-o entrypoint=''`` clears a consuming image ENTRYPOINT (one that
+        # parses sparkrun's appended ``bash -c`` as its own flags) without
+        # having to fork a third-party recipe just to add two lines of
+        # executor_config.  Empty string is the meaningful value here and
+        # survives ``coerce_value``; see ExecutorConfig.entrypoint.
+        "entrypoint",
+    }
+)
 
 
 def _summarize_platforms(
@@ -353,68 +381,133 @@ def run(
         else:
             host_source = "localhost"
 
-    # Resolve the effective host list via the scheduler (single source of
-    # truth): ``hosts_used`` IS the list run/stop/logs all share.  Applies
-    # solo / max_nodes as orthogonal constraints; multi-GPU hosts and
-    # explicit ``recipe.layout`` are honoured when ``cluster_def`` carries
-    # per-host hardware.
-    host_list, is_solo = resolve_effective_hosts_for_recipe(
-        host_list,
-        recipe,
-        overrides,
-        cluster_def=cluster_def,
-        runtime=runtime,
-        sctx=sctx,
-        solo=solo,
-    )
-    if recipe.mode == "cluster" and is_solo and not solo:
-        click.echo("Warning: Recipe requires cluster mode but only one host specified", err=True)
+    # Extract executor-specific keys from -o/--option overrides.  Done before
+    # the RunOptions build below so ``overrides`` and ``executor_config`` are
+    # already separated when the plan is computed — the plan's intent id and
+    # config chain must be the ones the launch uses.
+    option_executor_opts: dict[str, Any] = {}
+    for key in list(overrides.keys()):
+        if key in _EXECUTOR_OVERRIDE_KEYS:
+            option_executor_opts[key] = overrides.pop(key)
 
-    # --ensure: check if job is already running, exit 0 if so
-    if ensure:
-        from sparkrun.orchestration.job_metadata import check_job_running as _check_job, derive_cluster_id
-        from sparkrun.orchestration.primitives import build_ssh_kwargs
-
-        _cid = derive_cluster_id(recipe, host_list, overrides=overrides or None)
-        _ssh_kw = build_ssh_kwargs(config)
-        _status = _check_job(cluster_id=_cid, hosts=host_list, ssh_kwargs=_ssh_kw, cache_dir=str(config.cache_dir))
-        if _status.running:
-            click.echo("Job already running (cluster_id: %s)" % _cid)
-            if _status.metadata:
-                click.echo("  Recipe: %s" % _status.metadata.get("recipe", "unknown"))
-                click.echo("  Hosts:  %s" % ", ".join(_status.hosts))
-            sys.exit(0)
-
-    # Resolve cache dir, transfer mode, and transfer interface from cluster config
+    # Resolve cache dir, transfer mode, and transfer interface from cluster
+    # config.  Independent of placement, so it can precede the plan.
     cluster_cfg = resolve_cluster_config(cluster_name, hosts, hosts_file, cluster_mgr)
     local_cache_dir, remote_cache_dir, effective_transfer_mode, effective_transfer_interface = cluster_cfg.resolve_transfer_config(
         config, transfer_mode_override=transfer_mode
     )
 
-    # Resolve effective scheduler name for display + downstream RunOptions.
-    # Scheduler selection chain: CLI flag → recipe.scheduler → cluster.scheduler
-    # → greedy default (FALLBACK_DEFAULT_SCHEDULER).  Look up the plugin so the
-    # banner reflects the *actually-resolved* name rather than a possibly-``None``
-    # selector — matches what ``api.run`` stamps on ``RunResult.scheduler``.
-    from sparkrun.core.scheduler import (
-        FALLBACK_DEFAULT_SCHEDULER,
-        default_scheduler_upgrade_hint,
-        get_scheduler,
-        resolve_scheduler_selector,
+    # Build executor config from CLI flags, then layer the -o/--option-sourced
+    # keys on top — preserving the precedence where -o wins over the flag.
+    cli_executor_opts: dict[str, Any] = {}
+    if no_rm:
+        cli_executor_opts["auto_remove"] = False
+    if memory:
+        cli_executor_opts["memory_limit"] = memory
+    if restart_policy:
+        cli_executor_opts["restart_policy"] = restart_policy
+    if labels_override:
+        cli_executor_opts["labels"] = list(labels_override)
+    cli_executor_opts.update(option_executor_opts)
+
+    # Build the typed RunOptions for the library API.  The CLI already
+    # resolved the recipe, host list, cluster_def, and overrides above (so the
+    # banner / VRAM block can render those before launch); passing the loaded
+    # objects through avoids re-resolution inside the API and preserves the
+    # cwd-recipe discovery the CLI does through ``_load_recipe``.
+    #
+    # ``hosts`` is the **candidate** list — every host placement may choose
+    # from — not a pre-trimmed selection.  Narrowing it here would make this
+    # command's own placement authoritative over the launch's, leaving
+    # ``api.run`` unable to reach any host we discarded.
+    run_options = api.RunOptions(
+        recipe=recipe,
+        hosts=tuple(host_list),
+        cluster=cluster_def,
+        overrides=dict(overrides),
+        scheduler=scheduler_name,
+        solo=solo,
+        dry_run=dry_run,
+        follow=not no_follow,
+        detached=not foreground,
+        trust=trust,
+        transfer_mode=effective_transfer_mode,
+        transfer_interface=effective_transfer_interface,
+        cache_dir=remote_cache_dir,
+        local_cache_dir=local_cache_dir,
+        port=port,
+        ray_port=ray_port,
+        dashboard_port=dashboard_port,
+        dashboard=dashboard,
+        init_port=init_port,
+        executor_config=cli_executor_opts or None,
+        rootful=rootful,
+        diagnostics_path=diagnostics_path,
+        cluster_id_override=cluster_id_override,
+        sync_tuning=not no_sync_tuning,
+        extra_docker_opts=tuple(executor_args) if executor_args else None,
+        topology=cluster_cfg.topology,
+        recipe_ref=recipe_ref,
     )
 
-    effective_scheduler, scheduler_defaulted = resolve_scheduler_selector(
-        cli=scheduler_name,
-        recipe=getattr(recipe, "scheduler", None),
-        cluster=getattr(cluster_def, "scheduler", None),
-    )
+    # --ensure: if this workload is already serving, don't launch — and don't
+    # schedule either, which is why this runs before the plan.
+    #
+    # Keyed on the *intent* (recipe + parallelism + port), never on a
+    # host-derived cluster_id: a cluster_id also encodes placement, so the old
+    # lookup could not match a job placed by a status-aware scheduler (random
+    # placement token) and would launch a duplicate every time.  The intent is
+    # placement-independent, so the answer no longer depends on which scheduler
+    # is configured.  Hosts are the full candidate list — a deployment that
+    # landed on hosts this launch wouldn't pick still counts as running.
+    if ensure:
+        from sparkrun.orchestration.job_metadata import generate_intent_id
+
+        _match = api.find_running_intent(
+            generate_intent_id(recipe, overrides),
+            host_list,
+            cluster=cluster_def,
+            sctx=sctx,
+        )
+        if _match is not None:
+            click.echo("Job already running (cluster_id: %s)" % _match.cluster_id)
+            click.echo("  Recipe: %s" % (_match.recipe or recipe.qualified_name or "unknown"))
+            click.echo("  Hosts:  %s" % ", ".join(_match.hosts))
+            if _match.other_cluster_ids:
+                click.echo(
+                    "  Warning: %d other deployment(s) of this workload are also running: %s"
+                    % (len(_match.other_cluster_ids), ", ".join(_match.other_cluster_ids)),
+                    err=True,
+                )
+            sys.exit(0)
+
+    # Decide the launch ONCE.  Everything below renders from this plan, and the
+    # plan is handed back to ``api.run`` — so what is displayed is exactly what
+    # is launched.  Scheduling here and passing the winners as ``hosts`` instead
+    # would re-narrow the candidate set and reintroduce the class of failure
+    # where a launch reports "insufficient free capacity" while idle hosts sit
+    # unused because this pass already discarded them.
     try:
-        display_scheduler = get_scheduler(effective_scheduler, v=v).scheduler_name
-    except Exception:
-        display_scheduler = effective_scheduler or FALLBACK_DEFAULT_SCHEDULER
+        run_plan = api.plan(run_options, sctx=sctx)
+    except api.InsufficientCapacity as e:
+        click.echo("Error: %s" % e, err=True)
+        _render_capacity_diagnostics(getattr(e, "status", None), list(getattr(e, "host_list", ()) or host_list))
+        sys.exit(1)
+    except api.SparkrunError as e:
+        click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+
+    for _note in run_plan.notes:
+        click.echo(_note)
+
+    host_list = list(run_plan.host_list)
+    is_solo = run_plan.is_solo
+    if recipe.mode == "cluster" and is_solo and not solo:
+        click.echo("Warning: Recipe requires cluster mode but only one host specified", err=True)
 
     # Display summary before launch
     from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.scheduler import default_scheduler_upgrade_hint
     from sparkrun.core.version import display_version
 
     container_image = runtime.resolve_container(recipe, overrides)
@@ -427,47 +520,24 @@ def run(
         click.echo("Mode:      solo")
     else:
         click.echo("Mode:      cluster (%d nodes)" % len(host_list))
-    _platform_summary, _per_host = _summarize_platforms(host_list, cluster_def)
+    _platform_summary, _per_host = _summarize_platforms(host_list, run_plan.cluster)
     click.echo("Platform:  %s" % _platform_summary)
     if _per_host is not None:
         for _h, _line in _per_host:
             click.echo("  %-8s %s" % (_h + ":", _line))
-    click.echo("Scheduler: %s" % display_scheduler)
+    click.echo("Scheduler: %s" % run_plan.scheduler)
     # When nothing in the chain selected a scheduler we fell back to the 0.2.x
     # greedy default; recommend opting the cluster into occupancy-aware spreading.
-    if scheduler_defaulted and not is_solo:
+    if run_plan.scheduler_defaulted and not is_solo:
         click.echo(default_scheduler_upgrade_hint())
     if effective_transfer_mode not in ("auto", "local"):
         click.echo("Transfer:  %s" % effective_transfer_mode)
 
-    # Compute placement up-front when we have a cluster definition + multi-host
-    # workload, so the VRAM display can render per-host fit alongside the
-    # legacy DGX-Spark single-line summary.  Failures fall back silently —
-    # the legacy single-line fit always renders regardless.
-    display_placement = None
-    if cluster_def is not None and not is_solo:
-        try:
-            from sparkrun.core.limits import resolved_hardware_for_scheduling
-            from sparkrun.core.parallelism import extract_parallelism
-            from sparkrun.core.scheduler import SchedulingRequest
-
-            # Route through the *resolved* scheduler (not a bare greedy
-            # ``pack``) so the displayed per-host fit matches
-            # the scheduler the launch will actually use.  Pack against capped
-            # usable memory — the same caps the scheduler applies — and skip the
-            # live status query (display only): occupancy-aware schedulers then
-            # degrade to their greedy whole-GPU pack, which is the right shape for
-            # a pre-launch fit preview.
-            display_request = SchedulingRequest(
-                parallelism=extract_parallelism(recipe.build_config_chain(overrides)),
-                hosts=tuple(host_list),
-                host_hardware=resolved_hardware_for_scheduling(cluster_def, list(host_list)),
-                layout=recipe.layout,
-            )
-            display_placement = api.schedule(display_request, scheduler=effective_scheduler, sctx=sctx).assignment
-        except Exception:
-            display_placement = None
-
+    # The per-host fit table renders the plan's own placement.  It used to be
+    # a third scheduling call, deliberately made *without* live occupancy —
+    # which is how a capacity failure could print a table showing every target
+    # host as [OK] directly above the error that rejected them.
+    #
     # A local (absolute-path) model has no HuggingFace repo id to auto-detect
     # params from, so skip the HF lookup — the estimate falls back to recipe
     # defaults rather than erroring on a bogus repo id.
@@ -478,8 +548,8 @@ def run(
         cli_overrides=overrides,
         auto_detect=not is_local_model_path(recipe.model),
         cache_dir=local_cache_dir,
-        cluster=cluster_def,
-        placement=display_placement,
+        cluster=run_plan.cluster,
+        placement=run_plan.placement,
     )
 
     click.echo()
@@ -493,36 +563,6 @@ def run(
             click.echo("  Workers: %s" % ", ".join(host_list[1:]))
     click.echo()
 
-    # Build executor config from CLI flags
-    cli_executor_opts: dict[str, Any] = {}
-    if no_rm:
-        cli_executor_opts["auto_remove"] = False
-    if memory:
-        cli_executor_opts["memory_limit"] = memory
-    if restart_policy:
-        cli_executor_opts["restart_policy"] = restart_policy
-    if labels_override:
-        cli_executor_opts["labels"] = list(labels_override)
-
-    # Also extract executor-specific keys from -o/--option overrides
-    executor_keys = {
-        "auto_remove",
-        "restart_policy",
-        "privileged",
-        "gpus",
-        "ipc",
-        "shm_size",
-        "network",
-        "user",
-        "security_opt",
-        "cap_add",
-        "ulimit",
-        "devices",
-        "memory_limit",
-    }
-    for key in list(overrides.keys()):
-        if key in executor_keys:
-            cli_executor_opts[key] = overrides.pop(key)
     # --- Diagnostics setup ---
     diag = None
     if diagnostics_path:
@@ -549,52 +589,19 @@ def run(
             diag.phase_end("spark_diagnostics", error=str(e))
             logger.warning("Spark diagnostics collection failed: %s", e)
 
-    # Build the typed RunOptions for the library API.  The CLI already
-    # resolved the recipe, host list, cluster_def, and overrides above
-    # (so the banner / VRAM block could render those before launch);
-    # passing the loaded objects through avoids re-resolution inside
-    # ``api.run`` and preserves the cwd-recipe discovery the CLI does
-    # through ``_load_recipe``.  ``effective_scheduler`` was resolved
-    # above so the banner could display the actually-used name.
-
-    run_options = api.RunOptions(
-        recipe=recipe,
-        hosts=tuple(host_list),
-        cluster=cluster_def,
-        overrides=dict(overrides),
-        scheduler=effective_scheduler,
-        solo=is_solo,
-        dry_run=dry_run,
-        follow=not no_follow,
-        detached=not foreground,
-        trust=trust,
-        transfer_mode=effective_transfer_mode,
-        transfer_interface=effective_transfer_interface,
-        cache_dir=remote_cache_dir,
-        local_cache_dir=local_cache_dir,
-        port=port,
-        ray_port=ray_port,
-        dashboard_port=dashboard_port,
-        dashboard=dashboard,
-        init_port=init_port,
-        executor_config=cli_executor_opts or None,
-        rootful=rootful,
-        diagnostics_path=diagnostics_path,
-        cluster_id_override=cluster_id_override,
-        sync_tuning=not no_sync_tuning,
-        extra_docker_opts=tuple(executor_args) if executor_args else None,
-        topology=cluster_cfg.topology,
-        recipe_ref=recipe_ref,
-    )
-
     # Launch via the library API; the API call internally drives
     # ``launch_inference`` (which calls ``runtime.run``).  Tests that
     # mock ``runtime.run`` still observe the call because the runtime
     # layer is unchanged.
+    #
+    # ``plan=run_plan`` launches exactly what was displayed above — no
+    # second resolution, no second transport prepare, no second occupancy
+    # sweep, and no chance of the launch landing somewhere other than the
+    # hosts named in the banner.
     if diag:
         diag.phase_start("launch")
     try:
-        run_result = api.run(run_options, sctx=sctx)
+        run_result = api.run(run_options, sctx=sctx, plan=run_plan)
     except TransferError as e:
         if diag:
             diag.phase_end("launch", error=str(e))

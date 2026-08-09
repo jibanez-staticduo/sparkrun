@@ -233,11 +233,25 @@ _CONTAINER_NAME_RE = re.compile(
 def generate_intent_id(recipe: "Recipe", overrides: dict | None = None) -> str:
     """Deterministic :data:`INTENT_ID_LEN`-char hex *intent* identifier (no ``sparkrun_`` prefix).
 
-    Hashes ``recipe.runtime`` + ``recipe.model`` + port + served-model-name
-    + every non-default parallelism dimension in
+    Hashes ``recipe.runtime`` + ``recipe.model`` + ``recipe.container`` + port
+    + served-model-name + every non-default parallelism dimension in
     :data:`sparkrun.core.parallelism.PARALLELISM_KEYS` (tp, pp, dp, ep,
     cp).  Hosts are **not** hashed — same recipe + parallelism + port
     always yields the same intent_id regardless of scheduler placement.
+
+    The container image is included because the intent_id is not only a
+    discovery key: ``api.run`` treats a matching intent as *this launch's own
+    workload*, subtracting it from the occupancy snapshot and then evicting
+    it.  Two recipes serving the same model on the same port through
+    different images — say a stable build and a nightly — are different
+    workloads a user will reasonably want side by side, and without the image
+    in the hash, launching the second silently destroyed the first.  (``--image``
+    writes through to ``recipe.container``, so an image override is covered.)
+
+    It remains deliberately narrow otherwise: serve arguments are *not*
+    hashed, so ``stop`` / ``status`` / ``logs`` keep finding a live workload
+    after a relaunch that only tweaked a flag.  Callers that must distinguish
+    those hash :func:`derive_recipe_fingerprint` alongside this.
 
     Use :func:`generate_cluster_id` to compose this with a fresh
     placement token at launch time.
@@ -248,6 +262,11 @@ def generate_intent_id(recipe: "Recipe", overrides: dict | None = None) -> str:
     served_name = _resolve_override("served_model_name", overrides, recipe.defaults)
 
     parts: list[str] = [recipe.runtime, recipe.model]
+    # Empty/unset container (recipe relies on the runtime's default image)
+    # contributes nothing, so recipes that predate an explicit container keep
+    # hashing as before rather than all colliding on a placeholder.
+    if getattr(recipe, "container", None):
+        parts.append("image=%s" % recipe.container)
     if port is not None:
         parts.append("port=%s" % port)
     if served_name is not None:

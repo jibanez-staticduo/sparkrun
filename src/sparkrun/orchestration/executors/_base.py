@@ -23,6 +23,7 @@ from sparkrun.utils import merge_env
 from sparkrun.utils.shell import b64_encode_cmd, quote
 
 if TYPE_CHECKING:
+    from sparkrun.containers.entrypoint import EntrypointProbe
     from sparkrun.core.cluster_status import ClusterStatus
     from sparkrun.core.hardware import HostHardware
     from sparkrun.core.log_source import LogSource
@@ -544,6 +545,42 @@ class Executor(Plugin):
         """
         del paths, hosts, ssh_kwargs  # base is a no-op; substrate-aware executors override
         return {}
+
+    def verify_command_passthrough(
+        self,
+        image: str,
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> "EntrypointProbe | None":
+        """Report whether *image* would swallow the command sparkrun appends.
+
+        Second preflight peer of :meth:`query_status`, alongside
+        :meth:`verify_mount_sources`: that one asks "do the paths I will mount
+        exist on this substrate?", this one asks "will the command I append
+        actually run on this image?".
+
+        sparkrun always emits its launcher as CMD *arguments*, so an image whose
+        ENTRYPOINT consumes them (``ENTRYPOINT ["vllm","serve"]``) runs
+        something else entirely — while a passthrough wrapper ending in
+        ``exec "$@"`` (``/opt/nvidia/nvidia_entrypoint.sh``, inherited by most
+        NGC images) is harmless and must *not* be cleared.  The two are
+        indistinguishable by inspection, so substrate-aware executors settle it
+        empirically; see :mod:`sparkrun.containers.entrypoint`.
+
+        Returns the probe result, or ``None`` when this executor has no opinion.
+        The default is the safe no-op — container-less (``local``) and provider
+        executors that don't compose a Docker-style argv never block a launch.
+        Best-effort like :meth:`verify_mount_sources`: only a *confirmed*
+        consuming entrypoint is reported; "could not tell" reads as fine.
+
+        Args:
+            image: Resolved container image reference.
+            hosts: Target hosts for the launch.
+            ssh_kwargs: Connection settings for host-substrate probes.
+        """
+        del image, hosts, ssh_kwargs  # base is a no-op; substrate-aware executors override
+        return None
 
     @classmethod
     def workload_labels_for_cluster(

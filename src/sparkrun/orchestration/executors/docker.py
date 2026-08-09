@@ -27,6 +27,7 @@ from sparkrun.orchestration.job_metadata import INTENT_ID_LEN, PLACEMENT_TOKEN_L
 from sparkrun.utils.shell import args_list_to_shell_str, assert_safe_mount_source, b64_wrap_bash, quote
 
 if TYPE_CHECKING:
+    from sparkrun.containers.entrypoint import EntrypointProbe
     from sparkrun.core.cluster_status import ClusterStatus
     from sparkrun.core.hardware import HostHardware
     from sparkrun.core.log_source import LogSource
@@ -470,6 +471,46 @@ class DockerExecutor(Executor):
         inner.extend(["-n", str(int(tail)) if tail is not None else "+1"])
         inner.append(path)
         return "docker exec %s %s" % (quote(source.container), " ".join(quote(part) for part in inner))
+
+    def verify_command_passthrough(
+        self,
+        image: str,
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> "EntrypointProbe | None":
+        """Probe whether *image*'s ENTRYPOINT swallows the appended ``bash -c``.
+
+        Only one host is probed.  Image distribution has already established
+        that every host carries the same image (by Id or RepoDigest), and the
+        verdict is a property of the image, not of the host — so a second probe
+        would spend another container start to re-derive the same answer.
+
+        The executor's own :meth:`_accelerator_opts` are forwarded so the probe
+        container starts under the same device conditions the real launch will
+        use.  Without them an entrypoint that hard-fails on a missing GPU
+        *before* reaching ``exec "$@"`` would look indistinguishable from one
+        that consumed the command.
+
+        A resolved ``entrypoint`` override short-circuits the probe: the launch
+        will emit ``--entrypoint`` and the image's own ENTRYPOINT never runs, so
+        there is nothing left to consume the command.  Without this the probe
+        would reject the very fix it recommends — ``entrypoint: ""`` — since the
+        image keeps declaring a consuming ENTRYPOINT either way.
+        """
+        from sparkrun.containers.entrypoint import probe_image_entrypoint
+
+        if not image or not hosts:
+            return None
+        if self.config.entrypoint is not None:
+            logger.debug("Skipping entrypoint probe for %s: launch overrides entrypoint to %r", image, self.config.entrypoint)
+            return None
+        return probe_image_entrypoint(
+            image,
+            hosts[0],
+            ssh_kwargs=ssh_kwargs,
+            accel_opts=self._accelerator_opts(),
+        )
 
     def status_cmd(self, container_name: str) -> str:
         """Exit 0 iff a container named *container_name* is currently running."""

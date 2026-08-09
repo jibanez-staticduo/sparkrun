@@ -1,17 +1,30 @@
-"""``sparkrun.api.run`` — launch an inference workload from the library API.
+"""``sparkrun.api.plan`` / ``sparkrun.api.run`` — launch an inference workload.
 
-Orchestrates the full launch path:
+The launch path is split at the point where it stops deciding and starts
+acting:
 
-1. Resolve recipe / cluster / hosts / runtime.
-2. Apply overrides; resolve recipe (runtime selection finalized).
-3. Run the scheduler via :func:`sparkrun.api.schedule` to compute placement.
-4. Apply orthogonal constraints (solo, ``max_nodes``).
-5. Delegate to :func:`sparkrun.core.launcher.launch_inference`.
-6. Translate the launcher's :class:`LaunchResult` into :class:`RunResult`.
+:func:`plan` — **decide** (no cluster state changes)
+  1. Resolve recipe / cluster / hosts / runtime; prepare the transport.
+  2. Run the scheduler once via :func:`sparkrun.api.schedule`, against live
+     occupancy, applying the orthogonal constraints (solo, ``max_nodes``).
+  3. Compose intent_id / placement_token / cluster_id.
+  → :class:`RunPlan`
 
-The function raises :class:`~sparkrun.api.SparkrunError` (or a
-subclass) for any failure; on success it returns a populated
-:class:`RunResult`.
+:func:`run` — **act**
+  4. Evict this intent's superseded deployments.
+  5. Delegate to :func:`sparkrun.core.launcher.launch_inference`.
+  6. Translate the launcher's :class:`LaunchResult` into :class:`RunResult`.
+
+``run(options)`` plans internally, so the split is invisible to callers
+that don't need it.  It exists for the ones that do: anything rendering a
+pre-launch summary needs the target hosts *before* launching, and the only
+other way to get them is to schedule separately and pass the winners in as
+``options.hosts`` — which silently makes the display pass authoritative
+over which hosts ``run`` may still consider.  ``run(options, plan=plan)``
+lets the decision be made exactly once.
+
+Both functions raise :class:`~sparkrun.api.SparkrunError` (or a subclass)
+for any failure.
 """
 
 from __future__ import annotations
@@ -26,7 +39,7 @@ from sparkrun.api._errors import (
     LayoutRequired,
     SparkrunError,
 )
-from sparkrun.api._models import RunOptions, RunResult
+from sparkrun.api._models import RunOptions, RunPlan, RunResult
 
 if TYPE_CHECKING:
     from sparkrun.core.context import SparkrunContext
@@ -35,30 +48,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunResult:
-    """Launch the workload described by *options* and return a :class:`RunResult`.
+def plan(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunPlan:
+    """Decide *what* the launch described by *options* would do, without doing it.
+
+    Resolves recipe / cluster / runtime, prepares the transport, runs the
+    scheduler once against live occupancy, and composes the launch's
+    identifiers.  Returns a :class:`RunPlan`; changes no cluster state.
+
+    Hand the result to :func:`run` (``run(options, plan=plan)``) to launch
+    it.  That is the *only* correct way to render a pre-launch summary: a
+    caller that instead narrows ``options.hosts`` to its own placement and
+    calls ``run`` leaves ``run`` re-scheduling over the survivors, unable
+    to reach any host the first pass dropped — which turns a mere
+    scheduler disagreement into a launch failure on a cluster with free
+    capacity.
 
     Args:
-        options: Inputs for the launch.
-        sctx: Optional shared :class:`SparkrunContext`.  When omitted a
-            fresh session is built; callers chaining multiple ``api.*``
-            calls can construct one ``sctx`` and pass it to share
-            config / registry-manager / cluster-manager state.
+        options: Inputs for the launch (same struct :func:`run` takes).
+        sctx: Optional shared :class:`SparkrunContext`.
 
     Raises:
         :class:`InsufficientCapacity`: Scheduler can't fit the workload.
         :class:`LayoutRequired`: Cluster needs an explicit ``recipe.layout``.
         :class:`~sparkrun.api.RecipeNotFound`: Recipe lookup failed.
         :class:`~sparkrun.api.HostsUnreachable`: No usable host source.
-        :class:`~sparkrun.api.TrustRejected`: Recipe hooks rejected.
-        :class:`SparkrunError`: For other launch failures.
+        :class:`SparkrunError`: For other resolution failures.
     """
     from sparkrun.api._resolve import (
         resolve_cluster,
         resolve_recipe,
         resolve_runtime,
     )
-    from sparkrun.core.launcher import launch_inference
     from sparkrun.orchestration.job_metadata import (
         derive_placement_token_from_hosts,
         generate_cluster_id,
@@ -68,7 +88,6 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
     )
 
     sctx = resolve_sctx(sctx)
-    started_at = time.time()
     config = sctx.config
 
     # 1. Resolve inputs.  `resolve_cluster` always returns a populated
@@ -117,8 +136,8 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
     # three place identically — the scheduler's ``hosts_used`` IS the
     # effective host list, ``runtime.world_size()`` is baked into the
     # request, and ``max_nodes`` / solo are applied as orthogonal
-    # constraints.  ``notes`` (human-readable trim messages) are rendered
-    # by the CLI shell, not the library, so the API discards them.
+    # constraints.  ``notes`` (human-readable trim messages) are carried on
+    # the plan for renderers to echo; the library itself never prints.
     from sparkrun.api._hosts import resolve_effective_hosts
 
     # Deterministic intent for this launch (recipe + overrides).  Passed to the
@@ -129,7 +148,7 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
 
     placement: "RankAssignment | None"
     is_solo_request = bool(options.solo) or recipe.mode == "solo"
-    host_list, is_solo, _notes, placement = resolve_effective_hosts(
+    host_list, is_solo, notes, placement = resolve_effective_hosts(
         list(hosts),
         recipe,
         options.overrides,
@@ -183,13 +202,115 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
             # downstream consumers don't surface a fake one.
             placement_token = ""
 
+    return RunPlan(
+        recipe=recipe,
+        runtime=runtime,
+        cluster=cluster_def,
+        candidate_hosts=tuple(hosts),
+        host_list=tuple(host_list),
+        is_solo=is_solo,
+        placement=placement,
+        notes=tuple(notes),
+        scheduler_selector=effective_scheduler,
+        scheduler=_resolve_scheduler_name(effective_scheduler, sctx),
+        scheduler_defaulted=_scheduler_defaulted,
+        intent_id=intent_id,
+        placement_token=placement_token,
+        cluster_id=cluster_id_for_launch,
+    )
+
+
+def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None, plan: RunPlan | None = None) -> RunResult:
+    """Launch the workload described by *options* and return a :class:`RunResult`.
+
+    Args:
+        options: Inputs for the launch.
+        sctx: Optional shared :class:`SparkrunContext`.  When omitted a
+            fresh session is built; callers chaining multiple ``api.*``
+            calls can construct one ``sctx`` and pass it to share
+            config / registry-manager / cluster-manager state.
+        plan: Pre-computed :class:`RunPlan` from :func:`plan`.  When given,
+            resolution / transport preparation / placement are **not**
+            repeated — this launches exactly what the plan describes.  Pass
+            it whenever the target hosts were shown to a user first, so the
+            summary and the launch cannot diverge.  ``None`` (the default)
+            plans internally, which is what a caller that renders nothing
+            should do.  It must have been built from the same *options* and
+            *sctx*; a mismatched plan launches the plan's decisions.
+
+    Raises:
+        :class:`InsufficientCapacity`: Scheduler can't fit the workload.
+        :class:`LayoutRequired`: Cluster needs an explicit ``recipe.layout``.
+        :class:`~sparkrun.api.RecipeNotFound`: Recipe lookup failed.
+        :class:`~sparkrun.api.HostsUnreachable`: No usable host source.
+        :class:`~sparkrun.api.TrustRejected`: Recipe hooks rejected.
+        :class:`SparkrunError`: For other launch failures.
+    """
+    from sparkrun.core.launcher import launch_inference
+    from sparkrun.orchestration.job_metadata import parse_cluster_id
+
+    sctx = resolve_sctx(sctx)
+    started_at = time.time()
+    config = sctx.config
+
+    # ``_build_plan`` is a module-level alias for :func:`plan`, needed because
+    # the ``plan`` parameter shadows the function name in this scope.
+    if plan is None:
+        plan = _build_plan(options, sctx=sctx)
+
+    recipe = plan.recipe
+    runtime = plan.runtime
+    cluster_def = plan.cluster
+    hosts = list(plan.candidate_hosts)
+    host_list = list(plan.host_list)
+    is_solo = plan.is_solo
+    placement = plan.placement
+    effective_scheduler = plan.scheduler_selector
+    intent_id = plan.intent_id
+    placement_token = plan.placement_token
+    cluster_id_for_launch = plan.cluster_id
+
+    # ``ensure``: don't launch a duplicate of a workload that's already
+    # serving.  Matched on the *intent*, so the answer doesn't depend on which
+    # scheduler placed the running deployment (see ``api.find_running_intent``).
+    # Callers that need to skip *before* paying for a plan — the CLI's
+    # ``--ensure``, which short-circuits ahead of the banner — call
+    # ``find_running_intent`` themselves and leave this flag off; the query is
+    # the same one either way.
+    if options.ensure:
+        from sparkrun.api._intent import find_running_intent
+
+        match = find_running_intent(intent_id, hosts, cluster=cluster_def, sctx=sctx)
+        if match is not None:
+            logger.info("ensure: intent %s already running as %s; skipping launch", intent_id, match.cluster_id)
+            return _already_running_result(match, plan=plan, options=options, started_at=started_at, sctx=sctx)
+
+    # Re-apply the cluster's SSH user: a plan built against a different
+    # ``sctx`` (or a config reset in between) would otherwise leave the
+    # launch's SSH operations logging in as the wrong user.  Idempotent when
+    # the plan was built from this same context.
+    if getattr(cluster_def, "user", None):
+        try:
+            config.ssh_user = cluster_def.user
+        except Exception:
+            logger.debug("Failed to apply cluster SSH user to config", exc_info=True)
+
     # 3a-bis. Evict this intent's superseded deployments.  ``exclude_intent_id``
-    # above told the scheduler "my own containers aren't foreign load, I'm
-    # replacing them" — this is the half that actually replaces them.  It is a
-    # no-op on the deterministic (greedy) path, where the relaunch reuses the
-    # prior cluster_id and the runtime's step-1 cleanup already removes those
-    # containers by name.
-    if not options.dry_run:
+    # in the planning pass told the scheduler "my own containers aren't foreign
+    # load, I'm replacing them" — this is the half that actually replaces them.
+    # It is a no-op on the deterministic (greedy) path, where the relaunch
+    # reuses the prior cluster_id and the runtime's step-1 cleanup already
+    # removes those containers by name.
+    #
+    # Deferred to ``launch_inference``'s ``before_start`` hook rather than run
+    # here: this tears down a *serving* workload, and everything between here
+    # and the container start — image distribution, a multi-hundred-GB model
+    # download, tuning sync — can take minutes and fail or be interrupted.
+    # Evicting up front meant a `sparkrun run` killed with Ctrl-C during
+    # distribution left the cluster with neither the old deployment nor the
+    # new one.  By the time the hook fires, the only remaining step is
+    # starting containers.
+    def _evict_before_start() -> None:
         _evict_superseded_deployments(
             intent_id=intent_id,
             cluster_id_for_launch=cluster_id_for_launch,
@@ -220,6 +341,14 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
             _executor_name = None
         if _executor_name == "k8s":
             from sparkrun.api._run_k8s import run_k8s
+
+            # This path returns without going through ``launch_inference``, so
+            # it never reaches the ``before_start`` hook — evict here to keep
+            # replace-my-own-deployment semantics.  It does not get the SSH
+            # path's "only after distribution succeeded" guarantee; the k8s
+            # launcher owns its own image/volume staging.
+            if not options.dry_run:
+                _evict_before_start()
 
             return run_k8s(
                 options,
@@ -271,6 +400,9 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
         "recipe_ref": options.recipe_ref,
         "preserve_model_perms": options.preserve_model_perms,
         "skip_model_fan_out": options.skip_model_fan_out,
+        # ``None`` under --dry-run: the launcher also guards, but a dry run
+        # must not depend on a callee honouring the contract to stay read-only.
+        "before_start": None if options.dry_run else _evict_before_start,
     }
 
     # 5. Launch.
@@ -319,7 +451,7 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
         placement_token=final_placement_token,
         host_list=tuple(result.host_list),
         placement=placement,
-        scheduler=_resolve_scheduler_name(effective_scheduler, sctx),
+        scheduler=plan.scheduler or _resolve_scheduler_name(effective_scheduler, sctx),
         runtime=runtime.runtime_name,
         executor=_executor_name_from_result(result),
         started_at=started_at,
@@ -338,6 +470,51 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None) -> RunRes
 
     emit_run_telemetry(config, result=run_result, recipe=recipe, cluster=cluster_def, options=options)
     return run_result
+
+
+#: Module-level alias so :func:`run` can call :func:`plan` despite its own
+#: ``plan`` parameter shadowing the name inside that function's scope.
+_build_plan = plan
+
+
+def _already_running_result(match, *, plan: RunPlan, options: RunOptions, started_at: float, sctx) -> RunResult:
+    """Build the :class:`RunResult` for an ``ensure`` skip.
+
+    Describes the deployment that is *already* running, not the one the plan
+    would have launched — so ``cluster_id`` / ``host_list`` / ``placement_token``
+    come from *match*.  ``placement`` is ``None`` and ``launch_result`` is
+    ``None``: no launch happened, and reporting the plan's intended placement
+    would claim a rank layout that was never applied.
+    """
+    from sparkrun.orchestration.job_metadata import parse_cluster_id
+
+    try:
+        _, matched_token = parse_cluster_id(match.cluster_id)
+    except ValueError:
+        matched_token = ""
+
+    return RunResult(
+        cluster_id=match.cluster_id,
+        intent_id=match.intent_id,
+        placement_token=matched_token,
+        host_list=tuple(match.hosts),
+        placement=None,
+        scheduler=plan.scheduler or _resolve_scheduler_name(plan.scheduler_selector, sctx),
+        runtime=match.runtime or plan.runtime.runtime_name,
+        executor="",
+        started_at=started_at,
+        dry_run=options.dry_run,
+        is_solo=len(match.hosts) <= 1,
+        rc=0,
+        already_running=True,
+        metadata={
+            "recipe": match.recipe or getattr(plan.recipe, "qualified_name", None),
+            "model": getattr(plan.recipe, "model", None),
+            "ensure_skipped_launch": True,
+            "other_cluster_ids": list(match.other_cluster_ids),
+        },
+        launch_result=None,
+    )
 
 
 def _evict_superseded_deployments(

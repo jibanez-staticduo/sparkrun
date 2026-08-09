@@ -251,6 +251,8 @@ def resolve_effective_hosts_for_recipe(
     runtime=None,
     sctx: SparkrunContext | None = None,
     solo: bool = False,
+    scheduler: str | None = None,
+    exclude_intent_id: str | None = None,
 ) -> tuple[list[str], bool]:
     """CLI-layer adapter around :func:`sparkrun.api._hosts.resolve_effective_hosts`.
 
@@ -280,6 +282,19 @@ def resolve_effective_hosts_for_recipe(
             placement).
         sctx: Optional shared :class:`SparkrunContext`.
         solo: ``--solo`` flag value.
+        scheduler: Resolved scheduler name (CLI flag → recipe → cluster).
+            **Must be the same selector the launch will use.**  This trim
+            narrows the candidate host list *before* ``api.run`` re-schedules
+            over the survivors, so a different scheduler here picks a
+            different subset and ``api.run`` is then locked out of the hosts
+            this pass discarded — e.g. defaulting to greedy while the cluster
+            runs ``occupancy-sparse`` hands ``api.run`` the first N hosts
+            regardless of load, and the launch fails with "insufficient free
+            capacity" while idle hosts sit unused.
+        exclude_intent_id: Intent whose own still-running workloads are
+            subtracted from the occupancy snapshot, for the same reason:
+            ``api.run`` excludes them, so this pass must too or the two
+            passes disagree on a relaunch.
 
     Returns:
         ``(effective_host_list, is_solo)``.
@@ -303,6 +318,8 @@ def resolve_effective_hosts_for_recipe(
             runtime=runtime,
             sctx=sctx,
             solo=solo,
+            scheduler=scheduler,
+            exclude_intent_id=exclude_intent_id,
         )
     except api.InsufficientCapacity as e:
         # ``resolve_effective_hosts`` already shaped the message (host-count

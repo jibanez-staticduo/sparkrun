@@ -7,6 +7,7 @@ callers get the full flow with no Click / sys.exit coupling.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -214,7 +215,7 @@ def _execute_benchmark(
     )
     from sparkrun.core.cluster_manager import resolve_cluster_config
     from sparkrun.core.resolve import apply_recipe_overrides as _apply_recipe_overrides, load_recipe as _load_recipe
-    from sparkrun.api._hosts import resolve_effective_hosts, resolve_host_list
+    from sparkrun.api._hosts import resolve_host_list
     from sparkrun.api._errors import (
         NoResumableState,
         FrameworkCategoryMismatch,
@@ -430,32 +431,52 @@ def _execute_benchmark(
         raise BenchmarkFailed("Error: %s" % e, exit_code=1) from e
     cluster_mgr = sctx.cluster_manager
 
+    cluster_cfg = resolve_cluster_config(cluster_name, hosts, None, cluster_mgr)
+    local_cache_dir, remote_cache_dir, effective_transfer_mode, effective_transfer_interface = cluster_cfg.resolve_transfer_config(config)
+
+    run_options: "api.RunOptions | None" = None
+    run_plan: "api.RunPlan | None" = None
     if skip_run:
+        # No launch, so nothing to plan — just honour solo.
         is_solo = bool(solo) or recipe.mode == "solo" or len(host_list) <= 1
         if is_solo and len(host_list) > 1:
             host_list = host_list[:1]
     else:
-        # Mirror the inputs ``api.run`` will use below (anonymous cluster from the
-        # host list → default hardware) and pass the same ``exclude_intent_id`` so
-        # this pre-launch estimate places identically to the authoritative
-        # scheduling pass inside ``api.run`` — otherwise the banner host list could
-        # disagree with what actually launches.
-        from sparkrun.orchestration.job_metadata import generate_intent_id
-
-        host_list, is_solo, _notes, _placement = resolve_effective_hosts(
-            host_list,
-            recipe,
-            overrides,
-            cluster_def=None,
-            runtime=runtime,
-            sctx=sctx,
+        # Plan the launch now so the banner below can name the target hosts,
+        # then hand the same plan to ``api.run``.  The alternative — placing
+        # here and passing the winners as ``hosts`` — would narrow the
+        # candidate set, leaving ``api.run`` unable to reach any host this
+        # pass discarded, and would sweep the cluster's occupancy twice.
+        run_options = api.RunOptions(
+            recipe=recipe,
+            hosts=tuple(host_list),
+            overrides=dict(overrides),
             solo=solo,
+            dry_run=dry_run,
+            follow=False,
+            detached=True,
+            trust=None,
             scheduler=scheduler_name,
-            exclude_intent_id=generate_intent_id(recipe, overrides),
+            transfer_mode=effective_transfer_mode,
+            transfer_interface=effective_transfer_interface,
+            cache_dir=remote_cache_dir,
+            local_cache_dir=local_cache_dir,
+            # Pass the cluster's shared-cache prefs explicitly: this launch
+            # uses explicit hosts and so loses the named-cluster identity
+            # that launch_inference would otherwise read them from.
+            preserve_model_perms=cluster_cfg.preserve_model_perms,
+            skip_model_fan_out=cluster_cfg.skip_model_fan_out,
+            rootful=rootful,
+            sync_tuning=sync_tuning,
+            extra_docker_opts=tuple(executor_args) if executor_args else None,
+            recipe_ref=recipe_ref,
         )
-
-    cluster_cfg = resolve_cluster_config(cluster_name, hosts, None, cluster_mgr)
-    local_cache_dir, remote_cache_dir, effective_transfer_mode, effective_transfer_interface = cluster_cfg.resolve_transfer_config(config)
+        try:
+            run_plan = api.plan(run_options, sctx=sctx)
+        except api.SparkrunError as e:
+            raise BenchmarkFailed("Error: inference launch failed: %s" % e, exit_code=1) from e
+        host_list = list(run_plan.host_list)
+        is_solo = run_plan.is_solo
 
     # Notify the emitter that the recipe is fully resolved so it can render
     # presentation-only artifacts (e.g. the CLI's VRAM estimate) without
@@ -663,32 +684,16 @@ def _execute_benchmark(
         if not skip_run:
             logger.log(_PROGRESS_LEVEL, "Step 1/3: Launching inference...")
 
-            run_options = api.RunOptions(
-                recipe=recipe,
-                hosts=tuple(host_list),
-                overrides=dict(overrides),
-                solo=is_solo,
-                dry_run=dry_run,
-                follow=False,
-                detached=True,
-                trust=None,
-                scheduler=scheduler_name,
-                transfer_mode=effective_transfer_mode,
-                transfer_interface=effective_transfer_interface,
-                cache_dir=remote_cache_dir,
-                local_cache_dir=local_cache_dir,
-                # Pass the cluster's shared-cache prefs explicitly: this launch
-                # uses explicit hosts and so loses the named-cluster identity
-                # that launch_inference would otherwise read them from.
-                preserve_model_perms=cluster_cfg.preserve_model_perms,
-                skip_model_fan_out=cluster_cfg.skip_model_fan_out,
-                rootful=rootful,
-                sync_tuning=sync_tuning,
-                extra_docker_opts=tuple(executor_args) if executor_args else None,
-                recipe_ref=recipe_ref,
-            )
+            # ``run_options`` / ``run_plan`` were built together above.  A
+            # resumed benchmark may have pinned a container image SHA into
+            # ``overrides`` since then; refresh the options so the launch uses
+            # it.  The plan stays valid — the image is an input to neither
+            # placement (which reads parallelism + VRAM) nor the intent id
+            # (runtime + model + port + parallelism).
+            assert run_options is not None and run_plan is not None  # not skip_run
+            run_options = dataclasses.replace(run_options, overrides=dict(overrides))
             try:
-                run_result = api.run(run_options, sctx=sctx)
+                run_result = api.run(run_options, sctx=sctx, plan=run_plan)
             except api.SparkrunError as e:
                 raise BenchmarkFailed("Error: inference launch failed: %s" % e, exit_code=1) from e
 

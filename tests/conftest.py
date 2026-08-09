@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import yaml
 
+from _telemetry_guard import describe_escapes, install_telemetry_blocker
 from sparkrun.core.bootstrap import init_sparkrun
 from sparkrun.core.registry import RegistryManager
 
@@ -25,6 +26,12 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
     """
     monkeypatch.setenv("STATEFUL_ROOT", str(tmp_path / "stateful"))
     monkeypatch.setenv("SPARKRUN_NO_TELEMETRY", "1")
+    # ...and block the send itself, because the env var above is only policy.
+    # Any test can drop it (test_telemetry.py does, on purpose), and telemetry
+    # fails *open*: a MagicMock config makes `telemetry_enabled` return True,
+    # which is how mock objects reached the production collector as a
+    # benchmark's category/framework/profile. Checked at teardown below.
+    telemetry_attempts = install_telemetry_blocker(monkeypatch)
     # Hard-disable external-plugin auto-loading during tests. The feature flag
     # alone is not enough: pytest reads the developer's REAL ~/.config/sparkrun
     # (the SAF stateful root isn't "ready"), so a developer who enabled
@@ -100,6 +107,9 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
     sparkrun.core.bootstrap._variables = None
     yield
     sparkrun.core.bootstrap._variables = None
+
+    if telemetry_attempts:
+        pytest.fail(describe_escapes(telemetry_attempts), pytrace=False)
 
 
 @pytest.fixture

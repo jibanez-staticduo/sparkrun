@@ -146,7 +146,7 @@ def test_benchmark_run_uses_api_run_and_threads_scheduler_flag(fake_recipe_env, 
     """
     captured_options: list[Any] = []
 
-    def _fake_run(options, *, sctx=None):
+    def _fake_run(options, *, sctx=None, plan=None):
         captured_options.append(options)
         return _make_fake_run_result()
 
@@ -204,7 +204,7 @@ def test_benchmark_dry_run_does_not_require_the_execution_toolchain(fake_recipe_
     """
     captured_options: list[Any] = []
 
-    def _fake_run(options, *, sctx=None):
+    def _fake_run(options, *, sctx=None, plan=None):
         captured_options.append(options)
         return _make_fake_run_result()
 
@@ -230,7 +230,7 @@ def test_benchmark_run_scheduler_flag_defaults_to_none(fake_recipe_env):
     """
     captured_options: list[Any] = []
 
-    def _fake_run(options, *, sctx=None):
+    def _fake_run(options, *, sctx=None, plan=None):
         captured_options.append(options)
         return _make_fake_run_result()
 

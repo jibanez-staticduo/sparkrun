@@ -137,6 +137,51 @@ lists. Falsy values fall through to the dataclass defaults.
 | `intel`       | `--device /dev/accel`                                             |
 | `apple`/`cpu` | (none — route to a non-Docker executor)                           |
 
+### ENTRYPOINT preflight
+
+`Executor.verify_command_passthrough(image, hosts)` is the second write-path
+preflight alongside `verify_mount_sources` — that one asks "do the paths I will
+mount exist on this substrate?", this one asks "will the command I append
+actually run on this image?".
+
+sparkrun composes every workload as `docker run <opts> <image> bash -c <b64 cmd>`,
+so the command is always CMD *arguments* and the image's ENTRYPOINT decides what
+happens to them. Two opposite idioms are in wide use and `docker image inspect`
+cannot tell them apart — both are simply "a non-empty ENTRYPOINT":
+
+- **passthrough** — `/opt/nvidia/nvidia_entrypoint.sh` and friends: do setup,
+  then `exec "$@"`. Inherited by nearly every NGC-derived image, so this is the
+  *common* case. Clearing it would skip the setup.
+- **consuming** — `ENTRYPOINT ["vllm","serve"]`: the appended `bash -c …` is
+  parsed as that program's own flags, so the workload never starts.
+
+The verdict is therefore established empirically (`containers/entrypoint.py` +
+`scripts/image_entrypoint_probe.sh`) rather than by inspection or an allowlist:
+
+1. No ENTRYPOINT → `absent`, no container started (the cheap exit for most images).
+2. Run the real argv shape and look for a **computed** sentinel on stdout. Found
+   → `pass`. The sentinel is computed, not literal, because a consuming
+   entrypoint typically echoes the argv it rejected — an echo can reproduce a
+   literal token but never the evaluated one.
+3. Not found → re-run byte-identically with `--entrypoint ''`. Only if *that*
+   succeeds is the entrypoint provably the cause (`fail`); otherwise the fault
+   is elsewhere — stale CDI, no GPU, no bash — and the verdict is `unknown`.
+
+Only `fail` blocks, and `launcher._verify_image_command_passthrough` raises a
+`RecipeError` naming both fixes (`executor_config: {entrypoint: ""}` or
+`-o entrypoint=''`) rather than auto-clearing: the probe shows that clearing
+*works*, not that it is *harmless* — a consuming entrypoint may also be doing
+setup the workload needs.
+
+It runs from `distribute_from_config`'s `after_container_sync` hook — the image
+is resident on every target but the long, routinely-interrupted model sync has
+not started yet. One host is probed (the verdict is a property of the image, and
+distribution already established the image matches everywhere), under the
+launch's own accelerator flags. Everything is fail-open: unreachable host,
+timeout, unresolvable executor, or `SPARKRUN_NO_IMAGE_PROBE=1` all read as
+"proceed". The base implementation returns `None`, so container-less (`local`)
+and provider executors never block a launch.
+
 ### NVIDIA GPU access mode
 
 There are two ways to ask Docker for NVIDIA GPUs and neither works everywhere,

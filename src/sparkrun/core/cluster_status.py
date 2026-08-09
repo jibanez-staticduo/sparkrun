@@ -268,6 +268,35 @@ def _union_containers(
     return primary + tuple(extra)
 
 
+def workload_matches_intent(workload: RunningWorkload, intent_id: str) -> bool:
+    """``True`` when *workload* belongs to the launch intent *intent_id*.
+
+    The one answer to "is this workload mine?", shared by the two callers that
+    ask it for opposite reasons: placement subtracts its own intent's
+    workloads from the occupancy snapshot (so a relaunch doesn't treat its own
+    containers as foreign load), while ``--ensure`` looks for exactly those
+    workloads to decide there is nothing to launch.  They must agree, or
+    ``--ensure`` would decline to launch something placement had already
+    decided to replace.
+
+    Matches on :attr:`RunningWorkload.intent_id` when the executor could
+    recover it (container label / cached job metadata), else on the intent
+    prefix parsed out of the ``cluster_id``.  A workload whose name is not a
+    canonical sparkrun identifier matches nothing — deliberately: an
+    unidentifiable container is not evidence that *this* intent is running.
+    """
+    if not intent_id:
+        return False
+    if workload.intent_id == intent_id:
+        return True
+    try:
+        from sparkrun.orchestration.job_metadata import parse_cluster_id
+
+        return parse_cluster_id(workload.cluster_id)[0] == intent_id
+    except Exception:
+        return False
+
+
 def empty_status(hosts: list[str], executor: str = "") -> ClusterStatus:
     """Build a zero-occupancy snapshot — every host fully free, no workloads.
 

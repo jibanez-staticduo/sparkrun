@@ -6,6 +6,7 @@ with the main group command.
 
 from __future__ import annotations
 
+import json
 from unittest import mock
 
 import pytest
@@ -1988,13 +1989,41 @@ class TestClusterCommands:
         assert "Scheduler:   greedy" in result.output
 
     def test_cluster_update_clear_scheduler(self, runner, cluster_setup):
-        """Test clearing scheduler selector with empty string."""
-        runner.invoke(main, ["cluster", "update", "test-cluster", "--scheduler", "greedy"])
+        """Clearing the selector unsets it — and ``show`` says what now applies.
+
+        The stored value is gone (``scheduler`` is absent from the JSON), but
+        the cluster still *launches* with something, so ``show`` reports the
+        resolved fallback and flags it as a default rather than printing
+        nothing (which left no way to tell a greedy cluster from an
+        occupancy-aware one).
+        """
+        runner.invoke(main, ["cluster", "update", "test-cluster", "--scheduler", "occupancy-sparse"])
         result = runner.invoke(main, ["cluster", "update", "test-cluster", "--scheduler", ""])
         assert result.exit_code == 0, result.output
 
+        result = runner.invoke(main, ["cluster", "show", "test-cluster", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert not data.get("scheduler")
+        assert data["effective_scheduler"] == "greedy"
+        assert data["scheduler_defaulted"] is True
+
         result = runner.invoke(main, ["cluster", "show", "test-cluster"])
-        assert "Scheduler:" not in result.output
+        assert "Scheduler:   greedy (default — not set on this cluster)" in result.output
+
+    def test_cluster_show_reports_configured_scheduler(self, runner, cluster_setup):
+        """An explicitly-set scheduler shows without the "(default)" caveat."""
+        runner.invoke(main, ["cluster", "update", "test-cluster", "--scheduler", "occupancy-sparse"])
+
+        result = runner.invoke(main, ["cluster", "show", "test-cluster"])
+        assert result.exit_code == 0, result.output
+        assert "Scheduler:   occupancy-sparse" in result.output
+        assert "default —" not in result.output
+
+        result = runner.invoke(main, ["cluster", "show", "test-cluster", "--json"])
+        data = json.loads(result.output)
+        assert data["effective_scheduler"] == "occupancy-sparse"
+        assert data["scheduler_defaulted"] is False
 
 
 class TestClusterMonitor:
@@ -6067,73 +6096,111 @@ class TestCheckJobCommand:
 
 
 class TestRunEnsureFlag:
-    """Test the --ensure flag on the run command."""
+    """``--ensure`` — skip the launch when this workload is already serving.
+
+    Matching is on the launch *intent*, not on a host-derived cluster_id, so
+    these drive the real :func:`sparkrun.api.find_running_intent` over a
+    synthetic occupancy snapshot rather than stubbing the lookup out.
+    """
+
+    @staticmethod
+    def _running_intent_patch(*, hosts=("localhost",), placement_token="deadbeef0000"):
+        """Patch ``api.find_running_intent`` to see a deployment of whatever
+        intent the CLI asks about, placed on *hosts*.
+
+        The wrapper only *builds* the snapshot — matching and grouping run for
+        real, so a regression in either still fails the test.
+        """
+        import sparkrun.api as api
+        from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+
+        real = api.find_running_intent
+
+        def _spy(intent_id, query_hosts, **kwargs):
+            workload = RunningWorkload(
+                cluster_id="sparkrun_%s_%s" % (intent_id, placement_token),
+                intent_id=intent_id,
+                recipe_name=_TEST_RECIPE_NAME,
+                runtime_name="sglang",
+            )
+            snapshot = ClusterStatus(
+                hosts=tuple(HostOccupancy(host=h, workloads=(workload,), used_slots=1) for h in hosts),
+                executor="docker",
+            )
+            return real(intent_id, query_hosts, status=snapshot)
+
+        return mock.patch.object(api, "find_running_intent", _spy)
 
     def test_run_ensure_already_running(self, runner, reset_bootstrap):
-        """--ensure with running job exits 0 without launching."""
-        from sparkrun.orchestration.job_metadata import JobStatus
-
-        status = JobStatus(
-            running=True,
-            cluster_id="sparkrun_aabbccdd0011",
-            metadata={"recipe": _TEST_RECIPE_NAME},
-            hosts=["localhost"],
-        )
+        """--ensure with a running job exits 0 without launching."""
         with (
-            mock.patch(
-                "sparkrun.orchestration.job_metadata.check_job_running",
-                return_value=status,
-            ),
-            mock.patch(
-                "sparkrun.core.launcher.launch_inference",
-            ) as mock_launch,
+            self._running_intent_patch(),
+            mock.patch("sparkrun.core.launcher.launch_inference") as mock_launch,
         ):
             result = runner.invoke(
                 main,
-                [
-                    "run",
-                    _TEST_RECIPE_NAME,
-                    "--hosts",
-                    "localhost",
-                    "--ensure",
-                    "--solo",
-                ],
+                ["run", _TEST_RECIPE_NAME, "--hosts", "localhost", "--ensure", "--solo"],
             )
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "already running" in result.output
         mock_launch.assert_not_called()
 
-    def test_run_ensure_not_running(self, runner, reset_bootstrap):
-        """--ensure with no running job proceeds to launch."""
-        from sparkrun.orchestration.job_metadata import JobStatus
+    def test_run_ensure_matches_job_placed_on_other_hosts(self, runner, reset_bootstrap):
+        """A deployment on hosts this launch wouldn't pick still counts.
 
-        status = JobStatus(
-            running=False,
-            cluster_id="sparkrun_aabbccdd0011",
-            metadata=None,
-            hosts=["localhost"],
-        )
+        The old cluster_id-based lookup hashed the host list, so a job placed
+        anywhere else — which is the normal case under an occupancy-aware
+        scheduler — was invisible and ``--ensure`` launched a duplicate.
+        """
         with (
-            mock.patch(
-                "sparkrun.orchestration.job_metadata.check_job_running",
-                return_value=status,
-            ),
+            self._running_intent_patch(hosts=("10.0.0.9",)),
+            mock.patch("sparkrun.core.launcher.launch_inference") as mock_launch,
+        ):
+            result = runner.invoke(
+                main,
+                ["run", _TEST_RECIPE_NAME, "--hosts", "localhost", "--ensure", "--solo"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "already running" in result.output
+        assert "10.0.0.9" in result.output
+        mock_launch.assert_not_called()
+
+    def test_run_ensure_not_running(self, runner, reset_bootstrap):
+        """--ensure with no running job proceeds to launch.
+
+        The autouse status stub reports an idle cluster, so the real lookup
+        finds nothing — no patching needed.
+        """
+        with mock.patch.object(SglangRuntime, "run", return_value=0):
+            result = runner.invoke(
+                main,
+                ["run", _TEST_RECIPE_NAME, "--hosts", "localhost", "--ensure", "--solo", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        # Should proceed to launch — shows runtime info
+        assert "Runtime:" in result.output
+        assert "already running" not in result.output
+
+    def test_run_ensure_launches_when_cluster_unreachable(self, runner, reset_bootstrap):
+        """A failed status probe means "not running", so the launch proceeds.
+
+        Declining to launch because we couldn't tell is the worse failure —
+        ``--ensure`` exists to avoid duplicates, not to gate on reachability.
+        """
+
+        def _boom(hosts, **kwargs):
+            raise OSError("ssh: connect to host localhost port 22: Connection refused")
+
+        with (
+            mock.patch("sparkrun.api.status", _boom),
+            mock.patch("sparkrun.api._status.status", _boom),
             mock.patch.object(SglangRuntime, "run", return_value=0),
         ):
             result = runner.invoke(
                 main,
-                [
-                    "run",
-                    _TEST_RECIPE_NAME,
-                    "--hosts",
-                    "localhost",
-                    "--ensure",
-                    "--solo",
-                    "--dry-run",
-                ],
+                ["run", _TEST_RECIPE_NAME, "--hosts", "localhost", "--ensure", "--solo", "--dry-run"],
             )
-        assert result.exit_code == 0
-        # Should proceed to launch — shows runtime info
+        assert result.exit_code == 0, result.output
         assert "Runtime:" in result.output
 
 

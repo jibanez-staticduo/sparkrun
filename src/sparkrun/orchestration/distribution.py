@@ -16,6 +16,8 @@ from sparkrun.orchestration.transfer import TransferError
 from sparkrun.core.cluster_manager import ModelDistributionPrefs
 
 if TYPE_CHECKING:
+    from typing import Callable
+
     from sparkrun.core.config import SparkrunConfig
     from sparkrun.orchestration.comm_env import ClusterCommEnv
     from sparkrun.orchestration.infiniband import IBDetectionResult
@@ -720,6 +722,7 @@ def distribute_from_config(
     prefs: ModelDistributionPrefs | None = None,
     skip_model: bool = False,
     skip_container: bool = False,
+    after_container_sync: "Callable[[], None] | None" = None,
 ) -> tuple["ClusterCommEnv | None", dict[str, str], dict[str, str]]:
     """Distribute resources based on recipe ``distribution_config``.
 
@@ -741,6 +744,13 @@ def distribute_from_config(
         transfer_interface: Network interface for transfers.
         local_cache_dir: Control-machine cache dir for model downloads.
         pre_ib: Pre-computed IB detection results.
+        after_container_sync: Optional hook invoked once the container image is
+            resident on every target, *before* model download/distribution
+            starts.  This is the only point where the image can be inspected on
+            the substrate but the expensive, routinely-interrupted model sync
+            has not been paid for yet, so image-level preflights (see
+            ``launcher._verify_image_command_passthrough``) run here rather than
+            after Phase 3.  Raising from the hook aborts the launch.
 
     Returns:
         Tuple of (comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map).
@@ -774,6 +784,8 @@ def distribute_from_config(
                 logger.info("Ensuring container image is available locally...")
                 if ensure_image(image, dry_run=dry_run) != 0:
                     raise DistributionError(f"Failed to pull or locate image: {image}")
+        if after_container_sync is not None:
+            after_container_sync()
         if _model_names:
             with pending_op(_lock_id, "model_download", **_pop_kw):
                 for mn in _model_names:
@@ -862,6 +874,11 @@ def distribute_from_config(
                 )
             if img_failed:
                 raise DistributionError("Image distribution failed on: %s" % ", ".join(img_failed))
+
+    # Image is resident everywhere and the model sync has not started: the one
+    # window where an image-level preflight is both possible and still cheap.
+    if after_container_sync is not None:
+        after_container_sync()
 
     # Distribute models (skipped entirely when skip_model — e.g. a
     # cluster_config.resolved_model_path points at pre-placed shared weights).
