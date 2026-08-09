@@ -159,6 +159,9 @@ def logs(
     # nodes.  Uses ``executor.query_status`` (one parallel SSH sweep) — the
     # same source of truth as ``api.status`` and ``check_job_running``.
     # See ``_verify_log_source_alive`` for the full decision tree.
+    #
+    # Substrate knowledge stays behind the executor throughout: this module
+    # asks *what is running* and *what became of it*, never *how to look*.
     all_sources = (
         sources
         if scope == SCOPE_ALL
@@ -196,11 +199,17 @@ def _verify_log_source_alive(
     2. **Head dead, some workers alive** → raise with a pointer to
        ``--all-sources`` so the user can read from surviving nodes.
        With ``scope=SCOPE_ALL`` the reader can handle this, so proceed.
-    3. **All sources dead** (none in the snapshot) → follow-up
-       ``docker ps -a`` on the head distinguishes **stopped-but-exists**
-       (preserve metadata, investigation hints) from **fully removed**
-       (clean up stale metadata).  The status API uses ``docker ps``
-       (running only), so it can't make this distinction itself.
+    3. **All sources dead** (none in the snapshot) →
+       :meth:`Executor.describe_terminated` distinguishes
+       **stopped-but-inspectable** (preserve metadata, render the executor's
+       investigation hints) from **fully gone** (clean up stale metadata).
+       ``query_status`` reports only what is *running*, so it structurally
+       cannot make that distinction itself.
+
+    Every substrate-specific question — is anything left behind, what state is
+    it in, what should the operator run next — is answered by the executor.
+    This function contributes only sparkrun-level guidance (``--all-sources``,
+    ``sparkrun stop``), so it reads the same on docker, local and k8s.
 
     Best-effort: if the status query fails or a host is unreachable
     (in ``ClusterStatus.errors``), the precheck is skipped so a network
@@ -208,7 +217,6 @@ def _verify_log_source_alive(
     """
     if not sources:
         return
-    from sparkrun.orchestration.primitives import run_command_on_host
 
     head = sources[0]
 
@@ -230,14 +238,15 @@ def _verify_log_source_alive(
                 for c in w.containers:
                     if c.name == container_name:
                         return True
-                # Cluster_id present but this container not listed —
-                # could be a different container (head vs worker) or
-                # the executor didn't populate `containers`.  Check
-                # workload presence as a fallback: if the cluster_id
-                # has *any* workload on this host, the container might
-                # be running under a name we don't recognize.
+                # The cluster_id is here but this container isn't named.
+                # ``RunningWorkload.containers`` is optional — an executor that
+                # doesn't populate it can't answer per-container questions at
+                # all, so this is *inconclusive*, not "alive".  The difference
+                # only shows on workers: counting one alive by mistake reports
+                # "partially running, try --all-sources" for a workload that is
+                # entirely dead.
                 if not w.containers:
-                    return True  # containers not populated → assume alive
+                    return None
         return False  # host reachable, container not in snapshot
 
     head_status = _container_status(head.host, head.container)
@@ -271,37 +280,26 @@ def _verify_log_source_alive(
             "or `sparkrun stop %s` to clean up." % (cluster_id, head.host, ", ".join(alive_worker_hosts), cluster_id, cluster_id)
         )
 
-    # Every source is confirmed dead (none in the status snapshot).
-    # Determine whether the head container still exists (stopped) or is
-    # fully gone.  The status API uses ``docker ps`` (running only), so
-    # it can't make this distinction — a follow-up ``docker ps -a`` is
-    # the only way.
-    #
-    # Only rc=0 is actionable: empty stdout = gone, non-empty = stopped.
-    # Any other rc (255 SSH failure, 127 docker missing, -1 timeout) is
-    # inconclusive — assume the container exists (safer: preserves
-    # metadata for investigation rather than deleting it on a network blip).
-    exists_cmd = "docker ps -a --filter name=^%s$ --format '{{.ID}}'" % head.container
+    # Every source is confirmed dead.  Ask the executor what became of the head
+    # — whether anything is left to inspect, and how to inspect it.  A missing
+    # entry means "cannot tell" (unreachable host, an executor with no
+    # post-mortem support), which must not be read as "gone": that verdict is
+    # what deletes cached metadata.
     try:
-        exists_result = run_command_on_host(head.host, exists_cmd, ssh_kwargs=ssh_kwargs, timeout=10, quiet=True)
-        if exists_result.returncode == 0:
-            container_exists = bool(exists_result.stdout.strip())
-        else:
-            container_exists = True  # inconclusive → preserve metadata
-    except Exception:  # noqa: BLE001 — if the follow-up fails, assume stopped (safer for investigation)
-        container_exists = True
+        terminated = executor.describe_terminated([head], ssh_kwargs=ssh_kwargs)
+    except Exception:  # noqa: BLE001 — best-effort, like the status sweep above
+        logger.debug("describe_terminated failed for %s", cluster_id, exc_info=True)
+        terminated = {}
+    info = terminated.get((head.host, head.container))
 
-    if container_exists:
+    if info is None or info.exists is not False:
         raise JobNotFound(
-            "Workload %s is not currently running on %s (container %r has stopped).\n"
-            "The job metadata has been preserved so you can investigate:\n"
-            "  docker logs %s       # check why it stopped\n"
-            "  docker inspect %s    # exit code, OOM-killed, etc.\n"
-            "Run `sparkrun stop %s` to clean up when ready."
-            % (cluster_id, head.host, head.container, head.container, head.container, cluster_id)
+            "Workload %s is not currently running on %s%s.\n"
+            "The job metadata has been preserved so you can investigate.%s\n"
+            "Run `sparkrun stop %s` to clean up when ready." % (cluster_id, head.host, _detail_suffix(info), _hint_block(info), cluster_id)
         )
 
-    # Container is fully gone — metadata is stale.  Remove it so
+    # Confirmed gone — the cached metadata is stale.  Remove it so
     # ``logs <TAB>`` stops suggesting this dead workload.
     try:
         from sparkrun.orchestration.job_metadata import remove_job_metadata
@@ -311,9 +309,30 @@ def _verify_log_source_alive(
         logger.debug("Failed to remove stale metadata for %s", cluster_id, exc_info=True)
 
     raise JobNotFound(
-        "Workload %s is not currently running on %s (container %r no longer exists).\n"
-        "The stale job metadata has been removed. Run `sparkrun status` to see running workloads." % (cluster_id, head.host, head.container)
+        "Workload %s is not running on %s and nothing remains to read%s.\n"
+        "The stale job metadata has been removed. Run `sparkrun status` to see running workloads.%s"
+        % (cluster_id, head.host, _detail_suffix(info), _hint_block(info))
     )
+
+
+def _detail_suffix(info) -> str:
+    """Render an executor's substrate-native state as a parenthetical, if any."""
+    detail = getattr(info, "detail", None)
+    return " (%s)" % detail if detail else ""
+
+
+def _hint_block(info) -> str:
+    """Render an executor's investigation hints as an indented block.
+
+    The commands are the executor's — ``docker logs`` on a Docker host,
+    ``kubectl logs`` on k8s, a plain ``cat`` for a ``local`` job — so this only
+    lays them out.  An executor with nothing useful to suggest contributes
+    nothing rather than a heading with an empty list under it.
+    """
+    hints = getattr(info, "investigate_hints", ()) or ()
+    if not hints:
+        return ""
+    return "\n" + "\n".join("  %s" % h for h in hints)
 
 
 def _resolve_runtime_for_job(meta: dict | None, cluster_id: str, *, recipe=None, sctx: "SparkrunContext | None"):

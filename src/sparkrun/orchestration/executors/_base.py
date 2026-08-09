@@ -24,7 +24,7 @@ from sparkrun.utils.shell import b64_encode_cmd, quote
 
 if TYPE_CHECKING:
     from sparkrun.containers.entrypoint import EntrypointProbe
-    from sparkrun.core.cluster_status import ClusterStatus
+    from sparkrun.core.cluster_status import ClusterStatus, TerminationInfo
     from sparkrun.core.hardware import HostHardware
     from sparkrun.core.log_source import LogSource
 
@@ -511,6 +511,40 @@ class Executor(Plugin):
         from sparkrun.core.cluster_status import empty_status
 
         return empty_status(hosts, executor=self.executor_name)
+
+    def describe_terminated(
+        self,
+        sources: "list[LogSource]",
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> "dict[tuple[str, str], TerminationInfo]":
+        """Report on workloads :meth:`query_status` no longer reports as running.
+
+        The post-mortem peer of :meth:`query_status`: that answers "what is
+        running"; this answers, for something that is *not*, whether its remains
+        are still on this substrate and how the operator inspects them.
+
+        Keyed by ``(host, container)`` rather than by name alone, because a name
+        is only unique per host — Ray worker containers share one name across
+        every node.  A source this executor cannot speak for (unreachable host,
+        no container engine, an inconclusive probe) is simply absent from the
+        mapping, which callers must read as "cannot tell".
+
+        Every part of the answer is substrate-specific — a stopped Docker
+        container, a leftover ``local`` pidfile, a Failed Pod — which is why it
+        belongs here rather than in the caller.  Notably the
+        :attr:`~sparkrun.core.cluster_status.TerminationInfo.investigate_hints`:
+        ``docker logs`` is wrong advice on a k8s cluster and meaningless for a
+        native process.
+
+        Best-effort, like :meth:`query_status` and the ``verify_*`` preflights:
+        it must never raise, and it reports
+        :attr:`~sparkrun.core.cluster_status.TerminationInfo.exists` as ``None``
+        rather than guessing.  The base implementation returns ``{}`` — "cannot
+        tell" — so an executor that does not implement it degrades to preserving
+        cached job metadata rather than deleting it.
+        """
+        return {}
 
     # --- Preflight ---
 

@@ -39,10 +39,15 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
 
 from sparkrun.orchestration.executors._base import Executor
 from sparkrun.orchestration.k8s.client import KubectlClient
 from sparkrun.utils.shell import b64_wrap_bash, quote
+
+if TYPE_CHECKING:
+    from sparkrun.core.cluster_status import TerminationInfo
+    from sparkrun.core.log_source import LogSource
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +277,83 @@ class K8sExecutor(Executor):
         prefix = self._kubectl_prefix()
         # jsonpath returns empty string when Pod is missing → fails the test.
         return "[ \"$(%s get pod %s -o jsonpath='{.status.phase}' 2>/dev/null)\" = 'Running' ]" % (prefix, quote(container_name))
+
+    def describe_terminated(
+        self,
+        sources: "list[LogSource]",
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> "dict[tuple[str, str], TerminationInfo]":
+        """Read the terminal phase of Pods the status sweep no longer reports.
+
+        A ``Succeeded`` / ``Failed`` Pod is retained by the API server until
+        something deletes it, so unlike a ``--rm`` container its remains are
+        normally still there — and ``kubectl logs`` still works on it, which is
+        exactly what the operator wants next.  An empty phase means the Pod is
+        gone from the API server entirely.
+        """
+        from sparkrun.core.cluster_status import TerminationInfo
+        from sparkrun.orchestration.ssh import run_remote_scripts_parallel
+
+        if not sources:
+            return {}
+
+        ssh_kwargs = ssh_kwargs or {}
+        by_host: dict[str, list[str]] = {}
+        for source in sources:
+            by_host.setdefault(source.host, []).append(source.container)
+
+        hosts = list(by_host)
+        prefix = self._kubectl_prefix()
+        names = sorted({s.container for s in sources})
+        script = (
+            "\n".join(
+                "printf '%%s\\t%%s\\n' %s \"$(%s get pod %s -o jsonpath='{.status.phase}' 2>/dev/null)\"" % (quote(n), prefix, quote(n))
+                for n in names
+            )
+            + "\n"
+        )
+        try:
+            results = run_remote_scripts_parallel(
+                hosts,
+                script,
+                ssh_user=ssh_kwargs.get("ssh_user"),
+                ssh_key=ssh_kwargs.get("ssh_key"),
+                ssh_options=ssh_kwargs.get("ssh_options"),
+                timeout=ssh_kwargs.get("timeout", 15),
+                quiet=True,
+                allow_local=True,
+            )
+        except Exception:  # noqa: BLE001 — best-effort, like query_status
+            logger.debug("describe_terminated: probe failed", exc_info=True)
+            return {}
+
+        found: dict[tuple[str, str], TerminationInfo] = {}
+        result_by_host = {r.host: r for r in results}
+        for host in hosts:
+            r = result_by_host.get(host)
+            if r is None or r.returncode != 0:
+                logger.debug("describe_terminated: inconclusive for %r (rc=%s)", host, getattr(r, "returncode", "n/a"))
+                continue
+            phases = {}
+            for line in (r.stdout or "").splitlines():
+                name, sep, phase = line.partition("\t")
+                if sep and name.strip():
+                    phases[name.strip()] = phase.strip()
+            for container in by_host[host]:
+                phase = phases.get(container) or ""
+                if phase:
+                    found[(host, container)] = TerminationInfo(
+                        exists=True,
+                        detail="pod phase %s" % phase,
+                        investigate_hints=(
+                            "kubectl logs %s" % container,
+                            "kubectl describe pod %s" % container,
+                        ),
+                    )
+                else:
+                    found[(host, container)] = TerminationInfo(exists=False, detail="no pod by that name exists")
+        return found
 
     def inspect_exists_cmd(self, image: str) -> str:
         """No-op: Kubernetes pulls images on Pod creation."""

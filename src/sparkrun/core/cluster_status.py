@@ -73,6 +73,45 @@ class RunningWorkload:
 
 
 @dataclass(frozen=True)
+class TerminationInfo:
+    """What became of a workload that :class:`ClusterStatus` no longer reports.
+
+    The post-mortem peer of :class:`RunningWorkload`.  ``query_status`` answers
+    "what is running"; this answers, for something that is *not*, whether its
+    remains are still on the substrate and how the operator inspects them.
+
+    Produced by
+    :meth:`~sparkrun.orchestration.executors._base.Executor.describe_terminated`,
+    because every part of the answer is substrate-specific: a stopped Docker
+    container, a `local` pidfile whose process is gone, a Failed k8s Pod.
+    """
+
+    exists: bool | None
+    """Whether the workload's remains are still present on the substrate.
+
+    - ``True`` — still there (a stopped container, a leftover pidfile, a Failed
+      Pod), so there is something to inspect.
+    - ``False`` — **confirmed** gone.
+    - ``None`` — could not be determined.
+
+    Callers must treat ``None`` as inconclusive and never as ``False``: the
+    difference decides whether cached job metadata is deleted, and an
+    unreachable host must not be able to trigger that.
+    """
+
+    detail: str | None = None
+    """Substrate-native state, e.g. ``"Exited (137) 3 minutes ago"``."""
+
+    investigate_hints: tuple[str, ...] = field(default_factory=tuple)
+    """Substrate-native commands the operator can run next.
+
+    The executor owns the wording because it owns the substrate — ``docker
+    logs`` is wrong advice on a k8s cluster and meaningless for a ``local``
+    job.  Callers render these; they never author them.
+    """
+
+
+@dataclass(frozen=True)
 class GpuOccupancy:
     """Per-accelerator occupancy detail on a host.
 

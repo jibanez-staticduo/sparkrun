@@ -449,6 +449,38 @@ Each `Executor.query_status(hosts, …)` inspects its own backend (docker `docke
 ps`, local pidfile scan, k8s/modal control plane) and returns a `ClusterStatus`.
 There is no separate status extension point.
 
+**Post-mortem** (`Executor.describe_terminated(sources, …) -> {(host, container):
+TerminationInfo}`) is the *dead* peer of `query_status`: that reports what is
+running; this reports, for something that is **not**, whether its remains are
+still on the substrate and how the operator inspects them. `query_status` runs
+`docker ps` (running only), so it structurally cannot make that distinction —
+which is why `api.logs`'s liveness precheck needs a second question rather than
+a wider answer to the first.
+
+Every part of the answer is substrate-specific, including the remediation
+wording: `docker logs` is wrong advice on a k8s cluster and meaningless for a
+`local` job (a native process whose output is a host logfile). So
+`TerminationInfo` carries `investigate_hints` supplied by the executor;
+`api/_logs.py` lays them out and never authors them. Keyed by `(host,
+container)` because a container name is unique only per host — Ray worker
+containers share one name across nodes.
+
+Three rules, all of which exist because a `False` verdict is what **deletes**
+cached job metadata:
+
+- `exists=None` / an absent entry means *cannot tell* (unreachable host, no
+  container engine, an executor with no post-mortem support) and must never be
+  read as "gone". The base-class default is `{}`, so an unimplemented executor
+  degrades to preserving metadata.
+- Best-effort throughout: it never raises, exactly like `query_status` and the
+  `verify_*` preflights.
+- **`--rm` is why this is not a plain existence check.** `auto_remove` defaults
+  to `True`, so the daemon deletes a container the moment it exits: absence is
+  the *normal* outcome of a crash, not evidence a workload never ran. The Docker
+  executor knows its own config, so it reports *which* it was and hints at `-o
+  auto_remove=false` for the next attempt, instead of reporting the most
+  interesting failure as stale bookkeeping.
+
 **Mount-source preflight** (`Executor.verify_mount_sources(paths, hosts, …)`) is
 the substrate peer of `query_status` on the *write* path: "do these identity-mount
 sources already exist where the workload will run?" It validates pre-placed model

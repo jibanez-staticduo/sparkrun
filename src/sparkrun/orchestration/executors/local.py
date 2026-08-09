@@ -33,8 +33,9 @@ from sparkrun.orchestration.job_metadata import INTENT_ID_LEN, PLACEMENT_TOKEN_L
 from sparkrun.utils.shell import quote
 
 if TYPE_CHECKING:
-    from sparkrun.core.cluster_status import ClusterStatus
+    from sparkrun.core.cluster_status import ClusterStatus, TerminationInfo
     from sparkrun.core.hardware import HostHardware
+    from sparkrun.core.log_source import LogSource
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +296,80 @@ class LocalExecutor(Executor):
         """Exit 0 iff the workload's PID is still alive."""
         pid_file = self._resolve_pid_file(container_name)
         return ('{ _pid=$(cat %(pid)s 2>/dev/null || true); [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; }') % {"pid": pid_file}
+
+    def describe_terminated(
+        self,
+        sources: "list[LogSource]",
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> "dict[tuple[str, str], TerminationInfo]":
+        """Look for a dead workload's leftover pidfile and logfile.
+
+        There is no container here, so "does it still exist" means "did the
+        launch leave anything behind": the logfile is what an operator would
+        actually read, and unlike a Docker container nothing auto-removes it —
+        so the answer is usually yes, and the hint is a plain ``cat``.
+        """
+        from sparkrun.core.cluster_status import TerminationInfo
+        from sparkrun.orchestration.ssh import run_remote_scripts_parallel
+
+        if not sources:
+            return {}
+
+        ssh_kwargs = ssh_kwargs or {}
+        by_host: dict[str, list[str]] = {}
+        for source in sources:
+            by_host.setdefault(source.host, []).append(source.container)
+
+        hosts = list(by_host)
+        names = sorted({s.container for s in sources})
+        # ``<name>\t<log_file>`` for each workload whose logfile survives.
+        script = (
+            "\n".join(
+                "[ -e %s ] && printf '%%s\\t%%s\\n' %s %s || true"
+                % (quote(self._resolve_log_file(n)), quote(n), quote(self._resolve_log_file(n)))
+                for n in names
+            )
+            + "\n"
+        )
+        try:
+            results = run_remote_scripts_parallel(
+                hosts,
+                script,
+                ssh_user=ssh_kwargs.get("ssh_user"),
+                ssh_key=ssh_kwargs.get("ssh_key"),
+                ssh_options=ssh_kwargs.get("ssh_options"),
+                timeout=ssh_kwargs.get("timeout", 15),
+                quiet=True,
+                allow_local=True,
+            )
+        except Exception:  # noqa: BLE001 — best-effort, like query_status
+            logger.debug("describe_terminated: probe failed", exc_info=True)
+            return {}
+
+        found: dict[tuple[str, str], TerminationInfo] = {}
+        result_by_host = {r.host: r for r in results}
+        for host in hosts:
+            r = result_by_host.get(host)
+            if r is None or r.returncode != 0:
+                logger.debug("describe_terminated: inconclusive for %r (rc=%s)", host, getattr(r, "returncode", "n/a"))
+                continue
+            logs = {}
+            for line in (r.stdout or "").splitlines():
+                name, sep, path = line.partition("\t")
+                if sep and name.strip():
+                    logs[name.strip()] = path.strip()
+            for container in by_host[host]:
+                log_file = logs.get(container)
+                if log_file:
+                    found[(host, container)] = TerminationInfo(
+                        exists=True,
+                        detail="process is gone; its log file remains",
+                        investigate_hints=("cat %s" % log_file,),
+                    )
+                else:
+                    found[(host, container)] = TerminationInfo(exists=False, detail="no log file remains on the host")
+        return found
 
     def inspect_exists_cmd(self, image: str) -> str:
         """No-op: there is no image concept for native execution."""
