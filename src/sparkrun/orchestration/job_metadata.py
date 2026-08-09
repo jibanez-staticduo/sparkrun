@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING, Optional
@@ -525,6 +526,14 @@ def save_job_metadata(
         "runtime": recipe.runtime,
         "hosts": hosts,
         "intent_id": intent_id_meta,
+        # Launch time, so consumers can order jobs by recency.  The read side
+        # (``api.list_jobs``) has always looked for this key; nothing wrote it,
+        # so every job's ``started_at`` was ``None`` and the documented
+        # "most recent first" ordering silently degraded to alphabetical by
+        # cluster_id.  Recorded here rather than derived from file mtime
+        # because mtime is only a proxy — a rewrite (relaunch of the same
+        # cluster_id, a backup restore, an rsync of the cache) moves it.
+        "started_at": time.time(),
         "placement_token": placement_token_meta,
     }
     if recipe_ref:

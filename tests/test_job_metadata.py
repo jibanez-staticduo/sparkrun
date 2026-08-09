@@ -520,3 +520,138 @@ class TestParseContainerName:
         assert parse_container_name("sparkrun_%s_%s_head" % ("a" * 15, self.PLACE)) is None
         # Wrong placement length (11 instead of 12).
         assert parse_container_name("sparkrun_%s_%s_head" % (self.INTENT, "a" * 11)) is None
+
+
+# --------------------------------------------------------------------------
+# started_at — launch time, and the ordering that depends on it
+# --------------------------------------------------------------------------
+
+
+class TestStartedAt:
+    """``list_jobs`` documents "most recent first"; nothing recorded a time.
+
+    ``_job_info_from_file`` has always read ``started_at``, but
+    ``save_job_metadata`` never wrote it — so every job resolved to ``None``
+    and the sort key silently degraded to alphabetical by cluster_id.
+    """
+
+    def _recipe(self):
+        from sparkrun.core.recipe import Recipe
+
+        return Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+
+    def test_save_records_launch_time(self, tmp_path):
+        import time
+
+        from sparkrun.orchestration.job_metadata import load_job_metadata, save_job_metadata
+
+        before = time.time()
+        cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+        save_job_metadata(cluster_id, self._recipe(), ["h1"], cache_dir=str(tmp_path))
+        after = time.time()
+
+        meta = load_job_metadata(cluster_id, cache_dir=str(tmp_path))
+        assert before <= meta["started_at"] <= after
+
+    def test_list_jobs_reads_it(self, tmp_path):
+        from sparkrun.api import list_jobs
+        from sparkrun.orchestration.job_metadata import save_job_metadata
+
+        save_job_metadata("sparkrun_aaaaaaaaaaaaaaaa_111111111111", self._recipe(), ["h1"], cache_dir=str(tmp_path))
+        (job,) = list_jobs(cache_dir=str(tmp_path))
+        assert job.started_at is not None
+
+    def test_orders_most_recent_first(self, tmp_path, monkeypatch):
+        from sparkrun.api import list_jobs
+        from sparkrun.orchestration.job_metadata import save_job_metadata
+
+        # Launch order is deliberately the *reverse* of alphabetical order, so
+        # the assertion fails under the old (alphabetical) behaviour rather
+        # than passing by coincidence.  cluster_ids are hex — `parse_cluster_id`
+        # rejects anything else — so the two differ only in a/f.
+        clock = iter([1_700_000_000.0, 1_700_000_500.0])
+        monkeypatch.setattr("sparkrun.orchestration.job_metadata.time.time", lambda: next(clock))
+
+        for cid in ("sparkrun_aaaaaaaaaaaaaaaa_111111111111", "sparkrun_ffffffffffffffff_222222222222"):
+            save_job_metadata(cid, self._recipe(), ["h1"], cache_dir=str(tmp_path))
+
+        ordered = [j.cluster_id for j in list_jobs(cache_dir=str(tmp_path))]
+        assert ordered[0].startswith("sparkrun_ffff"), "newest launch must sort first, not the alphabetical winner"
+
+
+class TestStartedAtBackfill:
+    """Jobs written before the field existed must still order correctly.
+
+    On a long-lived cache that is most of them, and leaving those as "no
+    timestamp" reproduces the exact ordering bug the field was added to fix.
+    """
+
+    def _write(self, tmp_path, name: str, body: str, mtime: float | None = None):
+        import os
+
+        jobs = tmp_path / "jobs"
+        jobs.mkdir(parents=True, exist_ok=True)
+        path = jobs / name
+        path.write_text(body)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_missing_started_at_falls_back_to_mtime(self, tmp_path):
+        from sparkrun.api import list_jobs
+
+        self._write(
+            tmp_path,
+            "aaaaaaaaaaaaaaaa_111111111111.yaml",
+            "cluster_id: sparkrun_aaaaaaaaaaaaaaaa_111111111111\nhosts: [h1]\n",
+            mtime=1_700_000_000.0,
+        )
+        (job,) = list_jobs(cache_dir=str(tmp_path))
+        assert job.started_at == 1_700_000_000.0
+
+    def test_recorded_value_beats_mtime(self, tmp_path):
+        """A rewrite (backup restore, cache rsync) moves mtime; the record doesn't."""
+        from sparkrun.api import list_jobs
+
+        self._write(
+            tmp_path,
+            "aaaaaaaaaaaaaaaa_111111111111.yaml",
+            "cluster_id: sparkrun_aaaaaaaaaaaaaaaa_111111111111\nstarted_at: 1600000000.0\nhosts: [h1]\n",
+            mtime=1_700_000_000.0,
+        )
+        (job,) = list_jobs(cache_dir=str(tmp_path))
+        assert job.started_at == 1_600_000_000.0
+
+    def test_unparseable_value_falls_back_to_mtime(self, tmp_path):
+        from sparkrun.api import list_jobs
+
+        self._write(
+            tmp_path,
+            "aaaaaaaaaaaaaaaa_111111111111.yaml",
+            "cluster_id: sparkrun_aaaaaaaaaaaaaaaa_111111111111\nstarted_at: not-a-number\nhosts: [h1]\n",
+            mtime=1_700_000_000.0,
+        )
+        (job,) = list_jobs(cache_dir=str(tmp_path))
+        assert job.started_at == 1_700_000_000.0
+
+    def test_mixed_recorded_and_backfilled_sort_together(self, tmp_path):
+        """A cache mid-migration holds both shapes; one ordering must cover both."""
+        from sparkrun.api import list_jobs
+
+        self._write(
+            tmp_path,
+            "aaaaaaaaaaaaaaaa_111111111111.yaml",
+            "cluster_id: sparkrun_aaaaaaaaaaaaaaaa_111111111111\nhosts: [h1]\n",
+            mtime=1_600_000_000.0,  # old, backfilled from mtime
+        )
+        self._write(
+            tmp_path,
+            "bbbbbbbbbbbbbbbb_222222222222.yaml",
+            "cluster_id: sparkrun_bbbbbbbbbbbbbbbb_222222222222\nstarted_at: 1700000000.0\nhosts: [h1]\n",
+            mtime=1_500_000_000.0,  # mtime is older, but the record is newer
+        )
+        ordered = [j.cluster_id for j in list_jobs(cache_dir=str(tmp_path))]
+        assert ordered == [
+            "sparkrun_bbbbbbbbbbbbbbbb_222222222222",
+            "sparkrun_aaaaaaaaaaaaaaaa_111111111111",
+        ]

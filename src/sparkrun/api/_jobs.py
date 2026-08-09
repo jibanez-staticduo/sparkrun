@@ -67,6 +67,31 @@ def list_jobs(
     return entries
 
 
+def _resolve_started_at(raw, meta_path: Path) -> float | None:
+    """Resolve a job's launch time, falling back to the file's mtime.
+
+    ``started_at`` was added to the metadata after the fact, so every job
+    written by an earlier sparkrun lacks it — on a long-lived cache that is
+    most of them.  Without a fallback those all sort as "no timestamp", which
+    is exactly the ordering bug the field was added to fix: the sort key sends
+    untimed entries to the back and orders them alphabetically by cluster_id.
+
+    The file's mtime is a good proxy — it is when the launch wrote the
+    metadata — and it is only ever consulted when the recorded value is absent
+    or unparseable, so a real ``started_at`` always wins over a mtime that a
+    later rewrite (backup restore, cache rsync) may have moved.
+    """
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            logger.debug("list_jobs: unparseable started_at %r in %s", raw, meta_path)
+    try:
+        return meta_path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _job_info_from_file(meta_path: Path) -> JobInfo | None:
     """Load one job metadata YAML and return a :class:`JobInfo`, or ``None`` on failure."""
     try:
@@ -86,12 +111,7 @@ def _job_info_from_file(meta_path: Path) -> JobInfo | None:
     hosts_raw = data.get("hosts") or ()
     hosts = tuple(str(h) for h in hosts_raw) if isinstance(hosts_raw, (list, tuple)) else ()
 
-    started_raw = data.get("started_at")
-    started_at: float | None
-    try:
-        started_at = float(started_raw) if started_raw is not None else None
-    except (TypeError, ValueError):
-        started_at = None
+    started_at = _resolve_started_at(data.get("started_at"), meta_path)
 
     # Decompose the cluster_id when the metadata didn't already record
     # intent_id / placement_token (e.g. a job metadata file written by
