@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import json
+from pathlib import Path
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import yaml
 from click.testing import CliRunner
 
+from _telemetry_guard import install_telemetry_blocker
 import sparkrun.api as api
 from sparkrun.cli import main
 from sparkrun.core.cluster_manager import ClusterDefinition
@@ -23,6 +27,7 @@ from sparkrun.telemetry.config import (
     telemetry_enabled,
 )
 from sparkrun.telemetry.events import build_run_event, build_setup_wizard_event
+from sparkrun.telemetry.util import int_value, string_value
 
 
 class _FakeResponse:
@@ -209,6 +214,121 @@ def test_benchmark_event_is_anonymous_and_low_cardinality():
     payload = json.dumps(event, sort_keys=True)
     for private_value in ("host-a", "host-b", "bench_secret", "sparkrun_secret", "sub-secret", "/home/drew/private"):
         assert private_value not in payload
+
+
+class _Flavor(Enum):
+    PLAIN = "plain"
+
+
+class _Opaque:
+    def __str__(self):
+        return "leaked-repr"
+
+
+def test_string_value_renders_scalars_only():
+    assert string_value("  vllm  ") == "vllm"
+    assert string_value(4) == "4"
+    assert string_value(0.5) == "0.5"
+    assert string_value(True) == "True"
+    assert string_value(Path("/tmp/x")) == "/tmp/x"
+    assert string_value(_Flavor.PLAIN) == "plain"
+
+    assert string_value(None) is None
+    assert string_value("   ") is None
+    # Anything else is dropped rather than rendered through ``str()`` --
+    # including objects that define a perfectly innocent ``__str__``.
+    assert string_value(_Opaque()) is None
+    assert string_value(["a"]) is None
+    assert string_value({"a": 1}) is None
+    assert string_value(len) is None
+
+
+def test_string_value_never_renders_a_test_double():
+    """The regression: mock reprs reached the collector as event dimensions."""
+    mock = MagicMock()
+    assert string_value(mock) is None
+    assert string_value(mock.category) is None
+    # A Mock satisfies os.PathLike (it synthesizes __fspath__), so the path case
+    # must be typed on PurePath rather than the protocol.
+    assert string_value(mock.__fspath__) is None
+
+
+def test_int_value_does_not_coerce_arbitrary_objects():
+    assert int_value("4") == 4
+    assert int_value(4.9) == 4
+    assert int_value(True) == 1
+    assert int_value(None, default=7) == 7
+    assert int_value("nope", default=7) == 7
+    # ``int(MagicMock())`` is 1 -- a confident, entirely fabricated number.
+    assert int_value(MagicMock(), default=None) is None
+
+
+def test_benchmark_event_drops_mock_dimensions():
+    """Reproduces the shape of the events that reached the live collector."""
+    mock = MagicMock()
+
+    event = build_benchmark_event(result=mock, options=mock, recipe=mock)
+
+    assert "MagicMock" not in json.dumps(event, sort_keys=True, default=str)
+    assert event["category"] is None
+    assert event["framework"] is None
+    assert event["profile"] is None
+    assert event.get("model") is None
+
+
+def test_run_event_drops_mock_dimensions():
+    mock = MagicMock()
+
+    event = build_run_event(result=mock, recipe=mock, cluster=mock, options=mock)
+
+    assert "MagicMock" not in json.dumps(event, sort_keys=True, default=str)
+    assert event["runtime"] is None
+    assert event["executor"] is None
+    assert event["scheduler"] is None
+
+
+def test_telemetry_fails_closed_on_anything_but_a_real_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("SPARKRUN_NO_TELEMETRY", raising=False)
+
+    assert telemetry_enabled(SparkrunConfig(tmp_path / "config.yaml")) is True
+    assert telemetry_enabled(MagicMock()) is False
+    assert telemetry_enabled(SimpleNamespace(get=lambda key, default=None: None)) is False
+    assert telemetry_enabled(None) is False
+
+    # Forcing telemetry on must not resurrect a config we do not recognize.
+    monkeypatch.setenv("SPARKRUN_NO_TELEMETRY", "0")
+    assert telemetry_enabled(MagicMock()) is False
+
+
+def test_emit_sends_nothing_when_handed_a_mock_config(tmp_path, monkeypatch):
+    """The vector behind every event that reached the live collector."""
+    from sparkrun.telemetry import emit_benchmark_telemetry
+
+    attempts = install_telemetry_blocker(monkeypatch)
+    monkeypatch.delenv("SPARKRUN_NO_TELEMETRY", raising=False)
+
+    emit_benchmark_telemetry(MagicMock(), result=MagicMock(), options=MagicMock())
+
+    assert attempts == []
+
+
+def test_test_suite_telemetry_blocker_records_despite_emit_swallowing(tmp_path, monkeypatch):
+    """The suite-wide guard must survive ``emit_*``'s blanket ``except Exception``.
+
+    Raising from the patched ``urlopen`` alone would be logged at DEBUG and
+    forgotten; the recorded attempt is what fails the test in
+    ``isolate_stateful``'s teardown.  Installing a fresh blocker here shadows
+    that one, so this test does not trip its own guard.
+    """
+    from sparkrun.telemetry import emit_benchmark_telemetry
+
+    attempts = install_telemetry_blocker(monkeypatch)
+    monkeypatch.delenv("SPARKRUN_NO_TELEMETRY", raising=False)
+
+    # A real config on the enabled path -- a mock one no longer sends at all.
+    emit_benchmark_telemetry(SparkrunConfig(tmp_path / "config.yaml"), result=MagicMock(), options=MagicMock())
+
+    assert len(attempts) == 1, "the blocker must record the send emit_* swallowed"
 
 
 def test_setup_telemetry_command_persists_preference(tmp_path, monkeypatch):

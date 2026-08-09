@@ -78,6 +78,38 @@ def resolve_scheduler_selector(
     return selector, selector is None
 
 
+def describe_effective_scheduler(
+    cli: str | None = None,
+    recipe: str | None = None,
+    cluster: str | None = None,
+    *,
+    v=None,
+) -> tuple[str, bool]:
+    """Return ``(resolved_name, defaulted)`` for the same chain launches use.
+
+    The display peer of :func:`resolve_scheduler_selector`: where that returns
+    the *selector* (``None`` when nothing named one), this resolves it to the
+    scheduler that would actually run, so ``cluster show`` / ``cluster
+    inspect`` / the ``run`` banner can never disagree with the launch about
+    which scheduler is in effect.
+
+    Answering this is not optional cosmetics.  A cluster created before the
+    ``scheduler`` field existed stores ``None`` and silently resolves to
+    :data:`FALLBACK_DEFAULT_SCHEDULER` — printing nothing (the old behavior)
+    left no way to tell a greedy cluster from an occupancy-aware one short of
+    launching something.
+
+    An unresolvable selector (e.g. a typo, or a plugin that failed to load) is
+    returned verbatim rather than raising: the caller is describing config, and
+    "what you configured, which does not resolve" is the useful answer.
+    """
+    selector, defaulted = resolve_scheduler_selector(cli=cli, recipe=recipe, cluster=cluster)
+    try:
+        return get_scheduler(selector, v=v).scheduler_name, defaulted
+    except Exception:
+        return selector or FALLBACK_DEFAULT_SCHEDULER, defaulted
+
+
 def new_cluster_scheduler_notice(scheduler: str = NEW_CLUSTER_DEFAULT_SCHEDULER) -> str:
     """Human-readable explanation shown when a new cluster opts into *scheduler*."""
     return (

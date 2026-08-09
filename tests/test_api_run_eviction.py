@@ -248,6 +248,13 @@ def _run_with_stubbed_launcher(opts):
     """``api.run(opts)`` with a hermetic launcher, returning the eviction mock."""
 
     def _fake_launch(**kwargs):
+        # Honour the real launcher's contract: ``before_start`` fires once,
+        # immediately before containers start — i.e. after every step that can
+        # fail slowly (distribution, model download).  A fake that skipped it
+        # would let the eviction move back to the top of ``api.run`` unnoticed.
+        hook = kwargs.get("before_start")
+        if hook is not None and not kwargs.get("dry_run"):
+            hook()
         return type(
             "FakeLaunchResult",
             (),
@@ -294,7 +301,7 @@ def test_dry_run_never_evicts():
     _run_with_stubbed_launcher(_run_options(dry_run=True)).assert_not_called()
 
 
-def test_real_run_evicts_before_launching():
+def test_real_run_evicts_before_starting_containers():
     """Positive control for the test above: a non-dry-run reaches the
     eviction step, and hands it the launch's own cluster_id so it can't tear
     down the deployment it is creating."""
@@ -304,3 +311,30 @@ def test_real_run_evicts_before_launching():
     kwargs = evict.call_args.kwargs
     assert kwargs["target_hosts"] == ["h1"]
     assert kwargs["cluster_id_for_launch"].startswith("sparkrun_%s_" % kwargs["intent_id"])
+
+
+def test_launch_that_dies_before_starting_containers_evicts_nothing():
+    """An interrupted launch must leave the running deployment alone.
+
+    Eviction used to run at the top of ``api.run``, before image distribution
+    and the model download — steps that take minutes and are routinely
+    Ctrl-C'd.  A launch killed there tore down the serving workload it was
+    replacing and then died without replacing it, leaving the cluster empty.
+    Now the teardown is the last thing before containers start, so anything
+    that fails earlier is harmless.
+    """
+
+    def _die_before_start(**kwargs):
+        # Model a Ctrl-C during "Distributing resources": the launcher raises
+        # without ever reaching its ``before_start`` hook.
+        raise KeyboardInterrupt
+
+    with (
+        patch("sparkrun.core.launcher.launch_inference", side_effect=_die_before_start),
+        patch("sparkrun.api._resolve.resolve_runtime", return_value=_FakeRuntime()),
+        patch("sparkrun.api._run._evict_superseded_deployments", return_value=[]) as evict,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            api.run(_run_options(dry_run=False, follow=False))
+
+    evict.assert_not_called()

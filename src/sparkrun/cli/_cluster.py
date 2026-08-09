@@ -653,9 +653,20 @@ def cluster_show(ctx, name, output_json):
 
     default_name = mgr.get_default()
 
+    # Resolve the scheduler the cluster would actually launch with.  A cluster
+    # predating the ``scheduler`` field stores ``None`` and falls back to
+    # greedy; showing only the stored value (the old behavior) printed nothing
+    # at all in that case, so there was no way to tell a greedy cluster from an
+    # occupancy-aware one without launching something.
+    from sparkrun.core.scheduler import describe_effective_scheduler
+
+    effective_scheduler, scheduler_defaulted = describe_effective_scheduler(cluster=c.scheduler, v=_get_context(ctx).variables)
+
     if output_json:
         data = c.to_dict()
         data["default"] = c.name == default_name
+        data["effective_scheduler"] = effective_scheduler
+        data["scheduler_defaulted"] = scheduler_defaulted
         print_json(data)
         return
 
@@ -681,8 +692,10 @@ def cluster_show(ctx, name, output_json):
         click.echo("Executor config:")
         for k, v in sorted(c.executor_config.items()):
             click.echo(f"  {k}: {v}")
-    if c.scheduler:
-        click.echo(f"Scheduler:   {c.scheduler}")
+    if scheduler_defaulted:
+        click.echo(f"Scheduler:   {effective_scheduler} (default — not set on this cluster)")
+    else:
+        click.echo(f"Scheduler:   {effective_scheduler}")
     click.echo(f"Default:     {'yes' if c.name == default_name else 'no'}")
     click.echo(f"Hosts ({len(c.hosts)}):")
     for h in c.hosts:
@@ -1271,12 +1284,24 @@ def cluster_inspect(ctx, name, hosts, hosts_file, cluster_name, dry_run, output_
         sparkrun_cache_dir=local_sparkrun,
     )
 
+    # Scheduler the cluster would launch with.  ``inspect`` reports *effective*
+    # configuration, and an unset cluster scheduler still resolves to one — so
+    # reporting the raw ``None`` would hide the thing most likely to explain a
+    # surprising placement.
+    from sparkrun.core.scheduler import describe_effective_scheduler
+
+    effective_scheduler, scheduler_defaulted = describe_effective_scheduler(cluster=cluster_cfg.scheduler, v=_get_context(ctx).variables)
+
     # Collect effective config summary
     effective_config = {
         "cluster": cluster_cfg.name,
         "ssh_user": config.ssh_user,
         "transport": cluster_cfg.transport,
         "provider_ref": cluster_cfg.provider_ref,
+        "scheduler": cluster_cfg.scheduler,
+        "scheduler_resolved": effective_scheduler,
+        "scheduler_defaulted": scheduler_defaulted,
+        "executor": cluster_cfg.executor,
         "transfer_mode": xfer_mode,
         "transfer_mode_resolved": resolved_mode,
         "transfer_interface": xfer_iface or "auto",
@@ -1338,6 +1363,12 @@ def cluster_inspect(ctx, name, hosts, hosts_file, cluster_name, dry_run, output_
     cfg_iface = xfer_iface or "auto"
     click.echo("  transfer_interface: %s" % _fmt_resolved(cfg_iface, resolved_iface))
     click.echo("  topology:           %s" % (cluster_cfg.topology or "(none)"))
+    if scheduler_defaulted:
+        click.echo("  scheduler:          %s (default — not set on this cluster)" % effective_scheduler)
+    else:
+        click.echo("  scheduler:          %s" % effective_scheduler)
+    if cluster_cfg.executor:
+        click.echo("  executor:           %s" % cluster_cfg.executor)
     click.echo("  hosts:              %s" % ", ".join(host_list))
     click.echo()
 

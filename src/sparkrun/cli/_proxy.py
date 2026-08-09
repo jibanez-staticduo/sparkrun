@@ -613,20 +613,57 @@ def load_cmd(
         # Try to register with a running proxy.
         from sparkrun import api
 
-        if api.proxy.status(sctx=sctx).running:
-            click.echo("Registering with proxy...")
-            import time
+        proxy_status = api.proxy.status(sctx=sctx)
+        if proxy_status.running:
+            # Discovery's liveness test is an HTTP probe of /v1/models, so
+            # syncing before the server is actually serving finds nothing.
+            # The launch above is detached — it returned when the containers
+            # came up, which for a large model is minutes early.
+            from sparkrun.core.launcher import wait_for_serve_ready
+            from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-            time.sleep(2)  # Brief delay for server startup
-            try:
-                synced = api.proxy.sync(require_running=True, sctx=sctx)
-            except api.proxy.ProxyUpdateFailed as exc:
-                click.echo("Error: %s" % exc, err=True)
-                sys.exit(1)
-            if synced.added:
-                click.echo("Registered %d model(s) with proxy (restarted)." % synced.added)
+            click.echo("Waiting for server to become ready...")
+            readiness = wait_for_serve_ready(result, ssh_kwargs=build_ssh_kwargs(config))
+
+            if not readiness.ready:
+                _warn_not_registered(readiness, proxy_status)
             else:
-                click.echo("Warning: model did not appear in proxy discovery.", err=True)
+                click.echo("Registering with proxy...")
+                try:
+                    synced = api.proxy.sync(require_running=True, sctx=sctx)
+                except api.proxy.ProxyUpdateFailed as exc:
+                    click.echo("Error: %s" % exc, err=True)
+                    sys.exit(1)
+                if synced.added:
+                    click.echo("Registered %d model(s) with proxy (restarted)." % synced.added)
+                else:
+                    click.echo(
+                        "Note: proxy already served this endpoint; no config change needed.",
+                    )
+
+
+def _warn_not_registered(readiness, proxy_status) -> None:
+    """Explain why a loaded model was not registered with the proxy.
+
+    Not an error: the workload is running either way, and the
+    auto-discover daemon registers it as soon as it answers.
+    """
+    if readiness.reason == "port":
+        click.echo(
+            "Warning: server port %d never started listening on %s (container may have exited)." % (readiness.port, readiness.head_host),
+            err=True,
+        )
+        click.echo("  Check the logs: sparkrun logs <cluster-id>", err=True)
+        return
+
+    click.echo(
+        "Warning: server at %s is still not answering — it may need longer to load." % readiness.health_url,
+        err=True,
+    )
+    if proxy_status.autodiscover_running:
+        click.echo("  The proxy's auto-discover will register it once it responds.", err=True)
+    else:
+        click.echo("  Register it once it responds with: sparkrun proxy sync", err=True)
 
 
 @proxy.command("unload")

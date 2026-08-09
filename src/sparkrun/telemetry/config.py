@@ -55,7 +55,24 @@ def env_telemetry_override() -> bool | None:
 
 
 def telemetry_enabled(config: SparkrunConfig) -> bool:
-    """Return whether telemetry should be emitted for this process."""
+    """Return whether telemetry should be emitted for this process.
+
+    Anything that is not a real :class:`SparkrunConfig` fails closed, ahead of
+    every other layer.  No production path can reach that branch — each caller
+    sources the config from ``SparkrunContext.config`` or constructs one
+    directly, and the class has no subclasses — but a *test double* does, and
+    the resolution below fails open for it: ``parse_bool()`` on a mock yields an
+    unrecognized string, returns None, and falls through to the unset default of
+    True.  A mock config therefore used to *enable* telemetry, which is how mock
+    objects were posted to the live collector on three separate occasions.
+
+    Checked before the environment override deliberately: ``SPARKRUN_NO_TELEMETRY=0``
+    forces telemetry on, and must not be able to resurrect this case.
+    """
+    if not isinstance(config, SparkrunConfig):
+        logger.debug("Telemetry disabled: config is a %s, not a SparkrunConfig", type(config).__name__)
+        return False
+
     env_override = env_telemetry_override()
     if env_override is not None:
         return env_override

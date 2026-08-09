@@ -12,7 +12,7 @@ import copy
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from sparkrun.core.backend_select import BackendBundle
@@ -281,6 +281,89 @@ def _verify_pre_placed_model(recipe, hosts, ssh_kwargs, *, runtime, cluster, con
         )
 
 
+def _verify_image_command_passthrough(
+    recipe,
+    image,
+    hosts,
+    ssh_kwargs,
+    *,
+    runtime,
+    cluster,
+    config,
+    executor_config,
+    rootless,
+    auto_user,
+    host_hardware,
+    v,
+) -> None:
+    """Fail fast when the image's ENTRYPOINT would swallow sparkrun's command.
+
+    sparkrun appends its launcher as CMD *arguments*, so an image whose
+    ENTRYPOINT consumes them (``ENTRYPOINT ["vllm","serve"]``) runs a different
+    program than intended — while the passthrough wrappers most NGC images ship
+    (``/opt/nvidia/nvidia_entrypoint.sh``, ending in ``exec "$@"``) are fine and
+    must be left alone.  Only a probe can tell them apart; see
+    :meth:`~sparkrun.orchestration.executors._base.Executor.verify_command_passthrough`.
+
+    Fails closed rather than auto-clearing the ENTRYPOINT.  The probe does
+    establish that clearing it *works*, but not that clearing it is *harmless* —
+    a consuming entrypoint may also perform setup the workload needs — so this
+    names both supported fixes and leaves the choice to the operator.
+
+    The executor is resolved with the same arguments the launch itself uses
+    below, so the probe container starts under the launch's own accelerator
+    flags (``host_hardware`` is what pins DGX Spark to ``--gpus`` over CDI).
+
+    Best-effort, matching :func:`_verify_pre_placed_model`: an unresolvable
+    executor, an unreachable host, or any probe error is skipped rather than
+    blocking.  Only a *confirmed* consuming entrypoint raises.
+    """
+    from sparkrun.core.recipe import RecipeError
+    from sparkrun.orchestration.executor import resolve_executor
+
+    if not image or not hosts:
+        return
+
+    try:
+        executor = resolve_executor(
+            recipe=recipe,
+            cluster=cluster,
+            runtime=runtime,
+            config=config,
+            cli_overrides=executor_config if isinstance(executor_config, dict) else None,
+            rootless=rootless,
+            auto_user=auto_user,
+            host_hardware=host_hardware,
+            v=v,
+        )
+    except Exception:
+        logger.debug("image entrypoint preflight: executor unresolvable; skipping probe", exc_info=True)
+        return
+
+    try:
+        probe = executor.verify_command_passthrough(image, hosts, ssh_kwargs=ssh_kwargs)
+    except Exception:
+        logger.debug("image entrypoint preflight: probe failed; skipping", exc_info=True)
+        return
+
+    if probe is None or not probe.consumes_command:
+        return
+
+    raise RecipeError(
+        "Container image %s declares ENTRYPOINT %s, which consumes the command sparkrun "
+        "appends rather than running it, so the workload would never start — the image's "
+        "own program parses sparkrun's launcher as its flags. Verified on %s: the same "
+        "command runs correctly once the entrypoint is cleared.\n"
+        "\n"
+        "Fix it in the recipe:\n"
+        "\n"
+        "    executor_config:\n"
+        '      entrypoint: ""\n'
+        "\n"
+        "or for a one-off run, pass:  -o entrypoint=''" % (image, probe.entrypoint or "(unknown)", probe.host)
+    )
+
+
 def resolve_effective_cache_dir(
     cache_dir: str | None,
     host_list: list[str],
@@ -490,6 +573,13 @@ def launch_inference(
     # post_launch_lifecycle).  CLI flag --trust + local/official-registry
     # recipes set this to True via resolve_recipe_trust().
     trust: bool = False,
+    # Called once, immediately before the runtime starts containers — after
+    # every step that can fail cheaply (distribution, model download, tuning)
+    # has succeeded.  ``sparkrun.api.run`` uses it to evict the deployments
+    # this launch supersedes, so an interrupted or failed launch cannot tear
+    # down a running workload it never got close to replacing.  Not called on
+    # ``dry_run``.
+    before_start: "Callable[[], None] | None" = None,
 ) -> LaunchResult:
     """Launch an inference workload.
 
@@ -882,6 +972,30 @@ def launch_inference(
             logger.debug("Could not resolve executor for image-skip decision; distributing image", exc_info=True)
             _skip_container = False
 
+        # Preflight: does this image actually run the command sparkrun appends?
+        # Runs from the distribution hook — i.e. once the image is resident on
+        # every target but *before* the model sync — because that is the only
+        # point where the image can be probed on the substrate and the launch
+        # has not yet paid for the long, routinely-interrupted transfer.
+        # Skipped on dry-run (no SSH) and for container-less executors.
+        def _probe_image_entrypoint() -> None:
+            if dry_run or _skip_container:
+                return
+            _verify_image_command_passthrough(
+                recipe,
+                container_image,
+                host_list,
+                ssh_kwargs,
+                runtime=runtime,
+                cluster=cluster,
+                config=config,
+                executor_config=executor_config,
+                rootless=rootless,
+                auto_user=auto_user,
+                host_hardware=_head_hw,
+                v=v,
+            )
+
         comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map = distribute_from_config(
             recipe,
             container_image,
@@ -899,6 +1013,7 @@ def launch_inference(
             prefs=_model_prefs,
             skip_model=_skip_model,
             skip_container=_skip_container,
+            after_container_sync=_probe_image_entrypoint,
         )
         # Re-save job metadata with IP maps from IB detection
         if not dry_run and (ib_ip_map or mgmt_ip_map):
@@ -1024,6 +1139,14 @@ def launch_inference(
 
         _rt_display = RUNTIME_DISPLAY.get(runtime.runtime_name, runtime.runtime_name)
         p.phase(5, "Launching %s runtime" % _rt_display)
+
+    # Last point before containers start.  Everything that can fail slowly and
+    # cheaply — image distribution, model download, tuning sync — is behind us,
+    # so a caller can safely tear down the deployment this launch replaces.
+    # Doing it any earlier means an interrupted `sparkrun run` leaves the
+    # cluster with neither the old workload nor the new one.
+    if before_start is not None and not dry_run:
+        before_start()
 
     # Build runtime.run() kwargs — include runtime-specific options only
     # when they were explicitly provided.
@@ -1186,6 +1309,112 @@ def launch_inference(
     )
 
 
+@dataclass(frozen=True)
+class ServeReadiness:
+    """Outcome of waiting for a launched workload's head endpoint.
+
+    ``reason`` is empty when ready, else ``"port"`` (never started
+    listening / container exited) or ``"health"`` (listening but never
+    returned HTTP 200).
+    """
+
+    ready: bool
+    head_host: str
+    head_ip: str
+    port: int
+    container: str
+    reason: str = ""
+
+    @property
+    def health_url(self) -> str:
+        return "http://%s:%d/v1/models" % (self.head_ip, self.port)
+
+
+def wait_for_serve_ready(
+    result: LaunchResult,
+    *,
+    ssh_kwargs: dict | None = None,
+    dry_run: bool = False,
+    port_max_retries: int = 120,
+    port_retry_interval: int = 2,
+    health_max_retries: int = 120,
+    health_retry_interval: int = 5,
+) -> ServeReadiness:
+    """Wait for a detached launch's head endpoint to answer ``/v1/models``.
+
+    ``launch_inference(detached=True)`` returns once the *containers* are
+    up, which for a large model is minutes before the server accepts a
+    request.  Callers that need to act on a serving endpoint must wait
+    for it explicitly.
+
+    Two stages, and the order matters: an inference server refuses
+    connections outright until its engine has finished initializing, so
+    the entire startup is indistinguishable from a crash when probing
+    the URL alone.  :func:`wait_for_port` polls the head *host* for a
+    listening socket and aborts early if the head container has exited;
+    only then is :func:`wait_for_healthy`'s connection-refused-means-dead
+    heuristic sound.
+
+    Args:
+        result: The :class:`LaunchResult` to wait on.
+        ssh_kwargs: SSH parameters for probing the head host.
+        dry_run: Report ready without waiting.
+        port_max_retries: Port-poll attempts (``port_retry_interval`` apart).
+        port_retry_interval: Seconds between port polls.
+        health_max_retries: Health-poll attempts (``health_retry_interval`` apart).
+        health_retry_interval: Seconds between health polls.
+
+    Returns:
+        A :class:`ServeReadiness` describing the head endpoint and
+        whether it became ready.
+    """
+    from sparkrun.orchestration.docker import generate_container_name, generate_node_container_name
+    from sparkrun.orchestration.health import wait_for_healthy, wait_for_port
+    from sparkrun.orchestration.primitives import detect_host_ip
+    from sparkrun.utils import is_local_host
+
+    head_host = result.host_list[0] if result.host_list else "localhost"
+
+    if result.is_solo:
+        container = generate_container_name(result.cluster_id, "solo")
+    else:
+        container = generate_node_container_name(result.cluster_id, 0)
+
+    if is_local_host(head_host):
+        head_ip = "127.0.0.1"
+    else:
+        try:
+            head_ip = detect_host_ip(head_host, ssh_kwargs=ssh_kwargs, dry_run=dry_run)
+        except RuntimeError:
+            head_ip = head_host
+
+    port = result.serve_port
+    base = ServeReadiness(True, head_host, head_ip, port, container)
+    if dry_run:
+        return base
+
+    if not wait_for_port(
+        head_host,
+        port,
+        max_retries=port_max_retries,
+        retry_interval=port_retry_interval,
+        ssh_kwargs=ssh_kwargs,
+        dry_run=dry_run,
+        container_name=container,
+    ):
+        return ServeReadiness(False, head_host, head_ip, port, container, reason="port")
+
+    if not wait_for_healthy(
+        base.health_url,
+        max_retries=health_max_retries,
+        retry_interval=health_retry_interval,
+        dry_run=dry_run,
+    ):
+        return ServeReadiness(False, head_host, head_ip, port, container, reason="health")
+
+    return base
+
+
 def post_launch_lifecycle(
     result: LaunchResult,
     remote_cache_dir: str,
@@ -1219,10 +1448,7 @@ def post_launch_lifecycle(
         run_post_commands,
         run_post_exec,
     )
-    from sparkrun.orchestration.health import wait_for_healthy, wait_for_port
-    from sparkrun.orchestration.primitives import build_ssh_kwargs, detect_host_ip
-    from sparkrun.orchestration.docker import generate_container_name, generate_node_container_name
-    from sparkrun.utils import is_local_host
+    from sparkrun.orchestration.primitives import build_ssh_kwargs
 
     p = progress  # short alias
     if p:
@@ -1233,52 +1459,24 @@ def post_launch_lifecycle(
     host_list = result.host_list
     overrides = result.overrides
     config = result.config
-    is_solo = result.is_solo
 
-    head_host = host_list[0] if host_list else "localhost"
     _ssh_kw = build_ssh_kwargs(config)
 
-    # Determine head container name
-    if is_solo:
-        head_container = generate_container_name(result.cluster_id, "solo")
-    else:
-        head_container = generate_node_container_name(result.cluster_id, 0)
-
-    # Detect head IP for health checks
-    if is_local_host(head_host):
-        head_ip = "127.0.0.1"
-    else:
-        try:
-            head_ip = detect_host_ip(head_host, ssh_kwargs=_ssh_kw, dry_run=dry_run)
-        except RuntimeError:
-            head_ip = head_host
-
-    # Determine effective port
-    config_chain = recipe.build_config_chain(overrides)
-    effective_port = config_chain.get("port", 8000)
-
     click.echo("Waiting for server to become ready...")
-    if not dry_run:
-        # Wait for port to be listening
-        port_ready = wait_for_port(
-            head_host,
-            effective_port,
-            max_retries=120,
-            retry_interval=2,
-            ssh_kwargs=_ssh_kw,
-            dry_run=dry_run,
-            container_name=head_container,
-        )
-        if not port_ready:
-            click.echo("Error: Server port %d never became ready" % effective_port, err=True)
-            sys.exit(1)
+    readiness = wait_for_serve_ready(result, ssh_kwargs=_ssh_kw, dry_run=dry_run)
+    head_host = readiness.head_host
+    head_ip = readiness.head_ip
+    effective_port = readiness.port
+    head_container = readiness.container
 
-        # Wait for HTTP 200 on /v1/models
-        health_url = "http://%s:%s/v1/models" % (head_ip, effective_port)
-        healthy = wait_for_healthy(health_url, max_retries=120, retry_interval=5, dry_run=dry_run)
-        if not healthy:
-            click.echo("Error: Server health check never passed at %s" % health_url, err=True)
-            sys.exit(1)
+    if not readiness.ready:
+        if readiness.reason == "port":
+            click.echo("Error: Server port %d never became ready" % effective_port, err=True)
+        else:
+            click.echo("Error: Server health check never passed at %s" % readiness.health_url, err=True)
+        sys.exit(1)
+
+    config_chain = recipe.build_config_chain(overrides)
 
     # Build hook context with extended variables
     hook_context = build_hook_context(

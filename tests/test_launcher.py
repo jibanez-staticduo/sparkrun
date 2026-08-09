@@ -793,3 +793,136 @@ def test_launch_inference_save_job_metadata_failure_is_best_effort(monkeypatch, 
 
     assert result.rc == 0
     assert save_calls, "save_job_metadata should have been attempted"
+
+
+# ---------------------------------------------------------------------------
+# wait_for_serve_ready
+# ---------------------------------------------------------------------------
+
+
+def _patch_serve_ready(monkeypatch, *, port_ready=True, healthy=True):
+    """Patch the probes wait_for_serve_ready imports lazily, recording calls."""
+    calls: list[str] = []
+
+    def _port(*_a, **_k):
+        calls.append("port")
+        return port_ready
+
+    def _health(*_a, **_k):
+        calls.append("health")
+        return healthy
+
+    monkeypatch.setattr("sparkrun.utils.is_local_host", lambda host: True)
+    monkeypatch.setattr("sparkrun.orchestration.docker.generate_container_name", lambda cid, suffix: "%s_%s" % (cid, suffix))
+    monkeypatch.setattr("sparkrun.orchestration.docker.generate_node_container_name", lambda cid, rank: "%s_node_%d" % (cid, rank))
+    monkeypatch.setattr("sparkrun.orchestration.health.wait_for_port", _port)
+    monkeypatch.setattr("sparkrun.orchestration.health.wait_for_healthy", _health)
+    return calls
+
+
+def test_wait_for_serve_ready_ready(monkeypatch):
+    """Both probes passing -> ready, no reason, and a usable health URL."""
+    from sparkrun.core.launcher import wait_for_serve_ready
+
+    calls = _patch_serve_ready(monkeypatch)
+    result = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime())
+
+    readiness = wait_for_serve_ready(result)
+
+    assert readiness.ready is True
+    assert readiness.reason == ""
+    assert readiness.head_ip == "127.0.0.1"
+    assert readiness.health_url == "http://127.0.0.1:8000/v1/models"
+    assert readiness.container == "sparkrun_lifecyclecid_solo"
+    assert calls == ["port", "health"]
+
+
+def test_wait_for_serve_ready_port_failure_skips_health(monkeypatch):
+    """A dead port must short-circuit.
+
+    wait_for_healthy treats consecutive connection refusals as "the server
+    died", which is exactly what a still-initializing server looks like —
+    so it is only sound once the port is confirmed listening.
+    """
+    from sparkrun.core.launcher import wait_for_serve_ready
+
+    calls = _patch_serve_ready(monkeypatch, port_ready=False)
+    result = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime())
+
+    readiness = wait_for_serve_ready(result)
+
+    assert readiness.ready is False
+    assert readiness.reason == "port"
+    assert calls == ["port"], "wait_for_healthy must not run before the port is up"
+
+
+def test_wait_for_serve_ready_health_failure(monkeypatch):
+    """Port up but never HTTP 200 -> reason='health'."""
+    from sparkrun.core.launcher import wait_for_serve_ready
+
+    calls = _patch_serve_ready(monkeypatch, healthy=False)
+    result = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime())
+
+    readiness = wait_for_serve_ready(result)
+
+    assert readiness.ready is False
+    assert readiness.reason == "health"
+    assert calls == ["port", "health"]
+
+
+def test_wait_for_serve_ready_dry_run_probes_nothing(monkeypatch):
+    """--dry-run reports ready without touching the network."""
+    from sparkrun.core.launcher import wait_for_serve_ready
+
+    calls = _patch_serve_ready(monkeypatch, port_ready=False, healthy=False)
+    result = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime())
+
+    readiness = wait_for_serve_ready(result, dry_run=True)
+
+    assert readiness.ready is True
+    assert calls == []
+
+
+def test_wait_for_serve_ready_uses_serve_port_not_recipe_port(monkeypatch):
+    """The probed port is the *resolved* one.
+
+    ``auto_port=True`` (how ``proxy load`` launches) can move the server off
+    the recipe's declared port; probing the recipe value would poll a port
+    nothing is listening on.
+    """
+    import dataclasses
+
+    from sparkrun.core.launcher import wait_for_serve_ready
+
+    probed: list[int] = []
+
+    _patch_serve_ready(monkeypatch)
+    monkeypatch.setattr(
+        "sparkrun.orchestration.health.wait_for_port",
+        lambda host, port, **_k: (probed.append(port), True)[1],
+    )
+
+    # Recipe declares 8000; auto_port moved the server to 8001.
+    result = _make_launch_result(_LifecycleRecipe(port=8000), _LifecycleRuntime())
+    result = dataclasses.replace(result, serve_port=8001)
+
+    readiness = wait_for_serve_ready(result)
+
+    assert probed == [8001]
+    assert readiness.port == 8001
+
+
+def test_wait_for_serve_ready_multinode_uses_head_container(monkeypatch):
+    """A non-solo launch watches the rank-0 container, not the solo name."""
+    import dataclasses
+
+    from sparkrun.core.launcher import wait_for_serve_ready
+
+    _patch_serve_ready(monkeypatch)
+    result = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime())
+    result = dataclasses.replace(result, is_solo=False, host_list=["h1", "h2"])
+
+    readiness = wait_for_serve_ready(result)
+
+    assert readiness.container == "sparkrun_lifecyclecid_node_0"
+    assert readiness.head_host == "h1"
