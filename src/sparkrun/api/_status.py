@@ -65,7 +65,7 @@ def status(
     # substrate (its ``status_scope``) and merge.  For an SSH cluster that's
     # docker + local (disjoint state on the same hosts); for a provider cluster
     # (modal / k8s) it's that provider alone.  See ``query_status_for_cluster``.
-    return query_status_for_cluster(
+    snapshot = query_status_for_cluster(
         cluster_def,
         list(hosts),
         executor=executor,
@@ -74,6 +74,30 @@ def status(
         config=config,
         v=v,
     )
+    _record_running_snapshot(snapshot, hosts, sctx)
+    return snapshot
+
+
+def _record_running_snapshot(snapshot: "ClusterStatus", hosts: list[str], sctx) -> None:
+    """Leave the sweep's answer behind for shell completion to read.
+
+    Completion cannot sweep for itself — it runs on every TAB, and a host that
+    no longer resolves would hang the terminal.  Recording it here, at the one
+    place every occupancy sweep passes through, means completion gets a live
+    view without ever opening a connection.
+
+    Only *reachable* hosts are recorded as covered: a host in
+    ``ClusterStatus.errors`` was not observed, and claiming otherwise would let
+    a reader conclude "not running" about a workload nobody looked at.
+    """
+    try:
+        from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+        cluster_ids = {w.cluster_id for entry in snapshot.hosts for w in entry.workloads if w.cluster_id}
+        covered = [h for h in hosts if h not in snapshot.errors]
+        save_running_snapshot(cluster_ids, covered, sctx=sctx)
+    except Exception:
+        logger.debug("Could not record running snapshot", exc_info=True)
 
 
 def status_report(

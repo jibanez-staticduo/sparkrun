@@ -884,48 +884,126 @@ def _describe_job(job) -> str:
     return " ".join(parts) if parts else ""
 
 
-def _complete_cluster_ids(incomplete: str):
-    """Return :class:`CompletionItem` instances for cached workload cluster_ids.
+#: How many cached jobs completion considers.  Bounds both the YAML parsing
+#: (each metadata file embeds a full recipe state) and the list a shell offers.
+COMPLETION_JOB_LIMIT = 25
 
-    Reads the local job metadata cache (``~/.cache/sparkrun/jobs/``) via
-    :func:`sparkrun.api.list_jobs` — no SSH round-trip, so it is fast
-    enough for interactive tab-completion (mirrors ``kubectl`` reading a
-    local cache rather than hitting the live API server).
 
-    Matching honours both the canonical ``sparkrun_<digest>`` form and
-    the bare ``<digest>`` short form (both accepted by
-    :func:`_is_cluster_id`), so ``628f…<TAB>`` and
-    ``sparkrun_628f…<TAB>`` both resolve.  The returned value is always
-    the full canonical form.
+def _complete_targets(incomplete: str, ctx=None):
+    """Complete ``logs`` / ``stop`` targets from the local job cache.
+
+    Two shapes are offered, in this order, and the split is dictated by how
+    each actually resolves rather than by preference:
+
+    1. **Recipe names**, for jobs on the cluster this invocation will target.
+       ``logs <recipe>`` resolves through live intent discovery against
+       whatever ``resolve_cluster`` returns, so offering a recipe whose only
+       deployment lives elsewhere would complete to something that then fails
+       to resolve.  Scoping them is what keeps a dead cluster's jobs out of the
+       list — and the target is read from the ``--cluster`` / ``--hosts``
+       already typed on the line, so ``logs --cluster lab <TAB>`` offers that
+       cluster's workloads even when no default cluster is configured.
+    2. **cluster_ids**, for everything else.  That form reads its hosts back
+       out of the job metadata, so it is cluster-agnostic and safe to offer for
+       any cluster.
+
+    Recipe names come first because on **bash there is no way to annotate a
+    completion** — ``BashComplete.format_completion`` emits ``type,value`` and
+    drops the help text entirely (zsh and fish do render it).  So the value
+    itself has to carry the meaning, and a recipe name does while a hex digest
+    does not.  kubectl completes pod *names* for the same reason; our analogue
+    of a pod name is the recipe, not the cluster_id.
+
+    Filtered to what is running whenever a recent occupancy snapshot exists
+    (see :func:`~sparkrun.orchestration.job_metadata.load_running_snapshot`) —
+    never by sweeping here, which would hang the shell on an unreachable host.
     """
     try:
         from sparkrun import api
+        from sparkrun.orchestration.job_metadata import load_running_snapshot
 
-        jobs = api.list_jobs()
-        items = []
+        jobs = api.list_jobs(limit=COMPLETION_JOB_LIMIT)
+        if not jobs:
+            return []
+
+        snapshot = load_running_snapshot()
+        target_hosts = _completion_cluster_hosts(ctx)
+
+        items: list = []
+        seen_recipes: set[str] = set()
         for job in jobs:
+            if not _job_is_live(job, snapshot):
+                continue
+            # A recipe name only resolves against the default cluster, so only
+            # offer it for jobs that actually live there.
+            recipe = job.recipe
+            # A URL-sourced recipe's "name" is the URL, which `logs` accepts
+            # but which is 80 characters of noise in a completion list — and
+            # completing it would re-fetch the URL.  Those jobs stay reachable
+            # by cluster_id, which is both shorter and unambiguous.
+            if recipe and _is_recipe_url(recipe):
+                recipe = None
+            if recipe and target_hosts and set(job.hosts) <= target_hosts and recipe not in seen_recipes:
+                seen_recipes.add(recipe)
+                if recipe.startswith(incomplete):
+                    items.append(click.shell_completion.CompletionItem(recipe, help=_describe_job(job)))
+                    continue
             cid = job.cluster_id
             digest = cid.removeprefix("sparkrun_")
-            if not (cid.startswith(incomplete) or digest.startswith(incomplete)):
-                continue
-            items.append(
-                click.shell_completion.CompletionItem(
-                    cid,
-                    help=_describe_job(job),
-                )
-            )
+            if cid.startswith(incomplete) or digest.startswith(incomplete):
+                items.append(click.shell_completion.CompletionItem(cid, help=_describe_job(job)))
         return items
     except Exception:  # noqa: BLE001 — completion must never crash; degrade to empty list
         return []
 
 
+def _job_is_live(job, snapshot) -> bool:
+    """Whether *job* should be offered, given a possibly-partial snapshot.
+
+    ``None`` (no snapshot, or a stale one) means show everything — completion
+    must not hide a workload on the strength of information it does not have.
+
+    A snapshot covers only the hosts that were actually swept, so a job whose
+    hosts fall outside it is *unknown*, not dead, and is kept.  Without that
+    check a placement query over two hosts of a four-host cluster would hide
+    every workload on the other two.
+    """
+    if snapshot is None:
+        return True
+    running, covered = snapshot
+    if job.cluster_id in running:
+        return True
+    return not (job.hosts and set(job.hosts) <= covered)
+
+
+def _completion_cluster_hosts(ctx=None) -> set[str]:
+    """Hosts that ``logs <recipe>`` would resolve against for this invocation.
+
+    Prefers the ``--cluster`` / ``--hosts`` already present on the command
+    line: completion runs after Click has parsed the options it has seen, so
+    ``logs --cluster lab <TAB>`` can scope to ``lab``.  Without that, a user
+    who always passes ``--cluster`` (and has no ``default_hosts`` in
+    ``config.yaml``) would never be offered a recipe name at all, since the
+    unqualified resolution raises and leaves nothing to compare against.
+    """
+    params = getattr(ctx, "params", None) or {}
+    try:
+        from sparkrun.api._resolve import resolve_cluster
+
+        hosts = params.get("hosts")
+        host_list = [h.strip() for h in hosts.split(",") if h.strip()] if isinstance(hosts, str) else None
+        return set(resolve_cluster(params.get("cluster_name"), host_list).hosts)
+    except Exception:
+        return set()
+
+
 class TargetType(RecipeNameType):
     """Click parameter type that accepts either a recipe name or a cluster ID.
 
-    Tab completion returns **running workload cluster_ids** first
-    (kubectl-style: complete the live thing you would ``logs``/``stop``),
-    falling back to recipe-name completion when no jobs are cached so an
-    empty cluster still lets the user address a workload by recipe.
+    Tab completion offers running workloads — recipe names for the default
+    cluster, cluster_ids elsewhere — falling back to recipe-name completion
+    when nothing is cached, so an empty cluster still lets the user address a
+    workload by recipe.
     """
 
     name = "target"
@@ -936,25 +1014,16 @@ class TargetType(RecipeNameType):
         return super().convert(value, param, ctx)
 
     def shell_complete(self, ctx, param, incomplete):
-        """Complete cluster_ids of recently-launched workloads.
-
-        Mirrors ``kubectl logs <TAB>``: the user is addressing a running
-        workload, so we surface cluster_ids from the local job metadata
-        cache (``~/.cache/sparkrun/jobs/`` — instant, no SSH round-trip).
-        Each carries a description of recipe + runtime + hosts for shells
-        that render it (zsh, fish).  Falls back to recipe-name completion
-        when no jobs are cached so an empty cluster still lets the user
-        type a recipe name.
-        """
+        """Complete the workload the user is addressing — see :func:`_complete_targets`."""
         # If the input already looks like a path or @registry ref, defer to
         # recipe/file completion — those are never cluster_ids.
         if incomplete and (incomplete[0] in (".", "/", "~") or incomplete.startswith("@")):
             return super().shell_complete(ctx, param, incomplete)
 
-        items = _complete_cluster_ids(incomplete)
+        items = _complete_targets(incomplete, ctx)
         if items:
             return items
-        # No running jobs — fall back to recipe names so the user can still
+        # Nothing cached — fall back to recipe names so the user can still
         # address a workload by recipe (logs/stop accept recipe names too).
         return super().shell_complete(ctx, param, incomplete)
 

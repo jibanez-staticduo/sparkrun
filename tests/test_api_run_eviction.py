@@ -59,7 +59,7 @@ def _evict(status, cluster, *, target_hosts, stop_results=None, stop_side_effect
         patch("sparkrun.orchestration.executor.query_status_for_cluster", return_value=status),
         patch.object(api, "stop", _fake_stop),
     ):
-        evicted = _evict_superseded_deployments(
+        evicted, _observed = _evict_superseded_deployments(
             intent_id=INTENT,
             cluster_id_for_launch=NEW,
             candidate_hosts=list(cluster.hosts),
@@ -201,7 +201,11 @@ def test_status_query_failure_is_swallowed(cluster):
                 config=None,
                 sctx=None,
             )
-            == []
+            # Nothing evicted, and — importantly — ``None`` rather than an
+            # empty set for the observed workloads: "couldn't look" must not
+            # read as "looked, nothing there", since the post-launch metadata
+            # prune treats the latter as licence to delete.
+            == ([], None)
         )
 
 
@@ -283,7 +287,7 @@ def _run_with_stubbed_launcher(opts):
     with (
         patch("sparkrun.core.launcher.launch_inference", side_effect=_fake_launch),
         patch("sparkrun.api._resolve.resolve_runtime", return_value=_FakeRuntime()),
-        patch("sparkrun.api._run._evict_superseded_deployments", return_value=[]) as evict,
+        patch("sparkrun.api._run._evict_superseded_deployments", return_value=([], set())) as evict,
     ):
         api.run(opts)
     return evict
@@ -332,7 +336,7 @@ def test_launch_that_dies_before_starting_containers_evicts_nothing():
     with (
         patch("sparkrun.core.launcher.launch_inference", side_effect=_die_before_start),
         patch("sparkrun.api._resolve.resolve_runtime", return_value=_FakeRuntime()),
-        patch("sparkrun.api._run._evict_superseded_deployments", return_value=[]) as evict,
+        patch("sparkrun.api._run._evict_superseded_deployments", return_value=([], set())) as evict,
     ):
         with pytest.raises(KeyboardInterrupt):
             api.run(_run_options(dry_run=False, follow=False))

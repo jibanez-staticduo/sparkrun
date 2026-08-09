@@ -654,6 +654,189 @@ def remove_job_metadata(
     logger.debug("Removed job metadata %s", meta_path)
 
 
+#: Filename (under the cache root) of the last observed occupancy snapshot.
+RUNNING_SNAPSHOT_FILE = "running.json"
+
+#: How long a recorded snapshot is trusted.  Short, because it is used to
+#: *hide* things: a workload that died five minutes ago should stop being
+#: offered, and one launched from another terminal should start being offered.
+RUNNING_SNAPSHOT_MAX_AGE_S = 600
+
+
+def save_running_snapshot(
+    cluster_ids: "set[str] | frozenset[str] | tuple[str, ...] | list[str]",
+    hosts: "list[str] | tuple[str, ...]",
+    *,
+    cache_dir: str | None = None,
+    sctx: "SparkrunContext | None" = None,
+) -> None:
+    """Record which workloads were observed running, and where we looked.
+
+    Shell completion cannot afford an SSH sweep — it runs on every TAB, and a
+    host that no longer resolves would hang the terminal with no way to signal
+    what it is waiting on.  But several commands (``run``, ``status``,
+    ``stop``) already pay for a sweep, so they can leave the answer behind for
+    completion to read for free.
+
+    *hosts* is recorded alongside because a sweep is frequently **partial** —
+    placement queries a candidate subset, not the whole cluster.  Without it a
+    reader cannot distinguish "not running" from "not looked at", and would
+    silently hide a live workload on an unswept host.
+
+    Best-effort and silent on failure: this is a convenience cache, and no
+    command should fail because it could not be written.
+    """
+    import json
+
+    cache_dir = _resolve_cache_dir(cache_dir, sctx)
+    payload = {
+        "at": time.time(),
+        "cluster_ids": sorted(str(c) for c in cluster_ids if c),
+        "hosts": sorted(str(h) for h in hosts if h),
+    }
+    try:
+        path = Path(cache_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        fd = open_private_write(path / RUNNING_SNAPSHOT_FILE)
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+    except Exception:
+        logger.debug("Could not write running snapshot", exc_info=True)
+
+
+def load_running_snapshot(
+    *,
+    cache_dir: str | None = None,
+    max_age_s: float | None = None,
+    sctx: "SparkrunContext | None" = None,
+) -> "tuple[frozenset[str], frozenset[str]] | None":
+    """Read the last observed occupancy snapshot.
+
+    Returns ``(cluster_ids, hosts_covered)``, or ``None`` when there is no
+    snapshot or it is older than *max_age_s* — in which case callers must fall
+    back to showing everything rather than hiding what they cannot vouch for.
+
+    *max_age_s* resolves to :data:`RUNNING_SNAPSHOT_MAX_AGE_S` at call time
+    rather than binding it as a default, so the module constant is a real knob
+    instead of a value frozen when this function was defined.
+    """
+    import json
+
+    if max_age_s is None:
+        max_age_s = RUNNING_SNAPSHOT_MAX_AGE_S
+    cache_dir = _resolve_cache_dir(cache_dir, sctx)
+    try:
+        with open(Path(cache_dir) / RUNNING_SNAPSHOT_FILE) as f:
+            data = json.load(f)
+        if time.time() - float(data["at"]) > max_age_s:
+            return None
+        return frozenset(data.get("cluster_ids") or ()), frozenset(data.get("hosts") or ())
+    except Exception:
+        return None
+
+
+#: Jobs older than this are candidates for pruning.
+PRUNE_MAX_AGE_DAYS = 30
+
+#: …unless they are among this many most recent for their intent.
+PRUNE_KEEP_PER_INTENT = 3
+
+
+def prune_job_metadata(
+    *,
+    cache_dir: str | None = None,
+    max_age_days: int = PRUNE_MAX_AGE_DAYS,
+    keep_per_intent: int = PRUNE_KEEP_PER_INTENT,
+    protected_cluster_ids: "set[str] | frozenset[str] | tuple[str, ...] | None" = None,
+    dry_run: bool = False,
+    sctx: "SparkrunContext | None" = None,
+) -> list[str]:
+    """Delete stale job metadata, returning the cluster_ids removed.
+
+    The cache is append-only: every launch writes a file and only an explicit
+    ``stop`` (or the ``logs`` staleness path) removes one, so a crashed job —
+    the common case under ``auto_remove``, where the container is gone before
+    anything asks about it — accumulates forever.  In practice that reaches
+    hundreds of dead entries against a couple of dozen live intents, which
+    makes the cache useless as a completion source and slow to read.
+
+    A job is **kept** when it is both:
+
+    - among the *keep_per_intent* most recent for its ``intent_id`` — so every
+      workload you actually run keeps a short history rather than being
+      erased wholesale, and
+    - younger than *max_age_days*.
+
+    Anything else is deleted.  ``keep_per_intent`` is a per-intent recency
+    window rather than a global count on purpose: a global "keep newest N"
+    would silently drop every trace of an intent you run rarely.
+
+    ``protected_cluster_ids`` is never deleted regardless of age. Callers pass
+    the cluster_ids they have just observed **running**, which is what makes
+    this safe to run automatically: a live workload's metadata is load-bearing
+    for ``stop`` / ``logs`` / proxy discovery, and deleting it would strand the
+    deployment. Age alone is not a sufficient guard — a long-lived server can
+    easily outlive the cutoff.
+
+    Best-effort: an unreadable or undeletable file is skipped, never raised.
+
+    Args:
+        max_age_days: Age cutoff in days. ``0`` disables the age test, making
+            *keep_per_intent* the only rule.
+        dry_run: Report what would be deleted without deleting it.
+
+    Returns:
+        cluster_ids removed (or that would be, under *dry_run*), most recent
+        first.
+    """
+    from sparkrun.api._jobs import list_jobs
+
+    cache_dir = _resolve_cache_dir(cache_dir, sctx)
+    protected = set(protected_cluster_ids or ())
+
+    try:
+        jobs = list_jobs(cache_dir=cache_dir)
+    except Exception:
+        logger.debug("prune_job_metadata: could not list jobs", exc_info=True)
+        return []
+
+    cutoff = (time.time() - max_age_days * 86400) if max_age_days else None
+    seen_per_intent: dict[str, int] = {}
+    removed: list[str] = []
+
+    # `list_jobs` is already recency-descending, so the per-intent counter
+    # walks newest-first and the first `keep_per_intent` entries it sees for
+    # an intent are exactly the ones to keep.
+    for job in jobs:
+        intent = job.intent_id or job.cluster_id
+        rank = seen_per_intent.get(intent, 0)
+        seen_per_intent[intent] = rank + 1
+
+        if job.cluster_id in protected:
+            continue
+        # Both conditions must hold to keep — an entry that is recent for its
+        # intent but ancient in absolute terms is still ancient.  (Making this
+        # an "or" instead keeps the newest K of every intent forever, which
+        # leaves a cache that never shrinks below one entry per intent ever
+        # launched.)
+        is_recent_for_intent = rank < keep_per_intent
+        is_young = cutoff is None or (job.started_at or 0.0) >= cutoff
+        if is_recent_for_intent and is_young:
+            continue
+
+        if not dry_run:
+            try:
+                remove_job_metadata(job.cluster_id, cache_dir=cache_dir)
+            except Exception:
+                logger.debug("prune_job_metadata: failed to remove %s", job.cluster_id, exc_info=True)
+                continue
+        removed.append(job.cluster_id)
+
+    if removed:
+        logger.debug("prune_job_metadata: %s %d job(s)", "would remove" if dry_run else "removed", len(removed))
+    return removed
+
+
 def load_job_metadata(
     cluster_id: str,
     cache_dir: str | None = None,

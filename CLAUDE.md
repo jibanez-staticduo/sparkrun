@@ -256,7 +256,7 @@ All remote operations use **SSH stdin piping** — scripts are generated as Pyth
 - **`infiniband.py`** — IB detection script generation, NCCL env var computation, IB IP mapping for fast transfers
 - **`networking.py`** — ConnectX-7 NIC detection, IP assignment planning, CX7 configuration script generation, host key distribution
 - **`primitives.py`** — Higher-level composition: `build_ssh_kwargs()`, `build_volumes()`, `merge_env()`, `detect_infiniband()`, `run_script_on_host()`, `cleanup_containers()`
-- **`job_metadata.py`** — Persistent job metadata (cluster_id → recipe mapping) stored in `~/.cache/sparkrun/jobs/`
+- **`job_metadata.py`** — Persistent job metadata (cluster_id → recipe mapping) stored in `~/.cache/sparkrun/jobs/` (see Job Metadata Lifecycle below)
 - **`executor.py`** — Public facade. Re-exports `Executor`, `ExecutorConfig`, `EXT_EXECUTOR`. `resolve_executor()` is the single sanctioned executor entry point; `query_status_for_cluster()` is the single status source (see Status Discovery below).
 - **`executors/`** — Executor plugin package. `_base.py` (ABC + dataclass), `docker.py` (default), `local.py` (experimental, no container), `k8s.py` (experimental draft, `kubectl run`-driven). Discovered via SAF. Each declares a `status_scope` (default `"host"`).
 - **`collectives/`** — `CollectiveBackend` ABC + implementations: `nccl.py` (default; wraps `infiniband.py`), `rccl.py` (AMD scaffold), `hccl.py` (Intel Gaudi scaffold). `get_backend(vendor)` is the lookup.
@@ -480,6 +480,65 @@ cached job metadata:
   executor knows its own config, so it reports *which* it was and hints at `-o
   auto_remove=false` for the next attempt, instead of reporting the most
   interesting failure as stale bookkeeping.
+
+### Job Metadata Lifecycle ("what have I launched?")
+
+`~/.cache/sparkrun/jobs/<digest>.yaml` is written by every launch and read by
+`stop` / `logs` / proxy discovery / `--ensure`. It is **append-only in
+practice**: only an explicit `stop` (or the `logs` staleness path) removes an
+entry, and a job that crashed under `auto_remove` is gone from docker before
+anything asks about it. Left alone this reaches hundreds of dead entries
+against a couple of dozen live intents.
+
+Three pieces keep it usable:
+
+- **`started_at`** is stamped at launch. The read side (`api.list_jobs`) always
+  looked for it but nothing wrote it, so every job was untimed and the
+  documented "most recent first" ordering silently degraded to alphabetical by
+  hex digest. `_resolve_started_at` backfills from file mtime for entries
+  predating the field — on any existing cache that is nearly all of them, so
+  without the backfill the fix would do nothing for anyone.
+- **`list_jobs(limit=N)`** pre-ranks by mtime (a stat per file) and parses only
+  the top N. Each file embeds a full serialized recipe state, so an unpruned
+  cache is ~1.7 MB and ~1.5 s to load — fine for a report, far too slow for
+  shell completion, which runs on every TAB.
+- **`prune_job_metadata`** keeps an entry only when it is *both* among the
+  newest `keep_per_intent` (3) for its `intent_id` *and* younger than
+  `max_age_days` (30). The per-intent window is deliberately not a global
+  count: "keep newest N overall" would erase every trace of a rarely-run
+  workload. Nothing in `protected_cluster_ids` is ever deleted.
+
+**Pruning runs from `run`, and only from `run`,** because that is the one
+command that both grows the cache and already holds a live occupancy snapshot —
+the eviction sweep's, which `_evict_superseded_deployments` now returns
+alongside the evictions. Age alone is *not* a sufficient guard: a long-lived
+server easily outlives the cutoff, and deleting its metadata strands the
+deployment. Where that snapshot is absent (`--dry-run`, or a failed status
+query) the prune is skipped entirely — `None` vs. an empty set is the
+difference between "couldn't look" and "looked, nothing there". Opt out with
+`jobs.autoprune: false`; sweep manually with the advanced-only
+`sparkrun setup prune-job-metadata-cache` (which has no snapshot, and says so).
+
+**`running.json`** is the completion half. Shell completion cannot sweep — it
+runs on every TAB, and a host that no longer resolves would hang the terminal
+with no way to signal what it is waiting on. So `api.status` (the single
+sweep choke point) leaves its answer behind, and completion reads it for free.
+The recorded *hosts* matter as much as the cluster_ids: a sweep is frequently
+partial (placement queries a candidate subset), and without knowing what was
+covered a reader cannot tell "not running" from "not looked at" — it would
+hide live workloads on unswept hosts. A stale or absent snapshot means show
+everything.
+
+**Completion targets** (`cli/_common.py:_complete_targets`) offer **recipe
+names first, cluster_ids second**, because on bash there is no way to annotate
+a completion — `BashComplete.format_completion` emits `type,value` and drops
+the help text entirely (zsh and fish render it). The value has to carry the
+meaning, and a recipe name does while a hex digest does not. The split is
+forced by how each form resolves: `logs <recipe>` goes through
+`resolve_cluster`, so recipe names are scoped to the cluster the invocation
+targets (read from the `--cluster` / `--hosts` already on the line, falling
+back to the default); `logs <cluster_id>` reads its hosts from the metadata and
+so is cluster-agnostic and safe to offer for any cluster.
 
 **Mount-source preflight** (`Executor.verify_mount_sources(paths, hosts, …)`) is
 the substrate peer of `query_status` on the *write* path: "do these identity-mount

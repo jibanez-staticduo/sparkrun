@@ -11,11 +11,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from unittest import mock
 import yaml
 
 from sparkrun.cli._common import (
     TARGET,
-    _complete_cluster_ids,
+    _complete_targets,
     _describe_job,
 )
 
@@ -81,48 +82,48 @@ def test_describe_job_partial():
 
 
 # ---------------------------------------------------------------------------
-# _complete_cluster_ids
+# _complete_targets
 # ---------------------------------------------------------------------------
 
 
-def test_complete_cluster_ids_empty_when_no_cache(jobs_cache: Path):
+def test_complete_targets_empty_when_no_cache(jobs_cache: Path):
     """No jobs directory → empty list, never raises."""
-    assert _complete_cluster_ids("") == []
+    assert _complete_targets("") == []
 
 
-def test_complete_cluster_ids_returns_all_on_empty_prefix(jobs_cache: Path):
+def test_complete_targets_returns_all_on_empty_prefix(jobs_cache: Path):
     """Empty incomplete → all cached cluster_ids."""
     _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alpha")
     _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="beta")
 
-    items = _complete_cluster_ids("")
+    items = _complete_targets("")
     assert len(items) == 2
     values = {i.value for i in items}
     assert values == {"sparkrun_aaaaaaaaaaaa", "sparkrun_bbbbbbbbbbbb"}
 
 
-def test_complete_cluster_ids_matches_full_form(jobs_cache: Path):
+def test_complete_targets_matches_full_form(jobs_cache: Path):
     """``sparkrun_abc…`` prefix matches the canonical cluster_id."""
     _write_job_meta(jobs_cache, "abcdef123456", recipe="alpha")
     _write_job_meta(jobs_cache, "bbbbb1234567", recipe="beta")
 
-    items = _complete_cluster_ids("sparkrun_abc")
+    items = _complete_targets("sparkrun_abc")
     assert len(items) == 1
     assert items[0].value == "sparkrun_abcdef123456"
 
 
-def test_complete_cluster_ids_matches_bare_digest(jobs_cache: Path):
+def test_complete_targets_matches_bare_digest(jobs_cache: Path):
     """Bare hex digest prefix also matches (short-form CLI input)."""
     _write_job_meta(jobs_cache, "abcdef123456", recipe="alpha")
     _write_job_meta(jobs_cache, "bbbbb1234567", recipe="beta")
 
-    items = _complete_cluster_ids("abcd")
+    items = _complete_targets("abcd")
     assert len(items) == 1
     # The returned value is always the canonical form.
     assert items[0].value == "sparkrun_abcdef123456"
 
 
-def test_complete_cluster_ids_descriptions(jobs_cache: Path):
+def test_complete_targets_descriptions(jobs_cache: Path):
     """Completion items carry recipe + runtime + hosts in the description."""
     _write_job_meta(
         jobs_cache,
@@ -132,7 +133,7 @@ def test_complete_cluster_ids_descriptions(jobs_cache: Path):
         hosts=["127.0.0.1", "192.168.70.8"],
     )
 
-    items = _complete_cluster_ids("")
+    items = _complete_targets("")
     assert len(items) == 1
     desc = items[0].help or ""
     assert "@eugr/inkling-small-nvfp4" in desc
@@ -140,13 +141,13 @@ def test_complete_cluster_ids_descriptions(jobs_cache: Path):
     assert "127.0.0.1,192.168.70.8" in desc
 
 
-def test_complete_cluster_ids_no_match(jobs_cache: Path):
+def test_complete_targets_no_match(jobs_cache: Path):
     """Prefix that matches nothing → empty list."""
     _write_job_meta(jobs_cache, "abcdef123456")
-    assert _complete_cluster_ids("zzz") == []
+    assert _complete_targets("zzz") == []
 
 
-def test_complete_cluster_ids_handles_exception(jobs_cache: Path, monkeypatch):
+def test_complete_targets_handles_exception(jobs_cache: Path, monkeypatch):
     """If api.list_jobs() raises, completion degrades to empty list (never crashes)."""
     _write_job_meta(jobs_cache, "abcdef123456", recipe="alpha")
 
@@ -154,7 +155,7 @@ def test_complete_cluster_ids_handles_exception(jobs_cache: Path, monkeypatch):
         raise RuntimeError("disk exploded")
 
     monkeypatch.setattr("sparkrun.api.list_jobs", _boom)
-    assert _complete_cluster_ids("") == []
+    assert _complete_targets("") == []
 
 
 # ---------------------------------------------------------------------------
@@ -219,3 +220,163 @@ def test_target_shell_complete_bare_digest(jobs_cache: Path):
     items = TARGET.shell_complete(ctx=None, param=None, incomplete="628f")
     assert len(items) == 1
     assert items[0].value == "sparkrun_628f56e0461d"
+
+
+# ---------------------------------------------------------------------------
+# Recipe-name completion, default-cluster scoping, and the running filter
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def default_cluster(monkeypatch):
+    """Make ``resolve_cluster()`` (no args) resolve to a known host set.
+
+    That is what a bare ``logs <recipe>`` resolves against, so it decides
+    which jobs may be offered by recipe name.
+    """
+    from sparkrun.core.cluster_manager import ClusterDefinition
+
+    def _fake(*args, **kwargs):
+        return ClusterDefinition(name="default", hosts=["h1", "h2"])
+
+    monkeypatch.setattr("sparkrun.api._resolve.resolve_cluster", _fake)
+    return {"h1", "h2"}
+
+
+def test_recipe_name_offered_for_default_cluster_jobs(jobs_cache: Path, default_cluster):
+    """On bash the value is all the user sees, so it must be the meaningful one.
+
+    ``BashComplete.format_completion`` emits ``type,value`` and drops the help
+    text, so a hex cluster_id completes to something unreadable.  A recipe name
+    resolves through intent discovery and is what a human actually types.
+    """
+    _write_job_meta(jobs_cache, "abcdef123456", recipe="my-recipe", hosts=["h1"])
+
+    values = {i.value for i in _complete_targets("")}
+    assert values == {"my-recipe"}
+
+
+def test_offcluster_job_is_offered_by_id_not_recipe(jobs_cache: Path, default_cluster):
+    """A recipe name only resolves against the default cluster.
+
+    Offering one whose deployment lives elsewhere would complete to something
+    that then fails to resolve — worse than not offering it.  The cluster_id
+    form carries its own hosts, so it stays available.
+    """
+    _write_job_meta(jobs_cache, "abcdef123456", recipe="elsewhere", hosts=["tnr-dead"])
+
+    values = {i.value for i in _complete_targets("")}
+    assert values == {"sparkrun_abcdef123456"}
+
+
+def test_recipe_names_are_deduped(jobs_cache: Path, default_cluster):
+    """Relaunches share a recipe; the name is worth offering exactly once."""
+    _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="same", hosts=["h1"])
+    _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="same", hosts=["h1"])
+
+    values = [i.value for i in _complete_targets("")]
+    assert values.count("same") == 1
+    # The second deployment stays addressable by id.
+    assert "sparkrun_bbbbbbbbbbbb" in values or "sparkrun_aaaaaaaaaaaa" in values
+
+
+def test_running_snapshot_filters_dead_jobs(jobs_cache: Path, default_cluster):
+    """A fresh snapshot hides what it saw *not* running."""
+    from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+    _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+    _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="dead", hosts=["h1"])
+    save_running_snapshot({"sparkrun_aaaaaaaaaaaa"}, ["h1", "h2"], cache_dir=str(jobs_cache.parent))
+
+    values = {i.value for i in _complete_targets("")}
+    assert values == {"alive"}
+
+
+def test_stale_snapshot_hides_nothing(jobs_cache: Path, default_cluster):
+    """Completion must not hide a workload on information it can't vouch for."""
+    from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+    _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+    _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="dead", hosts=["h1"])
+    save_running_snapshot({"sparkrun_aaaaaaaaaaaa"}, ["h1"], cache_dir=str(jobs_cache.parent))
+
+    with mock.patch("sparkrun.orchestration.job_metadata.RUNNING_SNAPSHOT_MAX_AGE_S", -1):
+        values = {i.value for i in _complete_targets("")}
+    assert values == {"alive", "dead"}
+
+
+def test_uncovered_hosts_are_unknown_not_dead(jobs_cache: Path, default_cluster):
+    """A partial sweep must not read as "everything else is dead".
+
+    Placement queries a candidate subset, not the whole cluster, so a snapshot
+    routinely covers only some hosts.  A job outside it was never looked at.
+    """
+    from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+    _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="onh1", hosts=["h1"])
+    _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="onh2", hosts=["h2"])
+    # Only h1 was swept, and nothing was running there.
+    save_running_snapshot(set(), ["h1"], cache_dir=str(jobs_cache.parent))
+
+    values = {i.value for i in _complete_targets("")}
+    assert values == {"onh2"}, "the unswept host's job must survive; the swept host's must not"
+
+
+def test_completion_parses_at_most_the_limit(jobs_cache: Path, default_cluster, monkeypatch):
+    """Cost is dominated by YAML parsing, so the cap must bound the parse."""
+    from sparkrun.cli import _common
+
+    for i in range(40):
+        _write_job_meta(jobs_cache, "%012x" % i, recipe="r%d" % i, hosts=["h1"])
+
+    monkeypatch.setattr(_common, "COMPLETION_JOB_LIMIT", 5)
+    parsed: list = []
+
+    import sparkrun.api._jobs as jobs_mod
+
+    real_from_file = jobs_mod._job_info_from_file
+
+    def _counting(path):
+        parsed.append(path)
+        return real_from_file(path)
+
+    monkeypatch.setattr(jobs_mod, "_job_info_from_file", _counting)
+    _complete_targets("")
+    assert len(parsed) == 5
+
+
+def test_cluster_option_on_the_line_scopes_recipe_names(jobs_cache: Path, monkeypatch):
+    """``logs --cluster lab <TAB>`` scopes to lab, not to the default cluster.
+
+    Completion runs after Click has parsed the options it has seen, so the
+    target is knowable.  Without this a user who always passes ``--cluster``
+    (and has no ``default_hosts``) is never offered a recipe name at all.
+    """
+    from sparkrun.core.cluster_manager import ClusterDefinition
+
+    def _fake(cluster_input=None, hosts_input=None, **kwargs):
+        if cluster_input == "lab":
+            return ClusterDefinition(name="lab", hosts=["h9"])
+        raise RuntimeError("no default cluster configured")
+
+    monkeypatch.setattr("sparkrun.api._resolve.resolve_cluster", _fake)
+    _write_job_meta(jobs_cache, "abcdef123456", recipe="lab-recipe", hosts=["h9"])
+
+    class _Ctx:
+        params = {"cluster_name": "lab", "hosts": None}
+
+    assert {i.value for i in _complete_targets("", _Ctx())} == {"lab-recipe"}
+    # With no cluster on the line the default resolution raises, so the job is
+    # still offered — by id rather than by a name that wouldn't resolve.
+    assert {i.value for i in _complete_targets("")} == {"sparkrun_abcdef123456"}
+
+
+def test_url_sourced_recipe_completes_by_id(jobs_cache: Path, default_cluster):
+    """A URL "name" is valid input but useless as a completion value."""
+    _write_job_meta(
+        jobs_cache,
+        "abcdef123456",
+        recipe="https://spark-arena.com/api/recipes/cd00e976/raw",
+        hosts=["h1"],
+    )
+    assert {i.value for i in _complete_targets("")} == {"sparkrun_abcdef123456"}

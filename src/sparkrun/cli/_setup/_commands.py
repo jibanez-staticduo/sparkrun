@@ -31,6 +31,7 @@ from ._phases import (
 )
 from ._ssh import _run_ssh_mesh
 from ._sudo import _record_setup_phase
+from sparkrun.orchestration.job_metadata import PRUNE_KEEP_PER_INTENT, PRUNE_MAX_AGE_DAYS
 
 
 @setup.command("completion", hidden=True)
@@ -2463,3 +2464,72 @@ def setup_diagnose(ctx, hosts, hosts_file, cluster_name, dry_run, output_file, o
 
     if fail:
         sys.exit(1)
+
+
+@setup.command("prune-job-metadata-cache", hidden=HIDE_ADVANCED_OPTIONS)
+@click.option(
+    "--older-than",
+    "older_than_days",
+    type=int,
+    default=None,
+    help="Age cutoff in days (default: %d). Use 0 to ignore age." % PRUNE_MAX_AGE_DAYS,
+)
+@click.option(
+    "--keep-per-intent",
+    type=int,
+    default=None,
+    help="Keep this many most recent jobs per workload identity (default: %d)." % PRUNE_KEEP_PER_INTENT,
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would be removed without removing it.")
+def setup_prune_job_metadata_cache(older_than_days, keep_per_intent, dry_run):
+    """Delete stale entries from the local job metadata cache.
+
+    Job metadata (~/.cache/sparkrun/jobs/) records the recipe, hosts and
+    container image behind every launch, so stop/logs/proxy discovery can find
+    a workload later.  Only an explicit 'stop' removes an entry, so a job that
+    crashed — the norm when auto_remove is on and the container is gone before
+    anything asks about it — stays cached forever.  Left alone this reaches
+    hundreds of dead entries and makes 'logs <TAB>' unusable.
+
+    'sparkrun run' prunes automatically using the occupancy snapshot it
+    already has (disable with 'jobs.autoprune: false' in config.yaml).  This
+    command is the manual sweep, for when you want to reclaim the cache
+    without launching something.
+
+    An entry is KEPT when it is both among the most recent for its workload
+    identity AND newer than the age cutoff.
+
+    WARNING: this command has no live cluster snapshot to check against, so —
+    unlike the automatic prune — it cannot protect a running workload whose
+    metadata has aged out.  Run 'sparkrun status' first if you have long-lived
+    deployments, or pass --dry-run to review the list.
+
+    Examples:
+
+      sparkrun setup prune-job-metadata-cache --dry-run
+
+      sparkrun setup prune-job-metadata-cache --older-than 90
+
+      sparkrun setup prune-job-metadata-cache --keep-per-intent 1
+    """
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+    config = SparkrunConfig()
+    kwargs = {"cache_dir": str(config.cache_dir), "dry_run": dry_run}
+    if older_than_days is not None:
+        kwargs["max_age_days"] = older_than_days
+    if keep_per_intent is not None:
+        kwargs["keep_per_intent"] = keep_per_intent
+
+    removed = prune_job_metadata(**kwargs)
+    if not removed:
+        click.echo("Nothing to prune.")
+        return
+
+    for cluster_id in removed:
+        click.echo("  %s %s" % ("would remove" if dry_run else "removed", cluster_id))
+    click.echo()
+    click.echo("%s %d job metadata entrie(s)." % ("Would remove" if dry_run else "Removed", len(removed)))
+    if dry_run:
+        click.echo("Re-run without --dry-run to apply.")

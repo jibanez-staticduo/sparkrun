@@ -3,6 +3,10 @@ plus identifier-model coverage (intent_id / placement_token split)."""
 
 from __future__ import annotations
 
+import yaml
+
+import time
+
 import re
 from pathlib import Path
 from unittest import mock
@@ -655,3 +659,131 @@ class TestStartedAtBackfill:
             "sparkrun_bbbbbbbbbbbbbbbb_222222222222",
             "sparkrun_aaaaaaaaaaaaaaaa_111111111111",
         ]
+
+
+# --------------------------------------------------------------------------
+# prune_job_metadata
+# --------------------------------------------------------------------------
+
+
+class TestPruneJobMetadata:
+    """The cache is append-only, so without a prune it grows without bound.
+
+    Keep = among the newest ``keep_per_intent`` for its intent AND younger
+    than ``max_age_days``.  Everything else goes.
+    """
+
+    def _write(self, tmp_path, intent: str, token: str, age_days: float, recipe="r"):
+        import os
+
+        from sparkrun.core.recipe import Recipe
+        from sparkrun.orchestration.job_metadata import save_job_metadata
+
+        cid = "sparkrun_%s_%s" % (intent, token)
+        recipe_obj = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": recipe})
+        save_job_metadata(cid, recipe_obj, ["h1"], cache_dir=str(tmp_path))
+        # Rewrite started_at so age is deterministic, and match mtime to it.
+        path = tmp_path / "jobs" / ("%s_%s.yaml" % (intent, token))
+        data = yaml.safe_load(path.read_text())
+        stamp = time.time() - age_days * 86400
+        data["started_at"] = stamp
+        path.write_text(yaml.safe_dump(data))
+        os.utime(path, (stamp, stamp))
+        return cid
+
+    def test_age_rule_prunes_even_the_only_job_of_an_intent(self, tmp_path):
+        """Both conditions must hold to keep, so age alone is enough to prune.
+
+        An "or" here would keep the newest entry of every intent ever launched,
+        leaving a cache that never shrinks.
+        """
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        fresh = self._write(tmp_path, "a" * 16, "1" * 12, age_days=1)
+        old = self._write(tmp_path, "b" * 16, "2" * 12, age_days=90)
+
+        removed = set(prune_job_metadata(cache_dir=str(tmp_path)))
+        assert old in removed
+        assert fresh not in removed
+
+    def test_per_intent_rule_keeps_a_short_history(self, tmp_path):
+        """Among *recent* jobs, each intent keeps its newest few relaunches."""
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        jobs = [self._write(tmp_path, "c" * 16, "%012d" % i, age_days=i) for i in range(5)]
+
+        removed = set(prune_job_metadata(cache_dir=str(tmp_path), keep_per_intent=3))
+        assert removed == {jobs[3], jobs[4]}
+
+    def test_per_intent_window_is_not_a_global_cap(self, tmp_path):
+        """A rarely-run intent must not be erased by a busy one's relaunches."""
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        busy = [self._write(tmp_path, "a" * 16, "%012d" % i, age_days=i) for i in range(5)]
+        rare = self._write(tmp_path, "b" * 16, "9" * 12, age_days=6)
+
+        removed = set(prune_job_metadata(cache_dir=str(tmp_path), keep_per_intent=2))
+        assert rare not in removed
+        assert set(busy[2:]) <= removed
+
+    def test_never_deletes_a_running_workload(self, tmp_path):
+        """Age is not a sufficient guard — a server can outlive the cutoff.
+
+        Its metadata is load-bearing for stop/logs/proxy discovery, so deleting
+        it would strand the deployment.
+        """
+        from sparkrun.orchestration.job_metadata import load_job_metadata, prune_job_metadata
+
+        ancient = self._write(tmp_path, "d" * 16, "3" * 12, age_days=400)
+        removed = prune_job_metadata(cache_dir=str(tmp_path), protected_cluster_ids={ancient})
+        assert removed == []
+        assert load_job_metadata(ancient, cache_dir=str(tmp_path)) is not None
+
+    def test_dry_run_deletes_nothing(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import load_job_metadata, prune_job_metadata
+
+        old = self._write(tmp_path, "e" * 16, "4" * 12, age_days=90)
+        removed = prune_job_metadata(cache_dir=str(tmp_path), dry_run=True)
+        assert removed == [old]
+        assert load_job_metadata(old, cache_dir=str(tmp_path)) is not None
+
+    def test_age_zero_disables_the_age_test(self, tmp_path):
+        """Then keep_per_intent is the only rule — useful for a hard compaction."""
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        recent = [self._write(tmp_path, "f" * 16, "%012d" % i, age_days=i) for i in range(3)]
+        removed = prune_job_metadata(cache_dir=str(tmp_path), max_age_days=0, keep_per_intent=1)
+        assert set(removed) == {recent[1], recent[2]}
+
+    def test_empty_cache_is_a_noop(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        assert prune_job_metadata(cache_dir=str(tmp_path)) == []
+
+
+class TestRunningSnapshot:
+    def test_round_trip(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import load_running_snapshot, save_running_snapshot
+
+        save_running_snapshot({"sparkrun_a_b"}, ["h1", "h2"], cache_dir=str(tmp_path))
+        running, covered = load_running_snapshot(cache_dir=str(tmp_path))
+        assert running == {"sparkrun_a_b"}
+        assert covered == {"h1", "h2"}
+
+    def test_absent_snapshot_is_none(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import load_running_snapshot
+
+        assert load_running_snapshot(cache_dir=str(tmp_path)) is None
+
+    def test_stale_snapshot_is_none(self, tmp_path):
+        """Used to *hide* things, so it must expire rather than mislead."""
+        from sparkrun.orchestration.job_metadata import load_running_snapshot, save_running_snapshot
+
+        save_running_snapshot({"sparkrun_a_b"}, ["h1"], cache_dir=str(tmp_path))
+        assert load_running_snapshot(cache_dir=str(tmp_path), max_age_s=-1) is None
+
+    def test_corrupt_snapshot_is_none(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import RUNNING_SNAPSHOT_FILE, load_running_snapshot
+
+        (tmp_path / RUNNING_SNAPSHOT_FILE).write_text("{not json")
+        assert load_running_snapshot(cache_dir=str(tmp_path)) is None
