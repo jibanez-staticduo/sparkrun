@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from enum import Enum
+import logging
+from pathlib import PurePath
 import platform
 
 from sparkrun.core.parallelism import PARALLELISM_KEYS, extract_parallelism
 from sparkrun.core.registry import BOOTSTRAP_REGISTRY_URLS, FALLBACK_DEFAULT_REGISTRIES
 
 from .types import TelemetryEvent
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_url(url: str) -> str:
@@ -22,11 +27,40 @@ _DEFAULT_REGISTRY_URLS = {normalize_url(url) for url in BOOTSTRAP_REGISTRY_URLS}
 }
 
 
-def string_value(value) -> str | None:
-    """Return a non-empty stripped string for telemetry dimensions."""
-    if value is None:
+#: The only types a telemetry dimension may be rendered from.  Deliberately a
+#: closed list: every value here is read off a loosely typed domain object with
+#: ``getattr``, so an unconditional ``str()`` renders whatever the caller
+#: happened to be holding — which is how ``"<MagicMock name='mock.category'
+#: id=...>"`` once reached the collector as a benchmark's category.  A dimension
+#: that goes missing is a far cheaper failure than one carrying an object repr.
+#:
+#: ``os.PathLike`` is *not* used for the path case: it is a runtime protocol
+#: satisfied by anything with ``__fspath__``, which ``MagicMock`` synthesizes —
+#: it would readmit exactly what this excludes.
+_SCALAR_TYPES = (str, bool, int, float, PurePath, Enum)
+
+
+def _scalar(value):
+    """Return *value* narrowed to a JSON-safe scalar, or None if it is not one."""
+    if value is None or not isinstance(value, _SCALAR_TYPES):
         return None
-    text = str(value).strip()
+    if isinstance(value, Enum):
+        inner = value.value
+        return inner if isinstance(inner, (str, bool, int, float)) else None
+    return value
+
+
+def string_value(value) -> str | None:
+    """Return a non-empty stripped string for telemetry dimensions.
+
+    Anything that is not a plain scalar yields ``None`` rather than its repr.
+    """
+    scalar = _scalar(value)
+    if scalar is None:
+        if value is not None:
+            logger.debug("Dropping non-scalar telemetry value of type %s", type(value).__name__)
+        return None
+    text = str(scalar).strip()
     return text or None
 
 
@@ -112,9 +146,15 @@ def attr_bool(source, name: str) -> bool:
 
 
 def int_value(value, *, default: int | None = None) -> int | None:
-    """Parse an integer telemetry value, returning the provided default on failure."""
+    """Parse an integer telemetry value, returning the provided default on failure.
+
+    Narrowed to scalars first, for the reason :data:`_SCALAR_TYPES` documents:
+    ``int()`` on an arbitrary object invokes ``__int__``, which ``MagicMock``
+    synthesizes — so an unnarrowed conversion reports a confident ``1`` for a
+    test double.
+    """
     try:
-        return int(value)
+        return int(_scalar(value))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
 
