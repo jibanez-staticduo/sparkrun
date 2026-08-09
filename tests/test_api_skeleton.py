@@ -177,6 +177,56 @@ def test_resolve_cluster_raises_when_no_source():
         resolve_cluster(None, None)
 
 
+def test_resolve_cluster_uses_the_default_cluster(tmp_path):
+    """``sparkrun cluster set-default`` is a host source for the api layer too.
+
+    ``core.hosts.resolve_hosts`` has always consulted it ahead of
+    ``config.default_hosts``; ``resolve_cluster`` did not, so a user whose only
+    host source was a default cluster got ``HostsUnreachable`` from every
+    ``api.*`` entry point that resolves without an explicit cluster.
+    """
+    from sparkrun.api._resolve import resolve_cluster
+    from sparkrun.core.cluster_manager import ClusterManager
+
+    mgr = ClusterManager(tmp_path)
+    mgr.create(name="lab", hosts=["h1", "h2"], user="alice")
+    mgr.set_default("lab")
+
+    resolved = resolve_cluster(None, None, cluster_mgr=mgr)
+    assert resolved.name == "lab"
+    assert resolved.hosts == ["h1", "h2"]
+    # The whole definition, not just its hosts — a bare host list would drop
+    # the SSH user and send the sweep in as the wrong account.
+    assert resolved.user == "alice"
+
+
+def test_resolve_cluster_explicit_input_beats_the_default(tmp_path):
+    from sparkrun.api._resolve import resolve_cluster
+    from sparkrun.core.cluster_manager import ClusterManager
+
+    mgr = ClusterManager(tmp_path)
+    mgr.create(name="lab", hosts=["h1"])
+    mgr.create(name="other", hosts=["h9"])
+    mgr.set_default("lab")
+
+    assert resolve_cluster("other", cluster_mgr=mgr).name == "other"
+    assert resolve_cluster(None, ["h5"], cluster_mgr=mgr).hosts == ["h5"]
+
+
+def test_resolve_cluster_survives_a_dangling_default(tmp_path):
+    """A default naming a deleted cluster falls through, it doesn't crash."""
+    from sparkrun.api._resolve import resolve_cluster
+    from sparkrun.core.cluster_manager import ClusterManager
+
+    mgr = ClusterManager(tmp_path)
+    mgr.create(name="lab", hosts=["h1"])
+    mgr.set_default("lab")
+    mgr.delete("lab")
+
+    with pytest.raises(api.HostsUnreachable):
+        resolve_cluster(None, None, cluster_mgr=mgr)
+
+
 def test_resolve_cluster_by_name(tmp_path):
     """A string cluster name uses the provided ClusterManager."""
     from sparkrun.api._resolve import resolve_cluster

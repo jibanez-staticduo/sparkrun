@@ -42,10 +42,18 @@ def _write_job_meta(jobs_dir: Path, digest: str, **fields) -> Path:
 
 @pytest.fixture
 def jobs_cache(tmp_path: Path, monkeypatch) -> Path:
-    """Redirect the sparkrun cache (and thus ``~/.cache/sparkrun/jobs/``) to tmp_path."""
+    """Redirect the sparkrun cache (and thus ``~/.cache/sparkrun/jobs/``) to tmp_path.
+
+    Also disables completion's live status sweep.  Without that every
+    completion test would attempt real SSH to its fixture hostnames — slow,
+    non-hermetic, and dependent on how fast the resolver fails.  Tests that
+    exercise the live path re-enable it and patch ``api.status`` (see
+    :class:`TestLiveStatusCompletion`).
+    """
     import sparkrun.core.config as _config_module
 
     monkeypatch.setattr(_config_module, "DEFAULT_CACHE_DIR", tmp_path, raising=False)
+    monkeypatch.setattr("sparkrun.cli._common._completion_status_timeout", lambda: 0.0)
     return tmp_path / "jobs"
 
 
@@ -98,8 +106,9 @@ def test_complete_targets_returns_all_on_empty_prefix(jobs_cache: Path):
 
     items = _complete_targets("")
     assert len(items) == 2
-    values = {i.value for i in items}
-    assert values == {"sparkrun_aaaaaaaaaaaa", "sparkrun_bbbbbbbbbbbb"}
+    # No cluster on the line and none configured in this sandbox, so there is
+    # nothing to scope recipe names against — the ids are still offered.
+    assert {i.value for i in items} == {"sparkrun_aaaaaaaaaaaa", "sparkrun_bbbbbbbbbbbb"}
 
 
 def test_complete_targets_matches_full_form(jobs_cache: Path):
@@ -163,13 +172,12 @@ def test_complete_targets_handles_exception(jobs_cache: Path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_target_shell_complete_returns_cluster_ids(jobs_cache: Path):
-    """When jobs are cached, TargetType completes cluster_ids (not recipes)."""
+def test_target_shell_complete_offers_cached_workloads(jobs_cache: Path):
+    """When jobs are cached, TargetType completes them rather than every recipe."""
     _write_job_meta(jobs_cache, "abcdef123456", recipe="my-recipe")
 
-    items = TARGET.shell_complete(ctx=None, param=None, incomplete="")
-    values = {i.value for i in items}
-    assert "sparkrun_abcdef123456" in values
+    values = {i.value for i in TARGET.shell_complete(ctx=None, param=None, incomplete="")}
+    assert values == {"sparkrun_abcdef123456"}
 
 
 def test_target_shell_complete_falls_back_to_recipes(jobs_cache: Path):
@@ -366,8 +374,9 @@ def test_cluster_option_on_the_line_scopes_recipe_names(jobs_cache: Path, monkey
         params = {"cluster_name": "lab", "hosts": None}
 
     assert {i.value for i in _complete_targets("", _Ctx())} == {"lab-recipe"}
-    # With no cluster on the line the default resolution raises, so the job is
-    # still offered — by id rather than by a name that wouldn't resolve.
+    # With no cluster on the line and none configured, there is no target to
+    # scope against — so the job is offered by id rather than by a name that
+    # would not resolve.  The target is never *guessed*.
     assert {i.value for i in _complete_targets("")} == {"sparkrun_abcdef123456"}
 
 
@@ -380,3 +389,291 @@ def test_url_sourced_recipe_completes_by_id(jobs_cache: Path, default_cluster):
         hosts=["h1"],
     )
     assert {i.value for i in _complete_targets("")} == {"sparkrun_abcdef123456"}
+
+
+class TestLiveStatusCompletion:
+    """Completion queries the cluster so the list reflects what is running.
+
+    The sweep costs an SSH round-trip per TAB.  That is the accepted price: a
+    cached snapshot is only as fresh as the last command that happened to
+    sweep, and a stale "running" list is the useless-hex-digest problem
+    restated.
+    """
+
+    @pytest.fixture
+    def live(self, monkeypatch):
+        """Re-enable the sweep (the shared fixture disables it) and stub status."""
+        monkeypatch.setattr("sparkrun.cli._common._completion_status_timeout", lambda: 5.0)
+
+        from sparkrun.core.cluster_manager import ClusterDefinition
+
+        monkeypatch.setattr(
+            "sparkrun.api._resolve.resolve_cluster",
+            lambda *a, **k: ClusterDefinition(name="lab", hosts=["h1", "h2"]),
+        )
+
+        def _install(running, errors=None):
+            from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+
+            errors = errors or {}
+            hosts = tuple(
+                HostOccupancy(host=h, workloads=tuple(RunningWorkload(cluster_id=c) for c in running.get(h, ())))
+                for h in ("h1", "h2")
+                if h not in errors
+            )
+            calls: list = []
+
+            def _fake_status(hosts_arg, **kwargs):
+                calls.append(kwargs)
+                return ClusterStatus(hosts=hosts, executor="docker", errors=dict(errors))
+
+            monkeypatch.setattr("sparkrun.api.status", _fake_status)
+            return calls
+
+        return _install
+
+    def test_dead_jobs_are_not_offered(self, jobs_cache: Path, live):
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+        _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="dead", hosts=["h1"])
+        live({"h1": ["sparkrun_aaaaaaaaaaaa"]})
+
+        assert {i.value for i in _complete_targets("")} == {"alive"}
+
+    def test_running_workload_without_metadata_is_still_offered(self, jobs_cache: Path, live):
+        """Launched from another machine, or its metadata pruned.
+
+        It is exactly what the user is reaching for, and the cluster just told
+        us it is there — so the id is offered even with nothing cached.
+        """
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="known", hosts=["h1"])
+        live({"h1": ["sparkrun_aaaaaaaaaaaa", "sparkrun_cccccccccccc"]})
+
+        assert {i.value for i in _complete_targets("")} == {"known", "sparkrun_cccccccccccc"}
+
+    def test_sweep_is_bounded_by_a_timeout(self, jobs_cache: Path, live):
+        """The one hard limit on how long a TAB can take."""
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+        calls = live({"h1": ["sparkrun_aaaaaaaaaaaa"]})
+
+        _complete_targets("")
+        assert calls and calls[0]["ssh_kwargs"]["timeout"] == 5.0
+
+    def test_unreachable_host_leaves_its_jobs_offered(self, jobs_cache: Path, live):
+        """A host we failed to reach is unknown, not empty."""
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="onh1", hosts=["h1"])
+        _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="onh2", hosts=["h2"])
+        live({"h1": []}, errors={"h2": "unreachable"})
+
+        # h1 was swept and had nothing → its job is gone.  h2 was not → kept.
+        assert {i.value for i in _complete_targets("")} == {"onh2"}
+
+    def test_query_failure_falls_back_to_the_cached_snapshot(self, jobs_cache: Path, monkeypatch):
+        from sparkrun.core.cluster_manager import ClusterDefinition
+        from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+        monkeypatch.setattr("sparkrun.cli._common._completion_status_timeout", lambda: 5.0)
+        monkeypatch.setattr(
+            "sparkrun.api._resolve.resolve_cluster",
+            lambda *a, **k: ClusterDefinition(name="lab", hosts=["h1"]),
+        )
+        monkeypatch.setattr("sparkrun.api.status", mock.Mock(side_effect=RuntimeError("network down")))
+
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+        _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="dead", hosts=["h1"])
+        save_running_snapshot({"sparkrun_aaaaaaaaaaaa"}, ["h1"], cache_dir=str(jobs_cache.parent))
+
+        assert {i.value for i in _complete_targets("")} == {"alive"}
+
+    def test_no_cluster_and_no_jobs_skips_the_sweep(self, jobs_cache: Path, monkeypatch):
+        """Nothing to query and nothing to offer — don't open a connection."""
+        monkeypatch.setattr("sparkrun.cli._common._completion_status_timeout", lambda: 5.0)
+        monkeypatch.setattr(
+            "sparkrun.api._resolve.resolve_cluster",
+            mock.Mock(side_effect=RuntimeError("no default cluster")),
+        )
+        status = mock.Mock()
+        monkeypatch.setattr("sparkrun.api.status", status)
+
+        assert _complete_targets("") == []
+        status.assert_not_called()
+
+    def test_unresolvable_cluster_skips_the_sweep(self, jobs_cache: Path, monkeypatch):
+        """No target means nothing to query — and nothing gets hidden either.
+
+        The target is taken from the command line or the configured default,
+        never guessed: pointing an SSH sweep at a cluster the user did not name
+        is worse than offering an unfiltered list.
+        """
+        monkeypatch.setattr("sparkrun.cli._common._completion_status_timeout", lambda: 5.0)
+        monkeypatch.setattr(
+            "sparkrun.api._resolve.resolve_cluster",
+            mock.Mock(side_effect=RuntimeError("no default cluster")),
+        )
+        status = mock.Mock()
+        monkeypatch.setattr("sparkrun.api.status", status)
+
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="r", hosts=["h1"])
+        assert {i.value for i in _complete_targets("")} == {"sparkrun_aaaaaaaaaaaa"}
+        status.assert_not_called()
+
+
+def test_completion_status_timeout_is_configurable(monkeypatch, tmp_path):
+    """Zero disables the sweep — the escape hatch for a flaky link."""
+    import sparkrun.core.config as _config_module
+    from sparkrun.cli._common import COMPLETION_STATUS_TIMEOUT_S, _completion_status_timeout
+
+    monkeypatch.setattr(_config_module, "DEFAULT_CONFIG_DIR", tmp_path, raising=False)
+    assert _completion_status_timeout() == COMPLETION_STATUS_TIMEOUT_S
+
+    (tmp_path / "config.yaml").write_text("completion:\n  status_timeout_s: 0\n")
+    assert _completion_status_timeout() == 0.0
+
+
+def test_offcluster_jobs_are_hidden_once_the_cluster_answers(jobs_cache: Path, monkeypatch):
+    """A verified sweep retires other clusters' leftovers.
+
+    They can't be verified — a torn-down cloud instance keeps its jobs in the
+    cache forever and its hostnames stop resolving — so treating them as
+    "unknown, therefore keep" is what leaves a completion list full of dead
+    entries.  They are reachable by naming their cluster, which sweeps it.
+    """
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+
+    monkeypatch.setattr("sparkrun.cli._common._completion_status_timeout", lambda: 5.0)
+    monkeypatch.setattr(
+        "sparkrun.api._resolve.resolve_cluster",
+        lambda *a, **k: ClusterDefinition(name="lab", hosts=["h1"]),
+    )
+    monkeypatch.setattr(
+        "sparkrun.api.status",
+        lambda hosts, **kw: ClusterStatus(
+            hosts=(HostOccupancy(host="h1", workloads=(RunningWorkload(cluster_id="sparkrun_aaaaaaaaaaaa"),)),),
+            executor="docker",
+        ),
+    )
+
+    _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="live-here", hosts=["h1"])
+    _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="dead-here", hosts=["h1"])
+    _write_job_meta(jobs_cache, "cccccccccccc", recipe="gone-cloud", hosts=["tnr-dead"])
+
+    assert {i.value for i in _complete_targets("")} == {"live-here"}
+
+
+def test_jobs_survive_when_nothing_could_be_verified(jobs_cache: Path, default_cluster):
+    """Without a snapshot, hiding anything would be guessing — so nothing is."""
+    _write_job_meta(jobs_cache, "cccccccccccc", recipe="gone-cloud", hosts=["tnr-dead"])
+    assert {i.value for i in _complete_targets("")} == {"sparkrun_cccccccccccc"}
+
+
+class TestCompletionSnapshotReuse:
+    """A burst of TABs should cost one sweep, not one per keystroke."""
+
+    @pytest.fixture
+    def cluster_lab(self, monkeypatch):
+        from sparkrun.core.cluster_manager import ClusterDefinition
+
+        monkeypatch.setattr("sparkrun.cli._common._completion_status_timeout", lambda: 5.0)
+        monkeypatch.setattr(
+            "sparkrun.api._resolve.resolve_cluster",
+            lambda *a, **k: ClusterDefinition(name="lab", hosts=["h1", "h2"]),
+        )
+
+    def _spy_status(self, monkeypatch):
+        from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy, RunningWorkload
+
+        calls: list = []
+
+        def _fake(hosts, **kwargs):
+            calls.append(hosts)
+            return ClusterStatus(
+                hosts=(
+                    HostOccupancy(host="h1", workloads=(RunningWorkload(cluster_id="sparkrun_aaaaaaaaaaaa"),)),
+                    HostOccupancy(host="h2"),
+                ),
+                executor="docker",
+            )
+
+        monkeypatch.setattr("sparkrun.api.status", _fake)
+        return calls
+
+    def test_fresh_covering_snapshot_skips_the_sweep(self, jobs_cache: Path, cluster_lab, monkeypatch):
+        from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+        _write_job_meta(jobs_cache, "bbbbbbbbbbbb", recipe="dead", hosts=["h1"])
+        save_running_snapshot({"sparkrun_aaaaaaaaaaaa"}, ["h1", "h2"], cache_dir=str(jobs_cache.parent))
+        calls = self._spy_status(monkeypatch)
+
+        assert {i.value for i in _complete_targets("")} == {"alive"}
+        assert calls == [], "a fresh snapshot covering the target must not trigger SSH"
+
+    def test_snapshot_from_another_cluster_does_not_count(self, jobs_cache: Path, cluster_lab, monkeypatch):
+        """It says nothing about these hosts.
+
+        Accepting it would mark the target's hosts unobserved, which puts every
+        dead job straight back into the list.
+        """
+        from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+        save_running_snapshot({"sparkrun_zzzz"}, ["other-host"], cache_dir=str(jobs_cache.parent))
+        calls = self._spy_status(monkeypatch)
+
+        _complete_targets("")
+        assert calls, "a snapshot covering unrelated hosts must not be reused"
+
+    def test_partial_coverage_does_not_count(self, jobs_cache: Path, cluster_lab, monkeypatch):
+        """h2 was never swept, so the snapshot can't speak for the cluster."""
+        from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+        save_running_snapshot({"sparkrun_aaaaaaaaaaaa"}, ["h1"], cache_dir=str(jobs_cache.parent))
+        calls = self._spy_status(monkeypatch)
+
+        _complete_targets("")
+        assert calls
+
+    def test_expired_snapshot_triggers_a_fresh_sweep(self, jobs_cache: Path, cluster_lab, monkeypatch):
+        """Otherwise a workload stopped minutes ago keeps being offered."""
+        from sparkrun.orchestration.job_metadata import save_running_snapshot
+
+        _write_job_meta(jobs_cache, "aaaaaaaaaaaa", recipe="alive", hosts=["h1"])
+        save_running_snapshot({"sparkrun_aaaaaaaaaaaa"}, ["h1", "h2"], cache_dir=str(jobs_cache.parent))
+        monkeypatch.setattr("sparkrun.cli._common._completion_cache_ttl", lambda: 0.0)
+        calls = self._spy_status(monkeypatch)
+
+        _complete_targets("")
+        assert calls, "ttl=0 must sweep every time"
+
+
+def test_status_records_the_snapshot_for_completion(tmp_path, monkeypatch):
+    """``api.status`` is the choke point every sweep passes through.
+
+    Recording there is what makes completion's first sweep pay for the ones
+    after it — and what lets any other command's sweep prime it too.
+    """
+    import sparkrun.core.config as _config_module
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.orchestration.job_metadata import load_running_snapshot
+    from sparkrun.orchestration.ssh import RemoteResult
+
+    monkeypatch.setattr(_config_module, "DEFAULT_CACHE_DIR", tmp_path, raising=False)
+
+    import sparkrun.api as api
+
+    ps = '{"Names":"sparkrun_aaaaaaaaaaaaaaaa_111111111111_solo","Status":"Up 1 min","Image":"img","ID":"x","Labels":""}'
+    with mock.patch(
+        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+        return_value=[
+            RemoteResult(host="h1", returncode=0, stdout=ps, stderr=""),
+            RemoteResult(host="h2", returncode=1, stdout="", stderr="unreachable"),
+        ],
+    ):
+        api.status(["h1", "h2"], cluster=ClusterDefinition(name="c", hosts=["h1", "h2"]))
+
+    running, covered = load_running_snapshot(cache_dir=str(tmp_path))
+    assert "sparkrun_aaaaaaaaaaaaaaaa_111111111111" in running
+    # h2 failed, so it is not claimed as observed — otherwise a reader would
+    # conclude "nothing running there" about a host nobody could reach.
+    assert covered == {"h1"}

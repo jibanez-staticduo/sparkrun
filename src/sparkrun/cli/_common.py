@@ -888,6 +888,18 @@ def _describe_job(job) -> str:
 #: (each metadata file embeds a full recipe state) and the list a shell offers.
 COMPLETION_JOB_LIMIT = 25
 
+#: How long completion reuses a recorded snapshot before sweeping again.
+#: Short on purpose: long enough that a burst of TABs costs one sweep, short
+#: enough that a workload stopped moments ago stops being offered.  Override
+#: with ``completion.cache_ttl_s``.
+COMPLETION_CACHE_TTL_S = 60.0
+
+#: Per-host ceiling for completion's live status sweep, in seconds.  Hosts are
+#: swept in parallel, so this is roughly the worst-case added TAB latency —
+#: paid in full only when a host is unreachable.  Override with
+#: ``completion.status_timeout_s``; ``0`` disables the sweep.
+COMPLETION_STATUS_TIMEOUT_S = 5.0
+
 
 def _complete_targets(incomplete: str, ctx=None):
     """Complete ``logs`` / ``stop`` targets from the local job cache.
@@ -903,9 +915,10 @@ def _complete_targets(incomplete: str, ctx=None):
        list — and the target is read from the ``--cluster`` / ``--hosts``
        already typed on the line, so ``logs --cluster lab <TAB>`` offers that
        cluster's workloads even when no default cluster is configured.
-    2. **cluster_ids**, for everything else.  That form reads its hosts back
-       out of the job metadata, so it is cluster-agnostic and safe to offer for
-       any cluster.
+    2. **cluster_ids**, for everything else on the target cluster — a second
+       deployment of the same recipe, or a job whose recipe name would not
+       resolve.  That form reads its hosts back out of the job metadata, so it
+       stays valid regardless of which cluster is being addressed.
 
     Recipe names come first because on **bash there is no way to annotate a
     completion** — ``BashComplete.format_completion`` emits ``type,value`` and
@@ -914,28 +927,30 @@ def _complete_targets(incomplete: str, ctx=None):
     does not.  kubectl completes pod *names* for the same reason; our analogue
     of a pod name is the recipe, not the cluster_id.
 
-    Filtered to what is running whenever a recent occupancy snapshot exists
-    (see :func:`~sparkrun.orchestration.job_metadata.load_running_snapshot`) —
-    never by sweeping here, which would hang the shell on an unreachable host.
+    **Filtered to what is actually running**, by querying the target cluster.
+    That costs an SSH sweep on every TAB, which is a real price — but a list of
+    dozens of dead hex digests is not worth having, and the cached-snapshot
+    alternative is only ever as fresh as the last command that swept.  The
+    sweep is hard-bounded by :func:`_completion_status_timeout` (a subprocess
+    timeout per host, run in parallel), so an unreachable host costs that
+    ceiling once rather than hanging the shell.  On any failure it falls back
+    to the recorded snapshot, then to showing everything: completion must
+    never hide a workload on the strength of information it does not have.
     """
     try:
         from sparkrun import api
-        from sparkrun.orchestration.job_metadata import load_running_snapshot
 
         jobs = api.list_jobs(limit=COMPLETION_JOB_LIMIT)
-        if not jobs:
-            return []
-
-        snapshot = load_running_snapshot()
-        target_hosts = _completion_cluster_hosts(ctx)
+        cluster_def = _completion_cluster(ctx)
+        target_hosts = set(getattr(cluster_def, "hosts", ()) or ())
+        snapshot = _completion_running(cluster_def)
 
         items: list = []
         seen_recipes: set[str] = set()
+        offered_ids: set[str] = set()
         for job in jobs:
-            if not _job_is_live(job, snapshot):
+            if not _job_is_live(job, snapshot, target_hosts):
                 continue
-            # A recipe name only resolves against the default cluster, so only
-            # offer it for jobs that actually live there.
             recipe = job.recipe
             # A URL-sourced recipe's "name" is the URL, which `logs` accepts
             # but which is 80 characters of noise in a completion list — and
@@ -943,48 +958,169 @@ def _complete_targets(incomplete: str, ctx=None):
             # by cluster_id, which is both shorter and unambiguous.
             if recipe and _is_recipe_url(recipe):
                 recipe = None
+            # A recipe name resolves only against the target cluster, so only
+            # offer it for jobs that actually live there.
             if recipe and target_hosts and set(job.hosts) <= target_hosts and recipe not in seen_recipes:
                 seen_recipes.add(recipe)
                 if recipe.startswith(incomplete):
                     items.append(click.shell_completion.CompletionItem(recipe, help=_describe_job(job)))
+                    offered_ids.add(job.cluster_id)
                     continue
             cid = job.cluster_id
             digest = cid.removeprefix("sparkrun_")
             if cid.startswith(incomplete) or digest.startswith(incomplete):
                 items.append(click.shell_completion.CompletionItem(cid, help=_describe_job(job)))
+                offered_ids.add(cid)
+
+        # A workload the cluster reports running but the local cache has no
+        # metadata for — launched from another machine, or pruned — is still
+        # addressable by id, and is exactly what the user is reaching for.
+        if snapshot is not None:
+            for cid in sorted(snapshot[0] - offered_ids):
+                digest = cid.removeprefix("sparkrun_")
+                if cid.startswith(incomplete) or digest.startswith(incomplete):
+                    items.append(click.shell_completion.CompletionItem(cid))
         return items
     except Exception:  # noqa: BLE001 — completion must never crash; degrade to empty list
         return []
 
 
-def _job_is_live(job, snapshot) -> bool:
+def _completion_running(cluster_def):
+    """Which workloads are running, for completion's purposes.
+
+    Cache first, then a live sweep.  A TAB burst — the usual way completion is
+    used — then costs one SSH round-trip rather than one per keystroke, and
+    ``api.status`` records every sweep it performs, so the sweep this function
+    triggers is itself what makes the next TAB instant.
+
+    The cache is only accepted when it **covers the target's hosts**: a
+    snapshot left behind by a sweep of some *other* cluster says nothing about
+    this one, and treating its hosts as unobserved would put every dead job
+    back in the list.
+
+    :data:`COMPLETION_CACHE_TTL_S` is deliberately much shorter than
+    :data:`~sparkrun.orchestration.job_metadata.RUNNING_SNAPSHOT_MAX_AGE_S`.
+    The point of caching here is to make a burst of TABs cheap, which needs
+    seconds, not minutes — and the longer window would keep offering a
+    workload for ten minutes after it was stopped, which is the staleness this
+    whole path exists to eliminate.  The longer window is still honoured as a
+    *fallback* when a live sweep fails: stale information beats none.
+
+    Returns ``(running_cluster_ids, hosts_covered)``, or ``None`` for "could
+    not establish", which callers must treat as "show everything".  Hosts the
+    sweep failed to reach are excluded from the covered set, so a workload on
+    an unreachable host reads as unknown rather than dead.
+    """
+    from sparkrun.orchestration.job_metadata import load_running_snapshot
+
+    target = set(getattr(cluster_def, "hosts", ()) or ())
+    cached = load_running_snapshot(max_age_s=_completion_cache_ttl())
+    if cached is not None and target and target <= cached[1]:
+        return cached
+
+    timeout = _completion_status_timeout()
+    if cluster_def is not None and timeout > 0:
+        try:
+            from sparkrun import api
+            from sparkrun.core.config import SparkrunConfig
+            from sparkrun.orchestration.primitives import build_ssh_kwargs
+
+            config = SparkrunConfig()
+            if getattr(cluster_def, "user", None):
+                config.ssh_user = cluster_def.user
+            ssh_kwargs = build_ssh_kwargs(config)
+            # The one hard bound on how long a TAB can take: a per-host
+            # subprocess timeout, with the hosts swept in parallel.
+            ssh_kwargs["timeout"] = timeout
+
+            hosts = list(cluster_def.hosts)
+            status = api.status(hosts, cluster=cluster_def, ssh_kwargs=ssh_kwargs)
+            running = {w.cluster_id for entry in status.hosts for w in entry.workloads if w.cluster_id}
+            covered = frozenset(h for h in hosts if h not in status.errors)
+            return frozenset(running), covered
+        except Exception:
+            logger.debug("Completion status query failed; falling back to the cached snapshot", exc_info=True)
+
+    # Live sweep unavailable or failed: a stale snapshot beats none.
+    return load_running_snapshot()
+
+
+def _completion_cache_ttl() -> float:
+    """How long a recorded snapshot is reused before completion sweeps again.
+
+    ``completion.cache_ttl_s`` in ``config.yaml``; ``0`` sweeps on every TAB.
+    """
+    return _completion_setting("cache_ttl_s", COMPLETION_CACHE_TTL_S)
+
+
+def _completion_status_timeout() -> float:
+    """Per-host ceiling for completion's status sweep, in seconds.
+
+    ``completion.status_timeout_s`` in ``config.yaml``; ``0`` disables the live
+    query entirely and falls back to the recorded snapshot.  Exists because the
+    right value is a property of the user's network, not of sparkrun — and
+    because someone on a flaky VPN needs a way to turn it off without losing
+    completion altogether.
+    """
+    return _completion_setting("status_timeout_s", COMPLETION_STATUS_TIMEOUT_S)
+
+
+def _completion_setting(key: str, default: float) -> float:
+    """Read one ``completion.*`` float from config, never raising."""
+    try:
+        from sparkrun.core.config import SparkrunConfig
+
+        return max(float(SparkrunConfig().get("completion.%s" % key, default)), 0.0)
+    except Exception:
+        return default
+
+
+def _job_is_live(job, snapshot, target_hosts: "set[str] | None" = None) -> bool:
     """Whether *job* should be offered, given a possibly-partial snapshot.
 
     ``None`` (no snapshot, or a stale one) means show everything — completion
     must not hide a workload on the strength of information it does not have.
 
-    A snapshot covers only the hosts that were actually swept, so a job whose
-    hosts fall outside it is *unknown*, not dead, and is kept.  Without that
-    check a placement query over two hosts of a four-host cluster would hide
-    every workload on the other two.
+    Three cases once a snapshot exists:
+
+    - **Running** → offer it.
+    - **On a host we swept, and absent from the sweep** → dead; hide it.
+    - **On a host we did not sweep** → *unknown*.  A sweep is often partial (a
+      placement query covers a candidate subset), and hiding a workload nobody
+      looked at is worse than showing a stale one.
+
+    …except when the job lives entirely **outside the cluster this invocation
+    targets**.  Those are not unknown so much as not this command's business:
+    they are the long-dead deployments of clusters that no longer exist (a
+    torn-down cloud instance keeps its jobs in the cache forever, and its
+    hostnames stop resolving, so they can never be verified). Verifying them
+    would mean sweeping every cluster any recent job ever touched, paying the
+    full connect timeout for each dead one. Naming that cluster
+    (``logs --cluster other <TAB>``) sweeps it and offers its live workloads.
     """
     if snapshot is None:
         return True
     running, covered = snapshot
     if job.cluster_id in running:
         return True
-    return not (job.hosts and set(job.hosts) <= covered)
+    hosts = set(job.hosts or ())
+    if target_hosts and hosts and not (hosts & target_hosts):
+        return False
+    return not (hosts and hosts <= covered)
 
 
-def _completion_cluster_hosts(ctx=None) -> set[str]:
-    """Hosts that ``logs <recipe>`` would resolve against for this invocation.
+def _completion_cluster(ctx=None):
+    """The cluster this invocation targets, or ``None`` if none can be resolved.
 
     Prefers the ``--cluster`` / ``--hosts`` already present on the command
-    line: completion runs after Click has parsed the options it has seen, so
-    ``logs --cluster lab <TAB>`` can scope to ``lab``.  Without that, a user
-    who always passes ``--cluster`` (and has no ``default_hosts`` in
-    ``config.yaml``) would never be offered a recipe name at all, since the
-    unqualified resolution raises and leaves nothing to compare against.
+    line — completion runs after Click has parsed the options it has seen, so
+    ``logs --cluster lab <TAB>`` scopes to ``lab``.  Otherwise it is whatever
+    :func:`~sparkrun.api._resolve.resolve_cluster` resolves with no arguments:
+    the default cluster, then ``config.default_hosts``.
+
+    Deliberately *only* those sources.  Guessing a target — from the most
+    recent job, say — would silently point completion (and its SSH sweep) at a
+    cluster the user never named.
     """
     params = getattr(ctx, "params", None) or {}
     try:
@@ -992,9 +1128,9 @@ def _completion_cluster_hosts(ctx=None) -> set[str]:
 
         hosts = params.get("hosts")
         host_list = [h.strip() for h in hosts.split(",") if h.strip()] if isinstance(hosts, str) else None
-        return set(resolve_cluster(params.get("cluster_name"), host_list).hosts)
+        return resolve_cluster(params.get("cluster_name"), host_list)
     except Exception:
-        return set()
+        return None
 
 
 class TargetType(RecipeNameType):

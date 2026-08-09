@@ -156,8 +156,13 @@ def resolve_cluster(
          when both are given.
       3. No cluster but *hosts_input* given → synthesize an anonymous
          cluster (``name=""``) carrying those hosts.
-      4. No cluster, no *hosts_input*, but ``config.default_hosts`` → synthesize.
-      5. Otherwise → raise :class:`HostsUnreachable`.
+      4. No cluster, no *hosts_input*, but a **default cluster** is set
+         (``sparkrun cluster set-default``) → return it, in full.
+      5. …else ``config.default_hosts`` → synthesize.
+      6. Otherwise → raise :class:`HostsUnreachable`.
+
+    Steps 4 and 5 mirror :func:`sparkrun.core.hosts.resolve_hosts`, which has
+    always consulted the default cluster ahead of ``config.default_hosts``.
 
     Synthesized anonymous clusters have ``name=""`` (empty string) and
     empty ``hosts_hardware`` — equivalent to "no overrides, use the
@@ -212,12 +217,47 @@ def resolve_cluster(
     if explicit_hosts is not None:
         return ClusterDefinition(name="", hosts=explicit_hosts)
 
+    # The default cluster (``sparkrun cluster set-default``), which lives in a
+    # marker file the ClusterManager owns rather than in ``config.yaml``.
+    # Consulted ahead of ``config.default_hosts`` to match the ordering
+    # :func:`sparkrun.core.hosts.resolve_hosts` has always used — without this
+    # the two resolvers disagreed, and a user whose only host source was a
+    # default cluster got ``HostsUnreachable`` from every ``api.*`` entry point
+    # that resolves without an explicit cluster.  Returning the definition
+    # rather than just its hosts also carries the cluster's SSH user, executor
+    # and scheduler, which a bare host list would silently drop.
+    default_cluster = _default_cluster(sctx, cluster_mgr)
+    if default_cluster is not None:
+        return default_cluster
+
     effective_config = config if config is not None else (sctx.config if sctx is not None else None)
     default_hosts = getattr(effective_config, "default_hosts", None) if effective_config is not None else None
     if default_hosts:
         return ClusterDefinition(name="", hosts=list(default_hosts))
 
-    raise HostsUnreachable("No hosts provided and no default hosts configured")
+    raise HostsUnreachable("No hosts provided, no default cluster, and no default hosts configured")
+
+
+def _default_cluster(sctx, cluster_mgr) -> "ClusterDefinition | None":
+    """Load the configured default cluster, or ``None`` when there isn't one.
+
+    Best-effort: a missing marker file, a default naming a cluster that has
+    since been deleted, or an unreadable cluster dir all fall through to the
+    next host source rather than raising.
+    """
+    try:
+        if cluster_mgr is None and sctx is not None:
+            cluster_mgr = sctx.cluster_manager
+        if cluster_mgr is None:
+            from sparkrun.core.cluster_manager import ClusterManager
+            from sparkrun.core.config import get_config_root
+
+            cluster_mgr = ClusterManager(get_config_root())
+        name = cluster_mgr.get_default()
+        return cluster_mgr.get(name) if name else None
+    except Exception:
+        logger.debug("No default cluster available", exc_info=True)
+        return None
 
 
 def _replace_cluster_hosts(cluster: "ClusterDefinition", hosts: list[str]) -> "ClusterDefinition":

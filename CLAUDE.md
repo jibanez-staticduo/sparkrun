@@ -519,15 +519,39 @@ difference between "couldn't look" and "looked, nothing there". Opt out with
 `jobs.autoprune: false`; sweep manually with the advanced-only
 `sparkrun setup prune-job-metadata-cache` (which has no snapshot, and says so).
 
-**`running.json`** is the completion half. Shell completion cannot sweep — it
-runs on every TAB, and a host that no longer resolves would hang the terminal
-with no way to signal what it is waiting on. So `api.status` (the single
-sweep choke point) leaves its answer behind, and completion reads it for free.
-The recorded *hosts* matter as much as the cluster_ids: a sweep is frequently
+**`running.json`** is the completion half. Completion filters to what is
+*actually running*, which means a live `api.status` sweep — a deliberate
+choice: a list of dozens of dead hex digests is not worth having. The cost is
+managed rather than avoided:
+
+- **Cache first.** A recorded snapshot is reused for `COMPLETION_CACHE_TTL_S`
+  (60s), so a burst of TABs costs one sweep, not one per keystroke. Measured:
+  1.15s cold, 0.08s warm. The TTL is far shorter than the file's own
+  `RUNNING_SNAPSHOT_MAX_AGE_S` (600s) because the point here is to make a burst
+  cheap — the longer window would keep offering a workload for ten minutes
+  after it was stopped. The long window is still honoured as a *fallback* when
+  a sweep fails: stale beats nothing.
+- **A snapshot is only reused when it covers the target's hosts.** One left by
+  a sweep of some other cluster says nothing about this one, and treating its
+  hosts as unobserved would put every dead job back in the list.
+- **Hard-bounded.** `COMPLETION_STATUS_TIMEOUT_S` (5s) is a per-host subprocess
+  timeout with the hosts swept in parallel, so an unreachable host costs that
+  ceiling once instead of hanging the shell. `completion.status_timeout_s: 0`
+  disables the sweep entirely for anyone on a flaky link.
+- `api.status` records every sweep it performs, so the sweep completion
+  triggers is what makes the next TAB instant — and any other command's sweep
+  primes it too.
+
+The recorded *hosts* matter as much as the cluster_ids. A sweep is frequently
 partial (placement queries a candidate subset), and without knowing what was
-covered a reader cannot tell "not running" from "not looked at" — it would
-hide live workloads on unswept hosts. A stale or absent snapshot means show
-everything.
+covered a reader cannot tell "not running" from "not looked at" — it would hide
+live workloads on unswept hosts. So an unswept host's workloads are *unknown*
+and kept — **except** when the job lies entirely outside the target cluster.
+Those are the leftovers of clusters that no longer exist (a torn-down cloud
+instance keeps its jobs forever and its hostnames stop resolving, so they can
+never be verified); verifying them would mean sweeping every cluster any recent
+job touched, paying a full connect timeout for each dead one. Naming that
+cluster sweeps it. A stale or absent snapshot still means show everything.
 
 **Completion targets** (`cli/_common.py:_complete_targets`) offer **recipe
 names first, cluster_ids second**, because on bash there is no way to annotate
@@ -536,9 +560,17 @@ the help text entirely (zsh and fish render it). The value has to carry the
 meaning, and a recipe name does while a hex digest does not. The split is
 forced by how each form resolves: `logs <recipe>` goes through
 `resolve_cluster`, so recipe names are scoped to the cluster the invocation
-targets (read from the `--cluster` / `--hosts` already on the line, falling
-back to the default); `logs <cluster_id>` reads its hosts from the metadata and
-so is cluster-agnostic and safe to offer for any cluster.
+targets; `logs <cluster_id>` reads its hosts from the metadata and so stays
+valid regardless.
+
+The **target cluster** is resolved from, in order: the `--cluster` / `--hosts`
+already on the command line (completion runs after Click has parsed the options
+it has seen), then `default_hosts`, then **the most recently launched job's
+cluster** — matched back to a configured cluster where possible so the sweep
+inherits its SSH user and executor. That last source is what makes a bare
+`logs <TAB>` work: without a target there is nothing to sweep, so nothing can
+be confirmed dead and every cached job is offered, which is the wall of hex
+digests all of this exists to remove.
 
 **Mount-source preflight** (`Executor.verify_mount_sources(paths, hosts, …)`) is
 the substrate peer of `query_status` on the *write* path: "do these identity-mount
