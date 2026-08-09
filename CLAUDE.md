@@ -563,14 +563,23 @@ forced by how each form resolves: `logs <recipe>` goes through
 targets; `logs <cluster_id>` reads its hosts from the metadata and so stays
 valid regardless.
 
-The **target cluster** is resolved from, in order: the `--cluster` / `--hosts`
-already on the command line (completion runs after Click has parsed the options
-it has seen), then `default_hosts`, then **the most recently launched job's
-cluster** — matched back to a configured cluster where possible so the sweep
-inherits its SSH user and executor. That last source is what makes a bare
-`logs <TAB>` work: without a target there is nothing to sweep, so nothing can
-be confirmed dead and every cached job is offered, which is the wall of hex
-digests all of this exists to remove.
+The **target** is the `--cluster` / `--hosts` already on the command line
+(completion runs after Click has parsed the options it has seen), else whatever
+`resolve_cluster()` returns with no arguments. It is never *guessed* — inferring
+one from, say, the most recent job would point completion's SSH sweep at a
+cluster the user never named. With no target nothing can be confirmed dead, so
+everything cached is offered.
+
+That makes `resolve_cluster`'s chain load-bearing here, and it was missing a
+step. **The default cluster** (`sparkrun cluster set-default`, stored in a
+marker file the `ClusterManager` owns rather than in `config.yaml`) is now
+consulted between `hosts_input` and `config.default_hosts` — the ordering
+`core/hosts.py:resolve_hosts` has always used. The two resolvers disagreed, so
+a user whose only host source was a default cluster got `HostsUnreachable` from
+every `api.*` entry point that resolves without an explicit cluster. It returns
+the whole definition rather than just the hosts, so the cluster's SSH user /
+executor / scheduler come with it; a dangling default (naming a deleted
+cluster) falls through to the next source instead of raising.
 
 **Mount-source preflight** (`Executor.verify_mount_sources(paths, hosts, …)`) is
 the substrate peer of `query_status` on the *write* path: "do these identity-mount
