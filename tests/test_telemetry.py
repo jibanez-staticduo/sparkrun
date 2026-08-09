@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import yaml
 from click.testing import CliRunner
 
+from _telemetry_guard import install_telemetry_blocker
 import sparkrun.api as api
 from sparkrun.cli import main
 from sparkrun.core.cluster_manager import ClusterDefinition
@@ -283,6 +284,26 @@ def test_run_event_drops_mock_dimensions():
     assert event["runtime"] is None
     assert event["executor"] is None
     assert event["scheduler"] is None
+
+
+def test_test_suite_telemetry_blocker_records_despite_emit_swallowing(monkeypatch):
+    """The suite-wide guard must survive ``emit_*``'s blanket ``except Exception``.
+
+    Raising from the patched ``urlopen`` alone would be logged at DEBUG and
+    forgotten; the recorded attempt is what fails the test in
+    ``isolate_stateful``'s teardown.  Installing a fresh blocker here shadows
+    that one, so this test does not trip its own guard.
+    """
+    from sparkrun.telemetry import emit_benchmark_telemetry
+
+    attempts = install_telemetry_blocker(monkeypatch)
+    # A MagicMock config makes ``telemetry_enabled`` fail open -- the exact
+    # condition under which the real leaks were sent.
+    monkeypatch.delenv("SPARKRUN_NO_TELEMETRY", raising=False)
+
+    emit_benchmark_telemetry(MagicMock(), result=MagicMock(), options=MagicMock())
+
+    assert len(attempts) == 1, "the blocker must record the send emit_* swallowed"
 
 
 def test_setup_telemetry_command_persists_preference(tmp_path, monkeypatch):
