@@ -1360,14 +1360,15 @@ class RuntimePlugin(Plugin):
             should_run_locally,
         )
 
-        container_name = self._resolve_executor().container_name(cluster_id, "solo")
+        executor = self._resolve_executor()
+        container_name = executor.container_name(cluster_id, "solo")
         ssh_kwargs = build_ssh_kwargs(config)
         is_local = should_run_locally(host, ssh_kwargs.get("ssh_user"))
 
         if is_local:
-            cleanup_containers_local([container_name], dry_run=dry_run)
+            cleanup_containers_local([container_name], dry_run=dry_run, executor=executor)
         else:
-            cleanup_containers([host], [container_name], ssh_kwargs=ssh_kwargs, dry_run=dry_run)
+            cleanup_containers([host], [container_name], ssh_kwargs=ssh_kwargs, dry_run=dry_run, executor=executor)
 
         logger.info("Solo workload '%s' stopped on %s", cluster_id, host)
         return 0

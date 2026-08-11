@@ -361,12 +361,42 @@ def test_teardown_script_reports_removed_count():
     """The removed count comes from the teardown, not from len(hosts)."""
     from sparkrun.orchestration.docker import docker_teardown_script, parse_teardown_removed
 
-    # 'a' exists (rm succeeds), 'b' does not (rm fails); neither survives.
-    stub = "docker() { if [ \"$1\" = 'ps' ]; then return 0; elif [ \"$3\" = 'a' ]; then return 0; else return 1; fi; }\n"
+    # Real docker semantics: only 'a' exists, and ``rm -f`` exits 0 for both
+    # (see test_teardown_script_does_not_count_containers_that_never_existed).
+    # The census must be what distinguishes them.  State goes through a file
+    # because the census runs inside ``$(...)`` — a subshell, where a variable
+    # assignment would not survive.
+    stub = (
+        "_state=$(mktemp)\n"
+        "docker() {\n"
+        '  if [ "$1" = "ps" ]; then [ -s "$_state" ] || echo a; return 0; fi\n'
+        '  if [ "$1" = "rm" ]; then echo removed > "$_state"; return 0; fi\n'
+        "  return 0\n"
+        "}\n"
+    )
     rc, out, _err = _run_script(docker_teardown_script(["a", "b"]), stub)
 
     assert rc == 0
     assert parse_teardown_removed(out) == 1
+
+
+def test_teardown_script_does_not_count_containers_that_never_existed():
+    """``docker rm -f <missing>`` exits 0, so removals must not be the count.
+
+    Regression: ``stop`` feeds every candidate name (solo / head / worker /
+    node_N) to every host and counted each successful ``rm``, so a
+    single-container job reported four containers removed — and a host holding
+    nothing at all reported removals.
+    """
+    from sparkrun.orchestration.docker import docker_teardown_script, parse_teardown_removed
+
+    # An empty but perfectly healthy docker: ps succeeds listing nothing, and
+    # rm -f exits 0 for names that do not exist (verified against Docker 28).
+    stub = "docker() { return 0; }\n"
+    rc, out, _err = _run_script(docker_teardown_script(["a", "b", "c"]), stub)
+
+    assert rc == 0
+    assert parse_teardown_removed(out) == 0
 
 
 def test_teardown_script_tolerates_containers_that_are_already_gone():

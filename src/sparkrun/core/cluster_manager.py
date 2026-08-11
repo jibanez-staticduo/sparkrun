@@ -375,6 +375,15 @@ class ClusterStatusResult:
     pending_ops: list[dict[str, Any]]  # relevant pending operations
     total_containers: int
     host_count: int
+    container_executors: dict[tuple[str, str], str] = field(default_factory=dict)
+    """``(host, container_name)`` → the executor that reported it.
+
+    Keyed by the pair because a container name is unique only per host (Ray
+    worker containers share one name across nodes) — the same key
+    ``Executor.describe_terminated`` uses.  Consumed by ``api.stop_all`` to
+    tear each workload down through its own substrate; a missing entry means
+    unattributed and falls back to the cluster's default executor.
+    """
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the result to a JSON-serializable dictionary."""
@@ -913,6 +922,7 @@ def classify_cluster_status(
     total_containers = 0
     reachable_hosts: set[str] = set()
     host_container_counts: dict[str, int] = {}
+    container_executors: dict[tuple[str, str], str] = {}
 
     for hostocc in snapshot.hosts:
         reachable_hosts.add(hostocc.host)
@@ -921,6 +931,8 @@ def classify_cluster_status(
             for c in w.containers:
                 total_containers += 1
                 count += 1
+                if c.executor:
+                    container_executors[(hostocc.host, c.name)] = c.executor
                 if c.name.endswith("_solo") or c.role == "solo":
                     raw_solo_entries.append((w.cluster_id, hostocc.host, c))
                 else:
@@ -959,6 +971,7 @@ def classify_cluster_status(
         pending_ops=relevant_ops,
         total_containers=total_containers,
         host_count=len(host_list),
+        container_executors=container_executors,
     )
 
 

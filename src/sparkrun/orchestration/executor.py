@@ -141,7 +141,7 @@ def query_status_for_cluster(
     query degrades to an empty snapshot with a logged warning rather than
     raising.
     """
-    from sparkrun.core.cluster_status import ClusterStatus, empty_status
+    from sparkrun.core.cluster_status import ClusterStatus, attribute_executor, empty_status
 
     try:
         scope, default_name = _resolve_status_scope(cluster, executor=executor, config=config, v=v)
@@ -166,7 +166,11 @@ def query_status_for_cluster(
     for name in ordered:
         try:
             ex = resolve_executor(cluster=cluster, cli_overrides={"executor": name}, rootless=False, auto_user=False, config=config, v=v)
-            snapshots.append(ex.query_status(list(hosts), ssh_kwargs=ssh_kwargs, host_hardware=host_hardware))
+            snapshot = ex.query_status(list(hosts), ssh_kwargs=ssh_kwargs, host_hardware=host_hardware)
+            # Stamp *before* the merge: afterwards a workload can hold
+            # containers from two substrates, and teardown has to send each
+            # back to the executor that reported it.
+            snapshots.append(attribute_executor(snapshot, name))
         except Exception:  # noqa: BLE001 - one backend failing never breaks status
             logger.debug("Status query via executor %r failed; skipping", name, exc_info=True)
 

@@ -104,11 +104,12 @@ def test_cleanup_after_failure_explicit_container_names_uses_named_primitive(mon
 
     captured: dict = {}
 
-    def fake_cleanup_containers(hosts, names, *, ssh_kwargs, dry_run, max_workers=None):
+    def fake_cleanup_containers(hosts, names, *, ssh_kwargs, dry_run, max_workers=None, executor=None):
         captured["hosts"] = list(hosts)
         captured["names"] = list(names)
         captured["dry_run"] = dry_run
         captured["max_workers"] = max_workers
+        captured["executor"] = executor
 
     monkeypatch.setattr("sparkrun.orchestration.primitives.cleanup_containers", fake_cleanup_containers)
 
@@ -121,6 +122,9 @@ def test_cleanup_after_failure_explicit_container_names_uses_named_primitive(mon
 
     assert captured["hosts"] == ["h1", "h2"]
     assert captured["names"] == ["cid_head", "cid_worker"]
+    # The launch's own executor tears down its own workloads — a docker-only
+    # teardown would leave a `local` executor's native processes running.
+    assert captured["executor"] is executor
 
 
 def test_cleanup_after_failure_hosts_subset_restricts_cleanup(monkeypatch):

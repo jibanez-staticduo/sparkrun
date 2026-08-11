@@ -215,8 +215,9 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         """Stop a vLLM Ray cluster."""
         from sparkrun.orchestration.primitives import build_ssh_kwargs, cleanup_containers
 
-        head_container = self._resolve_executor().container_name(cluster_id, "head")
-        worker_container = self._resolve_executor().container_name(cluster_id, "worker")
+        executor = self._resolve_executor()
+        head_container = executor.container_name(cluster_id, "head")
+        worker_container = executor.container_name(cluster_id, "worker")
         ssh_kwargs = build_ssh_kwargs(config)
 
         cleanup_containers(
@@ -224,6 +225,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             [head_container, worker_container],
             ssh_kwargs=ssh_kwargs,
             dry_run=dry_run,
+            executor=executor,
         )
         logger.info("Cluster '%s' stopped on %d host(s)", cluster_id, len(hosts))
         return 0
@@ -325,7 +327,7 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
             progress.step("Cleaning up existing containers")
         else:
             logger.info("Step 1/5: Cleaning up existing containers for cluster '%s'...", cluster_id)
-        cleanup_named_containers(ctx, [head_container, worker_container])
+        cleanup_named_containers(ctx, [head_container, worker_container], self._resolve_executor())
         logger.info("Step 1/5: Cleanup done (%.1fs)", time.monotonic() - t0)
 
         # Step 2: InfiniBand detection (skip if pre-detected nccl_env provided)

@@ -5258,7 +5258,7 @@ class TestClusterUserInCLICommands:
 
         captured_kwargs = {}
 
-        def mock_cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None):
+        def mock_cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None, *, executor=None):
             from sparkrun.orchestration.ssh import RemoteResult
 
             captured_kwargs.update(ssh_kwargs or {})

@@ -18,6 +18,7 @@ from typing import ClassVar, Mapping, TYPE_CHECKING
 
 from scitrera_app_framework import Plugin, Variables, ext_parse_bool, get_extensions
 
+from sparkrun.orchestration.teardown import TEARDOWN_REMOVED_MARKER
 from sparkrun.scripts import read_script
 from sparkrun.utils import merge_env
 from sparkrun.utils.shell import b64_encode_cmd, quote
@@ -477,6 +478,84 @@ class Executor(Plugin):
     def status_cmd(self, container_name: str) -> str:
         """Generate a command that exits 0 iff *container_name* is alive."""
         ...
+
+    def exists_cmd(self, container_name: str) -> str:
+        """Generate a command that exits 0 iff *container_name* is **present**.
+
+        The teardown peer of :meth:`status_cmd`, which asks the narrower
+        question "is it *running*?".  Present means anything teardown must
+        still remove — for Docker that includes an exited-but-not-removed
+        container, which ``status_cmd``'s ``docker ps`` cannot see and
+        ``docker rm -f`` must still delete.
+
+        The default is :meth:`status_cmd`, correct for every substrate where
+        a workload's only state *is* its liveness (the ``local`` executor: a
+        pidfile whose process is gone leaves nothing to remove).  Executors
+        with a separate dead-but-present state override.
+        """
+        return self.status_cmd(container_name)
+
+    def teardown_script(self, container_names: list[str] | tuple[str, ...]) -> str:
+        """Generate a script that removes *container_names* here, and **verifies it**.
+
+        The one seam through which every teardown path runs — ``sparkrun
+        stop``, ``stop --all``, and post-launch-failure cleanup — so a
+        workload is always torn down by the substrate that started it.  Before
+        this existed, teardown emitted ``docker rm -f`` unconditionally, which
+        meant a ``local`` executor's native process was asked about via Docker,
+        truthfully reported as absent, and left running while the caller
+        printed success.
+
+        The generated script must:
+
+        - remove every name in *container_names* (idempotently: a name that
+          isn't there is not a failure, and any residue such as a stale
+          pidfile is still cleaned up),
+        - exit non-zero, naming survivors on stderr, if anything is still
+          present afterwards,
+        - print :data:`~sparkrun.orchestration.teardown.TEARDOWN_REMOVED_MARKER`
+          with the number of workloads that were **actually present** before
+          the removal — not the number of names attempted.
+
+        The default composes :meth:`exists_cmd` and :meth:`stop_cmd`, so an
+        executor gets a correct teardown from the primitives it already
+        defines (this is the whole of the ``local`` and ``k8s`` implementations).
+
+        Executors whose substrate can be *unavailable* rather than merely empty
+        — a daemon or CLI that may be down, where "not present" and "cannot
+        tell" are different answers — must override to check substrate health
+        first, or an unreachable backend reads as a successful teardown.  That
+        is exactly why :class:`~sparkrun.orchestration.executors.docker.DockerExecutor`
+        overrides it.
+        """
+        from sparkrun.orchestration.teardown import format_teardown_removed
+
+        if not container_names:
+            return "echo %s\n" % quote(format_teardown_removed(0))
+
+        lines = ["_sr_removed=0"]
+        for name in container_names:
+            # Count what was there *before* removing it, so a candidate name
+            # that never existed isn't reported as a container we stopped.
+            lines.append("if %s; then _sr_removed=$((_sr_removed + 1)); fi" % self.exists_cmd(name))
+            # Runs unconditionally: teardown is idempotent, and for substrates
+            # that leave residue behind a dead workload (a `local` pidfile) the
+            # stop is what prunes it.
+            lines.append(self.stop_cmd(name))
+
+        lines.append('_sr_left=""')
+        for name in container_names:
+            lines.append('if %s; then _sr_left="$_sr_left "%s; fi' % (self.exists_cmd(name), quote(name)))
+        lines.extend(
+            [
+                'if [ -n "$_sr_left" ]; then',
+                '  echo "workloads still present:$_sr_left" >&2',
+                "  exit 1",
+                "fi",
+                'echo "%s$_sr_removed"' % TEARDOWN_REMOVED_MARKER,
+            ]
+        )
+        return "\n".join(lines) + "\n"
 
     @abstractmethod
     def inspect_exists_cmd(self, image: str) -> str:

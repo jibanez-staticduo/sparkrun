@@ -263,11 +263,11 @@ def cleanup_ranked_containers(ctx: ClusterContext, executor: Executor) -> list[s
     return _stop_ranked_containers_parallel(ctx, executor, list(ctx.hosts))
 
 
-def cleanup_named_containers(ctx: ClusterContext, container_names: list[str]) -> None:
-    """Stop named containers on all hosts."""
+def cleanup_named_containers(ctx: ClusterContext, container_names: list[str], executor: Executor | None = None) -> None:
+    """Stop named containers on all hosts, via *executor*'s substrate."""
     from sparkrun.orchestration.primitives import cleanup_containers
 
-    cleanup_containers(ctx.hosts, container_names, ssh_kwargs=ctx.ssh_kwargs, dry_run=ctx.dry_run)
+    cleanup_containers(ctx.hosts, container_names, ssh_kwargs=ctx.ssh_kwargs, dry_run=ctx.dry_run, executor=executor)
 
 
 def cleanup_after_failure(
@@ -310,6 +310,7 @@ def cleanup_after_failure(
                 ssh_kwargs=ctx.ssh_kwargs,
                 dry_run=ctx.dry_run,
                 max_workers=_config_ssh_cap(ctx.config),
+                executor=executor,
             )
             return
         # Ranked cleanup. Use the supplied host subset when provided so we

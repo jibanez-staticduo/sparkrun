@@ -65,8 +65,8 @@ def stop_all(
         :class:`~sparkrun.api._models.StopAllResult`.
     """
     from sparkrun.api._status import status_report
-    from sparkrun.orchestration.docker import parse_teardown_removed
-    from sparkrun.orchestration.primitives import cleanup_containers_by_host
+    from sparkrun.orchestration.primitives import cleanup_containers_by_host, merge_teardown_results
+    from sparkrun.orchestration.teardown import parse_teardown_removed
 
     host_list = list(hosts)
     result = discovered
@@ -85,7 +85,22 @@ def stop_all(
 
     host_containers = _containers_by_host(result)
 
-    results = cleanup_containers_by_host(host_containers, ssh_kwargs=ssh_kwargs, dry_run=dry_run)
+    # Discovery is cross-executor (docker + local share the "host" scope), so
+    # teardown must be too: each executor is dispatched with only the
+    # workloads *it* reported, then the per-host verdicts are recombined.
+    # Sending the whole set to one executor is what let a `local` workload
+    # survive a "successful" stop --all.
+    results: dict = {}
+    for executor_name, grouped in _group_by_executor(host_containers, result).items():
+        results = merge_teardown_results(
+            results,
+            cleanup_containers_by_host(
+                grouped,
+                ssh_kwargs=ssh_kwargs,
+                dry_run=dry_run,
+                executor=_resolve_teardown_executor(executor_name, cluster, host_list, sctx),
+            ),
+        )
 
     failed_hosts: dict[str, str] = {}
     for host in host_containers:
@@ -140,6 +155,70 @@ def _containers_by_host(result: "ClusterStatusResult") -> dict[str, list[str]]:
     for entry in result.solo_entries:
         host_containers.setdefault(entry.host, []).append(entry.name)
     return host_containers
+
+
+def _group_by_executor(
+    host_containers: dict[str, list[str]],
+    result: "ClusterStatusResult",
+) -> dict[str, dict[str, list[str]]]:
+    """Split a host→containers map into one such map per reporting executor.
+
+    Uses :attr:`ClusterStatusResult.container_executors`, stamped during
+    discovery.  Containers with no attribution (a snapshot from an executor
+    that predates the field, or a hand-built one in a test) group under ``""``
+    and are torn down with the cluster's default executor — the historical
+    behaviour, and the safe reading of "we don't know".
+    """
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for host, names in host_containers.items():
+        for name in names:
+            executor_name = result.container_executors.get((host, name), "")
+            grouped.setdefault(executor_name, {}).setdefault(host, []).append(name)
+    return grouped
+
+
+def _resolve_teardown_executor(
+    executor_name: str,
+    cluster: "str | ClusterDefinition | None",
+    hosts: list[str],
+    sctx: "SparkrunContext | None",
+):
+    """Build the :class:`Executor` that tears down *executor_name*'s workloads.
+
+    Resolved through the same chain the status sweep used
+    (``resolve_executor`` with the name as a CLI-level override), so the
+    executor's config matches the one that reported the workload — that
+    matters for substrates whose teardown depends on it, e.g. the ``local``
+    executor's ``pid_dir``, which is where the pidfile it must signal lives.
+
+    Returns ``None`` — meaning "let the primitive use its default" — for an
+    unattributed group or when resolution fails.  A teardown that can't
+    identify its substrate should still attempt the historical one rather than
+    skip the host entirely.
+    """
+    from sparkrun.orchestration.executor import resolve_executor
+
+    if not executor_name:
+        return None
+    try:
+        from sparkrun.api._resolve import resolve_cluster
+
+        cluster_def = resolve_cluster(cluster, hosts, sctx=sctx)
+        return resolve_executor(
+            cluster=cluster_def,
+            cli_overrides={"executor": executor_name},
+            rootless=False,
+            auto_user=False,
+            config=sctx.config if sctx is not None else None,
+            v=sctx.variables if sctx is not None else None,
+        )
+    except Exception:
+        logger.warning(
+            "Could not resolve executor %r for teardown; falling back to the default executor",
+            executor_name,
+            exc_info=True,
+        )
+        return None
 
 
 def _forget_job(cluster_id: str, cache_dir: str | None) -> None:

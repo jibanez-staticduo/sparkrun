@@ -518,6 +518,32 @@ class DockerExecutor(Executor):
         filter_arg = quote("name=^%s$" % container_name)
         return "[ -n \"$(docker ps --filter %s --format '{{.ID}}')\" ]" % filter_arg
 
+    def exists_cmd(self, container_name: str) -> str:
+        """Exit 0 iff the container is present — **running or exited**.
+
+        Diverges from :meth:`status_cmd` (``docker ps``) because a container
+        that exited without ``--rm`` still occupies its name and must still be
+        removed by teardown.
+        """
+        filter_arg = quote("name=^%s$" % container_name)
+        return "[ -n \"$(docker ps -a --filter %s --format '{{.ID}}')\" ]" % filter_arg
+
+    def teardown_script(self, container_names: list[str] | tuple[str, ...]) -> str:
+        """Remove *container_names* via docker, verifying the daemon answered.
+
+        Overrides the ABC's generic composition because Docker's substrate can
+        be *unavailable* rather than merely empty: a stopped daemon, a
+        permission error or an absent binary makes every ``exists_cmd`` probe
+        report "not present", which the generic verification would read as a
+        successful teardown.  :func:`~sparkrun.orchestration.docker.docker_teardown_script`
+        checks that ``docker ps`` itself succeeded and fails the teardown when
+        it did not.  It also does the census in one call instead of one per
+        candidate name.
+        """
+        from sparkrun.orchestration.docker import docker_teardown_script
+
+        return docker_teardown_script(list(container_names))
+
     def inspect_exists_cmd(self, image: str) -> str:
         """Generate a command to check if a docker image exists locally."""
         return "docker image inspect %s >/dev/null 2>&1" % quote(image)
