@@ -28,6 +28,7 @@ def setup(ctx):
 # ---------------------------------------------------------------------------
 
 from . import _commands as _commands  # noqa: E402, F401  — registers @setup.command() decorators
+from . import _fe_update as _fe_update  # noqa: E402, F401  — registers @setup.command("fe-system-update")
 from . import _gpu_clock as _gpu_clock  # noqa: E402, F401  — registers @setup.command("throttle-gpu-clock")
 from . import _k8s as _k8s  # noqa: E402, F401  — registers @setup.group("k8s")
 from . import _tailscale as _tailscale  # noqa: E402, F401  — registers @setup.group("tailscale")
