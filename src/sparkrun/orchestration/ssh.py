@@ -864,27 +864,30 @@ def verify_host_paths(
 def run_remote_sudo_script(
     host: str,
     script: str,
-    password: str,
+    password: str | None,
     ssh_user: str | None = None,
     ssh_key: str | None = None,
     ssh_options: list[str] | None = None,
     timeout: int = 60,
     dry_run: bool = False,
 ) -> RemoteResult:
-    """Execute a script on a remote host via ``sudo -S bash -s``.
+    """Execute a script on a remote host as root via SSH.
 
-    Prepends the sudo password to stdin so ``sudo -S`` can read it,
-    then the remaining stdin is consumed by ``bash -s`` as the script.
+    With a *password*, uses ``sudo -S bash -s`` and prepends the password to
+    stdin so ``sudo -S`` can read it; the remaining stdin is consumed by
+    ``bash -s`` as the script.  With ``password=None`` — which is what the
+    sudo helpers return once NOPASSWD is confirmed on every host — uses
+    ``sudo -n bash -s`` and feeds only the script, mirroring
+    :func:`sparkrun.orchestration.sudo._run_local_sudo_script`.
 
-    Only use this for hosts that do NOT have passwordless sudo.
-    For NOPASSWD hosts, use :func:`run_remote_script` instead — ``sudo -S``
-    on a NOPASSWD host would leave the password line in stdin for bash
-    to misinterpret as a command.
+    The password branch must not be used on a NOPASSWD host: ``sudo -S``
+    would not consume the password line, leaving it in stdin for bash to
+    misinterpret as a command.
 
     Args:
         host: Remote hostname or IP.
         script: Bash script content to execute.
-        password: Sudo password for the remote user.
+        password: Sudo password for the remote user, or None for NOPASSWD.
         ssh_user: Optional SSH username.
         ssh_key: Optional path to SSH private key.
         ssh_options: Additional SSH options.
@@ -899,8 +902,12 @@ def run_remote_sudo_script(
         return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
 
     cmd = build_ssh_cmd(host, ssh_user=ssh_user, ssh_key=ssh_key, ssh_options=ssh_options)
-    cmd.extend(["sudo", "-S", "bash", "-s"])
-    full_input = password + "\n" + script
+    if password is None:
+        cmd.extend(["sudo", "-n", "bash", "-s"])
+        full_input = script
+    else:
+        cmd.extend(["sudo", "-S", "bash", "-s"])
+        full_input = password + "\n" + script
 
     logger.debug("  SSH sudo script -> %s (%d bytes)", host, len(script))
 

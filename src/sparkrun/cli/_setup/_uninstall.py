@@ -336,7 +336,7 @@ def setup_uninstall(ctx, cluster_name, yes, dry_run, keep_cluster, phases, force
 
     def _sudo_on_host(host, script, timeout=300):
         pw = _ensure_sudo_password()
-        return run_sudo_script_on_host(host, script, pw or "", ssh_kwargs=ssh_kwargs, timeout=timeout, dry_run=dry_run)
+        return run_sudo_script_on_host(host, script, pw, ssh_kwargs=ssh_kwargs, timeout=timeout, dry_run=dry_run)
 
     # ── Filter phases ────────────────────────────────────────────
     phase_filter = set(phases) if phases else None
