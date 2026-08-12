@@ -8,13 +8,21 @@ since its reboot takes the CLI down with it.
 
 from __future__ import annotations
 
+import re
 import threading
+import time
 
 from unittest import mock
 
 from click.testing import CliRunner
 
-from sparkrun.cli._setup._fe_update import _FE_UPDATE_STEPS, setup_fe_system_update
+from sparkrun.cli._setup._fe_update import (
+    _FE_UPDATE_STEPS,
+    _Heartbeat,
+    _elapsed,
+    _summarize,
+    setup_fe_system_update,
+)
 from sparkrun.orchestration.ssh import RemoteResult
 
 _STEP_CMDS = [cmd for _desc, cmd in _FE_UPDATE_STEPS]
@@ -33,7 +41,7 @@ def _kind(script: str) -> str:
     return _REBOOT
 
 
-def _run(hosts, *, local_hosts=(), fail=(), password=None, input="y\ny\n", barrier=None):
+def _run(hosts, *, local_hosts=(), fail=(), password=None, input="y\ny\n", barrier=None, stdout="done", stderr=None):
     """Invoke the command with sudo/SSH mocked, recording the dispatch order.
 
     *local_hosts* are the labels :func:`is_local_host` should accept — i.e. the
@@ -56,7 +64,12 @@ def _run(hosts, *, local_hosts=(), fail=(), password=None, input="y\ny\n", barri
             events.append((kind, host))
             assert pw == password, "password %r reached the dispatch" % (pw,)
         rc = 1 if host in fail else 0
-        return RemoteResult(host=host, returncode=rc, stdout="done", stderr="boom" if rc else "")
+        return RemoteResult(
+            host=host,
+            returncode=rc,
+            stdout=stdout,
+            stderr=(stderr if stderr is not None else ("boom" if rc else "")),
+        )
 
     with (
         mock.patch(
@@ -217,3 +230,111 @@ def test_dry_run_reboots_nothing_and_names_the_order():
     assert "me-box is this machine" in r.output
     assert "updated and rebooted last" in r.output
     assert "[dry-run] Would reboot: h1, me-box" in r.output
+
+
+# ---------------------------------------------------------------------------
+# Feedback
+# ---------------------------------------------------------------------------
+
+
+def test_step_announces_its_command_and_targets_before_running():
+    """The operator sees what is about to run, and where, before the wait."""
+    r, _events, _ = _run(["h1", "h2"])
+    assert r.exit_code == 0, r.output
+
+    for idx, (desc, cmd) in enumerate(_FE_UPDATE_STEPS, start=1):
+        assert "[%d/%d] %s" % (idx, len(_FE_UPDATE_STEPS), desc) in r.output
+        assert "  $ %s" % cmd in r.output
+    assert "dispatched to 2 host(s): h1, h2" in r.output
+
+
+def test_summary_table_and_total_elapsed():
+    r, _events, _ = _run(["h1", "me-box"], local_hosts=("me-box",))
+    assert r.exit_code == 0, r.output
+
+    assert re.search(r"Results \(\d+[ms]", r.output)
+    assert re.search(r"h1 +updated$", r.output, re.M)
+    assert re.search(r"me-box +updated \(this machine\)$", r.output, re.M)
+    assert "2 host(s) updated successfully." in r.output
+
+
+def test_failure_shows_both_streams():
+    """apt reports plenty of real failures on stdout, so stderr alone isn't enough."""
+    r, _events, _ = _run(
+        ["h1"],
+        fail=("h1",),
+        stdout="E: Could not get lock /var/lib/dpkg/lock-frontend",
+        stderr="",
+        input="y\n",
+    )
+    assert r.exit_code == 1, r.output
+    assert "stdout | E: Could not get lock" in r.output
+
+
+def test_summarize_prefers_the_verdict_over_the_tail():
+    """`apt update` ends on a line that says nothing; the count is further up."""
+    apt_update = (
+        "Hit:1 http://ports.ubuntu.com noble InRelease\n"
+        "Reading package lists...\n"
+        "37 packages can be upgraded. Run 'apt list --upgradable' to see them.\n"
+        "Building dependency tree...\n"
+        "Reading state information...\n"
+    )
+    assert _summarize(apt_update) == "37 packages can be upgraded. Run 'apt list --upgradable' to see them."
+
+    dist_upgrade = (
+        "Setting up linux-firmware ...\n12 upgraded, 3 newly installed, 0 to remove and 0 not upgraded.\nProcessing triggers ...\n"
+    )
+    assert _summarize(dist_upgrade) == "12 upgraded, 3 newly installed, 0 to remove and 0 not upgraded."
+
+
+def test_summarize_falls_back_to_the_last_line():
+    assert _summarize("something unrecognized\nand a final word\n") == "and a final word"
+    assert _summarize("   \n\n") == ""
+
+
+def test_elapsed_rendering():
+    assert _elapsed(0) == "0s"
+    assert _elapsed(45.7) == "45s"
+    assert _elapsed(60) == "1m00s"
+    assert _elapsed(192) == "3m12s"
+
+
+def test_heartbeat_names_outstanding_hosts_until_they_finish():
+    """A step that produces nothing for minutes must still say it is alive."""
+    lock = threading.Lock()
+    runner = CliRunner()
+    with runner.isolation() as (out, _err, _):
+        with _Heartbeat(["h1", "h2", "h3"], lock, interval=0.01) as beat:
+            time.sleep(0.05)
+            beat.done("h1")
+            time.sleep(0.05)
+        text = out.getvalue().decode()
+
+    assert "still running" in text
+    lines = [ln for ln in text.splitlines() if "still running" in ln]
+    # Once h1 reports, it drops out of the outstanding list.
+    assert any("1/3 done" in ln and "h1" not in ln for ln in lines)
+    assert all("h2" in ln and "h3" in ln for ln in lines)
+
+
+def test_heartbeat_stops_and_stays_silent_when_disabled():
+    lock = threading.Lock()
+    runner = CliRunner()
+    with runner.isolation() as (out, _err, _):
+        with _Heartbeat(["h1"], lock, enabled=False, interval=0.01):
+            time.sleep(0.05)
+        assert out.getvalue() == b""
+
+
+def test_heartbeat_truncates_a_wide_cluster():
+    lock = threading.Lock()
+    runner = CliRunner()
+    hosts = ["h%d" % i for i in range(8)]
+    with runner.isolation() as (out, _err, _):
+        with _Heartbeat(hosts, lock, interval=0.01):
+            time.sleep(0.05)
+        text = out.getvalue().decode()
+
+    assert "+4 more" in text
+    assert "0/8 done" in text

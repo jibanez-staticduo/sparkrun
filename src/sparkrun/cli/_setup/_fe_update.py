@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import socket
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -30,6 +32,107 @@ _REBOOT_TIMEOUT_S = 10
 
 #: Backgrounded so the SSH call returns before the host goes away.
 _REBOOT_SCRIPT = "nohup bash -c 'sleep 2 && reboot' &>/dev/null &"
+
+#: How often a step that is still running says so.  apt and fwupdmgr are
+#: captured, not streamed, so without this a `dist-upgrade` looks identical to
+#: a hung SSH for minutes at a time.
+_HEARTBEAT_S = 15
+
+#: Lines worth surfacing from a step's output, most specific first.  Matched
+#: against the whole of stdout rather than keyed to a step index, so reordering
+#: or adding a step doesn't silently mislabel the summary.
+_SUMMARY_PATTERNS = (
+    r"^\d+ upgraded, \d+ newly installed.*",
+    r"^\d+ packages can be upgraded.*",
+    r"^All packages are up to date.*",
+    r"^Successfully installed firmware.*",
+    r"^No updatable devices.*",
+    r"^Devices with no available firmware updates.*",
+    r"^Successfully downloaded new metadata.*",
+    r"^Metadata is up to date.*",
+)
+
+
+def _summarize(output: str) -> str:
+    """Pick the one line from *output* that tells the operator what happened.
+
+    apt and fwupdmgr both bury their verdict in a wall of progress noise, and
+    the tail is usually the least informative part of it — `apt update` ends on
+    a "Reading state information" line while the count of upgradable packages
+    sits several lines above.  Falls back to the last non-empty line.
+    """
+    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
+    if not lines:
+        return ""
+    for pattern in _SUMMARY_PATTERNS:
+        for line in lines:
+            if re.match(pattern, line):
+                return line
+    return lines[-1]
+
+
+def _elapsed(seconds: float) -> str:
+    """Render a duration the way an operator reads it: `45s`, `3m12s`."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return "%ds" % seconds
+    return "%dm%02ds" % divmod(seconds, 60)
+
+
+class _Heartbeat:
+    """Report the hosts a step is still waiting on, every :data:`_HEARTBEAT_S`.
+
+    Plain appended lines rather than a redrawn status line: this output is
+    routinely piped to a file or a CI log, and it interleaves with completion
+    lines printed from the main thread, so a carriage-return redraw would be
+    both fragile and unreadable after the fact.
+
+    Shares the caller's print lock so a heartbeat can't land in the middle of
+    a completion block.
+    """
+
+    def __init__(self, hosts, lock: threading.Lock, *, enabled: bool = True, interval: float | None = None):
+        self._pending = set(hosts)
+        self._total = len(self._pending)
+        self._lock = lock
+        # Resolved at call time, not bound as a default: a default argument
+        # freezes the module constant at import and silently ignores anyone
+        # who reassigns it.
+        self._interval = _HEARTBEAT_S if interval is None else interval
+        self._enabled = enabled and self._total > 0
+        self._stop = threading.Event()
+        self._t0 = time.monotonic()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> _Heartbeat:
+        if self._enabled:
+            # Daemon: an interrupt must not be held up by the ticker.
+            self._thread = threading.Thread(target=self._tick, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def done(self, host: str) -> None:
+        with self._lock:
+            self._pending.discard(host)
+
+    def _tick(self) -> None:
+        while not self._stop.wait(self._interval):
+            with self._lock:
+                if not self._pending:
+                    return
+                waiting = sorted(self._pending)
+                shown = ", ".join(waiting[:4])
+                if len(waiting) > 4:
+                    shown += ", +%d more" % (len(waiting) - 4)
+                click.echo(
+                    "  ... %s elapsed — %d/%d done, still running: %s"
+                    % (_elapsed(time.monotonic() - self._t0), self._total - len(waiting), self._total, shown)
+                )
 
 
 def _partition_control_node(host_list: list[str]) -> tuple[list[str], list[str]]:
@@ -104,14 +207,19 @@ def _run_on_hosts(
 def _report(result, elapsed: float) -> bool:
     """Print one host's outcome; return True when it succeeded."""
     if result.success:
-        click.echo("  %-30s OK   (%.0fs)" % (result.host, elapsed))
-        if result.stdout.strip():
-            for line in result.stdout.strip().splitlines()[-3:]:
-                click.echo("    %s" % line)
+        click.echo("  %-24s OK      %6s   %s" % (result.host, _elapsed(elapsed), _summarize(result.stdout)))
         return True
-    click.echo("  %-30s FAILED (%.0fs)" % (result.host, elapsed))
-    if result.stderr.strip():
-        click.echo("    %s" % result.stderr.strip()[:200], err=True)
+
+    click.echo("  %-24s FAILED  %6s   rc=%d" % (result.host, _elapsed(elapsed), result.returncode))
+    # Both streams, and more of them than the old 200-char stderr slice: apt
+    # reports plenty of real failures (a held lock, an unreachable mirror) on
+    # stdout, so truncating to stderr alone routinely showed nothing at all.
+    for label, stream in (("stderr", result.stderr), ("stdout", result.stdout)):
+        text = stream.strip()
+        if not text:
+            continue
+        for line in text.splitlines()[-5:]:
+            click.echo("    %s | %s" % (label, line[:300]), err=True)
     return False
 
 
@@ -137,34 +245,40 @@ def _run_update_steps(
     A host that fails one step is dropped from the rest.
     """
     failed: set[str] = set()
+    lock = threading.Lock()
 
     for idx, (desc, cmd) in enumerate(_FE_UPDATE_STEPS, start=1):
         active = [h for h in hosts if h not in failed]
         if not active:
             click.echo()
-            click.echo("All hosts failed — skipping remaining steps.")
+            click.echo("All hosts failed — skipping remaining steps %d-%d." % (idx, len(_FE_UPDATE_STEPS)))
             break
 
         click.echo()
         click.echo("[%d/%d] %s%s" % (idx, len(_FE_UPDATE_STEPS), desc, label))
-        click.echo("  running on %d host(s), longest first out..." % len(active))
+        click.echo("  $ %s" % cmd)
+        click.echo("  dispatched to %d host(s): %s" % (len(active), ", ".join(active)))
 
         ok = 0
-        for result, elapsed in _run_on_hosts(
-            active,
-            cmd,
-            password=password,
-            ssh_kwargs=ssh_kwargs,
-            timeout=_STEP_TIMEOUT_S,
-            dry_run=dry_run,
-            max_workers=max_workers,
-        ):
-            if _report(result, elapsed):
-                ok += 1
-            else:
-                failed.add(result.host)
+        step_t0 = time.monotonic()
+        with _Heartbeat(active, lock, enabled=not dry_run) as beat:
+            for result, elapsed in _run_on_hosts(
+                active,
+                cmd,
+                password=password,
+                ssh_kwargs=ssh_kwargs,
+                timeout=_STEP_TIMEOUT_S,
+                dry_run=dry_run,
+                max_workers=max_workers,
+            ):
+                beat.done(result.host)
+                with lock:
+                    if _report(result, elapsed):
+                        ok += 1
+                    else:
+                        failed.add(result.host)
 
-        click.echo("  %d/%d OK" % (ok, len(active)))
+        click.echo("  %d/%d OK in %s" % (ok, len(active), _elapsed(time.monotonic() - step_t0)))
 
     return failed
 
@@ -187,7 +301,7 @@ def _reboot_hosts(
         dry_run=dry_run,
         max_workers=max_workers,
     ):
-        click.echo("  %-30s %s" % (result.host, "rebooting" if result.success else "reboot FAILED"))
+        click.echo("  %-24s %s" % (result.host, "rebooting" if result.success else "reboot FAILED"))
 
 
 @setup.command("fe-system-update", hidden=True)
@@ -317,6 +431,7 @@ def setup_fe_system_update(ctx, hosts, hosts_file, cluster_name, user, dry_run):
     max_workers = resolve_parallel_cap(len(remote_hosts) or 1, config.max_parallel_ssh)
 
     # --- Step 4: Update the remote hosts, then this machine ---
+    run_t0 = time.monotonic()
     failed_hosts: set[str] = set()
     if remote_hosts:
         failed_hosts |= _run_update_steps(
@@ -325,7 +440,9 @@ def setup_fe_system_update(ctx, hosts, hosts_file, cluster_name, user, dry_run):
             ssh_kwargs=sudo_ssh_kwargs,
             dry_run=dry_run,
             max_workers=max_workers,
-            label=" — %d cluster host(s)" % len(remote_hosts) if control_node else "",
+            # No host count here — it goes stale the moment one drops out,
+            # and the dispatch line below already carries the live one.
+            label=" — cluster hosts" if control_node else "",
         )
 
     if control_node:
@@ -375,10 +492,17 @@ def setup_fe_system_update(ctx, hosts, hosts_file, cluster_name, user, dry_run):
 
     # --- Summary ---
     click.echo()
+    click.echo("Results (%s total)" % _elapsed(time.monotonic() - run_t0))
+    click.echo("-" * 40)
+    for h in ordered_hosts:
+        note = " (this machine)" if h == control_node else ""
+        click.echo("  %-24s %s%s" % (h, "FAILED" if h in failed_hosts else "updated", note))
+
     ok = len([h for h in ordered_hosts if h not in failed_hosts])
     fail = len(failed_hosts)
+    click.echo()
     if fail:
-        click.echo("Results: %d updated, %d failed (%s)" % (ok, fail, ", ".join(sorted(failed_hosts))))
+        click.echo("%d updated, %d failed (%s)" % (ok, fail, ", ".join(sorted(failed_hosts))))
         sys.exit(1)
     else:
-        click.echo("Results: %d host(s) updated successfully." % ok)
+        click.echo("%d host(s) updated successfully." % ok)
