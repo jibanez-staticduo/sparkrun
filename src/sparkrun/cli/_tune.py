@@ -20,6 +20,30 @@ from ._common import (
 logger = logging.getLogger(__name__)
 
 
+def _require_runtime_family(recipe, v, family: str, requirement: str):
+    """Resolve *recipe*'s runtime plugin, requiring it to be in *family*.
+
+    Matching on the runtime family rather than a hardcoded name list means a
+    new variant — ``vllm-ray``, ``eugr-vllm``, or an out-of-tree one — is
+    tunable without editing this module.  An unregistered runtime is, by
+    definition, not in the family, so it gets the same message as a wrong
+    one rather than a traceback out of ``get_runtime``.
+
+    Exits with an error message when the recipe doesn't qualify.
+    """
+    from sparkrun.core.bootstrap import get_runtime
+
+    try:
+        runtime = get_runtime(recipe.runtime, v)
+    except ValueError:
+        runtime = None
+
+    if runtime is None or runtime.get_family() != family:
+        click.echo("Error: %s (got runtime=%r)" % (requirement, recipe.runtime), err=True)
+        sys.exit(1)
+    return runtime
+
+
 @click.group()
 @click.pass_context
 def tune(ctx):
@@ -76,7 +100,6 @@ def tune_sglang(
       sparkrun tune sglang qwen3.5-35b-bf16-sglang -H myhost --tp 1 --tp 2 --tp 4
       sparkrun tune sglang qwen3.5-35b-bf16-sglang -H myhost --parallel 2
     """
-    from sparkrun.core.bootstrap import get_runtime
     from sparkrun.tuning.sglang import SglangTuner, DEFAULT_TP_SIZES
 
     sctx = _get_context(ctx)
@@ -85,16 +108,9 @@ def tune_sglang(
 
     recipe, _recipe_path, _registry_mgr = _load_recipe(config, recipe_name)
 
-    # Validate runtime is sglang
-    if recipe.runtime != "sglang":
-        click.echo(
-            "Error: tune sglang requires an SGLang recipe (got runtime=%r)" % recipe.runtime,
-            err=True,
-        )
-        sys.exit(1)
+    runtime = _require_runtime_family(recipe, v, "sglang", "tune sglang requires an SGLang recipe")
 
     # Resolve container image
-    runtime = get_runtime(recipe.runtime, v)
     container_image = image or runtime.resolve_container(recipe)
 
     # host_list injected by @with_host_context; only use the first host
@@ -134,9 +150,6 @@ def tune_sglang(
 
     rc = tuner.run_tuning(tp_sizes=effective_tp, parallel=parallel)
     sys.exit(rc)
-
-
-VLLM_RUNTIMES = {"vllm-ray", "vllm-distributed", "eugr-vllm"}
 
 
 @tune.command("vllm")
@@ -207,7 +220,6 @@ def tune_vllm(
       sparkrun tune vllm qwen3-moe-vllm -H myhost --tp 1 --tp 2 --tp 4
       sparkrun tune vllm qwen3-moe-vllm -H myhost --parallel 2
     """
-    from sparkrun.core.bootstrap import get_runtime
     from sparkrun.tuning.vllm import VllmTuner, DEFAULT_TP_SIZES
 
     sctx = _get_context(ctx)
@@ -216,16 +228,9 @@ def tune_vllm(
 
     recipe, _recipe_path, _registry_mgr = _load_recipe(config, recipe_name)
 
-    # Validate runtime is a vLLM variant
-    if recipe.runtime not in VLLM_RUNTIMES:
-        click.echo(
-            "Error: tune vllm requires a vLLM recipe (got runtime=%r)" % recipe.runtime,
-            err=True,
-        )
-        sys.exit(1)
+    runtime = _require_runtime_family(recipe, v, "vllm", "tune vllm requires a vLLM recipe")
 
     # Resolve container image
-    runtime = get_runtime(recipe.runtime, v)
     container_image = image or runtime.resolve_container(recipe)
 
     # host_list injected by @with_host_context; only use the first host
