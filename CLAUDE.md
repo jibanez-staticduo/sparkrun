@@ -62,6 +62,7 @@ src/sparkrun/
 ├── tuning/             # Triton fused MoE kernel tuning for SGLang and vLLM
 ├── builders/           # Container image builder plugins (docker-pull, eugr)
 ├── diagnostics/        # Host and run diagnostic collection (NDJSON output)
+├── plugins/            # In-tree cross-cutting integrations
 ├── proxy/              # Inference gateway (LiteLLM engine + gateway selection seam)
 ├── benchmarking/       # Benchmark framework plugins and result export (llama-benchy)
 ├── utils/              # Shared helpers (coerce_value, suppress_noisy_loggers, etc.)
@@ -171,6 +172,48 @@ can target a family without enumerating variants; exact name wins over family.
 Today DGX Spark uses this for `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 on vllm/sglang and `gpu_access_mode: gpus` (classic `--gpus` rather than CDI,
 whose `/etc/cdi/nvidia.yaml` goes stale across driver upgrades).
+
+### In-Tree Plugins (`plugins/` + `core/in_tree_plugins.py`)
+
+`sparkrun.plugins` is the **mate of the out-of-tree plugin system**: same
+registration path (`external_plugins.load_plugin_module` — SAF subclass scan,
+then the `register(v)` hook), different source. A first-party integration
+therefore has no capability an external one lacks.
+
+It is for **cross-cutting integrations only** — things that span several
+extension points and are only coherent as one removable unit: an integration
+contributing a backend implementation, a hidden CLI command and the wire
+protocol that backend calls back through, none of which is "a runtime" or "an
+executor" on its own. Packages that map cleanly onto one extension point
+(`runtimes`, `transports`, `executors`, `schedulers`, `builders`,
+`benchmarking`) stay where they are with their own `find_types_in_modules` scan
+in `core/bootstrap.py`.
+
+**Every in-tree plugin is gated by a feature flag** — the same reason
+`executor.docker` and `gateway.litellm` carry one despite shipping on. The flag
+is checked *before* the import, so turning a plugin off costs nothing at all:
+no import, no commands, no registrations. It is the plugin's **own** flag, not
+a separate presence flag — a dual-flag scheme was considered and rejected as
+incoherent (no point loading a plugin whose capability won't be used, and none
+in enabling that capability without the plugin).
+
+The binding lives in `in_tree_plugins.IN_TREE_PLUGIN_FEATURES` (data, not a
+plugin attribute) because the flag must resolve *without importing* the module
+it gates. A plugin missing an entry or a registered flag is skipped loudly,
+since unknown flags fail closed and the silent version would put the symptom
+far from its cause.
+
+One consequence worth knowing: `PluggableGroup` attaches plugin commands once
+per process, so the gate is effectively read once per CLI invocation (the test
+suite resets `_cli_ext_loaded`).
+
+**Layering trap.** `init_sparkrun` runs on the console-free `sparkrun.api` path,
+and plugin scanning imports *every* submodule of a plugin package. So the CLI
+registry lives in `core/cli_registry.py` (Click-free; `cli/ext.py` re-exports it
+and owns attachment), and a plugin registers a **loader** that *builds* its
+command with `import click` inside the function. Registering lazily is not
+enough on its own. `test_api_sctx_threading.py::test_sctx_layer_does_not_import_click`
+guards this.
 
 ### External Plugins (`core/external_plugins.py`)
 

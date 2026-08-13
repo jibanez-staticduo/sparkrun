@@ -155,6 +155,16 @@ def init_sparkrun(v: Variables | None = None, log_level: str = "WARNING") -> Var
 
     # External (out-of-tree) plugins from user-configured ``plugins.paths``.
     # No-op unless configured; never allowed to break startup.
+    # First-party cross-cutting integrations shipped in the wheel, then any
+    # out-of-tree plugins.  In-tree first so an external plugin can override or
+    # extend what one of them registered.
+    from sparkrun.core.in_tree_plugins import load_in_tree_plugins
+
+    try:
+        load_in_tree_plugins(v)
+    except Exception:  # noqa: BLE001 - a broken integration must not kill the CLI
+        logger.exception("In-tree plugin loading failed")
+
     from sparkrun.core.external_plugins import load_external_plugins
 
     try:
