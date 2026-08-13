@@ -6,8 +6,10 @@ from unittest.mock import MagicMock, patch
 from sparkrun.orchestration.ssh import (
     build_ssh_cmd,
     RemoteResult,
+    TIMEOUT_RETURNCODE,
     run_remote_script,
     run_remote_command,
+    run_remote_script_streaming,
     run_remote_scripts_parallel,
     run_remote_sudo_script,
     detect_sudo_on_hosts,
@@ -46,6 +48,71 @@ def test_build_ssh_cmd_with_options():
 
     assert "-v" in cmd
     assert "StrictHostKeyChecking=no" in cmd
+
+
+def test_build_ssh_cmd_keepalive_off_by_default():
+    """Short probes must not change shape — keepalive is opt-in."""
+    cmd = build_ssh_cmd("192.168.1.100")
+
+    assert not any(part.startswith("ServerAlive") for part in cmd)
+
+
+def test_build_ssh_cmd_with_keepalive():
+    """Long-lived sessions get ServerAlive probes so a dead link fails fast."""
+    cmd = build_ssh_cmd("192.168.1.100", keepalive=True)
+
+    assert "ServerAliveInterval=30" in cmd
+    assert "ServerAliveCountMax=6" in cmd
+
+
+def test_build_ssh_cmd_keepalive_overridable_by_caller_options():
+    """A caller's explicit ServerAlive* is appended after ours, so it wins."""
+    cmd = build_ssh_cmd(
+        "192.168.1.100",
+        ssh_options=["-o", "ServerAliveInterval=5"],
+        keepalive=True,
+    )
+
+    assert cmd.index("ServerAliveInterval=5") > cmd.index("ServerAliveInterval=30")
+
+
+@patch("sparkrun.orchestration.ssh.subprocess.run")
+def test_streaming_does_not_capture_by_default(mock_run):
+    """The streaming path must leave stdout/stderr attached to the terminal.
+
+    This is the whole point of the call: a capturing run shows the operator
+    nothing until a multi-hour payload finishes.
+    """
+    mock_run.return_value = MagicMock(returncode=0, stdout=None, stderr=None)
+
+    result = run_remote_script_streaming("192.168.1.100", "echo hi", timeout=60)
+
+    assert result.success
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs.get("capture_output") is not True
+    assert kwargs["stdout"] is None and kwargs["stderr"] is None
+
+
+@patch("sparkrun.orchestration.ssh.subprocess.run")
+def test_streaming_quiet_decodes_captured_bytes(mock_run):
+    """Captured output is bytes on this path; callers must still get str."""
+    mock_run.return_value = MagicMock(returncode=1, stdout=b"out\n", stderr=b"err\n")
+
+    result = run_remote_script_streaming("192.168.1.100", "false", quiet=True)
+
+    assert result.stdout == "out\n"
+    assert result.stderr == "err\n"
+
+
+@patch("sparkrun.orchestration.ssh.subprocess.run")
+def test_streaming_timeout_reports_124(mock_run):
+    mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ssh"], timeout=7, output=b"partial\n")
+
+    result = run_remote_script_streaming("192.168.1.100", "sleep 100", timeout=7)
+
+    assert result.returncode == TIMEOUT_RETURNCODE
+    assert "partial" in result.stdout
+    assert "timed out after 7s" in result.stderr
 
 
 def test_remote_result_success():
@@ -214,8 +281,33 @@ def test_run_remote_script_timeout(mock_run):
     result = run_remote_script("192.168.1.100", "sleep 100", timeout=10)
 
     assert not result.success
-    assert result.returncode == -1
+    # 124, like timeout(1) — distinguishable from the -1 used for "never ran",
+    # and it survives sys.exit() (which renders a negative rc as 255).
+    assert result.returncode == TIMEOUT_RETURNCODE
     assert "timed out" in result.stderr.lower()
+
+
+@patch("sparkrun.orchestration.ssh.subprocess.run")
+def test_run_remote_script_timeout_preserves_partial_output(mock_run):
+    """A killed payload's partial output must survive the timeout.
+
+    Multi-hour payloads (kernel tuning) produce everything the operator needs
+    to diagnose an overrun *before* being killed; dropping it left them with
+    nothing but "timed out".
+    """
+    mock_run.side_effect = subprocess.TimeoutExpired(
+        cmd=["ssh"],
+        timeout=10,
+        output=b"tuning TP=1: 63%\n",
+        stderr=b"warning: slow\n",
+    )
+
+    result = run_remote_script("192.168.1.100", "sleep 100", timeout=10)
+
+    assert result.returncode == TIMEOUT_RETURNCODE
+    assert "tuning TP=1: 63%" in result.stdout
+    assert "warning: slow" in result.stderr
+    assert "timed out after 10s" in result.stderr
 
 
 @patch("sparkrun.orchestration.ssh.subprocess.run")
@@ -327,7 +419,7 @@ def test_run_remote_sudo_script_timeout(mock_run):
     )
 
     assert not result.success
-    assert result.returncode == -1
+    assert result.returncode == TIMEOUT_RETURNCODE
     assert "timed out" in result.stderr.lower()
 
 
@@ -555,8 +647,8 @@ def test_parallel_hung_host_hits_timeout(mock_run):
     hosts = ["h1", "h2", "h3"]
     results = run_remote_scripts_parallel(hosts, "sleep 100", timeout=5)
     assert len(results) == 3
-    # Exactly one host timed out (rc=-1), the rest succeeded.
-    timed_out = [r for r in results if r.returncode == -1]
+    # Exactly one host timed out, the rest succeeded.
+    timed_out = [r for r in results if r.returncode == TIMEOUT_RETURNCODE]
     assert len(timed_out) == 1
     assert "timed out" in timed_out[0].stderr.lower()
 

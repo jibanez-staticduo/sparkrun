@@ -44,6 +44,23 @@ DEFAULT_MAX_PARALLEL_SSH = 20
 HEAD_DISTRIBUTE_MAX_PARALLEL = 4
 
 
+# Exit code reported when a call is killed by its own wall-clock timeout.
+# Matches ``timeout(1)`` (and the local-dispatch path, which has always used
+# it), so a timeout is distinguishable from the ``-1`` used for "the subprocess
+# never ran" and survives ``sys.exit(rc)`` — which renders a negative code as
+# 255 and loses the distinction entirely.
+TIMEOUT_RETURNCODE = 124
+
+# Keepalive probes for long-lived SSH sessions (opt-in via ``keepalive=True``).
+# A multi-hour session that goes quiet — a kernel-tuning sweep, a large model
+# download — is dropped by NAT/VPN idle timers with no notice to either end;
+# without probes the client then blocks until the caller's wall-clock timeout,
+# so a link that died in minute 3 surfaces as a timeout hours later.  At these
+# values a dead link is reported in ~3 minutes.
+DEFAULT_KEEPALIVE_INTERVAL = 30
+DEFAULT_KEEPALIVE_COUNT_MAX = 6
+
+
 # Env kill-switch for the remote session guard (see
 # :func:`wrap_with_session_guard`).  The guard relies on ``ps`` and on sshd
 # exiting when the client goes away; set this to opt out on a host where that
@@ -161,7 +178,12 @@ def should_run_locally(host: str, ssh_user: str | None = None) -> bool:
     return ssh_user == os.environ.get("USER", "root")
 
 
-def run_local_script(script: str, dry_run: bool = False, timeout: int | None = None) -> RemoteResult:
+def run_local_script(
+    script: str,
+    dry_run: bool = False,
+    timeout: int | None = None,
+    stream: bool = False,
+) -> RemoteResult:
     """Execute a script locally via subprocess.
 
     Args:
@@ -171,6 +193,10 @@ def run_local_script(script: str, dry_run: bool = False, timeout: int | None = N
             ``timeout``: a local dispatch must not be able to hang a
             caller (status polling, teardown) that bounded the remote
             path.  A timeout is reported as rc 124, like ``timeout(1)``.
+        stream: Connect stdout/stderr to this process's terminal instead of
+            capturing them, so a long payload's output appears as it is
+            produced.  The returned ``stdout``/``stderr`` are empty — the
+            local peer of :func:`run_remote_script_streaming`.
 
     Returns:
         RemoteResult with host set to ``"localhost"``.
@@ -184,7 +210,7 @@ def run_local_script(script: str, dry_run: bool = False, timeout: int | None = N
         proc = subprocess.run(
             ["bash", "-s"],
             input=script,
-            capture_output=True,
+            capture_output=not stream,
             text=True,
             timeout=timeout,
         )
@@ -192,15 +218,15 @@ def run_local_script(script: str, dry_run: bool = False, timeout: int | None = N
         logger.warning("Local execution timed out after %ss", timeout)
         return RemoteResult(
             host="localhost",
-            returncode=124,
+            returncode=TIMEOUT_RETURNCODE,
             stdout=_decode(e.stdout),
             stderr=(_decode(e.stderr) + ("\n" if e.stderr else "")) + "local execution timed out after %ss" % timeout,
         )
     return RemoteResult(
         host="localhost",
         returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
     )
 
 
@@ -279,10 +305,23 @@ def _run_subprocess(
                 result.stderr.strip()[:200],
             )
         return result
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         elapsed = time.monotonic() - t0
         logger.error("  %s <- %s TIMEOUT after %.0fs", label, host, elapsed)
-        return RemoteResult(host=host, returncode=-1, stdout="", stderr="Execution timed out")
+        # Preserve whatever the process managed to emit before it was killed.
+        # ``subprocess.run`` reaps the child and re-communicates before
+        # re-raising, so the partial output is on the exception — dropping it
+        # (as this did) means a multi-hour job that overran its cap reports
+        # nothing at all about how far it got.
+        partial_out = _decode(e.stdout)
+        partial_err = _decode(e.stderr)
+        note = "execution timed out after %ss" % (timeout if timeout is not None else round(elapsed))
+        return RemoteResult(
+            host=host,
+            returncode=TIMEOUT_RETURNCODE,
+            stdout=partial_out,
+            stderr=(partial_err + "\n" if partial_err else "") + note,
+        )
     except Exception as e:
         elapsed = time.monotonic() - t0
         logger.error("  %s <- %s ERROR (%.1fs): %s", label, host, elapsed, e)
@@ -295,6 +334,7 @@ def build_ssh_cmd(
     ssh_key: str | None = None,
     ssh_options: list[str] | None = None,
     connect_timeout: int = 10,
+    keepalive: bool = False,
 ) -> list[str]:
     """Build the base SSH command with standard options.
 
@@ -304,11 +344,27 @@ def build_ssh_cmd(
         ssh_key: Optional path to SSH private key file.
         ssh_options: Additional SSH command-line options.
         connect_timeout: SSH connection timeout in seconds.
+        keepalive: Emit ``ServerAlive*`` probes so a session that outlives its
+            link fails fast instead of blocking until the caller's wall-clock
+            timeout.  Opt-in per call site (like ``session_guard``): it is for
+            hours-long payloads, where the alternative is a dead link
+            masquerading as a timeout many hours later.  Caller-supplied
+            *ssh_options* are appended after these, so an explicit
+            ``-o ServerAliveInterval=…`` still wins.
 
     Returns:
         List of command parts suitable for subprocess.
     """
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}"]
+    if keepalive:
+        cmd.extend(
+            [
+                "-o",
+                f"ServerAliveInterval={DEFAULT_KEEPALIVE_INTERVAL}",
+                "-o",
+                f"ServerAliveCountMax={DEFAULT_KEEPALIVE_COUNT_MAX}",
+            ]
+        )
     if ssh_key:
         cmd.extend(["-i", ssh_key])
     if ssh_options:
@@ -330,6 +386,7 @@ def run_remote_script(
     quiet: bool = False,
     allow_local: bool = False,
     session_guard: bool = False,
+    keepalive: bool = False,
 ) -> RemoteResult:
     """Execute a script on a remote host via stdin piping.
 
@@ -353,6 +410,7 @@ def run_remote_script(
             :func:`wrap_with_session_guard`.  Opt-in, for long-running work
             that must not be orphaned by a killed launch.  Ignored on the
             local-dispatch path, which has no SSH session to lose.
+        keepalive: Emit SSH keepalive probes — see :func:`build_ssh_cmd`.
 
     Returns:
         RemoteResult with returncode, stdout, stderr.
@@ -370,7 +428,7 @@ def run_remote_script(
         script = wrap_with_session_guard(script)
         script_lines = script.count("\n")
 
-    cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
+    cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout, keepalive=keepalive)
     cmd.extend(["bash", "-s"])
 
     logger.debug("  SSH script -> %s (%d bytes)%s", host, len(script), f" [timeout={timeout}s]" if timeout else "")
@@ -400,6 +458,8 @@ def run_remote_script_streaming(
     dry_run: bool = False,
     quiet: bool = False,
     session_guard: bool = False,
+    keepalive: bool = False,
+    allow_local: bool = False,
 ) -> RemoteResult:
     """Execute a script on a remote host with real-time stdout/stderr.
 
@@ -423,6 +483,10 @@ def run_remote_script_streaming(
         quiet: If True, capture output instead of streaming to terminal.
         session_guard: Wrap the script so it dies with its SSH session — see
             :func:`wrap_with_session_guard`.
+        keepalive: Emit SSH keepalive probes — see :func:`build_ssh_cmd`.
+        allow_local: Run the script directly (no SSH) when *host* is this
+            machine, mirroring :func:`run_remote_script`.  Opt-in for the same
+            reason; the session guard is skipped on that path (no session).
 
     Returns:
         RemoteResult with returncode (stdout/stderr are empty when
@@ -432,10 +496,14 @@ def run_remote_script_streaming(
         logger.info("[dry-run] Would execute (streaming) on %s (%d bytes)", host, len(script))
         return RemoteResult(host=host, returncode=0, stdout="[dry-run]", stderr="")
 
+    if allow_local and should_run_locally(host, ssh_user):
+        logger.debug("  Dispatching locally (no SSH) for: %s", host)
+        return replace(run_local_script(script, timeout=timeout, stream=not quiet), host=host)
+
     if session_guard:
         script = wrap_with_session_guard(script)
 
-    cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout)
+    cmd = build_ssh_cmd(host, ssh_user, ssh_key, ssh_options, connect_timeout, keepalive=keepalive)
     cmd.extend(["bash", "-s"])
 
     logger.debug("  SSH script (streaming) -> %s (%d bytes)%s", host, len(script), " [timeout=%ds]" % timeout if timeout else "")
@@ -465,17 +533,26 @@ def run_remote_script_streaming(
             logger.debug("  SSH script (streaming) <- %s OK (%.1fs)", host, elapsed)
         else:
             logger.warning("  SSH script (streaming) <- %s FAILED rc=%d (%.1fs)", host, proc.returncode, elapsed)
-        stdout = getattr(proc, "stdout", "") or ""
-        stderr = getattr(proc, "stderr", "") or ""
+        # Captured output is bytes here (``text=False``); decode it so callers
+        # get the same str-typed RemoteResult the non-streaming path returns.
+        stdout = _decode(getattr(proc, "stdout", None))
+        stderr = _decode(getattr(proc, "stderr", None))
         if quiet and stdout:
             logger.debug("Captured stdout on %s:\n%s", host, stdout[-2000:])
         if quiet and stderr:
             logger.debug("Captured stderr on %s:\n%s", host, stderr[-2000:])
         return RemoteResult(host=host, returncode=proc.returncode, stdout=stdout, stderr=stderr)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         elapsed = time.monotonic() - t0
         logger.error("  SSH script (streaming) <- %s TIMEOUT after %.0fs", host, elapsed)
-        return RemoteResult(host=host, returncode=-1, stdout="", stderr="Execution timed out")
+        partial_err = _decode(e.stderr)
+        note = "execution timed out after %ss" % (timeout if timeout is not None else round(elapsed))
+        return RemoteResult(
+            host=host,
+            returncode=TIMEOUT_RETURNCODE,
+            stdout=_decode(e.stdout),
+            stderr=(partial_err + "\n" if partial_err else "") + note,
+        )
     except Exception as e:
         elapsed = time.monotonic() - t0
         logger.error("  SSH script (streaming) <- %s ERROR (%.1fs): %s", host, elapsed, e)

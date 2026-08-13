@@ -713,6 +713,45 @@ def run_script_on_host(
     return run_remote_script(host, script, timeout=timeout, dry_run=dry_run, **kw)
 
 
+def run_script_on_host_streaming(
+    host: str,
+    script: str,
+    ssh_kwargs: dict | None = None,
+    timeout: int | None = None,
+    dry_run: bool = False,
+    quiet: bool = False,
+    session_guard: bool = False,
+    keepalive: bool = False,
+) -> RemoteResult:
+    """Streaming peer of :func:`run_script_on_host`.
+
+    Dispatches to local or remote execution on the same terms, but connects
+    the payload's stdout/stderr to this process's terminal so output appears
+    as it is produced instead of arriving in one buffer at the end.  For
+    payloads that run for hours (kernel tuning, image builds) the difference
+    is between a live console and a blank one.
+
+    ``session_guard`` and ``keepalive`` are forwarded to the SSH path — see
+    :func:`~sparkrun.orchestration.ssh.wrap_with_session_guard` and
+    :func:`~sparkrun.orchestration.ssh.build_ssh_cmd`.  Neither applies to a
+    local dispatch, which has no SSH session to lose or to probe.
+    """
+    from sparkrun.orchestration.ssh import run_remote_script_streaming
+
+    kw = ssh_kwargs or {}
+    return run_remote_script_streaming(
+        host,
+        script,
+        timeout=timeout,
+        dry_run=dry_run,
+        quiet=quiet,
+        session_guard=session_guard,
+        keepalive=keepalive,
+        allow_local=True,
+        **kw,
+    )
+
+
 def run_command_on_host(
     host: str,
     command: str,
