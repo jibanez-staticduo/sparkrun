@@ -228,6 +228,7 @@ class TestTuneSglangCLI:
         assert "Tune SGLang fused MoE Triton kernels" in result.output
         assert "--tp" in result.output
         assert "--skip-clone" in result.output
+        assert "--timeout" in result.output
 
     def test_tune_group_help(self):
         from sparkrun.cli import main
@@ -269,6 +270,41 @@ class TestTuneSglangCLI:
         )
         assert result.exit_code != 0
         assert "requires an SGLang recipe" in result.output
+
+    def test_accepts_custom_timeout(selfself, tmp_path, monkeypatch):
+        """tune vllm should accept custom timeout in dry-run."""
+        from sparkrun.cli import main
+
+        recipe_file = tmp_path / "test-vllm-ray.yaml"
+        recipe_file.write_text(
+            yaml.dump(
+                {
+                    "sparkrun_version": "2",
+                    "name": "Test sglang",
+                    "model": "test/model",
+                    "runtime": "sglang",
+                    "container": "test:latest",
+                }
+            )
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "-v",
+                "tune",
+                "sglang",
+                str(recipe_file),
+                "-H",
+                "10.0.0.1",
+                "-n",
+                "--timeout",
+                "0"
+            ],
+        )
+        # Should not fail with runtime validation error
+        assert "Timeout set to 0 seconds" in (result.output or "")
 
 
 # ---------------------------------------------------------------------------
@@ -733,6 +769,7 @@ class TestTuneVllmCLI:
         assert "--vllm-tune-ref" in result.output
         # --skip-clone was retired with the vllm-tune integration.
         assert "--skip-clone" not in result.output
+        assert "--timeout" in result.output
 
     def test_tune_group_lists_vllm(self):
         from sparkrun.cli import main
@@ -806,6 +843,41 @@ class TestTuneVllmCLI:
         )
         # Should not fail with runtime validation error
         assert "requires a vLLM recipe" not in (result.output or "")
+    
+    def test_accepts_custom_timeout(selfself, tmp_path, monkeypatch):
+        """tune vllm should accept custom timeout in dry-run."""
+        from sparkrun.cli import main
+
+        recipe_file = tmp_path / "test-vllm-ray.yaml"
+        recipe_file.write_text(
+            yaml.dump(
+                {
+                    "sparkrun_version": "2",
+                    "name": "Test vLLM",
+                    "model": "test/model",
+                    "runtime": "vllm",
+                    "container": "test:latest",
+                }
+            )
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "-v",
+                "tune",
+                "vllm",
+                str(recipe_file),
+                "-H",
+                "10.0.0.1",
+                "-n",
+                "--timeout",
+                "0"
+            ],
+        )
+        # Should not fail with runtime validation error
+        assert "Timeout set to 0 seconds" in (result.output or "")
 
 
 # ---------------------------------------------------------------------------

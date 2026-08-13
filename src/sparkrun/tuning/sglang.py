@@ -126,7 +126,8 @@ class SglangTuner(BaseTuner):
             self.host,
             patch_script,
             ssh_kwargs=self.ssh_kwargs,
-            timeout=15,
+            # negative timeout means no timeout; 0 guarantees failure which could be useful in testing.
+            timeout=(self.timeout if self.timeout >= 0 else None),
             dry_run=self.dry_run,
         )
         if result.success or self.dry_run:

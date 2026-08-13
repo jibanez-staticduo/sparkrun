@@ -98,6 +98,7 @@ class BaseTuner:
         cache_dir: str | None = None,
         output_dir: str | None = None,
         skip_clone: bool = False,
+        timeout: int = 0,
         dry_run: bool = False,
     ):
         self.host = host
@@ -108,7 +109,11 @@ class BaseTuner:
         self._custom_output_dir = output_dir is not None
         self.output_dir = output_dir or str(self._default_output_dir())
         self.skip_clone = skip_clone
+        self.timeout = timeout
         self.dry_run = dry_run
+
+        if timeout >= 0:
+            logger.info("Timeout set to %d seconds", timeout)
 
         from sparkrun.orchestration.primitives import build_ssh_kwargs
 

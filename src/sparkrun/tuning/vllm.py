@@ -43,11 +43,6 @@ logger = logging.getLogger(__name__)
 VLLM_TUNING_CACHE_SUBDIR = "tuning/vllm"
 VLLM_TUNING_CONTAINER_PATH = "/tuning/vllm"
 
-# Per-TP tuning timeout: vllm-tune's MoE phase can take 1.5-3 hours, FP8 adds
-# another 15-25 minutes; allow 8 hours per invocation to match the prior
-# BaseTuner budget.
-_TUNE_TIMEOUT_SEC = 28800
-
 # Subdir on the remote host where the pinned vllm-tune checkout lives.
 _VLLM_TUNE_REMOTE_PARENT = "$HOME/.cache/sparkrun/vllm-tune"
 
@@ -166,9 +161,13 @@ class VllmTuner:
         mode: str = "all",
         vllm_tune_ref: str | None = None,
         dry_run: bool = False,
+        timeout: int = 0,
     ):
         if mode not in VALID_MODES:
             raise ValueError("mode must be one of %s, got %r" % (VALID_MODES, mode))
+
+        if timeout >= 0:
+            logger.info("Timeout set to %d seconds", timeout)
 
         from sparkrun.orchestration.primitives import build_ssh_kwargs
 
@@ -179,6 +178,7 @@ class VllmTuner:
         self.cache_dir = cache_dir
         self.mode = mode
         self.dry_run = dry_run
+        self.timeout = timeout
 
         self._custom_output_dir = output_dir is not None
         self.output_dir = output_dir or str(get_vllm_tuning_dir())
@@ -440,7 +440,8 @@ class VllmTuner:
             self.host,
             tune_cmd,
             ssh_kwargs=self.ssh_kwargs,
-            timeout=_TUNE_TIMEOUT_SEC,
+            # If a nonzero timeout is set, use it, otherwise, no timeout.
+            timeout=(self.timeout if self.timeout >= 0 else None),
             dry_run=self.dry_run,
         )
         if self.dry_run:

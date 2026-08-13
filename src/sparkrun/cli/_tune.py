@@ -35,6 +35,7 @@ def tune(ctx):
 @click.option("--output-dir", default=None, help="Override tuning config output directory")
 @click.option("--skip-clone", is_flag=True, help="Skip cloning SGLang repo (scripts already in image)")
 @click.option("--parallel", "-j", type=int, default=1, help="Run N tuning jobs concurrently (default: 1 = sequential)")
+@click.option("--timeout", "-t", type=int, default=-1, help="Add a timeout to tuning jobs, measured in seconds. (default: -1 = no timeout)")
 @dry_run_option
 @click.pass_context
 @with_host_context
@@ -49,6 +50,7 @@ def tune_sglang(
     output_dir,
     skip_clone,
     parallel,
+    timeout,
     dry_run,
     config_path=None,
     host_list=None,
@@ -121,6 +123,7 @@ def tune_sglang(
         cache_dir=remote_cache_dir,
         output_dir=output_dir,
         skip_clone=skip_clone,
+        timeout=timeout,
         dry_run=dry_run,
     )
 
@@ -150,6 +153,7 @@ VLLM_RUNTIMES = {"vllm-ray", "vllm-distributed", "eugr-vllm"}
     help="Override the vllm-tune git ref (tag/branch/SHA) pinned in config",
 )
 @click.option("--parallel", "-j", type=int, default=1, help="Run N tuning jobs concurrently (default: 1 = sequential)")
+@click.option("--timeout", "-t", type=int, default=-1, help="Add a timeout to tuning jobs, measured in seconds. (default: -1 = no timeout)")
 @dry_run_option
 @click.pass_context
 @with_host_context
@@ -165,6 +169,7 @@ def tune_vllm(
     mode,
     vllm_tune_ref,
     parallel,
+    timeout,
     dry_run,
     config_path=None,
     host_list=None,
@@ -246,6 +251,7 @@ def tune_vllm(
         mode=mode,
         vllm_tune_ref=vllm_tune_ref,
         dry_run=dry_run,
+        timeout=timeout,
     )
 
     rc = tuner.run_tuning(tp_sizes=effective_tp, parallel=parallel)
