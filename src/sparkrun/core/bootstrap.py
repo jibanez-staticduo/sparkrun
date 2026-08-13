@@ -88,6 +88,7 @@ def init_sparkrun(v: Variables | None = None, log_level: str = "WARNING") -> Var
     for builder_cls in discovered_builders:
         try:
             register_plugin(builder_cls, v=v)
+            _record_builder_gate(builder_cls)
             logger.debug("Registered builder: %s", builder_cls.__name__)
         except (ValueError, TypeError) as e:
             logger.debug("Skipping builder %s: %s", builder_cls.__name__, e)
@@ -323,30 +324,58 @@ def get_default_framework_for_category(
     )
 
 
+#: Builder name/alias -> the feature flag gating it, recorded at discovery.
+#:
+#: A gated builder hides itself from ``get_extensions`` (see
+#: ``BuilderPlugin.is_multi_extension``), so by the time :func:`get_builder`
+#: fails to find one it can no longer tell "disabled" from "never existed".
+#: Discovery runs *before* that gate, which is the one place both are visible.
+_BUILDER_GATES: dict[str, str] = {}
+
+
+def _record_builder_gate(builder_cls: "type[BuilderPlugin]") -> None:
+    """Record *builder_cls*'s feature flag under its name and every alias."""
+    flag = getattr(builder_cls, "required_feature_flag", None)
+    if not flag:
+        return
+    for alias in (getattr(builder_cls, "builder_name", ""), *getattr(builder_cls, "builder_aliases", ())):
+        if alias:
+            _BUILDER_GATES[alias] = flag
+
+
 def get_builder(name: str, v: Variables | None = None) -> "BuilderPlugin":
-    """Get a specific builder by name.
+    """Get a specific builder by canonical name or alias.
 
     Args:
-        name: Builder name (e.g. "docker-pull", "eugr")
+        name: Builder name or alias (e.g. "docker-pull", "eugr", "uv-venv", "venv")
         v: Optional Variables instance; uses singleton if not provided
 
     Raises:
-        ValueError: If the builder is not found
+        BuilderUnavailableError: The builder exists but its feature flag is off.
+        ValueError: No builder claims *name*.
     """
     if v is None:
         v = get_variables()
 
     all_builders = get_extensions(EXT_BUILDER, v=v)
     for _plugin_name, builder in all_builders.items():
-        if builder.builder_name == name:
+        if builder.matches_name(name):
             return builder
+
+    gate = _BUILDER_GATES.get(name)
+    if gate is not None:
+        from sparkrun.builders.base import BuilderUnavailableError
+
+        raise BuilderUnavailableError(
+            "Builder %r is disabled by feature flag %r. Enable it with `sparkrun setup features enable %s`." % (name, gate, gate)
+        )
 
     available = [b.builder_name for b in all_builders.values()]
     raise ValueError("Unknown builder: %r. Available: %s" % (name, available))
 
 
 def list_builders(v: Variables | None = None) -> list[str]:
-    """List all registered builder names."""
+    """List canonical names of all enabled builders (aliases excluded)."""
     if v is None:
         v = get_variables()
 

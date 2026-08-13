@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from logging import Logger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from scitrera_app_framework import Plugin, Variables
 
@@ -29,6 +29,19 @@ PULLABLE_REGISTRY_PREFIXES = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class BuilderUnavailableError(ValueError):
+    """A recipe named a real builder that is gated off by a feature flag.
+
+    Distinct from the plain ``ValueError`` raised for an *unknown* builder,
+    which callers may reasonably warn about and skip. This one must not be
+    skipped: the user named a builder that exists, and for an environment
+    builder (a venv the serve command depends on) continuing without it would
+    launch the workload under the wrong interpreter. Mirrors
+    ``ExecutorUnavailableError`` — an explicitly-requested but unavailable
+    plugin fails loudly rather than silently downgrading.
+    """
 
 
 def _flatten_dict(d: dict, prefix: str = "", sep: str = "_", normalize: bool = False) -> dict[str, str]:
@@ -61,10 +74,25 @@ class BuilderPlugin(Plugin):
 
     Subclasses must define:
         - builder_name: str identifier (e.g. "docker-pull", "eugr")
+
+    Optionally:
+        - builder_aliases: alternate spellings ``builder:`` accepts
+        - required_feature_flag: gate this builder behind a feature flag
     """
 
     eager = False
     builder_name: str = ""
+
+    #: Alternate names :func:`~sparkrun.core.bootstrap.get_builder` also
+    #: accepts.  Deliberately *not* surfaced by ``list_builders`` — an alias is
+    #: another spelling of one builder, and listing it would imply a second one
+    #: exists.
+    builder_aliases: ClassVar[tuple[str, ...]] = ()
+
+    #: Feature flag gating this builder, or ``None`` for always-available.
+    #: Mirrors :class:`~sparkrun.orchestration.executors._base.Executor` and
+    #: :class:`~sparkrun.transports.base.Transport`.
+    required_feature_flag: ClassVar[str | None] = None
 
     def name(self) -> str:
         return "sparkrun.builder.%s" % self.builder_name
@@ -76,7 +104,20 @@ class BuilderPlugin(Plugin):
         return False
 
     def is_multi_extension(self, v: Variables) -> bool:
+        # SAF only exposes a multi-extension plugin (via get_extensions) when
+        # this returns True at registration.  A gated builder hides itself here
+        # — it stays in the plugin registry but is absent from get_extensions /
+        # list_builders / resolution, so naming it fails closed
+        # (BuilderUnavailableError).  See core.features.
+        if self.required_feature_flag:
+            from sparkrun.core.features import feature_gate_enabled
+
+            return feature_gate_enabled(self.required_feature_flag, v)
         return True
+
+    def matches_name(self, name: str) -> bool:
+        """True when *name* is this builder's canonical name or an alias."""
+        return name == self.builder_name or name in self.builder_aliases
 
     def initialize(self, v: Variables, logger: Logger) -> BuilderPlugin:
         return self

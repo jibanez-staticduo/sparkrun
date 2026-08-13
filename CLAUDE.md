@@ -60,7 +60,7 @@ src/sparkrun/
 ├── models/             # HuggingFace model download, distribution, and VRAM estimation
 ├── containers/         # Container image distribution (docker save/load over SSH)
 ├── tuning/             # Triton fused MoE kernel tuning for SGLang and vLLM
-├── builders/           # Container image builder plugins (docker-pull, eugr)
+├── builders/           # Image + environment builder plugins (docker-pull, eugr, uv-venv)
 ├── diagnostics/        # Host and run diagnostic collection (NDJSON output)
 ├── plugins/            # In-tree cross-cutting integrations
 ├── proxy/              # Inference gateway (LiteLLM engine + gateway selection seam)
@@ -287,6 +287,82 @@ prompt unless `--trust` is passed. See `docs/SECURITY.md`.
 through `_cluster_ops.resolve_comm_env(ctx, comm_env, backends)`. When
 `backends` is `None`, `resolve_comm_env` falls back to the legacy NCCL
 generator (byte-identical for NVIDIA hosts).
+
+### Environment Builders (`builders/uv_venv.py`)
+
+A builder's canonical hook is `prepare()`, and it does not have to prepare an
+*image*. `uv-venv` is the first **environment** builder: it provisions a
+`uv`-created Python venv on each target host and writes a shell `env_file` that
+activates it, returning the image ref untouched. It pairs with `executor: local`
+(native, no container) — the answer to hosts where nested `docker run` doesn't
+work (Thunder's proot/fastvfs sandbox).
+
+The builder→executor coupling is a **core seam, not a special case**:
+`BuilderPlugin.default_env_file(recipe)` contributes `{"env_file": …}` as one
+layer of `resolve_executor`'s chain (`orchestration/executor.py:_builder_exec_dict`).
+It sits below the recipe layer (an explicit `executor_config.env_file` wins) but
+*above* cluster/runtime/config, because an environment builder's env_file is
+essential to running the workload at all — a cluster's generic one must not
+silently suppress it and leave the serve command under the wrong interpreter.
+
+Four properties are load-bearing and easy to break:
+
+- **Idempotency is content-addressed.** `dep_hash()` covers python,
+  torch_backend, inline requirements *and the contents* of any
+  `requirements_file`/`pyproject` — which are read control-side and embedded in
+  the provisioning script, never transferred. With no `venv_path`, the venv
+  lives at `$HOME/.cache/sparkrun/uv-venv/<dep-hash>`, so recipes with identical
+  deps share one venv and editing a requirements file re-provisions.
+- **The marker guards the venv, not the env_file.** `cuda_home` deliberately
+  stays *out* of `dep_hash` (it doesn't change the installed packages, and
+  including it would rebuild a multi-GB venv to edit one `export`), so the
+  env_file is rewritten on every run while the expensive half stays behind the
+  marker. Guarding the whole script on the marker — as the original did — made
+  adding `cuda_home` to a recipe whose venv already existed a *silent no-op*.
+- **Quoting is split deliberately, and what can't be quoted is validated.**
+  `venv_path`/`env_file`/`cuda_home` are emitted double-quoted so bash expands
+  `$HOME` *on the host*, which rules out `shlex`-quoting them — so they are
+  validated against a strict charset instead (`$HOME`/`~` prefix + `[A-Za-z0-9_./+-]`).
+  This is not optional: `builder_config` is recipe content, recipes come from
+  registries, and unlike `executor_config` it has **no trust gate**. Requirements
+  and python are `shlex`-quoted; a requirement may not begin with `-`, because
+  `--index-url=…` survives `shlex.quote` untouched and would reach `uv` as a
+  flag that repoints the package index.
+- **Heredoc delimiters are content-derived.** Staged requirement files are
+  written through a quoted heredoc whose delimiter is seeded from a hash of the
+  content (and extended on collision). A fixed delimiter is an injection
+  vector — a requirements file containing that line closes the heredoc early
+  and everything after it executes as shell.
+
+`prepare()` fans out with `run_remote_scripts_parallel(..., allow_local=True,
+session_guard=True)`. The guard is not optional for this payload: a first-time
+vllm+torch install is minutes of network per host, and without it a Ctrl-C on
+the control node leaves `uv pip install` running on every host with nothing left
+to observe or stop it (issue #240).
+
+**Gating** is `builder.uv_venv` — off on `stable`, on for `beta`/`alpha` via
+`channel_defaults`. Unlike an image builder it mutates the host (creating venvs,
+installing packages), so stable requires an explicit opt-in.
+`BuilderPlugin.required_feature_flag` + the `is_multi_extension` self-gate is
+the same mechanism `Executor`/`Transport`/`TelemetryProvider` use.
+
+Two consequences of gating a *builder* specifically:
+
+- `get_builder` must distinguish **disabled** from **unknown**, or a stable user
+  running an alpha recipe is told their recipe is wrong when their channel is.
+  A gated builder is hidden from `get_extensions`, so the distinction is
+  recorded at discovery in `bootstrap._BUILDER_GATES` (the one point where both
+  are visible) and raises `BuilderUnavailableError`.
+- The launcher's builder phase **must not skip it**. Phase 2 warns-and-continues
+  for an *unknown* builder only; `BuilderUnavailableError` is re-raised, and the
+  `try` now wraps `get_builder` alone — a `ValueError` out of `prepare()` is a
+  build failure, and reporting it as "builder not found, skipping" launched the
+  workload without the environment it asked for.
+
+**Aliases**: `builder_aliases` lets one builder answer to several spellings
+(`venv` → `uv-venv`). `list_builders()` returns canonical names only — an alias
+is another spelling of one builder, and listing it would imply a second exists
+and put a phantom name in every "Available: […]".
 
 ### Orchestration Layer (`orchestration/`)
 
@@ -1038,7 +1114,9 @@ experimental executors), `cli.setup.k8s` (gating the entire `sparkrun setup
 k8s` command group), `cli.setup.tailscale` (gating the `sparkrun setup
 tailscale` group), and `transports.thunder` (gating the Thunder Compute
 transport + `cluster import thunder`) — are off by default on **every** channel;
-enable them explicitly per-flag. The `setup k8s` group self-gates in its Click
+enable them explicitly per-flag. `builder.uv_venv` is the first flag to use
+`channel_defaults` for a *plugin* rather than for visibility: off on `stable`,
+on for `beta`/`alpha` (see Environment Builders below). The `setup k8s` group self-gates in its Click
 callback (raises pointing at `setup features enable cli.setup.k8s`) and hides
 itself from `setup --help` unless the flag resolves on at import; `setup
 tailscale` and `cluster import thunder` gate the same way

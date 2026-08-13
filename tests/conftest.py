@@ -49,6 +49,11 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
     # so the CLI tests that exercise it keep passing (the gate itself is tested
     # explicitly in test_k8s_setup with the env override cleared).
     monkeypatch.setenv("SPARKRUN_FEATURE_CLI_SETUP_K8S", "1")
+    # Same for the uv-venv builder (off on stable, on for beta/alpha): SAF
+    # decides is_multi_extension once at registration, so a test cannot un-hide
+    # a builder the process already registered as gated. Enable it here and
+    # exercise the gate itself in the clean subprocesses of test_uv_venv.py.
+    monkeypatch.setenv("SPARKRUN_FEATURE_BUILDER_UV_VENV", "1")
     # Point the user config dir at the sandbox too. STATEFUL_ROOT alone does
     # not cover it: DEFAULT_CONFIG_DIR is computed from Path.home() at import
     # time, so without this a test silently reads the developer's real

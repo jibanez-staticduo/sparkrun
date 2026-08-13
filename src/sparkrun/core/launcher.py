@@ -808,10 +808,23 @@ def launch_inference(
     if recipe.builder:
         if p:
             p.phase(2)
+        from sparkrun.builders.base import BuilderUnavailableError
         from sparkrun.core.bootstrap import get_builder
 
+        # Only *lookup* is tolerated failing here. A ValueError out of
+        # prepare() is a real build failure, and reporting it as "builder not
+        # found, skipping" would launch the workload without the environment
+        # it asked for. A gated builder is likewise never skipped: the user
+        # named one that exists (see BuilderUnavailableError).
         try:
             builder = get_builder(recipe.builder, v)
+        except BuilderUnavailableError:
+            raise
+        except ValueError:
+            builder = None
+            logger.warning("Builder '%s' not found, skipping", recipe.builder)
+
+        if builder is not None:
             container_image = builder.prepare(
                 container_image,
                 recipe,
@@ -821,8 +834,6 @@ def launch_inference(
                 transfer_mode=effective_transfer_mode,
                 ssh_kwargs=ssh_kwargs,
             )
-        except ValueError:
-            logger.warning("Builder '%s' not found, skipping", recipe.builder)
         if p:
             p.phase_end()
     else:
