@@ -1157,3 +1157,380 @@ class TestMountPointConstants:
         """TUNING_ENV_PATH must be the parent of TUNING_CONTAINER_PATH."""
         assert TUNING_CONTAINER_PATH.startswith(TUNING_ENV_PATH)
         assert TUNING_CONTAINER_PATH == TUNING_ENV_PATH + "/configs"
+
+
+# ===========================================================================
+# Long-run plumbing: streaming, logging, timeouts, parallel safety
+# ===========================================================================
+
+
+class TestStreamedTuneScript:
+    """The wrapper that makes a multi-hour sweep observable and recoverable."""
+
+    def _script(self, cmd="vllm-tune.sh model --tp 2", log="/home/u/.cache/sparkrun/tuning/logs/t.log"):
+        from sparkrun.tuning._common import build_streamed_tune_script
+
+        return build_streamed_tune_script(cmd, log)
+
+    def test_forces_unbuffered_python(self):
+        """Without this, 'streaming' delivers 8 KB at a time and looks hung."""
+        assert "PYTHONUNBUFFERED=1" in self._script()
+
+    def test_tees_to_the_host_side_log(self):
+        script = self._script()
+        assert 'tee -a "/home/u/.cache/sparkrun/tuning/logs/t.log"' in script
+
+    def test_creates_the_log_directory(self):
+        assert 'mkdir -p "/home/u/.cache/sparkrun/tuning/logs"' in self._script()
+
+    def test_propagates_the_tuning_exit_code_not_tees(self):
+        """With tee in the pipeline, $? is tee's — which is 0 for any failure."""
+        script = self._script()
+        assert "rc=${PIPESTATUS[0]}" in script
+        assert "exit $rc" in script
+
+    def test_redirects_stderr_into_the_stream(self):
+        assert "2>&1 | tee" in self._script()
+
+    def test_compound_command_is_fully_captured_and_its_rc_propagates(self, tmp_path):
+        """Executed for real, because the failure mode is shell precedence.
+
+        Tuning commands are compound (``mkdir … && cd … && python3 …``).  With
+        a bare ``cmd 2>&1 | tee``, the redirection and pipe bind to the *last*
+        simple command only: the earlier stages' output bypasses the log and
+        ``PIPESTATUS[0]`` reports the wrong command's status.  Substring
+        assertions can't see that — running it can.
+        """
+        import subprocess
+
+        log = tmp_path / "logs" / "t.log"
+        script = self._script(
+            cmd="printf 'first\\n' && printf 'second\\n' >&2 && exit 42",
+            log=str(log),
+        )
+        proc = subprocess.run(["bash", "-s"], input=script, text=True, capture_output=True)
+
+        assert proc.returncode == 42, "tee's exit status masked the tuning failure"
+        contents = log.read_text()
+        assert "first" in contents and "second" in contents
+        assert "rc=42" in contents
+
+
+class TestTuneLogPath:
+    def test_log_dir_is_a_sibling_of_the_config_cache(self):
+        """Logs must not land in the dir that is bind-mounted and rsynced."""
+        from sparkrun.tuning._common import remote_tune_log_dir
+
+        assert remote_tune_log_dir("/home/u/.cache/sparkrun/tuning/vllm") == "/home/u/.cache/sparkrun/tuning/logs"
+
+    def test_log_name_carries_backend_model_and_tp(self):
+        from sparkrun.tuning._common import remote_tune_log_path
+
+        path = remote_tune_log_path(
+            "/home/u/.cache/sparkrun/tuning/vllm",
+            "vllm-tune",
+            "Qwen/Qwen3-MoE",
+            4,
+            "20260813-101500",
+        )
+        assert path.startswith("/home/u/.cache/sparkrun/tuning/logs/")
+        assert "vllm-tune" in path
+        assert "Qwen-Qwen3-MoE" in path
+        assert "tp4" in path
+        assert path.endswith("-20260813-101500.log")
+
+    def test_model_slug_has_no_path_separators(self):
+        """A '/' in the model id would otherwise redirect the log elsewhere."""
+        from sparkrun.tuning._common import remote_tune_log_path
+
+        path = remote_tune_log_path("/c/tuning/vllm", "vllm-tune", "org/model", 1, "ts")
+        assert path.count("/") == "/c/tuning/logs/".count("/")
+
+
+class TestResolveTuningTimeout:
+    def test_default_is_24_hours(self):
+        from sparkrun.tuning._common import resolve_tuning_timeout
+
+        assert resolve_tuning_timeout(None, None) == 24 * 3600
+
+    def test_cli_override_wins_over_config(self, tmp_path):
+        from sparkrun.core.config import SparkrunConfig
+        from sparkrun.tuning._common import resolve_tuning_timeout
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({"tuning": {"timeout_hours": 10}}))
+        config = SparkrunConfig(config_path=cfg_file)
+
+        assert resolve_tuning_timeout(36, config) == 36 * 3600
+
+    def test_config_used_when_no_cli_override(self, tmp_path):
+        from sparkrun.core.config import SparkrunConfig
+        from sparkrun.tuning._common import resolve_tuning_timeout
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({"tuning": {"timeout_hours": 10}}))
+        config = SparkrunConfig(config_path=cfg_file)
+
+        assert resolve_tuning_timeout(None, config) == 10 * 3600
+
+    def test_zero_means_no_cap(self):
+        from sparkrun.tuning._common import resolve_tuning_timeout
+
+        assert resolve_tuning_timeout(0, None) is None
+
+    def test_fractional_hours_supported(self):
+        from sparkrun.tuning._common import resolve_tuning_timeout
+
+        assert resolve_tuning_timeout(0.5, None) == 1800
+
+    def test_describe_timeout_renders_none_as_none(self):
+        from sparkrun.tuning._common import describe_timeout
+
+        assert describe_timeout(None) == "none"
+
+
+class TestResolveTuningParallel:
+    """Concurrent jobs on one GPU contend, so the measured latencies are wrong."""
+
+    def test_downgrades_to_sequential_by_default(self):
+        from sparkrun.tuning._common import resolve_tuning_parallel
+
+        assert resolve_tuning_parallel(4, n_jobs=4) == 1
+
+    def test_force_parallel_honours_the_request(self):
+        from sparkrun.tuning._common import resolve_tuning_parallel
+
+        assert resolve_tuning_parallel(4, n_jobs=4, force=True) == 4
+
+    def test_single_job_is_never_downgraded_or_warned(self):
+        from sparkrun.tuning._common import resolve_tuning_parallel
+
+        assert resolve_tuning_parallel(4, n_jobs=1) == 4
+        assert resolve_tuning_parallel(1, n_jobs=4) == 1
+
+
+class TestTailText:
+    def test_short_text_passes_through(self):
+        from sparkrun.tuning._common import tail_text
+
+        assert tail_text("a\nb\nc") == "a\nb\nc"
+
+    def test_long_text_is_tailed_and_says_so(self):
+        from sparkrun.tuning._common import tail_text
+
+        out = tail_text("\n".join(str(i) for i in range(500)), max_lines=10)
+        assert out.splitlines()[0].startswith("... (490 earlier lines omitted)")
+        assert out.endswith("499")
+        assert len(out.splitlines()) == 11
+
+
+class TestVllmTunerStreaming:
+    """`--foreground` exists so output streams; the call site must not swallow it."""
+
+    def _tuner(self, **kw):
+        return VllmTuner(host="10.0.0.1", image="test:latest", model="Qwen/Qwen3-MoE", **kw)
+
+    def _ok(self):
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        return RemoteResult(host="10.0.0.1", returncode=0, stdout="", stderr="")
+
+    def _fail(self, rc=1, stdout="boom"):
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        return RemoteResult(host="10.0.0.1", returncode=rc, stdout=stdout, stderr="err")
+
+    def test_tune_runs_through_the_streaming_dispatcher(self):
+        from unittest.mock import patch
+
+        tuner = self._tuner()
+        with (
+            patch("sparkrun.orchestration.primitives.run_script_on_host_streaming", return_value=self._ok()) as stream,
+            patch("sparkrun.orchestration.primitives.run_command_on_host", return_value=self._ok()),
+        ):
+            assert tuner._run_one_tp("/opt/vllm-tune/vllm-tune.sh", 2) == 0
+
+        assert stream.call_count == 1
+        kwargs = stream.call_args.kwargs
+        # The GPU is held for hours: a killed sparkrun must not orphan it, and
+        # a dead link must not masquerade as a slow sweep.
+        assert kwargs["session_guard"] is True
+        assert kwargs["keepalive"] is True
+        assert kwargs["timeout"] == tuner.timeout_sec
+        assert kwargs["quiet"] is False
+        # ...and the payload is the tee-wrapped script, not the bare command.
+        script = stream.call_args.args[1]
+        assert "PYTHONUNBUFFERED=1" in script
+        assert "tee -a" in script
+        assert "--foreground" in script
+
+    def test_parallel_path_captures_instead_of_interleaving(self):
+        from unittest.mock import patch
+
+        tuner = self._tuner(force_parallel=True)
+        with (
+            patch("sparkrun.orchestration.primitives.run_script_on_host_streaming", return_value=self._ok()) as stream,
+            patch("sparkrun.orchestration.primitives.run_command_on_host", return_value=self._ok()),
+        ):
+            tuner._run_tp_parallel("/opt/vllm-tune.sh", (1, 2), 2, [])
+
+        assert all(call.kwargs["quiet"] is True for call in stream.call_args_list)
+
+    def test_export_is_attempted_even_when_tuning_fails(self):
+        """A sweep that died late may still have written usable configs."""
+        from unittest.mock import patch
+
+        tuner = self._tuner()
+        with (
+            patch("sparkrun.orchestration.primitives.run_script_on_host_streaming", return_value=self._fail()),
+            patch("sparkrun.orchestration.primitives.run_command_on_host", return_value=self._ok()) as export,
+        ):
+            rc = tuner._run_one_tp("/opt/vllm-tune.sh", 2)
+
+        assert rc == 1
+        assert export.call_count == 1
+        assert "--export-sparkrun" in export.call_args.args[1]
+
+    def test_timeout_is_reported_as_a_timeout_with_the_remedy(self, caplog):
+        import logging
+        from unittest.mock import patch
+        from sparkrun.orchestration.ssh import TIMEOUT_RETURNCODE
+
+        tuner = self._tuner(timeout_hours=2)
+        with (
+            patch(
+                "sparkrun.orchestration.primitives.run_script_on_host_streaming",
+                return_value=self._fail(rc=TIMEOUT_RETURNCODE, stdout=""),
+            ),
+            patch("sparkrun.orchestration.primitives.run_command_on_host", return_value=self._ok()),
+            caplog.at_level(logging.ERROR, logger="sparkrun.tuning._common"),
+        ):
+            rc = tuner._run_one_tp("/opt/vllm-tune.sh", 2)
+
+        assert rc == TIMEOUT_RETURNCODE
+        text = caplog.text
+        assert "cap" in text and "--timeout" in text
+        # ...and it names the host-side log, which survived the kill.
+        assert "/tuning/logs/" in text
+
+    def test_failure_output_is_tailed_not_dumped(self, caplog):
+        """Hours of tqdm output buried the actual error (issue #206)."""
+        import logging
+        from unittest.mock import patch
+
+        tuner = self._tuner()
+        firehose = "\n".join("progress %d" % i for i in range(5000)) + "\nRealError: boom"
+        with (
+            patch("sparkrun.orchestration.primitives.run_script_on_host_streaming", return_value=self._fail(stdout=firehose)),
+            patch("sparkrun.orchestration.primitives.run_command_on_host", return_value=self._ok()),
+            caplog.at_level(logging.ERROR, logger="sparkrun.tuning._common"),
+        ):
+            tuner._run_one_tp("/opt/vllm-tune.sh", 2)
+
+        assert "RealError: boom" in caplog.text
+        assert "earlier lines omitted" in caplog.text
+        assert "progress 0\n" not in caplog.text
+
+
+class TestTuningPartialResultsSurvive:
+    """Earlier TP successes must reach the control node when a later one fails."""
+
+    def test_vllm_syncs_back_after_a_failed_tp(self):
+        from unittest.mock import patch
+
+        tuner = VllmTuner(host="10.0.0.1", image="i", model="m")
+        with (
+            patch.object(VllmTuner, "_install_vllm_tune", return_value="/opt/vllm-tune.sh"),
+            patch.object(VllmTuner, "_preflight", return_value=0),
+            patch.object(VllmTuner, "_ensure_remote_output_dir", return_value=0),
+            patch.object(VllmTuner, "_run_one_tp", side_effect=[0, 1]),
+            patch.object(VllmTuner, "_sync_back_configs") as sync,
+        ):
+            rc = tuner.run_tuning(tp_sizes=(1, 2))
+
+        assert rc == 1
+        assert sync.call_count == 1
+
+    def test_sglang_syncs_back_after_a_failed_tp(self):
+        from unittest.mock import patch
+
+        tuner = SglangTuner(host="10.0.0.1", image="i", model="m", skip_clone=True)
+        with (
+            patch.object(SglangTuner, "_launch_container", return_value=0),
+            patch.object(SglangTuner, "_detect_triton_version", return_value="3.6.0"),
+            patch.object(SglangTuner, "_pre_check_tp", return_value=False),
+            patch.object(SglangTuner, "_run_tune_for_tp", side_effect=[0, 1]),
+            patch.object(SglangTuner, "_sync_back_configs") as sync,
+            patch.object(SglangTuner, "_cleanup_container"),
+        ):
+            rc = tuner.run_tuning(tp_sizes=(1, 2))
+
+        assert rc == 1
+        assert sync.call_count == 1
+
+
+class TestSglangTunerStreaming:
+    def test_tune_runs_through_the_streaming_dispatcher(self):
+        from unittest.mock import patch
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        tuner = SglangTuner(host="10.0.0.1", image="i", model="m")
+        ok = RemoteResult(host="10.0.0.1", returncode=0, stdout="", stderr="")
+        with patch("sparkrun.orchestration.primitives.run_script_on_host_streaming", return_value=ok) as stream:
+            assert tuner._run_tune_for_tp(2, "3.6.0") == 0
+
+        kwargs = stream.call_args.kwargs
+        assert kwargs["session_guard"] is True
+        assert kwargs["keepalive"] is True
+        assert kwargs["timeout"] == tuner.timeout_sec
+        assert "PYTHONUNBUFFERED=1" in stream.call_args.args[1]
+
+
+class TestTuneCliOptions:
+    def test_vllm_help_documents_timeout_and_force_parallel(self):
+        from sparkrun.cli import main
+
+        result = CliRunner().invoke(main, ["tune", "vllm", "--help"])
+        assert result.exit_code == 0
+        assert "--timeout" in result.output
+        assert "--force-parallel" in result.output
+
+    def test_sglang_help_documents_timeout(self):
+        from sparkrun.cli import main
+
+        result = CliRunner().invoke(main, ["tune", "sglang", "--help"])
+        assert result.exit_code == 0
+        assert "--timeout" in result.output
+
+
+class TestTunerOutputVisibleAtDefaultVerbosity:
+    """A multi-hour job that prints nothing is the bug being fixed.
+
+    The CLI's default tier is PROGRESS (25); the tuners emitted their banner
+    and every step line at INFO (20), so `sparkrun tune` printed *nothing at
+    all* unless the user happened to pass -v.
+    """
+
+    def _records_at_progress(self, caplog, run):
+        from sparkrun.core.progress import PROGRESS
+
+        with caplog.at_level(PROGRESS):
+            run()
+        return [r for r in caplog.records if r.levelno >= PROGRESS]
+
+    def test_vllm_banner_and_steps_reach_default_verbosity(self, caplog):
+        tuner = VllmTuner(host="10.0.0.1", image="i", model="m", dry_run=True)
+        records = self._records_at_progress(caplog, lambda: tuner.run_tuning(tp_sizes=(1,)))
+        text = "\n".join(r.getMessage() for r in records)
+
+        assert "Kernel Tuner" in text
+        assert "Step 4/5" in text
+        assert "Timeout:" in text
+
+    def test_sglang_banner_and_steps_reach_default_verbosity(self, caplog):
+        tuner = SglangTuner(host="10.0.0.1", image="i", model="m", dry_run=True)
+        records = self._records_at_progress(caplog, lambda: tuner.run_tuning(tp_sizes=(1,)))
+        text = "\n".join(r.getMessage() for r in records)
+
+        assert "Kernel Tuner" in text
+        assert "Step 4/5" in text

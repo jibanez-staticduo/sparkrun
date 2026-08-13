@@ -25,6 +25,14 @@ DEFAULT_CACHE_DIR = Path.home() / ".cache" / "sparkrun"
 DEFAULT_VLLM_TUNE_REPO = "https://github.com/SeraphimSerapis/vllm-tune.git"
 DEFAULT_VLLM_TUNE_REF = "main"
 
+# Default wall-clock cap for one tuning run (per TP size), in hours.
+# Kernel autotuning sweeps thousands of configurations at ~10s each: a single
+# MoE TP size on a Spark has been observed taking 5-6 hours, and vllm-tune runs
+# several such sweeps per invocation.  The previous 8-hour cap killed real runs
+# mid-sweep.  Overridable via `tuning.timeout_hours` in config.yaml or
+# `--timeout` on the CLI; 0 disables the cap.
+DEFAULT_TUNING_TIMEOUT_HOURS = 24.0
+
 # Defer to huggingface_hub's own resolution of the cache root, which
 # respects HF_HOME, HF_HUB_CACHE, and HUGGINGFACE_HUB_CACHE env vars.
 try:
@@ -464,6 +472,28 @@ class SparkrunConfig:
             if ref:
                 return str(ref)
         return DEFAULT_VLLM_TUNE_REF
+
+    @property
+    def tuning_timeout_hours(self) -> float:
+        """Wall-clock cap for a single tuning run, in hours (``tuning.timeout_hours``).
+
+        Applies per TP size, not per invocation.  Defaults to
+        :data:`DEFAULT_TUNING_TIMEOUT_HOURS`; ``0`` (or any non-positive
+        value) means no cap, which is safe now that long tuning sessions run
+        with SSH keepalives — a dead link surfaces in minutes rather than
+        being indistinguishable from a slow sweep.
+        """
+        tuning = self._data.get("tuning", {})
+        if isinstance(tuning, dict) and tuning.get("timeout_hours") is not None:
+            try:
+                return float(tuning["timeout_hours"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid tuning.timeout_hours=%r in config; using default of %s hours",
+                    tuning.get("timeout_hours"),
+                    DEFAULT_TUNING_TIMEOUT_HOURS,
+                )
+        return DEFAULT_TUNING_TIMEOUT_HOURS
 
     @property
     def external_plugin_paths(self) -> list[Path]:

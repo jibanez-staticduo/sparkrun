@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sparkrun.core.config import DEFAULT_CACHE_DIR
+from sparkrun.core.progress import PROGRESS
 from sparkrun.utils import format_duration as _format_duration  # noqa: F401 — re-exported for local callers
 from sparkrun.utils.shell import quote, safe_remote_path
 
@@ -72,6 +73,197 @@ def _get_tuning_env(
 
 
 # ---------------------------------------------------------------------------
+# Long-run plumbing shared by both tuners
+# ---------------------------------------------------------------------------
+
+
+def resolve_tuning_timeout(timeout_hours: float | None, config: SparkrunConfig | None) -> int | None:
+    """Resolve the per-TP wall-clock cap in seconds: CLI → config → default.
+
+    Returns ``None`` for "no cap", which a non-positive value selects.  That
+    is a supported choice rather than a footgun: tuning sessions now run with
+    SSH keepalives, so a dead link is reported in minutes instead of being
+    indistinguishable from a slow sweep — which is what the cap was really
+    guarding against.
+    """
+    from sparkrun.core.config import DEFAULT_TUNING_TIMEOUT_HOURS
+
+    if timeout_hours is None:
+        timeout_hours = config.tuning_timeout_hours if config is not None else DEFAULT_TUNING_TIMEOUT_HOURS
+    try:
+        hours = float(timeout_hours)
+    except (TypeError, ValueError):
+        logger.warning("Invalid tuning timeout %r; using %s hours", timeout_hours, DEFAULT_TUNING_TIMEOUT_HOURS)
+        hours = DEFAULT_TUNING_TIMEOUT_HOURS
+    if hours <= 0:
+        return None
+    return int(hours * 3600)
+
+
+def describe_timeout(timeout_sec: int | None) -> str:
+    """Render a resolved timeout for the run banner."""
+    return "none" if timeout_sec is None else _format_duration(timeout_sec)
+
+
+def resolve_tuning_parallel(parallel: int, n_jobs: int, force: bool = False) -> int:
+    """Clamp ``--parallel`` to 1 unless *force*, explaining why.
+
+    Tuning **measures kernel latency** to pick the fastest tile config, and
+    every job in a run targets the same single host — so concurrent jobs
+    contend for one GPU and the timings they compare are contaminated.  The
+    result is not a slower correct answer, it is a wrong config written to the
+    cache and auto-mounted by every later ``sparkrun run``.
+
+    Downgrading (rather than erroring) keeps existing ``-j`` scripts working
+    and merely makes them correct; ``force=True`` is the escape hatch for
+    someone deliberately measuring the contention itself.
+    """
+    if parallel <= 1 or n_jobs <= 1:
+        return max(1, parallel)
+    if force:
+        logger.warning(
+            "Running %d tuning jobs concurrently on one GPU (--force-parallel): the measured "
+            "kernel latencies will be contaminated by contention and the selected configs may "
+            "be wrong.",
+            parallel,
+        )
+        return parallel
+    logger.warning(
+        "Ignoring --parallel %d: tuning measures kernel latency on a single GPU, so concurrent "
+        "jobs contend and produce wrong configs. Running sequentially. Pass --force-parallel to "
+        "override.",
+        parallel,
+    )
+    return 1
+
+
+def _slugify_model(model: str) -> str:
+    """Reduce a model id to a filename-safe token."""
+    slug = "".join(ch if (ch.isalnum() or ch in "-._") else "-" for ch in model)
+    return slug.strip("-")[:80] or "model"
+
+
+def remote_tune_log_dir(remote_output_dir: str) -> str:
+    """Return the host-side directory for tuning logs.
+
+    A sibling of the flat config cache (``…/tuning/logs``), deliberately *not*
+    inside it: that directory is bind-mounted into inference containers and
+    rsynced back, and multi-hour tuning logs belong in neither.
+    """
+    import posixpath
+
+    parent = posixpath.dirname(remote_output_dir.rstrip("/")) or remote_output_dir
+    return posixpath.join(parent, "logs")
+
+
+def remote_tune_log_path(remote_output_dir: str, backend: str, model: str, tp_size: int, stamp: str) -> str:
+    """Return the host-side logfile path for one TP size's tuning run."""
+    import posixpath
+
+    name = "%s-%s-tp%d-%s.log" % (backend, _slugify_model(model), tp_size, stamp)
+    return posixpath.join(remote_tune_log_dir(remote_output_dir), name)
+
+
+def log_stamp() -> str:
+    """A sortable timestamp for log filenames."""
+    import time
+
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def build_streamed_tune_script(command: str, log_path: str) -> str:
+    """Wrap a tuning *command* so its output both streams and is recorded.
+
+    Three things the bare command doesn't do on its own:
+
+    * ``PYTHONUNBUFFERED`` — the tuner's progress is Python ``print``/tqdm
+      output, and Python block-buffers when stdout is a pipe (which it is,
+      over SSH).  Without this, "streaming" delivers 8 KB at a time and a
+      quiet sweep looks hung.
+    * ``tee`` to a host-side logfile — a dropped link, a Ctrl-C or an overrun
+      timeout otherwise loses every trace of a run that may have been going
+      for hours.  The log outlives the SSH session.
+    * ``PIPESTATUS[0]`` — with ``tee`` in the pipeline the shell would
+      otherwise report *tee's* exit status, turning any tuning failure into a
+      success.
+
+    The command runs inside a subshell because tuning commands are compound
+    (``mkdir … && cd … && python3 …``).  A bare ``cmd 2>&1 | tee`` binds the
+    redirection and the pipe to the *last* simple command only, so the earlier
+    stages' output would bypass the log and ``PIPESTATUS[0]`` would report the
+    wrong command's status.
+    """
+    import posixpath
+
+    log = safe_remote_path(log_path)
+    log_dir = safe_remote_path(posixpath.dirname(log_path))
+    return (
+        "#!/bin/bash\n"
+        "set -uo pipefail\n"
+        'mkdir -p "%s"\n'
+        "export PYTHONUNBUFFERED=1\n"
+        "(\n"
+        "%s\n"
+        ') 2>&1 | tee -a "%s"\n'
+        "rc=${PIPESTATUS[0]}\n"
+        'echo "[sparkrun] tuning command exited rc=$rc" >> "%s"\n'
+        "exit $rc\n"
+    ) % (log_dir, command, log, log)
+
+
+def report_tune_failure(
+    tp_size: int,
+    result,
+    elapsed: float,
+    host: str,
+    log_path: str,
+    timeout_sec: int | None,
+) -> None:
+    """Explain a failed or timed-out TP run without dumping the firehose.
+
+    Shared by both tuners: a timeout is reported as a timeout (naming the cap
+    that fired and how to raise it), not as an opaque non-zero exit, and only
+    the tail of the captured output is echoed — the full record is in the
+    host-side log.
+    """
+    from sparkrun.orchestration.ssh import TIMEOUT_RETURNCODE
+
+    if result.returncode == TIMEOUT_RETURNCODE:
+        logger.error(
+            "  Tuning for TP=%d hit its %s cap (%s elapsed) and was terminated.",
+            tp_size,
+            describe_timeout(timeout_sec),
+            _format_duration(elapsed),
+        )
+        logger.error("  Raise it with --timeout HOURS (or tuning.timeout_hours in config.yaml); --timeout 0 removes the cap.")
+    else:
+        logger.error(
+            "  Tuning for TP=%d failed (exit %d, %s)",
+            tp_size,
+            result.returncode,
+            _format_duration(elapsed),
+        )
+    logger.error("  Full output: %s:%s", host, log_path)
+    if result.stdout and result.stdout.strip():
+        logger.error("  stdout (tail):\n%s", tail_text(result.stdout))
+    if result.stderr and result.stderr.strip():
+        logger.error("  stderr (tail):\n%s", tail_text(result.stderr))
+
+
+def tail_text(text: str, max_lines: int = 60) -> str:
+    """Return the last *max_lines* lines of *text*, noting what was dropped.
+
+    Tuning emits tens of thousands of progress-bar lines; dumping all of them
+    into an error message buries the actual failure (see issue #206).
+    """
+    lines = (text or "").rstrip().splitlines()
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    dropped = len(lines) - max_lines
+    return "\n".join(["... (%d earlier lines omitted)" % dropped] + lines[-max_lines:])
+
+
+# ---------------------------------------------------------------------------
 # BaseTuner — shared orchestration skeleton
 # ---------------------------------------------------------------------------
 
@@ -99,6 +291,8 @@ class BaseTuner:
         output_dir: str | None = None,
         skip_clone: bool = False,
         dry_run: bool = False,
+        timeout_hours: float | None = None,
+        force_parallel: bool = False,
     ):
         self.host = host
         self.image = image
@@ -109,6 +303,9 @@ class BaseTuner:
         self.output_dir = output_dir or str(self._default_output_dir())
         self.skip_clone = skip_clone
         self.dry_run = dry_run
+        self.timeout_sec = resolve_tuning_timeout(timeout_hours, config)
+        self.force_parallel = force_parallel
+        self._log_stamp = log_stamp()
 
         from sparkrun.orchestration.primitives import build_ssh_kwargs
 
@@ -178,17 +375,21 @@ class BaseTuner:
         """
         import time
 
-        logger.info("=" * 60)
-        logger.info("sparkrun %s Kernel Tuner", self.runtime_label)
-        logger.info("=" * 60)
-        logger.info("Host:       %s", self.host)
-        logger.info("Image:      %s", self.image)
-        logger.info("Model:      %s", self.model)
-        logger.info("TP sizes:   %s", ", ".join(str(t) for t in tp_sizes))
-        logger.info("Parallel:   %d", parallel)
-        logger.info("Output:     %s", self.output_dir)
-        logger.info("Mode:       %s", "DRY-RUN" if self.dry_run else "LIVE")
-        logger.info("=" * 60)
+        logger.log(PROGRESS, "=" * 60)
+        logger.log(PROGRESS, "sparkrun %s Kernel Tuner", self.runtime_label)
+        logger.log(PROGRESS, "=" * 60)
+        parallel = resolve_tuning_parallel(parallel, len(tp_sizes), self.force_parallel)
+
+        logger.log(PROGRESS, "Host:       %s", self.host)
+        logger.log(PROGRESS, "Image:      %s", self.image)
+        logger.log(PROGRESS, "Model:      %s", self.model)
+        logger.log(PROGRESS, "TP sizes:   %s", ", ".join(str(t) for t in tp_sizes))
+        logger.log(PROGRESS, "Parallel:   %d", parallel)
+        logger.log(PROGRESS, "Output:     %s", self.output_dir)
+        logger.log(PROGRESS, "Timeout:    %s (per TP size)", describe_timeout(self.timeout_sec))
+        logger.log(PROGRESS, "Logs:       %s:%s", self.host, remote_tune_log_dir(self.remote_output_dir))
+        logger.log(PROGRESS, "Mode:       %s", "DRY-RUN" if self.dry_run else "LIVE")
+        logger.log(PROGRESS, "=" * 60)
 
         t_total = time.monotonic()
         tp_timings: list[tuple[int, float]] = []  # (tp_size, seconds)
@@ -206,7 +407,7 @@ class BaseTuner:
                     return rc
                 self._apply_patches()
             else:
-                logger.info("Step 2/5: Skipping clone (--skip-clone)")
+                logger.log(PROGRESS, "Step 2/5: Skipping clone (--skip-clone)")
 
             # Step 3: Detect Triton version
             triton_version = self._detect_triton_version()
@@ -226,13 +427,17 @@ class BaseTuner:
                     tp_timings,
                 )
 
+            # Step 5: Sync configs back to control node (remote hosts only).
+            # Unconditional, and *before* the failure return: a run that dies
+            # on TP=4 has usually already produced good configs for TP=1 and
+            # TP=2, and returning early stranded hours of completed work on
+            # the remote host.
+            self._sync_back_configs()
+
             if rc != 0:
                 return rc
 
-            # Step 5: Sync configs back to control node (remote hosts only)
-            self._sync_back_configs()
-
-            logger.info("Step 5/5: Tuning complete!")
+            logger.log(PROGRESS, "Step 5/5: Tuning complete!")
             total_elapsed = time.monotonic() - t_total
             self._print_timing_summary(tp_timings, total_elapsed)
             return 0
@@ -253,14 +458,16 @@ class BaseTuner:
 
         for i, tp in enumerate(tp_sizes):
             if self._pre_check_tp(tp, triton_version):
-                logger.info(
+                logger.log(
+                    PROGRESS,
                     "Step 4/5: TP=%d configs already exist, skipping (%d/%d)",
                     tp,
                     i + 1,
                     len(tp_sizes),
                 )
                 continue
-            logger.info(
+            logger.log(
+                PROGRESS,
                 "Step 4/5: Tuning TP=%d (%d/%d)...",
                 tp,
                 i + 1,
@@ -286,7 +493,8 @@ class BaseTuner:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         effective_workers = min(max_workers, len(tp_sizes))
-        logger.info(
+        logger.log(
+            PROGRESS,
             "Step 4/5: Tuning %d TP sizes with %d parallel workers...",
             len(tp_sizes),
             effective_workers,
@@ -296,19 +504,21 @@ class BaseTuner:
         needed_tp = []
         for tp in tp_sizes:
             if self._pre_check_tp(tp, triton_version):
-                logger.info("  TP=%d configs already exist, skipping", tp)
+                logger.log(PROGRESS, "  TP=%d configs already exist, skipping", tp)
             else:
                 needed_tp.append(tp)
 
         if not needed_tp:
-            logger.info("  All TP sizes already tuned, nothing to do")
+            logger.log(PROGRESS, "  All TP sizes already tuned, nothing to do")
             return 0
 
         failed: list[tuple[int, int]] = []  # (tp_size, exit_code)
 
         def _tune_one(tp: int) -> tuple[int, int, float]:
             t0 = time.monotonic()
-            rc = self._run_tune_for_tp(tp, triton_version)
+            # quiet: N concurrent sweeps interleaved on one terminal are
+            # unreadable.  Each still tees to its own host-side logfile.
+            rc = self._run_tune_for_tp(tp, triton_version, quiet=True)
             return tp, rc, time.monotonic() - t0
 
         with ThreadPoolExecutor(max_workers=effective_workers) as executor:
@@ -320,7 +530,7 @@ class BaseTuner:
                     logger.error("Tuning failed for TP=%d (exit %d)", tp, rc)
                     failed.append((tp, rc))
                 else:
-                    logger.info("  TP=%d done (%s)", tp, _format_duration(elapsed))
+                    logger.log(PROGRESS, "  TP=%d done (%s)", tp, _format_duration(elapsed))
 
         # Sort timings by TP size for consistent display
         tp_timings.sort(key=lambda x: x[0])
@@ -343,7 +553,7 @@ class BaseTuner:
         DockerExecutor = get_executor("docker")
 
         t0 = time.monotonic()
-        logger.info("Step 1/5: Launching tuning container on %s...", self.host)
+        logger.log(PROGRESS, "Step 1/5: Launching tuning container on %s...", self.host)
 
         # Ensure output directory exists on the remote host (as the SSH user, not root)
         mkdir_script = '#!/bin/bash\nset -uo pipefail\nmkdir -p "%s"\n' % safe_remote_path(self.remote_output_dir)
@@ -385,7 +595,7 @@ class BaseTuner:
             logger.error("Failed to launch tuning container: %s", result.stderr)
             return 1
 
-        logger.info("Step 1/5: Container launched (%.1fs)", time.monotonic() - t0)
+        logger.log(PROGRESS, "Step 1/5: Container launched (%.1fs)", time.monotonic() - t0)
         return 0
 
     def _clone_benchmarks(self) -> int:
@@ -396,7 +606,7 @@ class BaseTuner:
         from sparkrun.scripts import read_script
 
         t0 = time.monotonic()
-        logger.info("Step 2/5: Cloning %s benchmark scripts...", self.runtime_label)
+        logger.log(PROGRESS, "Step 2/5: Cloning %s benchmark scripts...", self.runtime_label)
 
         clone_script = read_script(self.clone_script)
         exec_cmd = docker_exec_cmd(self.container_name, clone_script)
@@ -416,7 +626,7 @@ class BaseTuner:
             logger.error("Failed to clone benchmark scripts: %s", result.stderr)
             return 1
 
-        logger.info("Step 2/5: Clone done (%.1fs)", time.monotonic() - t0)
+        logger.log(PROGRESS, "Step 2/5: Clone done (%.1fs)", time.monotonic() - t0)
         return 0
 
     def _detect_triton_version(self) -> str:
@@ -424,7 +634,7 @@ class BaseTuner:
         from sparkrun.orchestration.primitives import run_command_on_host
         from sparkrun.orchestration.docker import docker_exec_cmd
 
-        logger.info("Step 3/5: Detecting Triton version...")
+        logger.log(PROGRESS, "Step 3/5: Detecting Triton version...")
 
         detect_cmd = docker_exec_cmd(
             self.container_name,
@@ -440,13 +650,13 @@ class BaseTuner:
         )
 
         if self.dry_run:
-            logger.info("Step 3/5: [dry-run] Would detect Triton version")
+            logger.log(PROGRESS, "Step 3/5: [dry-run] Would detect Triton version")
             return "unknown"
 
         version = "unknown"
         if result.success and result.stdout.strip():
             version = result.stdout.strip().splitlines()[-1].strip()
-            logger.info("Step 3/5: Triton version: %s", version)
+            logger.log(PROGRESS, "Step 3/5: Triton version: %s", version)
         else:
             logger.warning(
                 "Step 3/5: Could not detect Triton version, using 'unknown': %s",
@@ -522,47 +732,63 @@ class BaseTuner:
         """
         raise NotImplementedError
 
-    def _run_tune_for_tp(self, tp_size: int, triton_version: str) -> int:
-        """Step 4 (per-TP): Run the tuning script for a given TP size."""
+    def _run_tune_for_tp(self, tp_size: int, triton_version: str, quiet: bool = False) -> int:
+        """Step 4 (per-TP): Run the tuning script for a given TP size.
+
+        Output streams to the terminal as it is produced and is teed to a
+        host-side logfile that outlives the SSH session.  *quiet* captures
+        instead of streaming — used when several TP sizes run concurrently
+        and interleaved output would be unreadable.
+        """
         import time
-        from sparkrun.orchestration.primitives import run_command_on_host
+        from sparkrun.orchestration.primitives import run_script_on_host_streaming
         from sparkrun.orchestration.docker import docker_exec_cmd
 
         t0 = time.monotonic()
         tune_cmd = self._build_tune_command(tp_size, triton_version)
         exec_cmd = docker_exec_cmd(self.container_name, tune_cmd)
+        log_path = self._tune_log_path(tp_size)
+        script = build_streamed_tune_script(exec_cmd, log_path)
 
-        # Tuning can take many hours (e.g. 4+ hours for TP=4 on large
-        # models).  Use an 8-hour timeout so remote SSH sessions aren't
-        # killed prematurely.
-        result = run_command_on_host(
+        logger.log(PROGRESS, "  TP=%d: log -> %s:%s", tp_size, self.host, log_path)
+        result = run_script_on_host_streaming(
             self.host,
-            exec_cmd,
+            script,
             ssh_kwargs=self.ssh_kwargs,
-            timeout=28800,
+            timeout=self.timeout_sec,
             dry_run=self.dry_run,
+            quiet=quiet,
+            # A sweep holds the GPU for hours: if this process dies (Ctrl-C,
+            # or the timeout above), the payload must die with its session
+            # rather than keep tuning invisibly on the host.
+            session_guard=True,
+            keepalive=True,
         )
 
         if self.dry_run:
-            logger.info("  [dry-run] Would run tuning for TP=%d", tp_size)
+            logger.log(PROGRESS, "  [dry-run] Would run tuning for TP=%d", tp_size)
             return 0
 
         elapsed = time.monotonic() - t0
         if not result.success:
-            logger.error(
-                "  Tuning for TP=%d failed (exit %d, %.1fs)",
-                tp_size,
-                result.returncode,
-                elapsed,
-            )
-            if result.stdout and result.stdout.strip():
-                logger.error("  stdout:\n%s", result.stdout.rstrip())
-            if result.stderr and result.stderr.strip():
-                logger.error("  stderr:\n%s", result.stderr.rstrip())
+            self._report_tune_failure(tp_size, result, elapsed, log_path)
             return result.returncode
 
-        logger.info("  TP=%d tuning complete (%.1fs)", tp_size, elapsed)
+        logger.log(PROGRESS, "  TP=%d tuning complete (%s)", tp_size, _format_duration(elapsed))
         return 0
+
+    def _tune_log_path(self, tp_size: int) -> str:
+        """Host-side logfile for this TP size's tuning run."""
+        return remote_tune_log_path(
+            self.remote_output_dir,
+            self.runtime_label.lower(),
+            self.model,
+            tp_size,
+            self._log_stamp,
+        )
+
+    def _report_tune_failure(self, tp_size: int, result, elapsed: float, log_path: str) -> None:
+        report_tune_failure(tp_size, result, elapsed, self.host, log_path, self.timeout_sec)
 
     def _print_timing_summary(
         self,
@@ -570,23 +796,24 @@ class BaseTuner:
         total_elapsed: float,
     ) -> None:
         """Print a timing summary table after tuning completes."""
-        logger.info("")
-        logger.info("=" * 60)
-        logger.info("Tuning Summary")
-        logger.info("=" * 60)
-        logger.info("  %-8s  %s", "TP Size", "Duration")
-        logger.info("  %-8s  %s", "-------", "--------")
+        logger.log(PROGRESS, "")
+        logger.log(PROGRESS, "=" * 60)
+        logger.log(PROGRESS, "Tuning Summary")
+        logger.log(PROGRESS, "=" * 60)
+        logger.log(PROGRESS, "  %-8s  %s", "TP Size", "Duration")
+        logger.log(PROGRESS, "  %-8s  %s", "-------", "--------")
         for tp, elapsed in tp_timings:
-            logger.info("  %-8d  %s", tp, _format_duration(elapsed))
-        logger.info("  %-8s  %s", "-------", "--------")
-        logger.info("  %-8s  %s", "Total", _format_duration(total_elapsed))
-        logger.info("")
-        logger.info("Tuning configs saved to: %s", self.output_dir)
-        logger.info(
+            logger.log(PROGRESS, "  %-8d  %s", tp, _format_duration(elapsed))
+        logger.log(PROGRESS, "  %-8s  %s", "-------", "--------")
+        logger.log(PROGRESS, "  %-8s  %s", "Total", _format_duration(total_elapsed))
+        logger.log(PROGRESS, "")
+        logger.log(PROGRESS, "Tuning configs saved to: %s", self.output_dir)
+        logger.log(
+            PROGRESS,
             "These will be auto-mounted in future 'sparkrun run' invocations for %s recipes.",
             self.runtime_label,
         )
-        logger.info("=" * 60)
+        logger.log(PROGRESS, "=" * 60)
 
     def _sync_back_configs(self) -> None:
         """Sync tuning configs from remote host back to the control node.
@@ -604,12 +831,12 @@ class BaseTuner:
             return
 
         if self.dry_run:
-            logger.info("  [dry-run] Would sync configs back from %s:%s", self.host, self.remote_output_dir)
+            logger.log(PROGRESS, "  [dry-run] Would sync configs back from %s:%s", self.host, self.remote_output_dir)
             return
 
         from sparkrun.orchestration.ssh import run_rsync_from_remote
 
-        logger.info("  Syncing tuning configs back from %s...", self.host)
+        logger.log(PROGRESS, "  Syncing tuning configs back from %s...", self.host)
         result = run_rsync_from_remote(
             host=self.host,
             source_path=self.remote_output_dir,
@@ -621,7 +848,7 @@ class BaseTuner:
             timeout=120,
         )
         if result.success:
-            logger.info("  Tuning configs synced to local %s", self.output_dir)
+            logger.log(PROGRESS, "  Tuning configs synced to local %s", self.output_dir)
         else:
             logger.warning(
                 "  Failed to sync tuning configs back from %s: %s",
@@ -634,7 +861,7 @@ class BaseTuner:
         from sparkrun.orchestration.primitives import run_command_on_host
         from sparkrun.orchestration.docker import docker_stop_cmd
 
-        logger.info("Cleaning up tuning container...")
+        logger.log(PROGRESS, "Cleaning up tuning container...")
         cmd = docker_stop_cmd(self.container_name)
         run_command_on_host(
             self.host,

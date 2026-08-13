@@ -20,6 +20,26 @@ from ._common import (
 logger = logging.getLogger(__name__)
 
 
+def timeout_option(f):
+    """``--timeout HOURS`` — per-TP wall-clock cap, shared by both tuners."""
+    return click.option(
+        "--timeout",
+        "timeout_hours",
+        type=float,
+        default=None,
+        help="Wall-clock cap per TP size, in hours (0 = no cap). Default: tuning.timeout_hours, else 24.",
+    )(f)
+
+
+def force_parallel_option(f):
+    """``--force-parallel`` — allow contended concurrent tuning jobs."""
+    return click.option(
+        "--force-parallel",
+        is_flag=True,
+        help="Allow --parallel > 1 despite GPU contention corrupting the latency measurements tuning depends on.",
+    )(f)
+
+
 @click.group()
 @click.pass_context
 def tune(ctx):
@@ -35,6 +55,8 @@ def tune(ctx):
 @click.option("--output-dir", default=None, help="Override tuning config output directory")
 @click.option("--skip-clone", is_flag=True, help="Skip cloning SGLang repo (scripts already in image)")
 @click.option("--parallel", "-j", type=int, default=1, help="Run N tuning jobs concurrently (default: 1 = sequential)")
+@timeout_option
+@force_parallel_option
 @dry_run_option
 @click.pass_context
 @with_host_context
@@ -49,6 +71,8 @@ def tune_sglang(
     output_dir,
     skip_clone,
     parallel,
+    timeout_hours,
+    force_parallel,
     dry_run,
     config_path=None,
     host_list=None,
@@ -67,7 +91,7 @@ def tune_sglang(
       sparkrun tune sglang qwen3.5-35b-bf16-sglang -H 192.168.11.13
       sparkrun tune sglang qwen3.5-35b-bf16-sglang --cluster mylab --tp 4
       sparkrun tune sglang qwen3.5-35b-bf16-sglang -H myhost --tp 1 --tp 2 --tp 4
-      sparkrun tune sglang qwen3.5-35b-bf16-sglang -H myhost --parallel 2
+      sparkrun tune sglang qwen3.5-35b-bf16-sglang -H myhost --timeout 36
     """
     from sparkrun.core.bootstrap import get_runtime
     from sparkrun.tuning.sglang import SglangTuner, DEFAULT_TP_SIZES
@@ -122,6 +146,8 @@ def tune_sglang(
         output_dir=output_dir,
         skip_clone=skip_clone,
         dry_run=dry_run,
+        timeout_hours=timeout_hours,
+        force_parallel=force_parallel,
     )
 
     rc = tuner.run_tuning(tp_sizes=effective_tp, parallel=parallel)
@@ -150,6 +176,8 @@ VLLM_RUNTIMES = {"vllm-ray", "vllm-distributed", "eugr-vllm"}
     help="Override the vllm-tune git ref (tag/branch/SHA) pinned in config",
 )
 @click.option("--parallel", "-j", type=int, default=1, help="Run N tuning jobs concurrently (default: 1 = sequential)")
+@timeout_option
+@force_parallel_option
 @dry_run_option
 @click.pass_context
 @with_host_context
@@ -165,6 +193,8 @@ def tune_vllm(
     mode,
     vllm_tune_ref,
     parallel,
+    timeout_hours,
+    force_parallel,
     dry_run,
     config_path=None,
     host_list=None,
@@ -184,13 +214,19 @@ def tune_vllm(
 
     Prerequisites on the remote host: ``jq``, ``docker``, ``git``.
 
+    Tuning output streams live and is also teed to a logfile on the target
+    host, so a dropped connection doesn't lose the record.  A sweep runs for
+    hours: raise or remove the per-TP cap with ``--timeout`` if a large MoE
+    model needs longer.
+
     \b
     Examples:
       sparkrun tune vllm qwen3-moe-vllm -H 192.168.11.13
       sparkrun tune vllm qwen3-moe-vllm --cluster mylab --tp 4 --mode moe
       sparkrun tune vllm qwen3-4b-fp8 -H myhost --mode fp8 --tp 1
       sparkrun tune vllm qwen3-moe-vllm -H myhost --tp 1 --tp 2 --tp 4
-      sparkrun tune vllm qwen3-moe-vllm -H myhost --parallel 2
+      sparkrun tune vllm qwen3-moe-vllm -H myhost --timeout 36
+      sparkrun tune vllm qwen3-moe-vllm -H myhost --timeout 0   # no cap
     """
     from sparkrun.core.bootstrap import get_runtime
     from sparkrun.tuning.vllm import VllmTuner, DEFAULT_TP_SIZES
@@ -246,6 +282,8 @@ def tune_vllm(
         mode=mode,
         vllm_tune_ref=vllm_tune_ref,
         dry_run=dry_run,
+        timeout_hours=timeout_hours,
+        force_parallel=force_parallel,
     )
 
     rc = tuner.run_tuning(tp_sizes=effective_tp, parallel=parallel)

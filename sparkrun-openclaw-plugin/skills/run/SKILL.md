@@ -196,12 +196,21 @@ sparkrun benchmark <recipe> --dry-run
 # Tune SGLang fused MoE kernels
 sparkrun tune sglang <recipe> --hosts <ip>
 sparkrun tune sglang <recipe> --cluster <name> --tp 1 --tp 2 --tp 4
-sparkrun tune sglang <recipe> -H <ip> --parallel 2
 
 # Tune vLLM fused MoE kernels
 sparkrun tune vllm <recipe> --hosts <ip>
 sparkrun tune vllm <recipe> --cluster <name> --tp 4
+
+# Raise (or remove) the per-TP wall-clock cap; default 24h
+sparkrun tune vllm <recipe> -H <ip> --timeout 36
+sparkrun tune vllm <recipe> -H <ip> --timeout 0
 ```
+
+Tuning is a multi-hour job per TP size. Output streams live and is also teed to
+a logfile on the target host (`~/.cache/sparkrun/tuning/logs/`), which survives a
+dropped SSH session. `--parallel > 1` is downgraded to sequential: tuning
+measures kernel latency on a single GPU, so concurrent jobs contend and select
+wrong configs (`--force-parallel` overrides).
 
 ## Inference Proxy
 

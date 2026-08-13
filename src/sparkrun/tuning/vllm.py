@@ -22,12 +22,21 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from sparkrun.core.progress import PROGRESS
 from sparkrun.tuning._common import (
     DEFAULT_TP_SIZES,  # noqa: F401 — re-exported for public API
     _format_duration,
     _get_tuning_dir,
     _get_tuning_env,
     _get_tuning_volumes,
+    build_streamed_tune_script,
+    describe_timeout,
+    log_stamp,
+    remote_tune_log_dir,
+    remote_tune_log_path,
+    report_tune_failure,
+    resolve_tuning_parallel,
+    resolve_tuning_timeout,
 )
 from sparkrun.utils.shell import quote, safe_remote_path, validate_git_url
 
@@ -42,11 +51,6 @@ logger = logging.getLogger(__name__)
 
 VLLM_TUNING_CACHE_SUBDIR = "tuning/vllm"
 VLLM_TUNING_CONTAINER_PATH = "/tuning/vllm"
-
-# Per-TP tuning timeout: vllm-tune's MoE phase can take 1.5-3 hours, FP8 adds
-# another 15-25 minutes; allow 8 hours per invocation to match the prior
-# BaseTuner budget.
-_TUNE_TIMEOUT_SEC = 28800
 
 # Subdir on the remote host where the pinned vllm-tune checkout lives.
 _VLLM_TUNE_REMOTE_PARENT = "$HOME/.cache/sparkrun/vllm-tune"
@@ -153,6 +157,11 @@ class VllmTuner:
         mode: ``"moe"`` / ``"fp8"`` / ``"all"`` (default ``"all"``).
         vllm_tune_ref: Override the git ref pinned in ``SparkrunConfig``.
         dry_run: Print commands without executing.
+        timeout_hours: Per-TP wall-clock cap; ``None`` resolves from config,
+            non-positive means no cap.
+        force_parallel: Permit concurrent tuning jobs on one GPU despite the
+            measurement contention that causes — see
+            :func:`~sparkrun.tuning._common.resolve_tuning_parallel`.
     """
 
     def __init__(
@@ -166,6 +175,8 @@ class VllmTuner:
         mode: str = "all",
         vllm_tune_ref: str | None = None,
         dry_run: bool = False,
+        timeout_hours: float | None = None,
+        force_parallel: bool = False,
     ):
         if mode not in VALID_MODES:
             raise ValueError("mode must be one of %s, got %r" % (VALID_MODES, mode))
@@ -179,6 +190,9 @@ class VllmTuner:
         self.cache_dir = cache_dir
         self.mode = mode
         self.dry_run = dry_run
+        self.timeout_sec = resolve_tuning_timeout(timeout_hours, config)
+        self.force_parallel = force_parallel
+        self._log_stamp = log_stamp()
 
         self._custom_output_dir = output_dir is not None
         self.output_dir = output_dir or str(get_vllm_tuning_dir())
@@ -201,19 +215,23 @@ class VllmTuner:
         parallel: int = 1,
     ) -> int:
         """Run vllm-tune for each TP size and rsync results back."""
-        logger.info("=" * 60)
-        logger.info("sparkrun vLLM Kernel Tuner (vllm-tune backend)")
-        logger.info("=" * 60)
-        logger.info("Host:           %s", self.host)
-        logger.info("Image:          %s", self.image)
-        logger.info("Model:          %s", self.model)
-        logger.info("TP sizes:       %s", ", ".join(str(t) for t in tp_sizes))
-        logger.info("Mode:           %s", self.mode)
-        logger.info("Parallel:       %d", parallel)
-        logger.info("Output:         %s", self.output_dir)
-        logger.info("vllm-tune ref:  %s @ %s", self.vllm_tune_repo, self.vllm_tune_ref)
-        logger.info("Run mode:       %s", "DRY-RUN" if self.dry_run else "LIVE")
-        logger.info("=" * 60)
+        parallel = resolve_tuning_parallel(parallel, len(tp_sizes), self.force_parallel)
+
+        logger.log(PROGRESS, "=" * 60)
+        logger.log(PROGRESS, "sparkrun vLLM Kernel Tuner (vllm-tune backend)")
+        logger.log(PROGRESS, "=" * 60)
+        logger.log(PROGRESS, "Host:           %s", self.host)
+        logger.log(PROGRESS, "Image:          %s", self.image)
+        logger.log(PROGRESS, "Model:          %s", self.model)
+        logger.log(PROGRESS, "TP sizes:       %s", ", ".join(str(t) for t in tp_sizes))
+        logger.log(PROGRESS, "Mode:           %s", self.mode)
+        logger.log(PROGRESS, "Parallel:       %d", parallel)
+        logger.log(PROGRESS, "Output:         %s", self.output_dir)
+        logger.log(PROGRESS, "Timeout:        %s (per TP size)", describe_timeout(self.timeout_sec))
+        logger.log(PROGRESS, "Logs:           %s:%s", self.host, remote_tune_log_dir(self.remote_output_dir))
+        logger.log(PROGRESS, "vllm-tune ref:  %s @ %s", self.vllm_tune_repo, self.vllm_tune_ref)
+        logger.log(PROGRESS, "Run mode:       %s", "DRY-RUN" if self.dry_run else "LIVE")
+        logger.log(PROGRESS, "=" * 60)
 
         t_total = time.monotonic()
         tp_timings: list[tuple[int, float]] = []
@@ -238,11 +256,14 @@ class VllmTuner:
             rc = self._run_tp_parallel(install_path, tp_sizes, parallel, tp_timings)
         else:
             rc = self._run_tp_sequential(install_path, tp_sizes, tp_timings)
-        if rc != 0:
-            return rc
 
-        # Step 5: rsync the flat cache back to the control machine.
+        # Step 5: rsync the flat cache back to the control machine.  Runs even
+        # when a later TP size failed — the earlier ones may represent hours of
+        # completed work, and returning early left it stranded on the host.
         self._sync_back_configs()
+        if rc != 0:
+            logger.log(PROGRESS, "Partial results (if any) were synced to %s", self.output_dir)
+            return rc
 
         total_elapsed = time.monotonic() - t_total
         self._print_timing_summary(tp_timings, total_elapsed)
@@ -290,7 +311,7 @@ class VllmTuner:
         else:
             body = "#!/bin/bash\n" + prelude + body
 
-        logger.info("Step 1/5: Ensuring vllm-tune %s is installed on %s...", self.vllm_tune_ref, self.host)
+        logger.log(PROGRESS, "Step 1/5: Ensuring vllm-tune %s is installed on %s...", self.vllm_tune_ref, self.host)
         result = run_script_on_host(
             self.host,
             body,
@@ -310,14 +331,14 @@ class VllmTuner:
         path = result.stdout.strip().splitlines()[-1].strip() if result.stdout.strip() else ""
         if not path:
             path = "%s/vllm-tune.sh" % dest
-        logger.info("Step 1/5: vllm-tune ready at %s:%s", self.host, path)
+        logger.log(PROGRESS, "Step 1/5: vllm-tune ready at %s:%s", self.host, path)
         return path
 
     def _preflight(self) -> int:
         """Verify jq, docker, and git are on PATH on the remote."""
         from sparkrun.orchestration.primitives import run_command_on_host
 
-        logger.info("Step 2/5: Preflight (jq, docker on remote)...")
+        logger.log(PROGRESS, "Step 2/5: Preflight (jq, docker on remote)...")
         # `command -v` returns non-zero if the binary is missing; report which.
         cmd = 'for bin in jq docker git; do command -v "$bin" >/dev/null 2>&1 || { echo "MISSING:$bin"; exit 1; }; done; echo OK'
         result = run_command_on_host(
@@ -375,7 +396,7 @@ class VllmTuner:
         tp_timings: list[tuple[int, float]],
     ) -> int:
         for i, tp in enumerate(tp_sizes):
-            logger.info("Step 4/5: Tuning TP=%d (%d/%d)...", tp, i + 1, len(tp_sizes))
+            logger.log(PROGRESS, "Step 4/5: Tuning TP=%d (%d/%d)...", tp, i + 1, len(tp_sizes))
             t0 = time.monotonic()
             rc = self._run_one_tp(install_path, tp)
             tp_timings.append((tp, time.monotonic() - t0))
@@ -394,7 +415,8 @@ class VllmTuner:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         effective_workers = min(max_workers, len(tp_sizes))
-        logger.info(
+        logger.log(
+            PROGRESS,
             "Step 4/5: Tuning %d TP sizes with %d parallel workers...",
             len(tp_sizes),
             effective_workers,
@@ -403,7 +425,9 @@ class VllmTuner:
 
         def _tune_one(tp: int) -> tuple[int, int, float]:
             t0 = time.monotonic()
-            rc = self._run_one_tp(install_path, tp)
+            # quiet: N concurrent sweeps interleaved on one terminal are
+            # unreadable.  Each still tees to its own host-side logfile.
+            rc = self._run_one_tp(install_path, tp, quiet=True)
             return tp, rc, time.monotonic() - t0
 
         with ThreadPoolExecutor(max_workers=effective_workers) as executor:
@@ -415,7 +439,7 @@ class VllmTuner:
                     logger.error("Tuning failed for TP=%d (exit %d)", tp, rc)
                     failed.append((tp, rc))
                 else:
-                    logger.info("  TP=%d done (%s)", tp, _format_duration(elapsed))
+                    logger.log(PROGRESS, "  TP=%d done (%s)", tp, _format_duration(elapsed))
 
         tp_timings.sort(key=lambda x: x[0])
         if failed:
@@ -423,9 +447,18 @@ class VllmTuner:
             return failed[0][1]
         return 0
 
-    def _run_one_tp(self, install_path: str, tp_size: int) -> int:
-        """Tune for a single TP size, then export to the sparkrun flat cache."""
-        from sparkrun.orchestration.primitives import run_command_on_host
+    def _run_one_tp(self, install_path: str, tp_size: int, quiet: bool = False) -> int:
+        """Tune for a single TP size, then export to the sparkrun flat cache.
+
+        vllm-tune is invoked with ``--foreground`` precisely so its progress
+        streams over the SSH session; this runs it through the streaming
+        dispatcher so that output reaches the terminal as it is produced
+        rather than being buffered until the run ends (which, for a sweep
+        measured in hours, means a blank console throughout).  *quiet*
+        captures instead — for concurrent TP sizes, whose interleaved output
+        would be unreadable.
+        """
+        from sparkrun.orchestration.primitives import run_script_on_host_streaming
 
         tune_cmd = build_vllm_tune_invocation(
             install_path=install_path,
@@ -435,33 +468,45 @@ class VllmTuner:
             image=self.image,
             sparkrun_dir=self.remote_output_dir,
         )
+        log_path = self._tune_log_path(tp_size)
+        script = build_streamed_tune_script(tune_cmd, log_path)
+
+        logger.log(PROGRESS, "  TP=%d: log -> %s:%s", tp_size, self.host, log_path)
         t0 = time.monotonic()
-        result = run_command_on_host(
+        result = run_script_on_host_streaming(
             self.host,
-            tune_cmd,
+            script,
             ssh_kwargs=self.ssh_kwargs,
-            timeout=_TUNE_TIMEOUT_SEC,
+            timeout=self.timeout_sec,
             dry_run=self.dry_run,
+            quiet=quiet,
+            # vllm-tune launches its own standalone container and holds the
+            # GPU for hours.  Without the guard, a Ctrl-C or an overrun
+            # timeout kills only the local ssh client and leaves the sweep
+            # running on the host, invisible and unstoppable from here.
+            session_guard=True,
+            keepalive=True,
         )
         if self.dry_run:
-            logger.info("  [dry-run] Would run: %s", tune_cmd)
+            logger.log(PROGRESS, "  [dry-run] Would run: %s", tune_cmd)
             return 0
-        if not result.success:
-            logger.error(
-                "  Tune for TP=%d failed (exit %d, %s)",
-                tp_size,
-                result.returncode,
-                _format_duration(time.monotonic() - t0),
-            )
-            if result.stdout and result.stdout.strip():
-                logger.error("  stdout:\n%s", result.stdout.rstrip())
-            if result.stderr and result.stderr.strip():
-                logger.error("  stderr:\n%s", result.stderr.rstrip())
-            return result.returncode
 
-        # Tuning succeeded; flatten outputs into the sparkrun cache so the
-        # runtime mixin can mount them.  vllm-tune's --export-sparkrun runs as
-        # a fast early-exit code path (just cp).
+        elapsed = time.monotonic() - t0
+        if not result.success:
+            report_tune_failure(tp_size, result, elapsed, self.host, log_path, self.timeout_sec)
+
+        # Flatten whatever exists into the sparkrun cache so the runtime mixin
+        # can mount it.  Attempted even after a failure: --export-sparkrun is
+        # an early-exit `cp`, and a sweep that died late may still have written
+        # usable configs that would otherwise be stranded in vllm-tune's own
+        # nested layout.
+        self._export_tp(install_path, tp_size, failed=not result.success)
+        return 0 if result.success else result.returncode
+
+    def _export_tp(self, install_path: str, tp_size: int, failed: bool = False) -> None:
+        """Run vllm-tune's ``--export-sparkrun`` step for one TP size."""
+        from sparkrun.orchestration.primitives import run_command_on_host
+
         export_cmd = build_vllm_tune_export(
             install_path=install_path,
             model=self.model,
@@ -476,15 +521,23 @@ class VllmTuner:
             timeout=300,
             dry_run=False,
         )
-        if not export_result.success:
-            logger.warning(
-                "  Export to sparkrun cache failed for TP=%d: %s",
-                tp_size,
-                export_result.stderr[:300],
-            )
-            # Don't fail the tuning run — configs still exist in vllm-tune's
-            # own nested layout on the remote; surface the warning.
-        return 0
+        if export_result.success:
+            if failed:
+                logger.log(PROGRESS, "  Exported partial TP=%d configs from the failed run", tp_size)
+            return
+        # Never fatal: configs (if any) still exist in vllm-tune's own nested
+        # layout on the remote.  After a failed tune there may simply be
+        # nothing to export, so that case is only worth a debug line.
+        log_fn = logger.debug if failed else logger.warning
+        log_fn(
+            "  Export to sparkrun cache failed for TP=%d: %s",
+            tp_size,
+            export_result.stderr[:300],
+        )
+
+    def _tune_log_path(self, tp_size: int) -> str:
+        """Host-side logfile for this TP size's tuning run."""
+        return remote_tune_log_path(self.remote_output_dir, "vllm-tune", self.model, tp_size, self._log_stamp)
 
     def _sync_back_configs(self) -> None:
         """Rsync the remote flat tuning cache back to the control machine."""
@@ -493,12 +546,12 @@ class VllmTuner:
         if is_local_host(self.host):
             return
         if self.dry_run:
-            logger.info("  [dry-run] Would rsync %s:%s -> %s", self.host, self.remote_output_dir, self.output_dir)
+            logger.log(PROGRESS, "  [dry-run] Would rsync %s:%s -> %s", self.host, self.remote_output_dir, self.output_dir)
             return
 
         from sparkrun.orchestration.ssh import run_rsync_from_remote
 
-        logger.info("Step 5/5: Syncing tuning configs back from %s...", self.host)
+        logger.log(PROGRESS, "Step 5/5: Syncing tuning configs back from %s...", self.host)
         result = run_rsync_from_remote(
             host=self.host,
             source_path=self.remote_output_dir,
@@ -510,7 +563,7 @@ class VllmTuner:
             timeout=300,
         )
         if result.success:
-            logger.info("  Tuning configs synced to local %s", self.output_dir)
+            logger.log(PROGRESS, "  Tuning configs synced to local %s", self.output_dir)
         else:
             logger.warning(
                 "  Failed to sync tuning configs back from %s: %s",
@@ -523,20 +576,20 @@ class VllmTuner:
         tp_timings: list[tuple[int, float]],
         total_elapsed: float,
     ) -> None:
-        logger.info("")
-        logger.info("=" * 60)
-        logger.info("Tuning Summary")
-        logger.info("=" * 60)
-        logger.info("  %-8s  %s", "TP Size", "Duration")
-        logger.info("  %-8s  %s", "-------", "--------")
+        logger.log(PROGRESS, "")
+        logger.log(PROGRESS, "=" * 60)
+        logger.log(PROGRESS, "Tuning Summary")
+        logger.log(PROGRESS, "=" * 60)
+        logger.log(PROGRESS, "  %-8s  %s", "TP Size", "Duration")
+        logger.log(PROGRESS, "  %-8s  %s", "-------", "--------")
         for tp, elapsed in tp_timings:
-            logger.info("  %-8d  %s", tp, _format_duration(elapsed))
-        logger.info("  %-8s  %s", "-------", "--------")
-        logger.info("  %-8s  %s", "Total", _format_duration(total_elapsed))
-        logger.info("")
-        logger.info("Tuning configs saved to: %s", self.output_dir)
-        logger.info("These will be auto-mounted in future 'sparkrun run' invocations.")
-        logger.info("=" * 60)
+            logger.log(PROGRESS, "  %-8d  %s", tp, _format_duration(elapsed))
+        logger.log(PROGRESS, "  %-8s  %s", "-------", "--------")
+        logger.log(PROGRESS, "  %-8s  %s", "Total", _format_duration(total_elapsed))
+        logger.log(PROGRESS, "")
+        logger.log(PROGRESS, "Tuning configs saved to: %s", self.output_dir)
+        logger.log(PROGRESS, "These will be auto-mounted in future 'sparkrun run' invocations.")
+        logger.log(PROGRESS, "=" * 60)
 
 
 # ---------------------------------------------------------------------------

@@ -955,6 +955,35 @@ inference runs. Common tuning internals live in `tuning/_common.py`; runtime-spe
 and `tuning/vllm.py`. `tuning/sync.py` handles syncing tuning configs from registries to local cache and runtime name
 normalization.
 
+**A tuning run is the longest thing sparkrun does** — thousands of configurations at ~10s each, so a *single* TP size
+on a real MoE model has been observed taking 5-6 hours (issue #206), and vllm-tune runs several such sweeps per
+invocation. Everything below follows from that:
+
+- **Output streams.** Both tuners dispatch through `primitives.run_script_on_host_streaming` rather than a capturing
+  call. `build_streamed_tune_script` wraps the command with `PYTHONUNBUFFERED=1` (Python block-buffers to a pipe, so
+  "streaming" without it delivers 8 KB at a time), tees to a host-side logfile that outlives the SSH session, and
+  propagates `PIPESTATUS[0]` — with `tee` in the pipeline the shell would otherwise report *tee's* status, turning
+  every tuning failure into a success. The command runs in a **subshell**: tuning commands are compound
+  (`mkdir … && cd … && python3 …`), and a bare `cmd 2>&1 | tee` binds only to the last simple command.
+- **Logs live at `<cache>/tuning/logs/`** — a sibling of the flat config cache, never inside it: that directory is
+  bind-mounted into inference containers and rsynced back.
+- **The session guard is on** (`session_guard=True`), so a Ctrl-C or an overrun timeout kills the remote sweep instead
+  of leaving it holding the GPU invisibly. **Keepalives are on** (`keepalive=True`), so a link that dies in minute 3
+  is reported in ~3 minutes instead of masquerading as a slow sweep until the wall-clock cap fires.
+- **The cap is `tuning.timeout_hours` (default 24h, per TP size)**, overridable with `--timeout HOURS`; `0` removes it.
+  The old hardcoded 8h killed real runs mid-sweep. A timeout is reported *as* a timeout (rc 124 via
+  `ssh.TIMEOUT_RETURNCODE`) naming the knob to raise, with the output **tailed**, not dumped — see
+  `report_tune_failure`.
+- **Partial results are always salvaged.** `--export-sparkrun` is attempted even after a failed sweep, and the
+  rsync-back step runs before the failure return — a run that dies on TP=4 has usually already produced good configs
+  for TP=1 and TP=2, and returning early stranded them on the remote host.
+- **`--parallel > 1` is downgraded to sequential** (`resolve_tuning_parallel`, `--force-parallel` overrides). Tuning
+  *measures kernel latency* and every job targets the same single GPU, so concurrent jobs contend and the comparison
+  is contaminated — the failure mode is a wrong config written to the cache and auto-mounted by every later
+  `sparkrun run`, not merely a slower correct one.
+- Tuner phase/step output is emitted at **`PROGRESS` (25)**, like the launch and benchmark paths. At `logger.info` it
+  was invisible at default verbosity, so a multi-hour job printed nothing at all unless the user passed `-v`.
+
 ### Utilities (`utils/`)
 
 Shared helpers used across multiple modules to avoid circular imports:
