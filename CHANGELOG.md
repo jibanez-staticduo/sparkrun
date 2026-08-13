@@ -27,8 +27,18 @@ For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NO
   local tag (upstream tags `vllm-node-b12x`) and the flag is forwarded verbatim.
   Long-term image pinning resolves against the `nightly-b12x` variant.
 
+### Added
+
+- `sparkrun tune vllm` / `sparkrun tune sglang`: `--timeout SECONDS`, a per-TP
+  ceiling on the tuning job itself. `0` (the default) means no ceiling.
+
 ### Changed
 
+- Tuning jobs are **unbounded by default**, replacing the fixed 8-hour cap on
+  both the vLLM and SGLang paths. A tuning run that is killed at the wire loses
+  all of its work, and the normal runtime is measured in hours (vllm-tune's MoE
+  phase alone is 1.5-3h), so completion now outranks bounded runtime. Pass
+  `--timeout` to get a ceiling back.
 - `run-recipe.sh` shim: `--ray`/`--no-ray` combined with `--solo` now warn and
   are ignored instead of erroring, matching upstream's
   `use_ray = args.ray and not is_solo`. The flags are recorded during parsing
