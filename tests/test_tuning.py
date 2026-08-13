@@ -8,6 +8,11 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+from sparkrun.tuning._common import (
+    NO_TIMEOUT,
+    describe_tuning_timeout,
+    resolve_tuning_timeout,
+)
 from sparkrun.tuning.sglang import (
     build_tuning_command,
     get_sglang_tuning_dir,
@@ -271,11 +276,11 @@ class TestTuneSglangCLI:
         assert result.exit_code != 0
         assert "requires an SGLang recipe" in result.output
 
-    def test_accepts_custom_timeout(selfself, tmp_path, monkeypatch):
-        """tune vllm should accept custom timeout in dry-run."""
+    def test_accepts_custom_timeout(self, tmp_path):
+        """tune sglang accepts a positive --timeout."""
         from sparkrun.cli import main
 
-        recipe_file = tmp_path / "test-vllm-ray.yaml"
+        recipe_file = tmp_path / "test-sglang.yaml"
         recipe_file.write_text(
             yaml.dump(
                 {
@@ -291,20 +296,34 @@ class TestTuneSglangCLI:
         runner = CliRunner()
         result = runner.invoke(
             main,
-            [
-                "-v",
-                "tune",
-                "sglang",
-                str(recipe_file),
-                "-H",
-                "10.0.0.1",
-                "-n",
-                "--timeout",
-                "0"
-            ],
+            ["-v", "tune", "sglang", str(recipe_file), "-H", "10.0.0.1", "-n", "--timeout", "600"],
         )
-        # Should not fail with runtime validation error
-        assert "Timeout set to 0 seconds" in (result.output or "")
+        assert result.exit_code == 0
+        assert "Tuning job timeout: 600s" in (result.output or "")
+
+    def test_rejects_negative_timeout(self, tmp_path):
+        """The expire-immediately sentinel is not reachable from the CLI."""
+        from sparkrun.cli import main
+
+        recipe_file = tmp_path / "test-sglang.yaml"
+        recipe_file.write_text(
+            yaml.dump(
+                {
+                    "sparkrun_version": "2",
+                    "name": "Test sglang",
+                    "model": "test/model",
+                    "runtime": "sglang",
+                    "container": "test:latest",
+                }
+            )
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["tune", "sglang", str(recipe_file), "-H", "10.0.0.1", "-n", "--timeout", "-1"],
+        )
+        assert result.exit_code != 0
 
 
 # ---------------------------------------------------------------------------
@@ -843,9 +862,9 @@ class TestTuneVllmCLI:
         )
         # Should not fail with runtime validation error
         assert "requires a vLLM recipe" not in (result.output or "")
-    
-    def test_accepts_custom_timeout(selfself, tmp_path, monkeypatch):
-        """tune vllm should accept custom timeout in dry-run."""
+
+    def test_accepts_custom_timeout(self, tmp_path):
+        """tune vllm accepts a positive --timeout."""
         from sparkrun.cli import main
 
         recipe_file = tmp_path / "test-vllm-ray.yaml"
@@ -864,20 +883,34 @@ class TestTuneVllmCLI:
         runner = CliRunner()
         result = runner.invoke(
             main,
-            [
-                "-v",
-                "tune",
-                "vllm",
-                str(recipe_file),
-                "-H",
-                "10.0.0.1",
-                "-n",
-                "--timeout",
-                "0"
-            ],
+            ["-v", "tune", "vllm", str(recipe_file), "-H", "10.0.0.1", "-n", "--timeout", "600"],
         )
-        # Should not fail with runtime validation error
-        assert "Timeout set to 0 seconds" in (result.output or "")
+        assert result.exit_code == 0
+        assert "Tuning job timeout: 600s" in (result.output or "")
+
+    def test_rejects_negative_timeout(self, tmp_path):
+        """The expire-immediately sentinel is not reachable from the CLI."""
+        from sparkrun.cli import main
+
+        recipe_file = tmp_path / "test-vllm-ray.yaml"
+        recipe_file.write_text(
+            yaml.dump(
+                {
+                    "sparkrun_version": "2",
+                    "name": "Test vLLM",
+                    "model": "test/model",
+                    "runtime": "vllm",
+                    "container": "test:latest",
+                }
+            )
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["tune", "vllm", str(recipe_file), "-H", "10.0.0.1", "-n", "--timeout", "-1"],
+        )
+        assert result.exit_code != 0
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1198,125 @@ class TestPreCheckTp:
         mock_result = RemoteResult(host="10.0.0.1", returncode=1, stdout="", stderr="")
         with patch("sparkrun.orchestration.primitives.run_command_on_host", return_value=mock_result):
             assert tuner._pre_check_tp(1, "3.6.0") is False
+
+
+# ===========================================================================
+# Tuning job timeout
+# ===========================================================================
+
+
+class TestResolveTuningTimeout:
+    """The 0 / >0 / <0 convention, in isolation."""
+
+    def test_zero_means_no_ceiling(self):
+        assert resolve_tuning_timeout(0) is None
+        assert resolve_tuning_timeout(NO_TIMEOUT) is None
+
+    def test_positive_is_a_budget(self):
+        assert resolve_tuning_timeout(600) == 600
+
+    def test_negative_expires_immediately(self):
+        # 0 is what subprocess.run treats as "already expired"; None would
+        # mean the opposite, so the distinction matters.
+        assert resolve_tuning_timeout(-1) == 0
+
+    def test_describe_names_both_states(self):
+        assert describe_tuning_timeout(0) == "none (unbounded)"
+        assert describe_tuning_timeout(600) == "600s"
+        assert "immediately" in describe_tuning_timeout(-1)
+
+
+def _capture_tune_calls(monkeypatch):
+    """Record every ``run_command_on_host`` call and report success."""
+    import sparkrun.orchestration.primitives as primitives
+    from sparkrun.orchestration.ssh import RemoteResult
+
+    calls = []
+
+    def _fake(host, command, **kwargs):
+        calls.append(kwargs)
+        return RemoteResult(host=host, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(primitives, "run_command_on_host", _fake)
+    return calls
+
+
+class TestEffectiveTuningTimeout:
+    """The timeout reaching the effective command, per runtime.
+
+    Asserting on the log line is not enough: the value has to survive the trip
+    from the flag to ``run_command_on_host``.  These pin the *first* call of
+    each tuning path — the tuning job itself — not the short fixed-budget
+    probes and exports around it.
+    """
+
+    # --- sglang: _run_tune_for_tp (in BaseTuner) ---
+
+    def test_sglang_default_is_unbounded(self, monkeypatch):
+        calls = _capture_tune_calls(monkeypatch)
+        tuner = SglangTuner(host="10.0.0.1", image="test:latest", model="m")
+        assert tuner._run_tune_for_tp(1, "3.6.0") == 0
+        assert calls[0]["timeout"] is None
+
+    def test_sglang_honors_explicit_budget(self, monkeypatch):
+        calls = _capture_tune_calls(monkeypatch)
+        tuner = SglangTuner(host="10.0.0.1", image="test:latest", model="m", timeout=600)
+        assert tuner._run_tune_for_tp(1, "3.6.0") == 0
+        assert calls[0]["timeout"] == 600
+
+    def test_sglang_negative_expires_immediately(self, monkeypatch):
+        calls = _capture_tune_calls(monkeypatch)
+        tuner = SglangTuner(host="10.0.0.1", image="test:latest", model="m", timeout=-1)
+        tuner._run_tune_for_tp(1, "3.6.0")
+        assert calls[0]["timeout"] == 0
+
+    def test_sglang_patch_step_keeps_its_own_guard(self, monkeypatch):
+        """--timeout is the job budget; the patch step stays fixed at 15s.
+
+        Otherwise the default (no ceiling) would let a wedged container hang
+        this best-effort ``docker exec`` forever.
+        """
+        import sparkrun.orchestration.primitives as primitives
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        seen = {}
+
+        def _fake_run_script_on_host(host, script, **kwargs):
+            seen.update(kwargs)
+            return RemoteResult(host=host, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(primitives, "run_script_on_host", _fake_run_script_on_host)
+
+        tuner = SglangTuner(host="10.0.0.1", image="test:latest", model="m", timeout=600)
+        tuner._apply_patches()
+        assert seen["timeout"] == 15
+
+    # --- vllm: _run_one_tp ---
+
+    def test_vllm_default_is_unbounded(self, monkeypatch):
+        calls = _capture_tune_calls(monkeypatch)
+        tuner = VllmTuner(host="10.0.0.1", image="test:latest", model="m")
+        assert tuner._run_one_tp("/opt/vllm-tune", 1) == 0
+        assert calls[0]["timeout"] is None
+
+    def test_vllm_honors_explicit_budget(self, monkeypatch):
+        calls = _capture_tune_calls(monkeypatch)
+        tuner = VllmTuner(host="10.0.0.1", image="test:latest", model="m", timeout=600)
+        assert tuner._run_one_tp("/opt/vllm-tune", 1) == 0
+        assert calls[0]["timeout"] == 600
+
+    def test_vllm_negative_expires_immediately(self, monkeypatch):
+        calls = _capture_tune_calls(monkeypatch)
+        tuner = VllmTuner(host="10.0.0.1", image="test:latest", model="m", timeout=-1)
+        tuner._run_one_tp("/opt/vllm-tune", 1)
+        assert calls[0]["timeout"] == 0
+
+    def test_vllm_export_step_keeps_its_own_guard(self, monkeypatch):
+        """The post-tune export is a fast `cp`; it keeps its fixed 300s."""
+        calls = _capture_tune_calls(monkeypatch)
+        tuner = VllmTuner(host="10.0.0.1", image="test:latest", model="m", timeout=600)
+        tuner._run_one_tp("/opt/vllm-tune", 1)
+        assert calls[1]["timeout"] == 300
 
 
 # ===========================================================================
