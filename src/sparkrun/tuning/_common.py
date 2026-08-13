@@ -23,6 +23,56 @@ DEFAULT_TP_SIZES = (1, 2, 4, 8)
 
 
 # ---------------------------------------------------------------------------
+# Tuning job timeout convention
+# ---------------------------------------------------------------------------
+#
+# Tuning is the one sparkrun operation whose *normal* runtime is measured in
+# hours (vllm-tune's MoE phase alone is 1.5-3h; TP=4 on a large model can run
+# past 4h), and a tuning run that is killed at the wire loses all of its work.
+# So the default here is deliberately the opposite of everywhere else in the
+# codebase: no ceiling at all, favoring completion over bounded runtime.
+#
+#   0   no timeout (the default) -> subprocess timeout=None
+#   >0  budget in seconds
+#   <0  expire immediately; a test-only escape hatch, unreachable from the CLI
+#
+# The negative case exists so a test can exercise the timeout branch without
+# actually waiting: ``subprocess.run(timeout=0)`` raises ``TimeoutExpired``
+# before the child does any work, and ``_run_subprocess`` turns that into an
+# ordinary failed ``RemoteResult``.  ``cli/_tune.py`` types the flag as
+# ``IntRange(min=0)``, so it can only arrive via a direct API call.
+
+NO_TIMEOUT = 0
+
+
+def resolve_tuning_timeout(timeout: int) -> int | None:
+    """Translate the tuning timeout convention into a subprocess timeout.
+
+    See the module-level convention above.  Returns ``None`` for "no
+    ceiling", the value itself for a positive budget, and ``0`` — which
+    expires immediately — for the negative test-only sentinel.
+    """
+    if timeout > 0:
+        return timeout
+    if timeout < 0:
+        return 0
+    return None
+
+
+def describe_tuning_timeout(timeout: int) -> str:
+    """Render *timeout* for the operator.
+
+    Both states are worth saying out loud: an unbounded run is the surprising
+    one, and it is the default.
+    """
+    if timeout > 0:
+        return "%ds" % timeout
+    if timeout < 0:
+        return "expire immediately (test sentinel)"
+    return "none (unbounded)"
+
+
+# ---------------------------------------------------------------------------
 # Parameterized host-side helpers
 # ---------------------------------------------------------------------------
 
@@ -81,6 +131,10 @@ class BaseTuner:
 
     Subclasses must set the class attributes below and override
     :meth:`_run_tune_for_tp`.
+
+    The ``timeout`` constructor argument is the per-TP tuning budget in
+    seconds; ``0`` (the default) means no ceiling.  See the timeout
+    convention at the top of this module.
     """
 
     # --- Class attributes set by subclasses ---
@@ -98,7 +152,7 @@ class BaseTuner:
         cache_dir: str | None = None,
         output_dir: str | None = None,
         skip_clone: bool = False,
-        timeout: int = 0,
+        timeout: int = NO_TIMEOUT,
         dry_run: bool = False,
     ):
         self.host = host
@@ -112,8 +166,7 @@ class BaseTuner:
         self.timeout = timeout
         self.dry_run = dry_run
 
-        if timeout >= 0:
-            logger.info("Timeout set to %d seconds", timeout)
+        logger.info("Tuning job timeout: %s", describe_tuning_timeout(timeout))
 
         from sparkrun.orchestration.primitives import build_ssh_kwargs
 
@@ -537,14 +590,14 @@ class BaseTuner:
         tune_cmd = self._build_tune_command(tp_size, triton_version)
         exec_cmd = docker_exec_cmd(self.container_name, tune_cmd)
 
-        # Tuning can take many hours (e.g. 4+ hours for TP=4 on large
-        # models).  Use an 8-hour timeout so remote SSH sessions aren't
-        # killed prematurely.
+        # Tuning can take many hours (e.g. 4+ hours for TP=4 on large models),
+        # so this is unbounded unless the operator asked for a ceiling — see
+        # the timeout convention at the top of this module.
         result = run_command_on_host(
             self.host,
             exec_cmd,
             ssh_kwargs=self.ssh_kwargs,
-            timeout=28800,
+            timeout=resolve_tuning_timeout(self.timeout),
             dry_run=self.dry_run,
         )
 

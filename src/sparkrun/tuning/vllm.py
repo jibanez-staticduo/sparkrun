@@ -24,10 +24,13 @@ from typing import TYPE_CHECKING
 
 from sparkrun.tuning._common import (
     DEFAULT_TP_SIZES,  # noqa: F401 — re-exported for public API
+    NO_TIMEOUT,
     _format_duration,
     _get_tuning_dir,
     _get_tuning_env,
     _get_tuning_volumes,
+    describe_tuning_timeout,
+    resolve_tuning_timeout,
 )
 from sparkrun.utils.shell import quote, safe_remote_path, validate_git_url
 
@@ -148,6 +151,8 @@ class VllmTuner:
         mode: ``"moe"`` / ``"fp8"`` / ``"all"`` (default ``"all"``).
         vllm_tune_ref: Override the git ref pinned in ``SparkrunConfig``.
         dry_run: Print commands without executing.
+        timeout: Per-TP tuning budget in seconds; ``0`` (the default) means no
+            ceiling.  See the timeout convention in :mod:`sparkrun.tuning._common`.
     """
 
     def __init__(
@@ -161,13 +166,12 @@ class VllmTuner:
         mode: str = "all",
         vllm_tune_ref: str | None = None,
         dry_run: bool = False,
-        timeout: int = 0,
+        timeout: int = NO_TIMEOUT,
     ):
         if mode not in VALID_MODES:
             raise ValueError("mode must be one of %s, got %r" % (VALID_MODES, mode))
 
-        if timeout >= 0:
-            logger.info("Timeout set to %d seconds", timeout)
+        logger.info("Tuning job timeout: %s", describe_tuning_timeout(timeout))
 
         from sparkrun.orchestration.primitives import build_ssh_kwargs
 
@@ -440,8 +444,10 @@ class VllmTuner:
             self.host,
             tune_cmd,
             ssh_kwargs=self.ssh_kwargs,
-            # If a nonzero timeout is set, use it, otherwise, no timeout.
-            timeout=(self.timeout if self.timeout >= 0 else None),
+            # vllm-tune's MoE phase alone runs 1.5-3h and FP8 adds another
+            # 15-25 min, so this is unbounded unless the operator asked for a
+            # ceiling — see the timeout convention in tuning/_common.py.
+            timeout=resolve_tuning_timeout(self.timeout),
             dry_run=self.dry_run,
         )
         if self.dry_run:

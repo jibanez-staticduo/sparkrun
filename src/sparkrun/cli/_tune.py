@@ -35,7 +35,12 @@ def tune(ctx):
 @click.option("--output-dir", default=None, help="Override tuning config output directory")
 @click.option("--skip-clone", is_flag=True, help="Skip cloning SGLang repo (scripts already in image)")
 @click.option("--parallel", "-j", type=int, default=1, help="Run N tuning jobs concurrently (default: 1 = sequential)")
-@click.option("--timeout", "-t", type=int, default=-1, help="Add a timeout to tuning jobs, measured in seconds. (default: -1 = no timeout)")
+@click.option(
+    "--timeout",
+    type=click.IntRange(min=0),
+    default=0,
+    help="Per-TP tuning timeout in seconds (default: 0 = no timeout)",
+)
 @dry_run_option
 @click.pass_context
 @with_host_context
@@ -153,7 +158,12 @@ VLLM_RUNTIMES = {"vllm-ray", "vllm-distributed", "eugr-vllm"}
     help="Override the vllm-tune git ref (tag/branch/SHA) pinned in config",
 )
 @click.option("--parallel", "-j", type=int, default=1, help="Run N tuning jobs concurrently (default: 1 = sequential)")
-@click.option("--timeout", "-t", type=int, default=-1, help="Add a timeout to tuning jobs, measured in seconds. (default: -1 = no timeout)")
+@click.option(
+    "--timeout",
+    type=click.IntRange(min=0),
+    default=0,
+    help="Per-TP tuning timeout in seconds (default: 0 = no timeout)",
+)
 @dry_run_option
 @click.pass_context
 @with_host_context

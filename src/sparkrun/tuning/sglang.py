@@ -126,8 +126,12 @@ class SglangTuner(BaseTuner):
             self.host,
             patch_script,
             ssh_kwargs=self.ssh_kwargs,
-            # negative timeout means no timeout; 0 guarantees failure which could be useful in testing.
-            timeout=(self.timeout if self.timeout >= 0 else None),
+            # A fixed step guard, deliberately not --timeout: this is a
+            # sub-second best-effort `docker exec`, and the job budget is the
+            # ceiling for the tuning run in _run_tune_for_tp.  Sharing one knob
+            # would mean the default ("no ceiling") lets a wedged container
+            # hang the patch step forever.
+            timeout=15,
             dry_run=self.dry_run,
         )
         if result.success or self.dry_run:
