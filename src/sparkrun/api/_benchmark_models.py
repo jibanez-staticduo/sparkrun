@@ -104,7 +104,16 @@ class BenchmarkOptions:
     cluster: "str | ClusterDefinition | None" = None
     """Named cluster (resolved via ClusterManager) or pre-loaded definition."""
     overrides: dict[str, Any] = field(default_factory=dict)
-    """Recipe / runtime overrides threaded into the launch (``image``, ``port``, …)."""
+    """Recipe / runtime overrides threaded into the launch.
+
+    Fed wholesale to :func:`sparkrun.core.resolve.apply_recipe_overrides`, so
+    this carries every knob ``RunOptions.overrides`` does — notably the
+    parallelism keys (``tensor_parallel`` / ``pipeline_parallel`` /
+    ``data_parallel``), which decide how many nodes the launch is placed on.
+    ``image`` is the one entry that is not an override: it rewrites
+    ``recipe.container``.  Flag-shaped spellings (``gpu_mem``) and canonical
+    ones (``gpu_memory_utilization``) both resolve.
+    """
 
     # --- Lifecycle ---
     resume: ResumeMode = ResumeMode.IF_EXISTS

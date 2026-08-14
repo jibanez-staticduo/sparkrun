@@ -568,11 +568,10 @@ def _run_benchmark(
         _overrides_from_flags["image"] = image
     if port:
         _overrides_from_flags["port"] = port
-    # Handle the options tuple (tensor_parallel, pipeline_parallel, etc.) by
-    # running _apply_recipe_overrides if there are any recipe-override args.
-    # We need a recipe object for this — but we delay recipe loading to the API.
-    # Instead, thread the raw CLI overrides through options.overrides so the API
-    # can apply them itself.
+    # Recipe loading is deferred to the API, so the recipe-override flags can't
+    # be applied here.  Thread them through ``options.overrides`` instead; the
+    # API feeds the whole dict to ``apply_recipe_overrides``, which is what maps
+    # ``gpu_mem`` onto ``gpu_memory_utilization`` and resolves the runtime.
     if tensor_parallel is not None:
         _overrides_from_flags["tensor_parallel"] = tensor_parallel
     if pipeline_parallel is not None:
@@ -583,11 +582,19 @@ def _run_benchmark(
         _overrides_from_flags["gpu_mem"] = gpu_mem
     if max_model_len is not None:
         _overrides_from_flags["max_model_len"] = max_model_len
-    # Apply options tuple (list of key=value strings from --option/-o flags)
+    # Apply options tuple (list of key=value strings from --option/-o flags).
+    # Values go through ``coerce_value`` and malformed entries are rejected —
+    # both matching ``apply_recipe_overrides``, which parses this same form on
+    # the ``sparkrun run`` path.
+    from sparkrun.utils import coerce_value
+
     for opt_str in options or ():
-        if "=" in opt_str:
-            k2, _, v2 = opt_str.partition("=")
-            _overrides_from_flags[k2.strip()] = v2.strip()
+        k2, sep, v2 = opt_str.partition("=")
+        k2 = k2.strip()
+        if not sep or not k2:
+            click.echo("Error: --option must be key=value, got: %s" % opt_str, err=True)
+            sys.exit(1)
+        _overrides_from_flags[k2] = coerce_value(v2.strip())
 
     state_extras: dict = {}
     if submission_id_for_extras:

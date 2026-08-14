@@ -237,8 +237,14 @@ def _execute_benchmark(
         cluster_name = getattr(options.cluster, "name", None)
 
     hosts = list(options.hosts) if options.hosts else []
-    image = options.overrides.get("image") if isinstance(options.overrides, dict) else None
-    port = options.overrides.get("port") if isinstance(options.overrides, dict) else None
+    # ``options.overrides`` is the benchmark peer of ``RunOptions.overrides``.
+    # ``image`` is the one entry that is *not* an override — it is a direct
+    # write to ``recipe.container`` — so it is pulled out here; ``port`` is
+    # named separately only because ``skip_run`` needs it below.  Everything
+    # else is forwarded verbatim (see the ``_apply_recipe_overrides`` call).
+    cli_overrides = dict(options.overrides) if isinstance(options.overrides, dict) else {}
+    image = cli_overrides.pop("image", None)
+    port = cli_overrides.pop("port", None)
 
     solo = options.solo
     profile = options.profile
@@ -397,16 +403,27 @@ def _execute_benchmark(
     # -----------------------------------------------------------------------
     # 4. Build overrides and resolve runtime/hosts
     # -----------------------------------------------------------------------
+    # Every remaining caller override is forwarded, so the benchmark builds the
+    # *same* overrides dict ``sparkrun run`` does.  Dropping them here is what
+    # made ``benchmark --tp 4`` fall back to solo while ``run --tp 4`` took four
+    # nodes: placement reads ``tensor_parallel`` off the config chain, and an
+    # empty overrides dict left it at the recipe's own value.
+    #
+    # Forwarding as ``**kwargs`` is deliberate — ``apply_recipe_overrides``
+    # binds the flag-shaped names (``gpu_mem`` → ``gpu_memory_utilization``)
+    # to its own parameters and passes anything else through untouched, so a
+    # caller may use either spelling.  ``options``/``recipe`` are its own
+    # parameter names and can never be recipe knobs.
+    reserved = {"options", "recipe"}
+    for key in sorted(reserved & cli_overrides.keys()):
+        emitter.warning("ignoring unsupported override %r" % key)
+        cli_overrides.pop(key)
     recipe, overrides = _apply_recipe_overrides(
-        (),  # options tuple (CLI only)
-        tensor_parallel=None,
-        pipeline_parallel=None,
-        data_parallel=None,
-        gpu_mem=None,
-        max_model_len=None,
+        (),  # options tuple (CLI only; already flattened into options.overrides)
         image=image,
         recipe=recipe,
         port=port,
+        **cli_overrides,
     )
 
     issues = recipe.validate()
