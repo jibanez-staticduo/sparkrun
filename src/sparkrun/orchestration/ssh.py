@@ -219,6 +219,24 @@ def _decode(raw: bytes | str | None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _failure_detail(result: "RemoteResult", limit: int = 200) -> str:
+    """Best available one-line explanation for a failed remote script.
+
+    Falls back from stderr to stdout, then to an explicit ``(no output)``.
+    Logging stderr alone produced a bare ``FAILED rc=1 (0.3s):`` with nothing
+    after the colon whenever the remote payload reported its problem on
+    *stdout* — which the embedded scripts routinely do, since they ``echo``
+    diagnostics. An empty reason reads as a tool malfunction rather than as a
+    remote command that failed for a stated reason.  Mirrors the fallback
+    :func:`sparkrun.orchestration.hooks._run_exec_command` already applies.
+    """
+    for stream in (result.stderr, result.stdout):
+        text = (stream or "").strip()
+        if text:
+            return text[:limit]
+    return "(no output)"
+
+
 def _run_subprocess(
     cmd: list[str] | str,
     host: str,
@@ -276,7 +294,7 @@ def _run_subprocess(
                 host,
                 proc.returncode,
                 elapsed,
-                result.stderr.strip()[:200],
+                _failure_detail(result),
             )
         return result
     except subprocess.TimeoutExpired:
