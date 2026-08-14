@@ -541,7 +541,6 @@ def launch_inference(
     registry_mgr: RegistryManager | None = None,
     auto_port: bool = False,
     sync_tuning: bool = True,
-    skip_keys: set[str] | frozenset[str] = frozenset(),
     dry_run: bool = False,
     detached: bool = True,
     follow: bool = True,
@@ -612,7 +611,6 @@ def launch_inference(
         registry_mgr: Registry manager for tuning config sync.
         auto_port: If True, auto-increment port when the desired port is in use.
         sync_tuning: Whether to sync tuning configs from registries.
-        skip_keys: Keys to suppress in serve command generation.
         dry_run: Show what would be done without executing.
         detached: Run containers in detached mode.
         follow: whether to follow logs
@@ -1135,7 +1133,6 @@ def launch_inference(
         is_cluster=not is_solo,
         num_nodes=len(host_list),
         head_ip=None,  # determined during launch
-        skip_keys=skip_keys,
     )
 
     # Best-effort page cache clear
@@ -1227,7 +1224,6 @@ def launch_inference(
         comm_env=comm_env,
         ib_ip_map=ib_ip_map,
         ib_iface_map=ib_iface_map,
-        skip_keys=skip_keys,
         executor=executor,
         progress=progress,
         extra_docker_opts=extra_docker_opts,

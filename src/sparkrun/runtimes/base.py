@@ -132,9 +132,17 @@ class RuntimePlugin(Plugin):
             is_cluster: Whether running in multi-node mode
             num_nodes: Total number of nodes in the cluster
             head_ip: Head node IP (only set for cluster mode)
-            skip_keys: Config keys to omit from the generated command.
-                Used by the benchmark flow to suppress ``served_model_name``
-                so the server responds to the raw HF model ID.
+            skip_keys: Config keys to omit from the generated command, whether
+                the runtime synthesizes the flags or the recipe supplied a
+                ``command:`` template (the rendered string is post-filtered).
+
+                Note this is a *caller-supplied* facility with no in-tree
+                caller today: ``launch_inference`` used to thread it so the
+                benchmark flow could suppress ``served_model_name`` and make
+                the server answer to the raw HF model id.  That was replaced by
+                telling the benchmark the served name instead (see
+                ``LlamaBenchyFramework.prepare_benchmark_args``), which leaves
+                the workload identical whether or not it is being benchmarked.
 
         Returns:
             The full command string to execute inside the container
@@ -652,7 +660,7 @@ class RuntimePlugin(Plugin):
             config: Config chain (must support ``.get(key)``).
             flag: The CLI flag to use (e.g. ``"--served-model-name"``
                 or ``"--alias"`` for llama.cpp).
-            skip_keys: Keys being suppressed (e.g. by benchmark flow).
+            skip_keys: Keys being suppressed by the caller.
 
         Returns:
             The command string, possibly with the flag appended.
