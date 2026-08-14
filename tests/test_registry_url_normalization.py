@@ -139,8 +139,9 @@ def test_legacy_official_migrates_trusted_for_every_spelling(url):
 
 
 def test_migration_of_a_recognized_url_terminates():
-    """Once at least one entry is trusted, the 'trusted: true' key lands on disk
-    and the one-time migration stops re-firing."""
+    """The migration stamps the file, so it cannot re-fire."""
+    from sparkrun.core.registry import CONFIG_VERSION
+
     d = Path(tempfile.mkdtemp())
     (d / "registries.yaml").write_text(
         yaml.safe_dump(
@@ -150,9 +151,9 @@ def test_migration_of_a_recognized_url_terminates():
     a, b = _hermetic()
     with a, b:
         mgr = RegistryManager(config_root=d, cache_root=d / "cache")
-        assert mgr._needs_trust_migration() is True
+        assert mgr._read_config_version() == 0
         mgr._load_registries()
-        assert mgr._needs_trust_migration() is False
+        assert mgr._read_config_version() == CONFIG_VERSION
 
 
 # ---------------------------------------------------------------------------
