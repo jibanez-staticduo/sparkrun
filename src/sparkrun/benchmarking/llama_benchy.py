@@ -175,9 +175,21 @@ class LlamaBenchyFramework(BenchmarkingPlugin):
         """Pull ``served_model_name`` off the recipe so llama-benchy can preserve
         the upstream HuggingFace model id for tokenization (its CLI requires
         this to be set explicitly when the served name differs from the model).
+
+        llama-benchy's ``--model`` is what sparkrun passes as ``recipe.model``
+        and is used for tokenization; ``--served-model-name`` is *the name sent
+        in API calls*, defaulting to ``--model``.  So missing this makes every
+        task request the model id from a server that only answers to the served
+        name — HTTP 404, whole sweep fails (issue #257).  The config chain is
+        blind to a name hardcoded in the recipe's ``command:``, hence the
+        fallback.
         """
+        from sparkrun.core.recipe import extract_served_model_name_from_command
+
         extra: dict[str, Any] = {}
-        served_model_name = config_chain.get("served_model_name")
+        served_model_name = config_chain.get("served_model_name") or extract_served_model_name_from_command(
+            getattr(recipe, "command", None)
+        )
         if served_model_name:
             extra["served_model_name"] = served_model_name
         return extra

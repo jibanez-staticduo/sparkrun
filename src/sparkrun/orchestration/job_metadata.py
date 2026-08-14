@@ -553,12 +553,19 @@ def save_job_metadata(
     if port is not None:
         meta["port"] = int(port)
 
-    # Persist served_model_name for proxy discovery
+    # Persist served_model_name for proxy discovery.  The command-template
+    # fallback matters here as much as in the benchmark: the proxy *routes* on
+    # this name, so a recipe that hardcodes --served-model-name in command:
+    # would be advertised (and proxied) under the model id the server rejects.
     served_name = None
     if overrides:
         served_name = overrides.get("served_model_name")
     if served_name is None and recipe.defaults:
         served_name = recipe.defaults.get("served_model_name")
+    if served_name is None:
+        from sparkrun.core.recipe import extract_served_model_name_from_command
+
+        served_name = extract_served_model_name_from_command(getattr(recipe, "command", None))
     if served_name is not None:
         meta["served_model_name"] = str(served_name)
 

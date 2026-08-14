@@ -516,6 +516,22 @@ workloads a user runs side by side, and while the image was excluded, launching
 the second silently evicted the first (observed live on a 4-host cluster).
 `--image` writes through to `recipe.container`, so overrides are covered.
 
+**The served name has two resolutions, deliberately.** The supported spelling is
+`defaults.served_model_name`, which every runtime reconciles into the rendered
+command via `RuntimePlugin._augment_served_model_name`. A recipe may instead
+hardcode `--served-model-name` in its `command:` template, which bypasses that
+and is invisible to the config chain — so
+`core/recipe.py:resolve_served_model_name` (declared → `command:` →
+model id, via `extract_served_model_name_from_command`) is the shared last
+resort for everything that needs the name for **display or routing**: the
+benchmark's request target (this was issue #257 — llama-benchy asked for the
+model id, HTTP 404, whole sweep dead), proxy-discovery metadata, and container
+labels. `generate_intent_id` is the **non**-consumer: it still hashes only the
+*declared* name, because widening it would change the intent id of every recipe
+that hardcodes the flag and orphan already-running workloads from `stop` /
+`logs` / `--ensure`, which recompute it. Precedent for parsing the template at
+all: `kv_cache_dtype` (issue #248).
+
 It stays narrow otherwise — serve arguments are **not** hashed — because
 `stop` / `logs` / `--ensure` recompute it from the recipe without the flags the
 user typed at launch. Three reasons not to widen it to the fingerprint:

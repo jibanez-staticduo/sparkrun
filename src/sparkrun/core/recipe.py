@@ -35,6 +35,14 @@ _RAY_BACKEND_RE = re.compile(r"--distributed-executor-backend\s+ray\b")
 # space- or =-separated. Captured so a recipe that sets the flag only inside the
 # free-form command: template is still picked up by the VRAM estimator (issue #248).
 _KV_CACHE_DTYPE_FLAG_RE = re.compile(r"--kv-?cache-dtype[=\s]+(\S+)", re.IGNORECASE)
+# The name a workload is *served under*, spelled differently per runtime:
+# vllm / sglang / modular-max use --served-model-name, atlas --model-name,
+# llama.cpp --alias.  (llama.cpp's short "-a" is deliberately excluded: a bare
+# short flag is too easy to collide with another tool's option.)  Captured so a
+# recipe that sets the name only inside the free-form command: template is still
+# visible to the benchmark, the proxy and the container labels — see
+# :func:`extract_served_model_name_from_command`.
+_SERVED_MODEL_NAME_FLAG_RE = re.compile(r"--(?:served-model-name|model-name|alias)[=\s]+(\S+)", re.IGNORECASE)
 _CMD_VLLM_RE = re.compile(r"^vllm\s+serve\b")
 _CMD_SGLANG_RE = re.compile(r"^(?:sglang\s+serve|python3?\s+-m\s+sglang\.launch_server)\b")
 _CMD_LLAMA_CPP_RE = re.compile(r"^llama-server\b")
@@ -334,6 +342,65 @@ def extract_kv_cache_dtype_from_command(command: str | None) -> str | None:
     if value.lower() in ("auto", ""):
         return None
     return value
+
+
+def extract_served_model_name_from_command(command: str | None) -> str | None:
+    """Extract the served-model name from a free-form command template.
+
+    The supported spelling is ``defaults.served_model_name`` — every runtime
+    reconciles that into the rendered command via
+    ``RuntimePlugin._augment_served_model_name``.  A recipe that instead writes
+    ``--served-model-name <name>`` straight into ``command:`` bypasses that
+    machinery, and the name becomes invisible to the config chain — so the
+    benchmark asks the endpoint for the *model id*, which the server does not
+    answer to, and every task fails with ``404 ... does not exist`` (issue #257).
+    The proxy and the container labels have the same blind spot.
+
+    Two guards on the captured value:
+
+    * A ``{placeholder}`` is rejected — an unrendered template means the value
+      really does live in the config chain, which resolves it properly; the
+      literal ``{served_model_name}`` would be worse than no answer.
+    * vLLM accepts several names after the flag (``--served-model-name a b c``)
+      and reports the first as the canonical id, so only the first is taken.
+
+    Returns the name, or ``None`` when the flag is absent or unusable.
+
+    This is deliberately a *last resort*, never a replacement for the config
+    chain: callers consult their own resolved value first.
+
+    Non-string input yields ``None`` rather than raising: callers reach this
+    via ``getattr(recipe, "command", None)`` on objects that only duck-type as
+    recipes, and this sits on the launch path's best-effort metadata write,
+    where a ``TypeError`` would fail a launch that was otherwise fine.
+    """
+    if not command or not isinstance(command, str):
+        return None
+    m = _SERVED_MODEL_NAME_FLAG_RE.search(command)
+    if not m:
+        return None
+    value = m.group(1).strip("\"'")
+    if not value or "{" in value or "}" in value:
+        return None
+    return value
+
+
+def resolve_served_model_name(recipe: "Recipe", declared: Any = None) -> str:
+    """The name a workload is actually served under: *declared* → command → model.
+
+    The single resolution order shared by every consumer that needs the served
+    name for *display or routing* (benchmark target, proxy discovery, container
+    labels).  ``declared`` is the caller's own already-resolved value — a config
+    chain lookup, a CLI override, a ``defaults`` read — and always wins.
+
+    Note the deliberate non-consumer: :func:`~sparkrun.orchestration.job_metadata.generate_intent_id`
+    still hashes only the *declared* name.  Widening it would change the intent
+    id of every recipe that hardcodes the flag, orphaning workloads already
+    running under the old id from ``stop`` / ``logs`` / ``--ensure``.
+    """
+    if declared is not None and str(declared):
+        return str(declared)
+    return extract_served_model_name_from_command(recipe.command) or recipe.model
 
 
 def _resolve_runtime_from_command_hint(recipe: Recipe) -> None:
@@ -1051,13 +1118,18 @@ class Recipe:
 
     @property
     def effective_served_model_name(self) -> str:
-        """Resolved served-model name: CLI override → recipe default → model id.
+        """Resolved served-model name: CLI override → recipe default → ``command:`` → model id.
 
         Mirrors the runtime serve-argument resolution (``--served-model-name``
         falls back to the model id when unset) so observers can read the name a
         workload is actually served under off the container labels.
+
+        The ``command:`` step is the last resort described in
+        :func:`resolve_served_model_name`: without it, a recipe that hardcodes
+        the flag in its command template labels its containers with the model id
+        while the server answers only to the hardcoded name.
         """
-        return self._effective_default("served_model_name") or self.model
+        return resolve_served_model_name(self, self._effective_default("served_model_name"))
 
     def build_config_chain(self, cli_overrides: dict[str, Any] | None = None, user_config: dict[str, Any] | None = None) -> Variables:
         """Build cascading config: CLI overrides -> user config -> recipe defaults.
