@@ -455,7 +455,7 @@ def _execute_benchmark(
             dry_run=dry_run,
             follow=False,
             detached=True,
-            trust=None,
+            trust=options.trust,
             scheduler=scheduler_name,
             transfer_mode=effective_transfer_mode,
             transfer_interface=effective_transfer_interface,

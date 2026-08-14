@@ -139,6 +139,15 @@ class BenchmarkOptions:
     """Registered scheduler name.  ``None`` selects the project default."""
     rootful: bool = False
     """Run containers privileged + as root."""
+    trust: bool = False
+    """Pre-acknowledge trust for third-party recipe hooks (``pre_exec`` /
+    ``post_exec`` / ``post_commands``), mirroring ``run``'s ``--trust``.
+
+    ``False`` does **not** mean "untrusted" — it means "no override", leaving
+    :func:`sparkrun.core.launcher.resolve_recipe_trust` to auto-trust local and
+    trusted-registry recipes as usual.  It matters only for a recipe that would
+    otherwise be prompted for: without it a benchmark on a non-TTY (CI, or an
+    agent driving the CLI) can only fail, since there is no prompt to answer."""
     sync_tuning: bool = True
     """Sync tuning configs from registries to local cache before launch."""
     extra_docker_opts: tuple[str, ...] | None = None
