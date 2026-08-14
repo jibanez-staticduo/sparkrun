@@ -222,10 +222,14 @@ class TestDefaultRegistries:
         from sparkrun.builders.eugr import EUGR_REPO_URL
 
         eugr_registry = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "eugr")
-        assert _normalize_registry_url(EUGR_REPO_URL) == "https://github.com/eugr/spark-vllm-docker"
+        # Compare canonical-to-canonical rather than against a literal: the
+        # normalizer's output form is an implementation detail (it dropped the
+        # scheme when it learned to match SSH remotes), while "these two URLs
+        # are the same repo" is the property under test.
+        assert _normalize_registry_url(EUGR_REPO_URL) == _normalize_registry_url("https://github.com/eugr/spark-vllm-docker")
         assert _normalize_registry_url(EUGR_REPO_URL) != _normalize_registry_url(eugr_registry.url)
         # And the builder URL must never be swept up by the registry migration.
-        assert _normalize_registry_url(EUGR_REPO_URL) in MIGRATED_REGISTRY_URLS
+        assert any(_normalize_registry_url(old) == _normalize_registry_url(EUGR_REPO_URL) for old in MIGRATED_REGISTRY_URLS)
         assert "spark-arena" not in EUGR_REPO_URL
 
     def test_old_eugr_url_is_migrated_not_deprecated(self):

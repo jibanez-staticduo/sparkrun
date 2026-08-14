@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -376,12 +377,59 @@ FALLBACK_DEFAULT_REGISTRIES = [
 ]
 
 
+#: scp-style SSH remote — ``[user@]host:org/repo``.  The ``[^/]`` on the path
+#: is what keeps this from also matching ``https://host/...``, where the
+#: character after the colon is a slash.
+_SCP_LIKE_SSH_RE = re.compile(r"^(?:[^@/\s]+@)?(?P<host>[A-Za-z0-9._-]+):(?P<path>[^/].*)$")
+
+
 def _normalize_registry_url(url: str) -> str:
-    """Canonicalize a git URL for comparison (drop trailing ``/`` and ``.git``)."""
-    normalized = (url or "").rstrip("/")
-    if normalized.endswith(".git"):
-        normalized = normalized[:-4]
-    return normalized
+    """Canonicalize a git URL so two spellings of one repo compare equal.
+
+    Drops the scheme, any ``user@`` credentials, and a trailing ``/`` or
+    ``.git``; rewrites the scp-style SSH form (``git@github.com:org/repo``) to
+    the same ``host/org/repo`` shape as an https URL; and lowercases the
+    result.
+
+    Stripping only ``/`` and ``.git`` — as this did — meant `official` spelled
+    ``git@github.com:spark-arena/recipe-registry.git``, ``http://…`` or with
+    any capitalisation did **not** match the shipped default, so the trust
+    backfill marked it untrusted and its recipes prompted for hook
+    confirmation forever (issue #257).  A non-TTY has no way to answer that
+    prompt.
+
+    The bound on how far to canonicalize: **never merge two URLs git would
+    resolve to different repos.** Scheme, credentials and case are all things
+    git ignores when picking the repo, so folding them is safe. Query strings
+    and fragments are deliberately *not* stripped — they are not part of a git
+    URL, so anything carrying one simply fails to match, which fails closed.
+
+    Lowercasing the path is safe for the comparison sets this feeds — the
+    trusted / deprecated / migrated URL lists are all GitHub, which is
+    case-insensitive — so a case-only difference cannot smuggle in a repo
+    other than the one we ship.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+
+    if "://" in raw:
+        rest = raw.split("://", 1)[1]
+    elif (m := _SCP_LIKE_SSH_RE.match(raw)) is not None:
+        rest = "%s/%s" % (m.group("host"), m.group("path").lstrip("/"))
+    else:
+        rest = raw
+
+    # Drop ``user[:pass]@`` from the authority only — a later ``@`` belongs to
+    # the path and is part of the repo's identity.
+    authority, sep, tail = rest.partition("/")
+    if "@" in authority:
+        rest = authority.rpartition("@")[2] + sep + tail
+
+    rest = rest.strip().lower().rstrip("/")
+    if rest.endswith(".git"):
+        rest = rest[:-4]
+    return rest.rstrip("/")
 
 
 def _default_trusted_urls() -> set[str]:
@@ -419,6 +467,29 @@ DEPRECATED_REGISTRIES: list[str] = [
 MIGRATED_REGISTRY_URLS: dict[str, str] = {
     "https://github.com/eugr/spark-vllm-docker": "https://github.com/spark-arena/eugr-recipes",
 }
+
+
+def _migrated_url_for(url: str) -> str | None:
+    """New URL for *url* if it names a moved registry, else ``None``.
+
+    Normalizes **both sides** rather than indexing the dict directly. The keys
+    above are written in their natural https form, so a direct lookup only
+    worked while the raw key and the canonicalized entry URL happened to
+    coincide — they stopped coinciding the moment the normalizer learned to
+    drop the scheme, which silently disabled every URL migration.
+
+    Evaluated per call against the live dict rather than cached into a
+    canonical-key map at import: a module-level snapshot ignores any later
+    edit to :data:`MIGRATED_REGISTRY_URLS`, which is both a testing footgun and
+    a trap for anyone who assumes the constant is the source of truth. The dict
+    holds a handful of entries, so the scan costs nothing.
+    """
+    canonical = _normalize_registry_url(url)
+    for old, new in MIGRATED_REGISTRY_URLS.items():
+        if _normalize_registry_url(old) == canonical:
+            return new
+    return None
+
 
 # Reserved name prefixes — only URLs from allowed GitHub orgs may use these.
 # This prevents third-party registries from impersonating official sources.
@@ -805,7 +876,16 @@ class RegistryManager:
         combined = list(discovered)
         for fallback in FALLBACK_DEFAULT_REGISTRIES:
             if fallback.name not in seen_names:
-                combined.append(fallback)
+                # Copy — never hand out the module-level entry itself.  Callers
+                # mutate what they get back (``untrust_registry`` flips
+                # ``trusted``, ``disable_registry`` flips ``enabled``), and on a
+                # fresh install this is the only path that produces entries, so
+                # aliasing rewrote the shipped defaults process-wide.  Harmless
+                # enough in a one-shot CLI; in the long-lived desktop sidecar it
+                # silently moved the trust baseline that
+                # :func:`_default_trusted_urls` — and so every later
+                # migration — is derived from.
+                combined.append(_dataclass_replace(fallback))
                 seen_names.add(fallback.name)
 
         # Persist so subsequent _load_registries() reads from file
@@ -975,7 +1055,7 @@ class RegistryManager:
         changed = False
         trusted_urls = _default_trusted_urls()
         for entry in entries:
-            new_url = MIGRATED_REGISTRY_URLS.get(_normalize_registry_url(entry.url))
+            new_url = _migrated_url_for(entry.url)
             if not new_url or _normalize_registry_url(entry.url) == _normalize_registry_url(new_url):
                 continue
             logger.info("Registry %r moved: %s -> %s", entry.name, entry.url, new_url)
@@ -1554,19 +1634,13 @@ class RegistryManager:
     def _is_deprecated_url(url: str) -> bool:
         """Check whether a registry URL matches a deprecated entry.
 
-        Strips trailing ``.git`` from the URL before comparison so that
-        ``https://github.com/org/repo.git`` matches ``https://github.com/org/repo``.
+        Shares :func:`_normalize_registry_url` with the trust and migrated-URL
+        comparisons.  This used to inline its own weaker copy of that logic, so
+        a deprecated registry spelled as an SSH remote (or with a different
+        scheme or capitalisation) was never cleaned up.
         """
-        normalized = url.rstrip("/")
-        if normalized.endswith(".git"):
-            normalized = normalized[:-4]
-        for dep_url in DEPRECATED_REGISTRIES:
-            dep_normalized = dep_url.rstrip("/")
-            if dep_normalized.endswith(".git"):
-                dep_normalized = dep_normalized[:-4]
-            if normalized == dep_normalized:
-                return True
-        return False
+        normalized = _normalize_registry_url(url)
+        return any(normalized == _normalize_registry_url(dep_url) for dep_url in DEPRECATED_REGISTRIES)
 
     def restore_missing_defaults(self) -> list[str]:
         """Add default registry entries that are missing from the config.
@@ -1588,7 +1662,7 @@ class RegistryManager:
 
         for default in FALLBACK_DEFAULT_REGISTRIES:
             if default.name not in existing_names:
-                entries.append(default)
+                entries.append(_dataclass_replace(default))  # copy — see _default_registries
                 added.append(default.name)
                 logger.info("Restored missing default registry: %s", default.name)
 
