@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from sparkrun.core.cluster_status import ClusterStatus, TerminationInfo
     from sparkrun.core.hardware import HostHardware
     from sparkrun.core.log_source import LogSource
+    from sparkrun.core.runtime_cache import RuntimeCacheMounts
 
 logger = logging.getLogger(__name__)
 
@@ -610,6 +611,20 @@ class LocalExecutor(Executor):
         from sparkrun.orchestration.ssh import verify_host_paths
 
         return verify_host_paths(hosts, list(paths), ssh_kwargs)
+
+    def ensure_runtime_cache(
+        self,
+        mounts: "RuntimeCacheMounts",
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> None:
+        """Native runs read the cache straight off the host FS (``_hostify_env``
+        rewrites the container paths back to host ones), so it is created and
+        swept exactly as for docker."""
+        from sparkrun.orchestration.runtime_cache import ensure_runtime_cache_on_hosts
+
+        ensure_runtime_cache_on_hosts(mounts, hosts, ssh_kwargs)
 
 
 # --------------------------------------------------------------------------

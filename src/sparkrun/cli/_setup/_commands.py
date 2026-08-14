@@ -2277,6 +2277,110 @@ def setup_diagnose(ctx, hosts, hosts_file, cluster_name, dry_run, output_file, o
         sys.exit(1)
 
 
+@setup.command("prune-runtime-cache", hidden=HIDE_ADVANCED_OPTIONS)
+@host_options
+@click.option(
+    "--older-than",
+    "older_than_days",
+    type=int,
+    default=None,
+    help="Age cutoff in days (default: the resolved runtime_cache.prune.max_age_days).",
+)
+@click.option("--all", "purge_all", is_flag=True, default=False, help="Remove every cached tree, ignoring the age cutoff.")
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would be removed, with sizes, without removing it.")
+@click.pass_context
+def setup_prune_runtime_cache(ctx, hosts, hosts_file, cluster_name, older_than_days, purge_all, dry_run):
+    """Reclaim disk from the compilation/autotune cache on cluster hosts.
+
+    The runtime cache (~/.cache/sparkrun/runtime-cache/ on each host) holds
+    torch.compile, Inductor, Triton, FlashInfer and TRT-LLM autotuner output so
+    a relaunch skips minutes of recompilation.  It lives on the TARGETS, not on
+    this machine, so this command fans out over SSH.
+
+    'sparkrun run' already sweeps the trees it can see on every launch (disable
+    with 'runtime_cache.prune.enabled: false').  This is the manual sweep, for
+    reclaiming space without launching something — and the only way to clear
+    trees for a model or image you no longer run at all.
+
+    A tree is aged by its last-used marker, which every launch re-stamps, so a
+    cache you use daily never ages out no matter how long ago it was written.
+
+    Examples:
+
+      sparkrun setup prune-runtime-cache --cluster mylab --dry-run
+
+      sparkrun setup prune-runtime-cache --cluster mylab --older-than 7
+
+      sparkrun setup prune-runtime-cache --cluster mylab --all
+    """
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.hosts import resolve_hosts
+    from sparkrun.core.runtime_cache import (
+        resolve_runtime_cache_root,
+        resolve_runtime_cache_settings,
+    )
+    from sparkrun.orchestration.primitives import build_ssh_kwargs, probe_remote_sparkrun_cache
+    from sparkrun.orchestration.runtime_cache import generate_runtime_cache_sweep_script
+    from sparkrun.orchestration.ssh import run_remote_scripts_parallel
+
+    config = SparkrunConfig()
+    cluster_mgr = _get_cluster_manager()
+    cluster_def = cluster_mgr.get_cluster(cluster_name) if cluster_name else None
+    host_list = resolve_hosts(hosts=hosts, hosts_file=hosts_file, cluster_name=cluster_name, cluster_mgr=cluster_mgr, config=config)
+    if not host_list:
+        raise click.UsageError("No hosts resolved. Pass --hosts or --cluster.")
+
+    settings = resolve_runtime_cache_settings(config=config, cluster=cluster_def)
+    max_age = older_than_days if older_than_days is not None else settings.prune_max_age_days
+    ssh_kwargs = build_ssh_kwargs(config)
+
+    if purge_all and not dry_run:
+        click.confirm("Remove ALL runtime cache trees on %d host(s)?" % len(host_list), abort=True)
+
+    total_kb = 0
+    total_trees = 0
+    for host in host_list:
+        # Each host resolves its own root: $HOME differs, and an explicit
+        # runtime_cache.dir applies everywhere.
+        try:
+            root = resolve_runtime_cache_root(settings, probe_remote_sparkrun_cache(host, **ssh_kwargs))
+            script = generate_runtime_cache_sweep_script(root, max_age_days=max_age, dry_run=dry_run, purge_all=purge_all)
+        except Exception as exc:
+            click.echo("  %s: skipped (%s)" % (host, exc))
+            continue
+
+        results = run_remote_scripts_parallel(
+            [host],
+            script,
+            ssh_user=ssh_kwargs.get("ssh_user"),
+            ssh_key=ssh_kwargs.get("ssh_key"),
+            ssh_options=ssh_kwargs.get("ssh_options"),
+            timeout=120,
+            quiet=True,
+            allow_local=True,
+        )
+        for r in results:
+            if r.returncode != 0:
+                click.echo("  %s: unreachable or sweep failed" % host)
+                continue
+            for line in r.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) != 3:
+                    continue
+                verb, size_kb, tree = parts
+                total_trees += 1
+                total_kb += int(size_kb) if size_kb.isdigit() else 0
+                click.echo("  %s  %6.1f GB  %s:%s" % (verb, int(size_kb) / 1048576 if size_kb.isdigit() else 0.0, host, tree))
+
+    click.echo()
+    if not total_trees:
+        click.echo("Nothing to prune.")
+        return
+    click.echo("%s %d tree(s), %.1f GB." % ("Would remove" if dry_run else "Removed", total_trees, total_kb / 1048576))
+    if dry_run:
+        click.echo("Re-run without --dry-run to apply.")
+
+
 @setup.command("prune-job-metadata-cache", hidden=HIDE_ADVANCED_OPTIONS)
 @click.option(
     "--older-than",

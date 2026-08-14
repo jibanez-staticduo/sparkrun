@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from sparkrun.core.cluster_status import ClusterStatus, TerminationInfo
     from sparkrun.core.hardware import HostHardware
     from sparkrun.core.log_source import LogSource
+    from sparkrun.core.runtime_cache import RuntimeCacheMounts
 
 logger = logging.getLogger(__name__)
 
@@ -743,6 +744,19 @@ class DockerExecutor(Executor):
         from sparkrun.orchestration.ssh import verify_host_paths
 
         return verify_host_paths(hosts, list(paths), ssh_kwargs)
+
+    def ensure_runtime_cache(
+        self,
+        mounts: "RuntimeCacheMounts",
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> None:
+        """Docker bind-mounts the cache from the host FS, so create/stamp/sweep it
+        there (shared host-substrate impl)."""
+        from sparkrun.orchestration.runtime_cache import ensure_runtime_cache_on_hosts
+
+        ensure_runtime_cache_on_hosts(mounts, hosts, ssh_kwargs)
 
 
 # --------------------------------------------------------------------------

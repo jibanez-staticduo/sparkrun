@@ -102,6 +102,19 @@ class SparkrunConfig:
         return Path(self._data.get("hf_cache_dir", str(DEFAULT_HF_CACHE_DIR)))
 
     @property
+    def runtime_cache(self) -> dict[str, Any]:
+        """User-level ``runtime_cache:`` block (compilation/autotune cache).
+
+        Top-level rather than nested under a ``cache:`` section because
+        ``cache_dir`` / ``hf_cache_dir`` are already top-level scalars — a
+        ``cache:`` block would straddle two spellings of the same idea.  See
+        :func:`sparkrun.core.runtime_cache.resolve_runtime_cache_settings` for
+        the layered chain this participates in.
+        """
+        raw = self._data.get("runtime_cache")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    @property
     def default_benchmark_output_dir(self) -> Path:
         defaults = self._data.get("defaults", {})
         dir_val = defaults.get("benchmark_output_dir")

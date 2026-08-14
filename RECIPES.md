@@ -404,6 +404,44 @@ defaults:
 
 ---
 
+## Runtime Cache
+
+Persists compilation and autotune output — torch.compile / Inductor graphs, Triton cubins,
+FlashInfer JIT modules, the TRT-LLM autotuner — on the target hosts so a relaunch skips minutes of
+recompilation. Containers are `--rm`, so without this it is all discarded on exit.
+
+**On by default.** A host directory is mounted at `/cache/runtime` (sibling of
+`/cache/huggingface`) and the relevant env vars are pointed into it, at the lowest env tier — a
+recipe's own `env:` always wins.
+
+```yaml
+runtime_cache: false          # shorthand: turn it off for this recipe
+
+runtime_cache:                # ...or set individual knobs
+  enabled: true
+  dir: /mnt/fast/rc           # host-side root (default: ~/.cache/sparkrun/runtime-cache)
+  key_by_model: true          # separate tree per model (default: on)
+  key_by_image: false         # separate tree per container image (default: off)
+  prune:
+    enabled: true
+    max_age_days: 30
+```
+
+Layered: **recipe `runtime_cache:` → CLI `--runtime-cache` / `--no-runtime-cache` → cluster
+`runtime_cache:` → `SparkrunConfig` `runtime_cache:` → runtime defaults → baseline.**
+`SPARKRUN_NO_RUNTIME_CACHE=1` is a kill switch that beats every layer.
+
+**About `key_by_image`.** It defaults off because the caches that dominate are content-addressed
+internally and are correct — and much more useful — in a tree shared across image versions. Turn it
+on for a runtime whose cache does not validate what wrote it. `trtllm` already does this for itself
+(its autotuner records the TRT-LLM version and GPU but checks neither on load), so TRT-LLM recipes
+need no `runtime_cache:` block to be safe.
+
+Trees are aged by a last-used marker that every launch re-stamps, so a cache you use daily never
+ages out. Sweep manually with `sparkrun setup prune-runtime-cache --cluster <name> --dry-run`.
+
+---
+
 ## Executor Config
 
 Controls how the workload is launched. Layered:

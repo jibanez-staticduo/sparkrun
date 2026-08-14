@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sparkrun.core.config import SparkrunConfig, resolve_hf_cache_home
+from sparkrun.core.config import DEFAULT_CACHE_DIR, SparkrunConfig, resolve_hf_cache_home
 from sparkrun.utils import is_valid_ip
 from sparkrun.orchestration.ssh import (
     DEFAULT_MAX_PARALLEL_SSH,
@@ -107,6 +107,71 @@ def resolved_model_volume(recipe) -> dict[str, str]:
 
     assert_safe_mount_source(path)
     return {path: path}
+
+
+def probe_remote_path(
+    host: str,
+    expr: str,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    timeout: int = 10,
+) -> str:
+    """SSH-probe *host*, echoing shell expression *expr*, and validate the result.
+
+    The generic form behind :func:`probe_remote_hf_cache`: any path sparkrun
+    needs on a target must be resolved in the *login user's* environment, not
+    the control machine's — ``$HOME`` differs, and on a cross-user or remote
+    launch the control machine's answer is simply wrong.
+
+    *expr* is embedded in a double-quoted ``echo`` so parameter expansion
+    happens on the host.  It is caller-supplied and never user input; the
+    *result* is validated against shell metacharacters because callers feed it
+    to ``shlex.quote``-aware code (volume mounts, generated scripts) that would
+    silently break on ``$``/``{``/``}``.
+    """
+    from sparkrun.utils.shell import assert_safe_path
+
+    result = run_remote_command(
+        host,
+        'echo "%s"' % expr,
+        ssh_user=ssh_user,
+        ssh_key=ssh_key,
+        ssh_options=ssh_options,
+        timeout=timeout,
+    )
+    if not result.success or not result.stdout.strip():
+        raise RuntimeError(
+            "Could not resolve remote path on %s (rc=%d): %s" % (host, result.returncode, result.stderr.strip() or "no output")
+        )
+    return assert_safe_path(result.stdout.strip())
+
+
+def probe_remote_sparkrun_cache(
+    host: str,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    timeout: int = 10,
+    dry_run: bool = False,
+) -> str:
+    """SSH-probe *host* for its sparkrun cache directory (``~/.cache/sparkrun``).
+
+    The runtime-cache peer of :func:`probe_remote_hf_cache`.  Honors
+    ``SPARKRUN_CACHE_DIR`` / ``XDG_CACHE_HOME`` on the target so a host that
+    relocates its caches is respected.
+    """
+    if dry_run:
+        return str(DEFAULT_CACHE_DIR)
+
+    return probe_remote_path(
+        host,
+        "${SPARKRUN_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sparkrun}",
+        ssh_user=ssh_user,
+        ssh_key=ssh_key,
+        ssh_options=ssh_options,
+        timeout=timeout,
+    )
 
 
 def probe_remote_hf_cache(

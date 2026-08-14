@@ -196,6 +196,15 @@ class ClusterDefinition:
     cluster express "every workload here gets these baseline executor
     settings" while still letting recipes/CLI tighten things.
     """
+    runtime_cache: dict[str, Any] | None = None
+    """Cluster-level compilation/autotune cache knobs (``enabled``,
+    ``key_by_image``, ``key_by_model``, ``dir``, ``prune``).
+
+    Layered between the global ``SparkrunConfig`` and the CLI in
+    :func:`sparkrun.core.runtime_cache.resolve_runtime_cache_settings`, so a
+    cluster on slow local disk can turn the cache off (or repoint it at a
+    shared mount) without touching any recipe.
+    """
     scheduler: str | None = None
     """Default scheduler selector for workloads on this cluster.
 
@@ -334,6 +343,8 @@ class ClusterDefinition:
             d["executor"] = self.executor
         if self.executor_config:
             d["executor_config"] = dict(self.executor_config)
+        if self.runtime_cache:
+            d["runtime_cache"] = dict(self.runtime_cache)
         if self.scheduler:
             d["scheduler"] = self.scheduler
         if self.max_gpu_memory_utilization is not None:
@@ -802,6 +813,8 @@ class ClusterManager:
             data["executor"] = cluster_def.executor
         if cluster_def.executor_config:
             data["executor_config"] = dict(cluster_def.executor_config)
+        if cluster_def.runtime_cache:
+            data["runtime_cache"] = dict(cluster_def.runtime_cache)
         if cluster_def.scheduler:
             data["scheduler"] = cluster_def.scheduler
         if cluster_def.max_gpu_memory_utilization is not None:
@@ -836,6 +849,9 @@ class ClusterManager:
         executor_config: dict[str, Any] | None = None
         if isinstance(raw_exec_cfg, dict) and raw_exec_cfg:
             executor_config = dict(raw_exec_cfg)
+
+        raw_rt_cache = data.get("runtime_cache")
+        runtime_cache: dict[str, Any] | None = dict(raw_rt_cache) if isinstance(raw_rt_cache, dict) and raw_rt_cache else None
 
         raw_max_util = data.get("max_gpu_memory_utilization")
         max_gpu_memory_utilization = float(raw_max_util) if raw_max_util is not None else None
@@ -873,6 +889,7 @@ class ClusterManager:
             hosts_hardware=hosts_hardware,
             executor=data.get("executor"),
             executor_config=executor_config,
+            runtime_cache=runtime_cache,
             scheduler=data.get("scheduler"),
             max_gpu_memory_utilization=max_gpu_memory_utilization,
             accelerator_memory_limits=accelerator_memory_limits,

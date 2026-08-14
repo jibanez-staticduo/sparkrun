@@ -189,6 +189,16 @@ def _summarize_platforms(
     "--trust", is_flag=True, default=False, hidden=True, help="Trust post_commands from third-party registries without confirmation"
 )
 @click.option(
+    "--runtime-cache/--no-runtime-cache",
+    "runtime_cache",
+    default=None,
+    hidden=HIDE_ADVANCED_OPTIONS,
+    help=(
+        "Persist compilation/autotune caches (torch.compile, Triton, FlashInfer, TRT-LLM "
+        "autotuner) on the target hosts across launches. Defaults to the recipe/cluster/config setting."
+    ),
+)
+@click.option(
     "--scheduler",
     "scheduler_name",
     default=None,
@@ -253,6 +263,7 @@ def run(
     transfer_mode,
     diagnostics_path,
     trust,
+    runtime_cache,
     scheduler_name,
     rebuild,
     env_overrides,
@@ -434,6 +445,7 @@ def run(
         transfer_mode=effective_transfer_mode,
         transfer_interface=effective_transfer_interface,
         cache_dir=remote_cache_dir,
+        runtime_cache=runtime_cache,
         local_cache_dir=local_cache_dir,
         port=port,
         ray_port=ray_port,

@@ -82,6 +82,7 @@ _KNOWN_KEYS = {
     "distribution_config",
     "layout",
     "cluster_config",
+    "runtime_cache",
 }
 
 
@@ -1046,6 +1047,13 @@ class Recipe:
         # Internal, undocumented launch overrides (see :class:`LaunchOverrides`).
         self.cluster_config: LaunchOverrides | None = LaunchOverrides.from_dict(data.get("cluster_config"))
 
+        # Compilation/autotune cache knobs — highest layer of the chain in
+        # :func:`sparkrun.core.runtime_cache.resolve_runtime_cache_settings`.
+        raw_rt_cache = data.get("runtime_cache")
+        if isinstance(raw_rt_cache, bool):
+            raw_rt_cache = {"enabled": raw_rt_cache}
+        self.runtime_cache: dict[str, Any] = dict(raw_rt_cache) if isinstance(raw_rt_cache, dict) else {}
+
         # Applied overrides (populated by resolve())
         self._applied_overrides: dict[str, Any] = {}
 
@@ -1643,6 +1651,7 @@ class Recipe:
             "distribution_config": dataclass_asdict(self.distribution_config),
             "layout": self.layout.to_dict() if self.layout else None,
             "cluster_config": self.cluster_config.to_dict() if self.cluster_config else None,
+            "runtime_cache": dict(self.runtime_cache),
             "_applied_overrides": dict(self._applied_overrides),
             "_raw": dict(self._raw),
         }
@@ -1688,6 +1697,7 @@ class Recipe:
         layout_state = state.get("layout")
         self.layout = RecipeLayout.from_dict(layout_state) if isinstance(layout_state, dict) else None
         self.cluster_config = LaunchOverrides.from_dict(state.get("cluster_config"))
+        self.runtime_cache = dict(state.get("runtime_cache") or {})
 
     @classmethod
     def _deserialize(cls, data: dict[str, Any]) -> Recipe:
@@ -1795,6 +1805,10 @@ class Recipe:
             cc_dict = self.cluster_config.to_dict()
             if cc_dict:
                 d["cluster_config"] = cc_dict
+
+        # -- Runtime (compilation/autotune) cache knobs --
+        if self.runtime_cache:
+            d["runtime_cache"] = dict(self.runtime_cache)
 
         # -- Metadata (absorb promoted keys) --
         d["metadata"] = meta = dict(self.metadata)

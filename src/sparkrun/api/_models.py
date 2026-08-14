@@ -84,6 +84,15 @@ class RunOptions:
     ``push`` / ``delegated``)."""
     cache_dir: str | None = None
     """Override the remote HuggingFace cache dir on target hosts."""
+    runtime_cache: bool | None = None
+    """Toggle the persistent compilation/autotune cache for this launch.
+
+    ``None`` (default) defers to the recipe / cluster / config / runtime
+    chain — see
+    :func:`sparkrun.core.runtime_cache.resolve_runtime_cache_settings`.
+    ``True`` / ``False`` force it on or off, outranking every layer except
+    the recipe's own ``runtime_cache:`` block and the
+    ``SPARKRUN_NO_RUNTIME_CACHE`` kill switch."""
 
     # Networking / runtime ports.
     port: int | None = None

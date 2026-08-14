@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from sparkrun.core.cluster_status import ClusterStatus, TerminationInfo
     from sparkrun.core.hardware import HostHardware
     from sparkrun.core.log_source import LogSource
+    from sparkrun.core.runtime_cache import RuntimeCacheMounts
 
 logger = logging.getLogger(__name__)
 
@@ -658,6 +659,41 @@ class Executor(Plugin):
         """
         del paths, hosts, ssh_kwargs  # base is a no-op; substrate-aware executors override
         return {}
+
+    def ensure_runtime_cache(
+        self,
+        mounts: "RuntimeCacheMounts",
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> None:
+        """Prepare the persistent compilation/autotune cache on this substrate.
+
+        Write-path peer of :meth:`verify_mount_sources`: that one asks "do the
+        paths I will mount already exist?", this one *makes* the paths it is
+        about to mount.  Three things in one pass — create the directories,
+        stamp the last-used marker, sweep aged sibling trees (see
+        :mod:`sparkrun.orchestration.runtime_cache`).
+
+        Creating them explicitly is not optional on a bind-mount substrate:
+        Docker materializes a missing ``-v`` source as a **root-owned**
+        directory, which breaks rootless docker and breaks the ``local``
+        executor outright.
+
+        The default is the safe no-op — a provider executor whose cache lives
+        in a managed volume overrides (or legitimately does nothing).
+        Best-effort by contract, like :meth:`verify_mount_sources` and
+        :meth:`query_status`: this must never raise, because a cache we could
+        not prepare costs a recompile while a raised exception costs the
+        launch.
+
+        Args:
+            mounts: The resolved plan from
+                :func:`sparkrun.core.runtime_cache.build_runtime_cache_mounts`.
+            hosts: Target hosts for the launch.
+            ssh_kwargs: Connection settings for host-substrate executors.
+        """
+        del mounts, hosts, ssh_kwargs  # base is a no-op; substrate-aware executors override
 
     def verify_command_passthrough(
         self,

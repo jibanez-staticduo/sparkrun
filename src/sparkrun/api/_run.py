@@ -386,6 +386,7 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None, plan: Run
         "transfer_mode": options.transfer_mode,
         "transfer_interface": options.transfer_interface,
         "cache_dir": options.cache_dir,
+        "runtime_cache_override": (None if options.runtime_cache is None else {"enabled": options.runtime_cache}),
         "local_cache_dir": options.local_cache_dir,
         "dry_run": options.dry_run,
         "detached": options.detached,

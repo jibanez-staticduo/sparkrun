@@ -34,6 +34,32 @@ class VllmMixin:
         env.update(get_vllm_tuning_env() or {})
         return env
 
+    def runtime_cache_paths(self, *, fingerprint: str = "") -> dict:
+        """Persist vLLM's compile / JIT caches across container restarts.
+
+        All four are content-addressed internally (torch.compile hashes its
+        config, Triton and FlashInfer key by kernel signature), which is why
+        vLLM does not need ``key_by_image`` — see
+        :mod:`sparkrun.core.runtime_cache`.
+
+        ``VLLM_CACHE_ROOT`` and ``FLASHINFER_CACHE_DIR`` are named explicitly
+        rather than left to the ``XDG_CACHE_HOME`` catch-all because both
+        libraries expand ``~/.cache/...`` directly instead of consulting XDG.
+
+        ``FLASHINFER_CACHE_DIR`` — not ``FLASHINFER_WORKSPACE_BASE``: the
+        workspace holds build intermediates that are worthless across runs and
+        would grow the tree for nothing.  The cache dir is the compiled output
+        worth keeping.
+        """
+        from sparkrun.core.runtime_cache import CachePath
+
+        return {
+            "VLLM_CACHE_ROOT": CachePath("vllm"),
+            "TORCHINDUCTOR_CACHE_DIR": CachePath("inductor"),
+            "TRITON_CACHE_DIR": CachePath("triton"),
+            "FLASHINFER_CACHE_DIR": CachePath("flashinfer"),
+        }
+
     def finalize_host_comm_env(self, host_env: dict[str, str]) -> dict[str, str]:
         """Advertise vLLM on the host's resolved ``NODE_IP``.
 

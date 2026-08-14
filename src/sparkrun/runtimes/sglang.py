@@ -333,6 +333,24 @@ class SglangRuntime(RuntimePlugin):
         env.update(get_sglang_tuning_env() or {})
         return env
 
+    # --- Compilation cache ---
+
+    def runtime_cache_paths(self, *, fingerprint: str = "") -> dict:
+        """Persist SGLang's torch.compile / Triton / FlashInfer caches.
+
+        SGLang's own graph cache goes through torch.compile, so Inductor covers
+        it.  All three are content-addressed internally and safe to share
+        across images — see :meth:`VllmMixin.runtime_cache_paths` for why
+        FlashInfer's *cache* dir is the one persisted and not its workspace.
+        """
+        from sparkrun.core.runtime_cache import CachePath
+
+        return {
+            "TORCHINDUCTOR_CACHE_DIR": CachePath("inductor"),
+            "TRITON_CACHE_DIR": CachePath("triton"),
+            "FLASHINFER_CACHE_DIR": CachePath("flashinfer"),
+        }
+
     # --- Cluster stop ---
 
     def _stop_cluster(

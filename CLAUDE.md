@@ -1083,6 +1083,49 @@ Two rules the seam exists to enforce:
 `tests/test_kv_strategies.py` registers a sliding-window strategy at runtime and asserts it reaches extraction,
 estimation, recipe write-back and validation with **no core edit** — the executable form of that claim.
 
+### Runtime Cache (`core/runtime_cache.py` + `orchestration/runtime_cache.py`)
+
+Containers are `--rm`, so every launch discarded its compilation and autotune output — torch.compile /
+Inductor graphs, Triton cubins, FlashInfer JIT modules, and the TRT-LLM autotuner, which was never
+written at all (issue #256). A host directory is now mounted at `/cache/runtime`, sibling of
+`/cache/huggingface` and the same convention.
+
+**The load-bearing invariant is that directory keying is hygiene, never correctness.** The host path
+is `<root>/<family>/[<image-key>/][<model-key>/]`, and `key_by_image` defaults **off** — so nothing
+may depend on the key to avoid loading a stale artifact. torch.compile / Inductor / Triton /
+FlashInfer are content-addressed internally and are correct (and far more useful) in a tree shared
+across image versions. TRT-LLM's autotuner is the exception in both directions: it holds tactics for
+exactly one configuration, so it carries `derive_recipe_fingerprint` **in its filename** regardless
+of the directory key; and it validates neither the version nor the GPU it records, so `trtllm`
+returns `{"key_by_image": True}` from `runtime_cache_defaults()` — the runtime tier, so every TRT-LLM
+recipe including a user's own is safe without a `runtime_cache:` block.
+
+The container path is **constant**; all keying is host-side, so recipes and serve commands never
+spell a key.
+
+| Piece | Role |
+|-------|------|
+| `RuntimePlugin.runtime_cache_paths(fingerprint=)` | env var → `CachePath` **relative** to the mount (`file=True` ⇒ only the parent is created) |
+| `RuntimePlugin.runtime_cache_defaults()` | runtime tier of the settings chain — same slot `default_executor()` holds in `resolve_executor` |
+| `resolve_runtime_cache_settings` | recipe → CLI → cluster → config → runtime → baseline; `SPARKRUN_NO_RUNTIME_CACHE` beats all |
+| `build_runtime_cache_mounts` | volumes + env + dirs, or `None` (⇒ byte-identical to pre-feature) |
+| `Executor.ensure_runtime_cache` | write-path peer of `verify_mount_sources`; base no-op, docker/local share the SSH impl |
+
+Two env rules are load-bearing and fail *silently* if broken (both have regression tests):
+
+- **`XDG_CACHE_HOME` is the catch-all, so `HF_HOME`/`HF_HUB_CACHE` must stay explicitly set** —
+  `huggingface_hub` honors XDG, and losing that ordering relocates the model cache off its own mount
+  and re-downloads the weights on every launch.
+- **The cache env is injected at the *lowest* tier**, not through `get_extra_env` (which wins over
+  `recipe.env` and would clobber a recipe that points `VLLM_CACHE_ROOT` itself).
+
+`ensure_runtime_cache` does mkdir + marker-touch + prune in **one** SSH round-trip. The `mkdir` is not
+optional — Docker materializes a missing `-v` source **root-owned**, breaking rootless and breaking
+`local` outright. Pruning ages trees by the `.sparkrun-last-used` marker rather than directory mtime,
+because reading a cache never touches the directory: an mtime-aged sweep would delete exactly the warm
+trees it should keep. Best-effort throughout — a cache that could not be prepared costs a recompile,
+never a launch. Manual sweep: `sparkrun setup prune-runtime-cache`. Design: `.slop/runtime-cache-design.md`.
+
 ### Kernel Tuning (`tuning/`)
 
 Provides utilities for running Triton fused MoE kernel tuning on DGX Spark and auto-mounting the resulting configs in
