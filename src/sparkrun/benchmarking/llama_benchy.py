@@ -51,6 +51,25 @@ _PASSTHROUGH_ARGS = {
     "tokenizer",  # tokenizer value configured in a recipe can pass-thru to benchmark profile definitions
 }
 
+# Runtime families whose OpenAI server rejects ``return_token_ids`` on a
+# *streaming* request, which llama-benchy sends unconditionally on every
+# measurement (``client.py:_build_generation_payload`` sets ``stream`` and
+# ``return_token_ids`` together).  SGLang's
+# ``entrypoints/openai/serving_chat.py`` raises for that pair:
+#
+#     return_token_ids is not supported with streaming on /v1/chat/completions.
+#     Please set stream=false when using return_token_ids=true.
+#
+# Every measurement request 400s while the warmup and coherence probes — which
+# set neither field — succeed, so the sweep looks healthy and reports nothing.
+#
+# This lives here rather than as a capability on ``RuntimePlugin`` because it is
+# a workaround for one tool's payload, not a property sparkrun otherwise needs:
+# nothing outside llama-benchy asks the question, and when llama-benchy moves to
+# ``/v1/completions`` (which SGLang *does* serve token ids from while streaming)
+# or SGLang implements it for chat, the fix is deleting this set.
+_NO_STREAMING_TOKEN_IDS_FAMILIES = frozenset({"sglang"})
+
 
 # ---------------------------------------------------------------------------
 # Progress-table row generation (consumed by progress_ui via ProgressTableSpec)
@@ -172,17 +191,21 @@ class LlamaBenchyFramework(BenchmarkingPlugin):
         config_chain: dict[str, Any],
         overrides: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Pull ``served_model_name`` off the recipe so llama-benchy can preserve
-        the upstream HuggingFace model id for tokenization (its CLI requires
-        this to be set explicitly when the served name differs from the model).
+        """Adapt llama-benchy's invocation to the server it will be pointed at.
 
-        llama-benchy's ``--model`` is what sparkrun passes as ``recipe.model``
-        and is used for tokenization; ``--served-model-name`` is *the name sent
-        in API calls*, defaulting to ``--model``.  So missing this makes every
-        task request the model id from a server that only answers to the served
-        name — HTTP 404, whole sweep fails (issue #257).  The config chain is
-        blind to a name hardcoded in the recipe's ``command:``, hence the
-        fallback.
+        **``served_model_name``** — llama-benchy's ``--model`` is what sparkrun
+        passes as ``recipe.model`` and is used for tokenization;
+        ``--served-model-name`` is *the name sent in API calls*, defaulting to
+        ``--model``.  So missing this makes every task request the model id from
+        a server that only answers to the served name — HTTP 404, whole sweep
+        fails (issue #257).  The config chain is blind to a name hardcoded in
+        the recipe's ``command:``, hence the fallback.
+
+        **``return_token_ids``** — suppressed for runtimes that reject it on a
+        streaming request; see :data:`_NO_STREAMING_TOKEN_IDS_FAMILIES`.
+
+        Both are merged by the caller with ``setdefault``, so anything the user
+        passed with ``-b`` wins.
         """
         from sparkrun.core.recipe import extract_served_model_name_from_command
 
@@ -192,7 +215,38 @@ class LlamaBenchyFramework(BenchmarkingPlugin):
         )
         if served_model_name:
             extra["served_model_name"] = served_model_name
+
+        if self._recipe_family(recipe) in _NO_STREAMING_TOKEN_IDS_FAMILIES:
+            extra["extra_body"] = "return_token_ids=false"
+            logger.warning(
+                "%s rejects return_token_ids on streaming requests; benchmarking with "
+                "return_token_ids=false. Token *totals* stay exact (read from the stream's "
+                "usage), but token arrival times are interpolated — so peak throughput and "
+                "the throughput timeseries are smoothed, which understates burstiness under "
+                "speculative decoding. Override with '-b extra_body=return_token_ids=true'.",
+                getattr(recipe, "runtime", "this runtime"),
+            )
         return extra
+
+    @staticmethod
+    def _recipe_family(recipe) -> str:
+        """Runtime family for *recipe*, or ``""`` when it can't be resolved.
+
+        Family rather than runtime *name* so a variant (``eugr-vllm`` → ``vllm``)
+        is covered without enumerating it.  Unresolvable → ``""``, which matches
+        no entry: the workaround costs measurement fidelity, and paying that on a
+        runtime we failed to identify would be the wrong default.
+        """
+        name = getattr(recipe, "runtime", None)
+        if not name:
+            return ""
+        try:
+            from sparkrun.core.bootstrap import get_runtime
+
+            return get_runtime(name).get_family() or ""
+        except Exception:
+            logger.debug("could not resolve runtime %r for family lookup", name, exc_info=True)
+            return ""
 
     def check_prerequisites(self) -> list[str]:
         """Check that uvx is available on PATH."""

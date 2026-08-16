@@ -148,3 +148,23 @@ def test_user_bench_args_still_win(runner, bench_env):
 
     assert result.exit_code == 0, result.output
     assert base_args.get("served_model_name") == "explicit"
+
+
+def test_return_token_ids_suppression_reaches_the_scheduled_tasks(runner, bench_env):
+    """The sglang workaround travels the same road, and hit the same pothole.
+
+    Its unit tests passed while it was completely inert in practice — the
+    framework produced the arg and the flow discarded it.  The fixture recipe is
+    an sglang one, so this asserts the whole chain rather than the plugin.
+    """
+    result, base_args = _spy_task_args(runner, bench_env)
+
+    assert result.exit_code == 0, result.output
+    assert base_args.get("extra_body") == "return_token_ids=false"
+
+
+def test_user_can_re_enable_token_ids_end_to_end(runner, bench_env):
+    result, base_args = _spy_task_args(runner, bench_env, ["-b", "extra_body=return_token_ids=true"])
+
+    assert result.exit_code == 0, result.output
+    assert base_args.get("extra_body") == "return_token_ids=true"
