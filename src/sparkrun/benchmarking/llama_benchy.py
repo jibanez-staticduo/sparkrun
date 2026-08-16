@@ -600,6 +600,19 @@ class LlamaBenchyFramework(BenchmarkingPlugin):
             "stdout": stdout,
         }
 
+    #: Metrics whose presence distinguishes a measured row from a placeholder.
+    #: llama-benchy always writes a row per test — the request parameters are
+    #: echoed even when every request failed — so a row's *existence* says
+    #: nothing; only a non-null metric does.
+    _MEASURED_KEYS = ("pp_throughput", "tg_throughput", "peak_throughput", "ttfr", "e2e_ttft")
+
+    def measured_nothing(self, parsed: dict[str, Any]) -> bool:
+        """True when no benchmark row carries a single non-null metric."""
+        rows = (parsed or {}).get("json", {}).get("benchmarks") or []
+        if not rows:
+            return True
+        return not any(isinstance(row, dict) and any(row.get(k) is not None for k in self._MEASURED_KEYS) for row in rows)
+
 
 # -- CSV headers matching llama-benchy's save_report(format="csv") --
 _CSV_HEADERS = [

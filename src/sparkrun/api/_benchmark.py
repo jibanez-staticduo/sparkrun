@@ -1078,6 +1078,19 @@ def _execute_benchmark(
             results = fw.parse_results(stdout_text, stderr_text, result_file=_parse_result_file)
             bench_result.results = results
 
+            # A framework that failed every request but exited 0 must not be
+            # reported as a completed benchmark.  The framework's own output is
+            # already captured per task; name it, because that is where the
+            # cause is (an HTTP status and body, in llama-benchy's case) and
+            # nothing else surfaces it.
+            if fw.measured_nothing(results):
+                where = "%s/runs/" % state_dir_str if tasks is not None else (_parse_result_file or "the benchmark output")
+                raise BenchmarkFailed(
+                    "benchmark produced no measurements — every request appears to have failed. "
+                    "%s exited successfully, so the cause is in its output: %s" % (fw.framework_name, where),
+                    exit_code=1,
+                )
+
             rows = results.get("rows", [])
             if rows:
                 emitter.info("")
