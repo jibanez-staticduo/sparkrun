@@ -167,6 +167,79 @@ def _should_remeasure_complete_state(
     return bool(on_complete_state(existing_state))
 
 
+def _resolve_running_deployment(
+    recipe,
+    overrides: dict,
+    candidate_hosts: list[str],
+    *,
+    solo: bool,
+    cluster: "str | None",
+    sctx: "SparkrunContext | None",
+    emitter: _ProgressEmitter,
+) -> tuple[list[str], bool, str | None]:
+    """Locate the deployment ``--skip-run`` is meant to benchmark.
+
+    ``--skip-run`` is the one benchmark path that does not launch, so it is
+    also the one that must not *place*: the workload is already serving
+    somewhere, and the question is where — not where it would go.  This is the
+    same question ``--ensure`` asks, so it uses the same key
+    (:func:`~sparkrun.api.find_running_intent`, keyed on the launch intent
+    rather than a cluster_id, which also encodes placement and so cannot match
+    a job scheduled under an ``occupancy-*`` scheduler).
+
+    Without this the branch simply kept the whole resolved cluster, which made
+    ``benchmark --skip-run`` report ``cluster (4 nodes)`` for a solo workload
+    and — worse than cosmetically — pointed ``head_host`` at
+    ``candidate_hosts[0]`` and recorded every candidate in the exported
+    results.  A ``tp: 1`` recipe benchmarked on one node was published as a
+    four-node measurement, and the run only reached the right server when the
+    workload happened to land on the first host in the list.
+
+    The intent's own hosts also carry the running deployment's **cluster_id**,
+    which is returned so the benchmark binds to the job that exists instead of
+    to one derived from a host set that was never launched.  Benchmark
+    *identity* is unaffected: :func:`derive_benchmark_id` hashes only the
+    intent half of a cluster_id, so prior state stays resumable.
+
+    Falls back to the previous behaviour (candidates, narrowed by ``solo``)
+    with a warning when nothing matches — an unreachable cluster or a
+    hand-started server is "couldn't tell", not "not running", and refusing to
+    benchmark on that basis is the worse failure.  Pass the **full** candidate
+    list to the lookup: a deployment that landed on a host this benchmark
+    would not have chosen still counts.
+    """
+    import sparkrun.api as api
+    from sparkrun.orchestration.job_metadata import generate_intent_id
+
+    fallback = list(candidate_hosts)
+    fallback_solo = bool(solo) or recipe.mode == "solo" or len(fallback) <= 1
+    if fallback_solo and len(fallback) > 1:
+        fallback = fallback[:1]
+
+    try:
+        intent_id = generate_intent_id(recipe, overrides)
+        match = api.find_running_intent(intent_id, list(candidate_hosts), cluster=cluster, sctx=sctx)
+    except Exception:
+        logger.debug("--skip-run: running-intent lookup failed", exc_info=True)
+        match = None
+
+    if match is None or not match.hosts:
+        emitter.warning(
+            "--skip-run: no running workload matched this recipe on %s; assuming %s" % (", ".join(candidate_hosts), ", ".join(fallback))
+        )
+        return fallback, fallback_solo, None
+
+    hosts = list(match.hosts)
+    if match.other_cluster_ids:
+        # find_running_intent already picked the widest deployment; say so
+        # rather than silently benchmarking one of several.
+        emitter.warning(
+            "--skip-run: %d deployments of this workload are running; benchmarking %s"
+            % (len(match.other_cluster_ids) + 1, match.cluster_id)
+        )
+    return hosts, len(hosts) <= 1, match.cluster_id
+
+
 # ---------------------------------------------------------------------------
 # Core orchestration
 # ---------------------------------------------------------------------------
@@ -453,12 +526,14 @@ def _execute_benchmark(
 
     run_options: "api.RunOptions | None" = None
     run_plan: "api.RunPlan | None" = None
-    if skip_run:
-        # No launch, so nothing to plan — just honour solo.
-        is_solo = bool(solo) or recipe.mode == "solo" or len(host_list) <= 1
-        if is_solo and len(host_list) > 1:
-            host_list = host_list[:1]
-    else:
+    # ``--skip-run`` does not launch, so it discovers its hosts rather than
+    # planning them — deferred to ``_resolve_running_deployment`` below, once
+    # ``overrides`` are final (the intent id hashes the resolved port).  The
+    # candidate list stays intact until then, because the lookup needs the
+    # cluster's *full* host set.
+    skip_run_cluster_id: str | None = None
+    is_solo = bool(solo) or recipe.mode == "solo" or len(host_list) <= 1
+    if not skip_run:
         # Plan the launch now so the banner below can name the target hosts,
         # then hand the same plan to ``api.run``.  The alternative — placing
         # here and passing the winners as ``hosts`` — would narrow the
@@ -507,6 +582,18 @@ def _execute_benchmark(
         config_chain = recipe.build_config_chain(overrides)
         serve_port = int(config_chain.get("port") or 8000)
         overrides["port"] = serve_port
+        # ``overrides`` are final now, so the intent id is stable — find the
+        # deployment that is actually serving rather than assuming the whole
+        # cluster is.
+        host_list, is_solo, skip_run_cluster_id = _resolve_running_deployment(
+            recipe,
+            overrides,
+            host_list,
+            solo=solo,
+            cluster=cluster_name,
+            sctx=sctx,
+            emitter=emitter,
+        )
 
     container_image = runtime.resolve_container(recipe, overrides)
 
@@ -558,7 +645,10 @@ def _execute_benchmark(
 
     from sparkrun.orchestration.job_metadata import derive_cluster_id as _derive_cid
 
-    cluster_id = _derive_cid(recipe, host_list, overrides=overrides)
+    # Under ``--skip-run`` the running deployment's own id wins: deriving one
+    # from a host set that was never launched yields a cluster_id no job
+    # metadata, ``stop`` or ``logs`` lookup can match.
+    cluster_id = skip_run_cluster_id or _derive_cid(recipe, host_list, overrides=overrides)
 
     bench_result.recipe = recipe
     bench_result.overrides = overrides
