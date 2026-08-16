@@ -223,6 +223,35 @@ def test_sglang_declares_inductor_and_triton():
     assert env["TRITON_CACHE_DIR"] == "/cache/runtime/triton"
 
 
+def test_sglang_declares_its_own_cache_root_not_just_flashinfers():
+    """``SGLANG_CACHE_DIR`` is where SGLang writes its FlashInfer autotune results.
+
+    Distinct from ``FLASHINFER_CACHE_DIR`` (FlashInfer's own JIT cubins), and not
+    reachable via ``XDG_CACHE_HOME`` — the upstream default is a literal
+    ``expanduser("~/.cache/sglang")``, so leaving it unset re-ran the autotune
+    sweep into the container's throwaway ``HOME`` on every launch.
+    """
+    m = _mounts(runtime=SglangRuntime())
+    assert m.env["SGLANG_CACHE_DIR"] == "/cache/runtime/sglang"
+    assert m.env["FLASHINFER_CACHE_DIR"] == "/cache/runtime/flashinfer"
+    assert "%s/sglang" % m.leaf in m.dirs
+
+
+def test_sglang_jit_cache_is_declared_because_it_does_not_track_the_root():
+    """Unset, SGLang's JIT build cache falls back to a hardcoded ``~/.cache/sglang/jit``.
+
+    Setting ``SGLANG_CACHE_DIR`` alone would leave it in the container.
+    """
+    m = _mounts(runtime=SglangRuntime())
+    assert m.env["SGLANG_JIT_CACHE_DIR"] == "/cache/runtime/sglang/jit"
+    assert "%s/sglang/jit" % m.leaf in m.dirs
+
+
+def test_sglang_declares_tilelang_cache():
+    """TileLang defaults to ``~/.tilelang/cache`` — outside XDG *and* the SGLang root."""
+    assert _mounts(runtime=SglangRuntime()).env["TILELANG_CACHE_DIR"] == "/cache/runtime/tilelang"
+
+
 def test_declared_directories_are_created():
     m = _mounts()
     assert m.leaf in m.dirs

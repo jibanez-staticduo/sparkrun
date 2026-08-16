@@ -336,12 +336,35 @@ class SglangRuntime(RuntimePlugin):
     # --- Compilation cache ---
 
     def runtime_cache_paths(self, *, fingerprint: str = "") -> dict:
-        """Persist SGLang's torch.compile / Triton / FlashInfer caches.
+        """Persist SGLang's torch.compile / Triton / FlashInfer / SGLang caches.
 
         SGLang's own graph cache goes through torch.compile, so Inductor covers
-        it.  All three are content-addressed internally and safe to share
-        across images — see :meth:`VllmMixin.runtime_cache_paths` for why
-        FlashInfer's *cache* dir is the one persisted and not its workspace.
+        it.  All of these are content-addressed or version-keyed internally and
+        safe to share across images — see :meth:`VllmMixin.runtime_cache_paths`
+        for why FlashInfer's *cache* dir is the one persisted and not its
+        workspace.
+
+        ``SGLANG_CACHE_DIR`` is the root of everything SGLang caches *itself*,
+        and is separate from ``FLASHINFER_CACHE_DIR`` even though both have
+        "flashinfer" trees.  ``FLASHINFER_CACHE_DIR`` is FlashInfer's own JIT
+        cubin cache; the FlashInfer **autotune** results SGLang collects on
+        startup are SGLang's, written to
+        ``$SGLANG_CACHE_DIR/flashinfer/autotune/<fi-version>/sm<arch>/<cfg-hash>/rank_*.json``.
+        Leaving it unset sent them to ``~/.cache/sglang`` — i.e. ``/tmp`` under
+        the ``$SHELL_USER`` container's ``HOME=/tmp`` — so every launch re-ran
+        the autotune sweep.  The XDG catch-all does not cover it: the default is
+        a literal ``os.path.expanduser("~/.cache/sglang")``.
+
+        ``SGLANG_JIT_CACHE_DIR`` is set explicitly rather than left to track
+        ``SGLANG_CACHE_DIR``, because it does not: unset, SGLang's JIT build
+        cache falls back to a hardcoded ``~/.cache/sglang/jit``.  (The DeepGEMM
+        cache, ``SGLANG_DG_CACHE_DIR``, *is* resolved lazily from
+        ``SGLANG_CACHE_DIR`` upstream, so it needs no entry.)
+
+        ``TILELANG_CACHE_DIR`` is the same class of miss from a different
+        library — SGLang's TileLang kernels default to ``~/.tilelang/cache``,
+        outside both XDG and the SGLang root.  Harmless when TileLang is absent
+        from the image.
         """
         from sparkrun.core.runtime_cache import CachePath
 
@@ -349,6 +372,9 @@ class SglangRuntime(RuntimePlugin):
             "TORCHINDUCTOR_CACHE_DIR": CachePath("inductor"),
             "TRITON_CACHE_DIR": CachePath("triton"),
             "FLASHINFER_CACHE_DIR": CachePath("flashinfer"),
+            "SGLANG_CACHE_DIR": CachePath("sglang"),
+            "SGLANG_JIT_CACHE_DIR": CachePath("sglang/jit"),
+            "TILELANG_CACHE_DIR": CachePath("tilelang"),
         }
 
     # --- Cluster stop ---
