@@ -209,7 +209,8 @@ def _summarize_platforms(
     "--rebuild/--no-rebuild",
     "rebuild",
     default=None,
-    help="Force the builder to produce a fresh image (no-op for docker-pull; forces a rebuild/fresh pull for eugr). "
+    help="Force a fresh image: an unconditional 'docker pull' for registry images (the default docker-pull path), "
+    "a from-scratch rebuild for eugr. Use when a local copy is stale or incomplete. "
     "Overrides the recipe's builder_config.rebuild setting.",
     hidden=HIDE_ADVANCED_OPTIONS,
 )

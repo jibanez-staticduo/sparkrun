@@ -240,12 +240,16 @@ def _distribute_image_push(
     worker_transfer_hosts: list[str] | None,
     ssh_kwargs: dict,
     dry_run: bool,
+    force_pull: bool = False,
 ) -> list[str]:
     """Push-mode image distribution: local → head, then head → workers via IB.
 
     1. Push image from local to head (``hosts[0]``) over management network.
     2. If workers exist, run ``image_distribute.sh`` on head to stream to
        workers over IB.
+
+    *force_pull* re-pulls on the control machine (step 1 sources the image from
+    there); the head then receives it over the wire, so step 2 is not forced.
 
     Returns:
         List of hostnames where distribution failed.
@@ -261,6 +265,7 @@ def _distribute_image_push(
         [head],
         transfer_hosts=None,
         dry_run=dry_run,
+        force_pull=force_pull,
         **ssh_kwargs,
     )
     if head_failed:
@@ -766,6 +771,16 @@ def distribute_from_config(
 
     dist_cfg = recipe.distribution_config.resolve(recipe, resolved_container=image)
 
+    # `sparkrun run --rebuild` (or `builder_config.rebuild` in the recipe) asks
+    # for the freshest possible image.  For a builder that *builds*, that is a
+    # from-scratch rebuild; for a registry image — the docker-pull default,
+    # which declares no builder at all and so never reaches the builder phase —
+    # the equivalent is an unconditional `docker pull`.  Reading it here rather
+    # than in the builder is what makes the flag reach those recipes.
+    _force_pull = bool(recipe.builder_config.get("rebuild")) if recipe.builder_config else False
+    if _force_pull:
+        logger.info("rebuild requested; forcing a fresh pull of image '%s'", image)
+
     # Single-localhost fast path: same as distribute_resources
     ssh_kwargs = build_ssh_kwargs(config)
     hf_token = _get_hf_token()
@@ -782,7 +797,7 @@ def distribute_from_config(
         if _do_local_ensure:
             with pending_op(_lock_id, "image_pull", **_pop_kw):
                 logger.info("Ensuring container image is available locally...")
-                if ensure_image(image, dry_run=dry_run) != 0:
+                if ensure_image(image, dry_run=dry_run, force_pull=_force_pull) != 0:
                     raise DistributionError(f"Failed to pull or locate image: {image}")
         if after_container_sync is not None:
             after_container_sync()
@@ -871,6 +886,7 @@ def distribute_from_config(
                     ssh_kwargs,
                     dry_run,
                     _auto_delegated,
+                    force_pull=_force_pull,
                 )
             if img_failed:
                 raise DistributionError("Image distribution failed on: %s" % ", ".join(img_failed))
@@ -968,8 +984,18 @@ def _distribute_single_image(
     ssh_kwargs: dict,
     dry_run: bool,
     auto_delegated: bool,
+    force_pull: bool = False,
 ) -> list[str]:
-    """Distribute a single image to a subset of hosts."""
+    """Distribute a single image to a subset of hosts.
+
+    *force_pull* (``sparkrun run --rebuild``) is routed to whichever side
+    actually pulls from the registry for the mode in play: the control machine
+    under ``local``/``push``, the head under ``delegated``.  It is deliberately
+    *not* applied to a head→worker leg that follows a push — the head has just
+    received the fresh image over the wire, and re-pulling there would both
+    duplicate the transfer and defeat push mode, which exists for heads that
+    cannot reach the registry at all.
+    """
     from sparkrun.containers.distribute import distribute_image_from_local, distribute_image_from_head
 
     # Map transfer hosts to target subset.  transfer_hosts is positionally aligned with
@@ -982,27 +1008,31 @@ def _distribute_single_image(
     w_hosts = _subset_transfer_hosts(full_hosts[1:], worker_transfer_hosts, target_set)
 
     if transfer_mode == "local":
-        return distribute_image_from_local(image, targets, transfer_hosts=t_hosts, dry_run=dry_run, **ssh_kwargs)
+        return distribute_image_from_local(image, targets, transfer_hosts=t_hosts, dry_run=dry_run, force_pull=force_pull, **ssh_kwargs)
     elif transfer_mode == "push":
         head = targets[0]
         if targets == full_hosts:
-            return _distribute_image_push(image, targets, w_hosts, ssh_kwargs, dry_run)
+            return _distribute_image_push(image, targets, w_hosts, ssh_kwargs, dry_run, force_pull=force_pull)
         # Subset push: push to head only, then head distributes
-        head_failed = distribute_image_from_local(image, [head], transfer_hosts=None, dry_run=dry_run, **ssh_kwargs)
+        head_failed = distribute_image_from_local(image, [head], transfer_hosts=None, dry_run=dry_run, force_pull=force_pull, **ssh_kwargs)
         if head_failed:
             return list(targets)
         if len(targets) > 1:
             return distribute_image_from_head(image, targets, worker_transfer_hosts=w_hosts, dry_run=dry_run, **ssh_kwargs)
         return []
     elif transfer_mode == "delegated":
-        result = distribute_image_from_head(image, targets, worker_transfer_hosts=w_hosts, dry_run=dry_run, **ssh_kwargs)
+        result = distribute_image_from_head(
+            image, targets, worker_transfer_hosts=w_hosts, dry_run=dry_run, force_pull=force_pull, **ssh_kwargs
+        )
         if result and auto_delegated:
             # Delegated pull failed (e.g. a private image the head can't pull).
             # Fall back to push: the control machine has the image locally → push
             # it to the head, then head fans out to any workers over IB.
             logger.info("Delegated image pull failed; falling back to push from the control machine")
             head = targets[0]
-            head_failed = distribute_image_from_local(image, [head], transfer_hosts=None, dry_run=dry_run, **ssh_kwargs)
+            head_failed = distribute_image_from_local(
+                image, [head], transfer_hosts=None, dry_run=dry_run, force_pull=force_pull, **ssh_kwargs
+            )
             if head_failed:
                 result = list(targets)
             elif len(targets) > 1:
@@ -1010,7 +1040,7 @@ def _distribute_single_image(
             else:
                 result = []
         return result
-    return distribute_image_from_local(image, targets, transfer_hosts=t_hosts, dry_run=dry_run, **ssh_kwargs)
+    return distribute_image_from_local(image, targets, transfer_hosts=t_hosts, dry_run=dry_run, force_pull=force_pull, **ssh_kwargs)
 
 
 def _distribute_single_model(
