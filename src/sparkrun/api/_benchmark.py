@@ -600,6 +600,23 @@ def _execute_benchmark(
     config_chain = recipe.build_config_chain(overrides)
     effective_tp = int(config_chain.get("tensor_parallel") or 1)
 
+    # ``bench_args`` must be *final* here, before anything reads it.  Three
+    # consumers below snapshot it — ``build_task_list`` copies it into each
+    # task's ``run_args`` (which is what the scheduler actually renders into a
+    # command), ``derive_benchmark_id`` hashes it, and ``BenchmarkRunState``
+    # persists it as ``base_args`` for resumes — so a contribution merged after
+    # them reaches none of the three.  Merging these two *after* the task list
+    # was built is exactly that bug: on the scheduled path (the default) the
+    # framework's recipe-derived args were silently dropped, taking
+    # ``served_model_name`` (issue #257) and the runtime-resolved ``api_key``
+    # with them.  Both use ``setdefault``, so a value the user passed with
+    # ``-b`` still wins.
+    for k, bv in fw.prepare_benchmark_args(recipe, config_chain, overrides).items():
+        bench_args.setdefault(k, bv)
+
+    if (api_key := runtime.resolve_api_key(recipe, overrides)) and "api_key" not in bench_args:
+        bench_args["api_key"] = api_key
+
     # -----------------------------------------------------------------------
     # 5. Display summary
     # -----------------------------------------------------------------------
@@ -917,12 +934,6 @@ def _execute_benchmark(
         est_tests = fw.estimate_test_count(bench_args)
         if est_tests is not None:
             logger.info("Estimated test iterations: %d", est_tests)
-
-        for k, bv in fw.prepare_benchmark_args(recipe, config_chain, overrides).items():
-            bench_args.setdefault(k, bv)
-
-        if (api_key := runtime.resolve_api_key(recipe, overrides)) and "api_key" not in bench_args:
-            bench_args["api_key"] = api_key
 
         stdout_text = ""
         stderr_text = ""
