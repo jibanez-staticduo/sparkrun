@@ -363,6 +363,15 @@ FALLBACK_DEFAULT_REGISTRIES = [
         url="https://github.com/spark-arena/community-recipe-registry.git",
         subpath="recipes",
         description="Community recipe registry",
+        # Must mirror the repo's own .sparkrun/registry.yaml manifest
+        # (recipes / tuning / benchmarks). The manifest is only consulted on
+        # first-run discovery, so a registries.yaml written from this fallback
+        # keeps whatever is spelled here forever — and an omitted subpath is
+        # not merely a default, it makes that asset kind *unresolvable*
+        # (``asset_dir`` returns nothing) and drops the path from the sparse
+        # checkout, so `registry update` never fetches it either.
+        tuning_subpath="tuning",
+        benchmark_subpath="benchmarking",
         visible=False,
         trusted=True,
     ),
@@ -1108,6 +1117,50 @@ class RegistryManager:
         return True
 
     @staticmethod
+    def _backfill_default_subpaths(entries: list[RegistryEntry]) -> bool:
+        """Fill in asset subpaths a shipped default gained after this file was written.
+
+        An omitted subpath is not a harmless default — it makes that asset kind
+        **unresolvable**.  ``asset_dir`` returns nothing when the field is
+        blank, so ``--profile <name>`` reports "not found" no matter how it is
+        spelled, and ``_build_sparse_paths`` drops the directory from the sparse
+        checkout so ``registry update`` never fetches it either.  The symptom is
+        therefore a registry that appears healthy and silently cannot serve
+        benchmark profiles, tuning configs or mods.
+
+        Nothing re-reads a registry's ``.sparkrun/registry.yaml`` manifest once
+        ``registries.yaml`` exists — manifests are consulted only on first-run
+        discovery — so a file written from :data:`FALLBACK_DEFAULT_REGISTRIES`
+        (which happens whenever discovery was offline) keeps whatever that list
+        spelled at the time, forever.
+
+        Only ever *adds*: a user who deliberately blanked a subpath gets it
+        back, which is the accepted trade for repairing the far more common
+        case, but a subpath the user has customised is never overwritten.
+        Matching is by URL, so a renamed registry is still repaired.
+
+        Returns:
+            True when any entry was modified (caller re-saves the file).
+        """
+        by_url = {_normalize_registry_url(e.url): e for e in FALLBACK_DEFAULT_REGISTRIES}
+        changed = False
+        for entry in entries:
+            shipped = by_url.get(_normalize_registry_url(entry.url))
+            if shipped is None:
+                continue
+            for field in ("tuning_subpath", "benchmark_subpath", "mods_subpath"):
+                if not getattr(entry, field) and getattr(shipped, field):
+                    setattr(entry, field, getattr(shipped, field))
+                    logger.info(
+                        "Backfilled %s=%r on registry %r from shipped default",
+                        field,
+                        getattr(shipped, field),
+                        entry.name,
+                    )
+                    changed = True
+        return changed
+
+    @staticmethod
     def _migrate_registry_urls(entries: list[RegistryEntry]) -> bool:
         """Rewrite entries whose URL appears in :data:`MIGRATED_REGISTRY_URLS`.
 
@@ -1192,10 +1245,14 @@ class RegistryManager:
                 else:
                     filtered.append(entry)
 
+            # Backfill asset subpaths a shipped default has gained since this
+            # file was written.  Content-detected, so it runs on every load.
+            subpaths_backfilled = self._backfill_default_subpaths(filtered)
+
             # --- One-shot migrations: version-gated, run at most once ever. ---
             migrated = self._run_one_shot_migrations(filtered) if pending_migrations else False
 
-            if migrated or urls_migrated:
+            if migrated or urls_migrated or subpaths_backfilled:
                 self._save_registries(filtered)
             return filtered
         except Exception as e:

@@ -31,14 +31,50 @@ _SGLANG_FLAG_MAP = {
     "chunked_prefill": "--chunked-prefill-size",
     "kv_cache_dtype": "--kv-cache-dtype",
     "tokenizer_path": "--tokenizer-path",
-    "speculative_draft_model_path": "--speculative-draft-model-path",
     "api_key": "--api-key",
+    # Serving-behaviour flags, spelled in nearly every real SGLang recipe's
+    # ``command:`` template. Without them a command-less recipe silently serves
+    # a differently-configured server.
+    "attention_backend": "--attention-backend",
+    "load_format": "--load-format",
+    "reasoning_parser": "--reasoning-parser",
+    "tool_call_parser": "--tool-call-parser",
+    "mm_feature_transport": "--mm-feature-transport",
+    # Speculative decoding (NEXTN / EAGLE / DSPARK).
+    "speculative_algorithm": "--speculative-algorithm",
+    "speculative_draft_model_path": "--speculative-draft-model-path",
+    "speculative_num_steps": "--speculative-num-steps",
+    "speculative_eagle_topk": "--speculative-eagle-topk",
+    "speculative_num_draft_tokens": "--speculative-num-draft-tokens",
+    "speculative_dspark_block_size": "--speculative-dspark-block-size",
+    # CUDA graph / torch.compile batch sizing.
+    "cuda_graph_bs": "--cuda-graph-bs",
+    "cuda_graph_max_bs": "--cuda-graph-max-bs",
+    "cuda_graph_max_bs_decode": "--cuda-graph-max-bs-decode",
+    "torch_compile_max_bs": "--torch-compile-max-bs",
+    "num_continuous_decode_steps": "--num-continuous-decode-steps",
+    # Kernel backends and hybrid-SSM knobs.
+    "fp8_gemm_backend": "--fp8-gemm-backend",
+    "fp4_gemm_backend": "--fp4-gemm-backend",
+    "moe_runner_backend": "--moe-runner-backend",
+    "mamba_ssm_dtype": "--mamba-ssm-dtype",
+    "mamba_full_memory_ratio": "--mamba-full-memory-ratio",
+    # NOTE: the boolean keys below must ALSO be listed here (``trust_remote_code``
+    # already is, above). ``build_flags_from_map`` iterates this map and consults
+    # ``bool_keys`` only to decide how to *render* a key it has already found, so
+    # a key listed solely in _SGLANG_BOOL_FLAGS is unreachable. Keep them in sync.
+    "enable_torch_compile": "--enable-torch-compile",
+    "disable_radix_cache": "--disable-radix-cache",
+    "disable_prefill_cuda_graph": "--disable-prefill-cuda-graph",
 }
 
+# Boolean flags (present = True, absent = False).
+# Every entry here MUST also have an entry in _SGLANG_FLAG_MAP — see note above.
 _SGLANG_BOOL_FLAGS = {
     "trust_remote_code",
     "enable_torch_compile",
     "disable_radix_cache",
+    "disable_prefill_cuda_graph",
 }
 
 
@@ -46,7 +82,7 @@ class SglangRuntime(RuntimePlugin):
     """Native SGLang runtime using prebuilt container images.
 
     SGLang uses its own distributed init mechanism for multi-node inference,
-    not Ray.  Each node runs the full ``sglang.launch_server`` command with
+    not Ray.  Each node runs the full ``sglang serve`` command with
     ``--dist-init-addr``, ``--nnodes``, and ``--node-rank`` arguments.
     """
 
@@ -107,7 +143,7 @@ class SglangRuntime(RuntimePlugin):
         head_ip: str | None = None,
         skip_keys: set[str] | frozenset[str] = frozenset(),
     ) -> str:
-        """Generate the sglang launch_server command.
+        """Generate the sglang serve command.
 
         For cluster mode this produces the *base* command without
         ``--node-rank``.  Use :meth:`generate_node_command` to get the
@@ -150,7 +186,7 @@ class SglangRuntime(RuntimePlugin):
     ) -> str:
         """Generate the sglang command for a specific node.
 
-        Produces the full ``sglang.launch_server`` invocation with the
+        Produces the full ``sglang serve`` invocation with the
         node-specific ``--dist-init-addr``, ``--nnodes``, and
         ``--node-rank`` flags appended.
         """
@@ -233,7 +269,11 @@ class SglangRuntime(RuntimePlugin):
         """Build the sglang command without cluster-specific arguments."""
         # For GGUF models, use the resolved file path instead of the HF repo name
         model_path = config.get("_gguf_model_path") or recipe.model
-        parts = ["python3", "-m", "sglang.launch_server", "--model-path", str(model_path)]
+        # ``sglang serve`` is the current entrypoint; ``python3 -m
+        # sglang.launch_server`` is the legacy spelling it replaced. Recipes
+        # carrying either form in an explicit ``command:`` still work — the
+        # runtime detector (``core.recipe._CMD_SGLANG_RE``) matches both.
+        parts = ["sglang", "serve", "--model-path", str(model_path)]
 
         tp = config.get("tensor_parallel")
         if tp:
@@ -261,7 +301,7 @@ class SglangRuntime(RuntimePlugin):
         head_ip: str | None = None,
         skip_keys: set[str] | frozenset[str] = frozenset(),
     ) -> str:
-        """Build the sglang launch_server command from structured config.
+        """Build the sglang serve command from structured config.
 
         For cluster mode, includes ``--dist-init-addr`` and ``--nnodes`` but
         NOT ``--node-rank`` (that is added per-node by the orchestrator or

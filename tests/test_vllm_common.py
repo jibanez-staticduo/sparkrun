@@ -89,3 +89,67 @@ def test_finalize_host_comm_env_base_runtime_is_noop():
     out = SglangRuntime().finalize_host_comm_env(host_env)
     assert "VLLM_HOST_IP" not in out
     assert out == host_env
+
+
+def test_serve_flags_emitted_without_command_template():
+    """Serving-behaviour keys reach the generated command (no ``command:`` block).
+
+    Regression guard for the flag-map gaps: these were previously absent from
+    ``VLLM_FLAG_MAP``, so a command-less recipe silently served a
+    differently-configured server — no tool/reasoning parsing, default
+    attention backend, default weight loader — with nothing reported.
+
+    ``enable_auto_tool_choice`` is the sharpest case: it was listed in
+    ``VLLM_BOOL_FLAGS`` but *not* in ``VLLM_FLAG_MAP``, and
+    ``build_flags_from_map`` iterates the map, so it was unreachable.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "flags",
+            "model": "Qwen/Qwen3.8-27B-FP8",
+            "runtime": "vllm",
+            "defaults": {
+                "port": 8000,
+                "attention_backend": "flashinfer",
+                "load_format": "instanttensor",
+                "reasoning_parser": "qwen3",
+                "tool_call_parser": "qwen3_coder",
+                "enable_auto_tool_choice": True,
+                "enable_prefix_caching": True,
+                "enable_chunked_prefill": True,
+                "async_scheduling": True,
+                "speculative_config": '{"method": "mtp", "num_speculative_tokens": 3}',
+                "tokenizer_mode": "auto",
+                "seed": 0,
+            },
+        }
+    )
+
+    cmd = VllmDistributedRuntime().generate_command(recipe, {}, is_cluster=False)
+    for expected in (
+        "--attention-backend flashinfer",
+        "--load-format instanttensor",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--enable-auto-tool-choice",
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--async-scheduling",
+        "--tokenizer-mode auto",
+        "--seed 0",
+    ):
+        assert expected in cmd, "missing %r in: %s" % (expected, cmd)
+
+
+def test_bool_flags_are_all_reachable():
+    """Every boolean key must also appear in the flag map.
+
+    ``build_flags_from_map`` iterates ``VLLM_FLAG_MAP`` and consults
+    ``bool_keys`` only to decide how to *render* a key it already found, so a
+    key listed solely in ``VLLM_BOOL_FLAGS`` is dead code that silently emits
+    nothing.  This guards the two lists staying in sync.
+    """
+    from sparkrun.runtimes._vllm_common import VLLM_BOOL_FLAGS, VLLM_FLAG_MAP
+
+    unreachable = sorted(k for k in VLLM_BOOL_FLAGS if k not in VLLM_FLAG_MAP)
+    assert not unreachable, "bool keys missing from VLLM_FLAG_MAP: %s" % unreachable

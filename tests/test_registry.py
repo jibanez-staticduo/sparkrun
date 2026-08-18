@@ -2274,3 +2274,61 @@ class TestStaleCacheOnUrlChange:
         assert not (cache / "eugr").exists()
         # The shared clone itself survives — another registry may still use it.
         assert (shared / ".git").exists()
+
+
+class TestBackfillDefaultSubpaths:
+    """A shipped default that gained an asset subpath must reach existing configs.
+
+    Nothing re-reads a registry's ``.sparkrun/registry.yaml`` once
+    ``registries.yaml`` exists, so a file written from
+    ``FALLBACK_DEFAULT_REGISTRIES`` keeps whatever that list spelled at the
+    time.  A blank subpath is not a benign default: ``asset_dir`` returns
+    nothing, so ``--profile <name>`` reports "not found" however it is spelled,
+    and the path is dropped from the sparse checkout so ``registry update``
+    never fetches it either.
+    """
+
+    def test_blank_subpath_is_filled_from_shipped_default(self, mgr):
+        shipped = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "community")
+        assert shipped.benchmark_subpath, "fixture assumes community ships a benchmark_subpath"
+
+        entry = RegistryEntry(name="community", url=shipped.url, subpath="recipes")
+        assert mgr._backfill_default_subpaths([entry]) is True
+        assert entry.benchmark_subpath == shipped.benchmark_subpath
+        assert entry.tuning_subpath == shipped.tuning_subpath
+
+    def test_user_customised_subpath_is_preserved(self, mgr):
+        shipped = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "community")
+        entry = RegistryEntry(
+            name="community",
+            url=shipped.url,
+            subpath="recipes",
+            benchmark_subpath="my-own-profiles",
+        )
+        mgr._backfill_default_subpaths([entry])
+        assert entry.benchmark_subpath == "my-own-profiles"
+
+    def test_unknown_registry_is_untouched(self, mgr):
+        entry = RegistryEntry(name="mine", url="https://example.com/mine.git", subpath="recipes")
+        assert mgr._backfill_default_subpaths([entry]) is False
+        assert entry.benchmark_subpath == ""
+
+    def test_already_complete_entry_reports_no_change(self, mgr):
+        """No change means no rewrite of registries.yaml on every load."""
+        shipped = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "community")
+        entry = RegistryEntry(
+            name="community",
+            url=shipped.url,
+            subpath="recipes",
+            tuning_subpath=shipped.tuning_subpath,
+            benchmark_subpath=shipped.benchmark_subpath,
+            mods_subpath=shipped.mods_subpath,
+        )
+        assert mgr._backfill_default_subpaths([entry]) is False
+
+    def test_community_default_matches_its_manifest(self):
+        """The shipped fallback must mirror the repo's own manifest keys."""
+        shipped = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "community")
+        assert shipped.subpath == "recipes"
+        assert shipped.tuning_subpath == "tuning"
+        assert shipped.benchmark_subpath == "benchmarking"

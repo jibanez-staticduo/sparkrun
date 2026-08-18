@@ -227,12 +227,37 @@ VLLM_FLAG_MAP = {
     "kv_cache_dtype": "--kv-cache-dtype",
     "otlp_traces_endpoint": "--otlp-traces-endpoint",
     "api_key": "--api-key",
+    # Serving-behaviour flags. These are spelled in nearly every real recipe's
+    # ``command:`` template; without them a command-less recipe silently serves
+    # a differently-configured server (no tool parsing, default attention
+    # backend, default weight loader).
+    "attention_backend": "--attention-backend",
+    "load_format": "--load-format",
+    "reasoning_parser": "--reasoning-parser",
+    "tool_call_parser": "--tool-call-parser",
+    "chat_template": "--chat-template",
+    "speculative_config": "--speculative-config",
+    "tokenizer_mode": "--tokenizer-mode",
+    "mm_encoder_tp_mode": "--mm-encoder-tp-mode",
+    "block_size": "--block-size",
+    "seed": "--seed",
+    # NOTE: ``enable_auto_tool_choice`` / ``enable_chunked_prefill`` /
+    # ``async_scheduling`` are booleans, but they must ALSO appear here.
+    # ``build_flags_from_map`` iterates this map and consults ``bool_keys``
+    # only to decide how to *render* a key it has already found, so a key
+    # listed solely in VLLM_BOOL_FLAGS is unreachable. Keep the two in sync.
+    "enable_auto_tool_choice": "--enable-auto-tool-choice",
+    "enable_chunked_prefill": "--enable-chunked-prefill",
+    "async_scheduling": "--async-scheduling",
 }
 
-# Boolean flags (present = True, absent = False)
+# Boolean flags (present = True, absent = False).
+# Every entry here MUST also have an entry in VLLM_FLAG_MAP — see the note above.
 VLLM_BOOL_FLAGS = {
     "enforce_eager",
     "enable_prefix_caching",
     "trust_remote_code",
     "enable_auto_tool_choice",
+    "enable_chunked_prefill",
+    "async_scheduling",
 }
