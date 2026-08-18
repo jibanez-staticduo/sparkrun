@@ -8,6 +8,41 @@ For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NO
 
 ## [Unreleased]
 
+### Security
+
+- Registry names and asset subpaths are now contained to the registry cache.
+  Both arrive from `.sparkrun/registry.yaml` manifests in **remote**
+  repositories (`sparkrun registry add <url>`, bootstrap discovery) and both
+  become real filesystem paths, with no charset validation anywhere before this:
+  `_cache_dir` is `cache_root / name`, so an escaping name resolved outside the
+  cache root and `_link_registry_to_shared` would then `shutil.rmtree` it (a
+  delete primitive), while `asset_dir` is `_cache_dir(name) / subpath`, so an
+  escaping subpath had `iter_asset_files` `rglob` a directory outside the clone
+  and `find_recipe` offer whatever YAML it found there as a runnable recipe (a
+  read primitive feeding the recipe loader). New
+  `assert_safe_registry_name` / `assert_safe_registry_subpath` /
+  `assert_safe_registry_entry` enforce this at every entry point: `add_registry`
+  and `validate_registry_name` raise, `_discover_manifest_entries` drops the
+  offending entry and keeps the rest (raising only when nothing survives, so a
+  wholly hostile manifest is never reported as a successful no-op add), and
+  `_load_registries_from_file` skips-with-warning — narrower than the enclosing
+  `except`, which reverts to the shipped defaults and would let one hand-edited
+  entry discard every registry the user has. Requiring each path component to
+  start alphanumeric also rules out `.`/`..`, dotfiles, a leading `-` (git would
+  read it as an option) and the `_url_<hash>` shared-clone prefix, whose
+  collision would have deleted the checkout every registry on that URL shares.
+  See `docs/SECURITY.md`.
+
+### Changed
+
+- Manifest discovery clones blob-filtered and sparse (`--filter=blob:none
+  --sparse` + `sparse-checkout set .sparkrun`) instead of pulling the whole
+  repository: only `.sparkrun/registry.yaml` is ever read, so the recipe trees
+  were wasted transfer on every bootstrap URL. A failed sparse-checkout raises
+  rather than falling through to "No `.sparkrun/registry.yaml` manifest found",
+  so a clone whose manifest directory was never materialized is not mistaken for
+  a repo that declares nothing.
+
 ### Added
 
 - `run-recipe.sh` shim: `-v/--volume LOCAL:CONTAINER` (repeatable), matching

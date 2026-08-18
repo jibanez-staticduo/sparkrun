@@ -987,6 +987,22 @@ with per-registry symlinks. Sparse checkout paths are the union of all subpaths 
 used by repos hosted under allowed GitHub organizations (`spark-arena`, `scitrera`, `eugr`, `dbotwinick`,
 `raphaelamorim`). Enforced via `validate_registry_name()`.
 
+**Path containment** is a *separate* question from namespace legitimacy, and a name can be perfectly safe and still be an
+impersonation. Names and subpaths come from remote `.sparkrun/registry.yaml` manifests and both become real paths — a
+name is a directory under the cache root (`_cache_dir` is `cache_root / name`, and `_link_registry_to_shared` `rmtree`s
+a non-link cache dir, so an escaping name is a *delete* primitive), and a subpath is resolved inside it (`asset_dir` is
+`_cache_dir(name) / subpath`, whose contents `find_recipe` offers as runnable recipes, so an escaping subpath is a
+*read* primitive feeding the recipe loader). `assert_safe_registry_name` / `assert_safe_registry_subpath` /
+`assert_safe_registry_entry` contain this; both charsets require each path component to start alphanumeric, which rules
+out `.`/`..`, dotfiles, a leading `-` (git would read it as an option) and the `_url_<hash>` shared-clone prefix in one
+rule. `validate_registry_name` runs the name check **first** — `../sparkrun-x` doesn't *start with* a reserved prefix, so
+the namespace rule alone would pass it. Enforcement differs by entry point on purpose: `add_registry` raises,
+`_discover_manifest_entries` drops the bad entry and keeps the rest (raising only when nothing survives, so a hostile
+manifest is never a successful no-op add), and `_load_registries_from_file` skips-with-warning — narrower than the
+enclosing `except`, which reverts to the shipped defaults and would let one hand-edited entry discard every registry the
+user has. `SUBPATH_FIELDS` is the list any new path-forming field must join, or it escapes validation entirely. See
+`docs/SECURITY.md`.
+
 **Tab completion**: `RecipeNameType.shell_complete()` in `_common.py` supports `@registry/recipe` syntax — `@` prefix
 lists registries, `@registry/` lists recipes from that registry. Falls back to showing registry names when recipe cache
 isn't populated.
