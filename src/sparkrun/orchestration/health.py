@@ -10,6 +10,84 @@ import time
 
 logger = logging.getLogger(__name__)
 
+#: Kernel socket tables read by the ``wait_for_port`` fallback probe.
+PROC_NET_TCP_PATHS = "/proc/net/tcp /proc/net/tcp6"
+
+#: ``/proc/net/tcp`` ``st`` column value for ``TCP_LISTEN``.
+_PROC_TCP_LISTEN = "0A"
+
+
+def proc_listen_probe_cmd(port: int, proc_paths: str = PROC_NET_TCP_PATHS) -> str:
+    """Build the ``/proc/net/tcp`` half of the listening-port probe.
+
+    The fallback for hosts without ``ss``.  Three details are
+    load-bearing, and getting any of them wrong reports a port as ready
+    when nothing is listening on it:
+
+    - **Filter on the state column.**  ``st`` must be ``0A``
+      (``TCP_LISTEN``).  A plain port match also hits ``ESTABLISHED``
+      and — the one that bites — ``TIME_WAIT`` rows, which linger for
+      ~60s after a workload is stopped.  Relaunching inside that window
+      would report the *new* server ready before it had bound.
+    - **Anchor to the local-address column.**  ``$3`` is the *remote*
+      address; matching it means any outbound connection to a host
+      serving on the same port number reads as "we are listening".
+    - **Read ``tcp6`` too**, via ``cat`` rather than as extra ``awk``
+      operands — awk aborts with a fatal error (ignoring ``END``) when a
+      file cannot be opened, and ``/proc/net/tcp6`` is absent on hosts
+      with IPv6 disabled.
+
+    Args:
+        port: TCP port to look for.
+        proc_paths: Space-separated socket tables to scan.  Overridden
+            by tests to run the probe against a fixture.
+
+    Returns:
+        A shell command that exits 0 iff *port* is in ``LISTEN`` state.
+    """
+    return "cat %s 2>/dev/null | awk '$4==\"%s\" && $2 ~ /:%04X$/{f=1} END{exit !f}'" % (
+        proc_paths,
+        _PROC_TCP_LISTEN,
+        port,
+    )
+
+
+def listen_probe_cmd(port: int, proc_paths: str = PROC_NET_TCP_PATHS) -> str:
+    """Build the side-effect-free "is *port* listening?" probe command.
+
+    Deliberately *not* ``nc -z``: that opens a real TCP connection,
+    which consumes one-shot rendezvous accepts.  Atlas's NCCL bootstrap
+    (rank 0) accepts exactly ``world_size - 1`` connections, hands out
+    its unique NCCL ID, then drops the listener — a probe connection
+    steals that single accept, the real worker gets "Connection refused"
+    forever, and the head spins in ``ncclCommInitRank``.
+
+    ``ss``'s own ``sport`` filter does the port matching, so no output
+    parsing is involved: grepping ``ss`` output for the port number has
+    to defend against the Recv-Q/Send-Q columns and against ``:18000``
+    matching a probe for ``8000``.  ``LISTEN`` is matched instead of
+    passing ``-H`` (added in iproute2 4.x) so the probe also works on
+    older hosts; the header line never contains it.  An ``ss`` that is
+    missing — or too old to parse the filter — exits non-zero and falls
+    through to :func:`proc_listen_probe_cmd`.
+
+    Note this matches a listener on *any* local address, where
+    ``nc -z localhost`` only reached loopback.  That is the intent: the
+    health check that follows connects via the head's routable IP, not
+    via loopback.
+
+    Args:
+        port: TCP port to look for.
+        proc_paths: Forwarded to :func:`proc_listen_probe_cmd`.
+
+    Returns:
+        A shell command that exits 0 iff *port* is in ``LISTEN`` state.
+    """
+    return 'ss -tln "sport = :%d" 2>/dev/null | grep -q LISTEN || %s' % (
+        port,
+        proc_listen_probe_cmd(port, proc_paths),
+    )
+
 
 def is_container_running(
     host: str,
@@ -69,18 +147,9 @@ def wait_for_port(
 
     from sparkrun.orchestration.primitives import run_command_on_host
 
-    # Check LISTEN state instead of `nc -z`: `nc -z` opens a real TCP
-    # connection, which consumes one-shot rendezvous accepts. Atlas's NCCL
-    # bootstrap (rank 0) accepts exactly world_size-1 connections, hands out
-    # its unique NCCL ID, then closes the listener — a probe connection steals
-    # that single accept, the real worker gets "Connection refused" forever,
-    # and the head spins in ncclCommInitRank. Checking the kernel socket table
-    # is side-effect free and matches "port is listening" for every runtime.
-    check_cmd = (
-        f"ss -tln 2>/dev/null | grep -qE ':{port}(\\s|$)' "
-        f"|| ss -tln6 2>/dev/null | grep -qE ':{port}(\\s|$)' "
-        f"|| grep -qE ':{port:04X} ' /proc/net/tcp"
-    )
+    # Reads the kernel socket table rather than connecting; see
+    # `listen_probe_cmd` for why a connecting probe breaks NCCL bootstrap.
+    check_cmd = listen_probe_cmd(port)
     for attempt in range(1, max_retries + 1):
         # Check container liveness before polling the port
         if container_name and attempt > 1:
