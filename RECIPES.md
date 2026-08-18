@@ -364,23 +364,24 @@ Explicit `runtime` always wins. Command-hint detection only fires when `runtime`
 | `eugr-vllm`        | Ray (inherits vllm-ray)                             | eugr container builds + Ray cluster            |
 | `atlas`            | Native (`--rank`, `--world-size`, `--master-addr`)  | Atlas Spark (avarok/atlas-gb10) — pure-Rust LLM inference; each rank runs `atlas serve`, rank 0 only HTTP |
 | `modular-max`      | None — single-node only                             | Modular MAX (`max serve`); tensor parallelism uses local GPUs via `--devices` (never multi-node) |
+| `ds4`              | None — single-node only                             | ds4 / DwarfStar (`ds4-server`); native C/CUDA engine for DeepSeek V4 and GLM 5.2 GGUFs |
 
 ### Common Defaults Keys
 
-| Key                      | vLLM                       | SGLang                  | llama.cpp            | TRT-LLM               | Atlas                 | Description                       |
-|--------------------------|----------------------------|-------------------------|----------------------|-----------------------|-----------------------|-----------------------------------|
-| `port`                   | `--port`                   | `--port`                | `--port`             | `--port`              | `--port`              | Serve port                        |
-| `host`                   | `--host`                   | `--host`                | `--host`             | `--host`              | `--host`              | Bind address                      |
-| `tensor_parallel`        | `-tp`                      | `--tp-size`             | `--split-mode row`   | `--tp_size`           | `--tp-size`           | TP degree (= node count on Spark) |
-| `pipeline_parallel`      | `-pp`                      | `--pp-size`             | `--split-mode layer` | `--pp_size`           | —                     | PP degree                         |
-| `ep_size`                | —                          | `--ep-size`             | —                    | —                     | `--ep-size`           | Expert-parallel degree            |
-| `gpu_memory_utilization` | `--gpu-memory-utilization` | `--mem-fraction-static` | —                    | —                     | `--gpu-memory-utilization` | GPU memory fraction          |
-| `max_model_len`          | `--max-model-len`          | `--context-length`      | `--ctx-size`         | `--max_seq_len`       | `--max-seq-len`       | Max sequence length               |
-| `served_model_name`      | `--served-model-name`      | `--served-model-name`   | `--alias`            | —                     | `--model-name`        | Model name in API                 |
-| `dtype`                  | `--dtype`                  | `--dtype`               | —                    | —                     | (auto)                | Model dtype                       |
-| `quantization`           | `--quantization`           | `--quantization`        | —                    | —                     | (auto)                | Quantization method               |
-| `trust_remote_code`      | `--trust-remote-code`      | `--trust-remote-code`   | —                    | `--trust_remote_code` | (no-op)               | Allow remote code                 |
-| `kv_cache_dtype`         | `--kv-cache-dtype`         | `--kv-cache-dtype`      | —                    | via extra config      | `--kv-cache-dtype`    | KV cache dtype                    |
+| Key                      | vLLM                       | SGLang                  | llama.cpp            | TRT-LLM               | Atlas                 | ds4                   | Description                       |
+|--------------------------|----------------------------|-------------------------|----------------------|-----------------------|-----------------------|-----------------------|-----------------------------------|
+| `port`                   | `--port`                   | `--port`                | `--port`             | `--port`              | `--port`              | `--port`              | Serve port                        |
+| `host`                   | `--host`                   | `--host`                | `--host`             | `--host`              | `--host`              | `--host`              | Bind address                      |
+| `tensor_parallel`        | `-tp`                      | `--tp-size`             | `--split-mode row`   | `--tp_size`           | `--tp-size`           | — (rejected)          | TP degree (= node count on Spark) |
+| `pipeline_parallel`      | `-pp`                      | `--pp-size`             | `--split-mode layer` | `--pp_size`           | —                     | — (rejected)          | PP degree                         |
+| `ep_size`                | —                          | `--ep-size`             | —                    | —                     | `--ep-size`           | —                     | Expert-parallel degree            |
+| `gpu_memory_utilization` | `--gpu-memory-utilization` | `--mem-fraction-static` | —                    | —                     | `--gpu-memory-utilization` | —                     | GPU memory fraction               |
+| `max_model_len`          | `--max-model-len`          | `--context-length`      | `--ctx-size`         | `--max_seq_len`       | `--max-seq-len`       | `-c` / `--ctx`        | Max sequence length               |
+| `served_model_name`      | `--served-model-name`      | `--served-model-name`   | `--alias`            | —                     | `--model-name`        | — (fixed ids)         | Model name in API                 |
+| `dtype`                  | `--dtype`                  | `--dtype`               | —                    | —                     | (auto)                | —                     | Model dtype                       |
+| `quantization`           | `--quantization`           | `--quantization`        | —                    | —                     | (auto)                | —                     | Quantization method               |
+| `trust_remote_code`      | `--trust-remote-code`      | `--trust-remote-code`   | —                    | `--trust_remote_code` | (no-op)               | —                     | Allow remote code                 |
+| `kv_cache_dtype`         | `--kv-cache-dtype`         | `--kv-cache-dtype`      | —                    | via extra config      | `--kv-cache-dtype`    | —                     | KV cache dtype                    |
 
 Any key can appear in `defaults` — there is no fixed schema. Runtime-specific keys (e.g. `tool_call_parser`, `ctx_size`,
 `n_gpu_layers`, `reasoning_parser`) are passed through to command template substitution.
@@ -805,6 +806,70 @@ command: |
 - `max_model_len` is auto-mapped to `ctx_size` for cross-runtime CLI compatibility
 - `tensor_parallel` → `--split-mode row`, `pipeline_parallel` → `--split-mode layer` (mutually exclusive)
 - Pre-synced GGUF: `-hf` auto-rewritten to `-m` with container cache path
+
+## GGUF Recipes (ds4 / DwarfStar)
+
+[ds4](https://github.com/antirez/ds4) is a native C/CUDA engine, not a general
+GGUF runner: only the DeepSeek V4 Flash/PRO and GLM 5.2 layouts published at
+[`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf)
+will load. Images come from [`spark-arena/dgx-ds4`](https://github.com/spark-arena/dgx-ds4)
+and default to `ghcr.io/spark-arena/dgx-ds4:stable`.
+
+```yaml
+name: ds4-flash-q2
+runtime: ds4
+model: antirez/deepseek-v4-gguf:IQ2XXS
+max_nodes: 1
+
+defaults:
+  # REQUIRED — see below.
+  served_model_name: deepseek-v4-flash
+  host: 0.0.0.0
+  port: 8000
+  ctx_size: 131072        # or the portable `max_model_len`
+  batched_session: 8
+
+  # Persistent on-disk KV cache
+  # kv_disk_dir: /cache/ds4-kv
+  # kv_disk_space_mb: 8192
+
+  # DSpark speculative decoding (needs the support GGUF alongside the model)
+  # mtp: /cache/huggingface/.../DeepSeek-V4-Flash-DSpark-support-0731.gguf
+  # dspark_confidence: 0.7
+
+  # Run a model larger than memory off local NVMe
+  # ssd_streaming: true
+  # ssd_streaming_cache_experts: 40GB
+```
+
+Four constraints come from `ds4-server` itself and each fails *silently* if
+ignored, so the runtime validates them up front:
+
+- **`served_model_name` is required and must be one of ds4's built-in ids.**
+  There is no alias flag; `/v1/models` answers only to `deepseek-v4-flash`,
+  `deepseek-v4-pro`, `glm-5.2`, `glm-5.2-chat`, `glm-5.2-nothink`,
+  `glm-5.2-reasoner` (and the `zai/`-prefixed spellings). Anything else is an
+  HTTP 404 on every request, benchmarks included.
+- **Single node.** `ds4-server` does not parse the distributed flags — those
+  live in the `ds4` CLI binary, which has no HTTP server. `tensor_parallel`,
+  `pipeline_parallel`, `data_parallel` and `min_nodes > 1` are rejected.
+- **No authentication.** ds4 accepts no `--api-key` and never reads the
+  `Authorization` header. Setting `api_key` is rejected rather than ignored;
+  restrict access at the network layer.
+- **No `/health`.** `GET /v1/models` is the readiness probe, and loading a
+  60–160 GB GGUF takes minutes.
+
+Other notes:
+
+- `max_model_len` is auto-mapped to `ctx_size` (`-c`), as for llama.cpp.
+- ds4 has no downloader; sparkrun pre-syncs the GGUF and passes the container
+  path as `-m`.
+- VRAM estimation reports zeros for these recipes — the estimator reads a
+  HuggingFace `config.json` and the weights repo is bare GGUF. DeepSeek V4 is
+  MLA, so supplying `num_layers` / `kv_lora_rank` / `qk_rope_head_dim` /
+  `model_params` under `metadata:` enables a real estimate.
+- `--cuda-tensor-parallel` (with `gpu_devices`) is *intra-host* multi-GPU and
+  does not apply to a DGX Spark's single GB10.
 
 ### Vision GGUF models (multimodal projector)
 

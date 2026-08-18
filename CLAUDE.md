@@ -257,9 +257,38 @@ provides solo-mode orchestration; runtimes override `run()`/`stop()`/`follow_log
 | **llama-cpp**        | `runtimes/llama_cpp.py`        | `LlamaCppRuntime`        | Experimental RPC   | `"native/rpc"` — workers run `rpc-server`, head connects via `--rpc`                        |
 | **trtllm**           | `runtimes/trtllm.py`           | `TrtllmRuntime`          | MPI (native)       | `"native"` — sleep infinity containers + mpirun on head                                     |
 | **eugr-vllm**        | `runtimes/eugr_vllm_ray.py`    | `EugrVllmRayRuntime`     | Ray (inherited)    | Extends VllmRayRuntime with eugr container builds and mods (v1 recipe support) (deprecated) |
+| **ds4**              | `runtimes/ds4.py`              | `Ds4Runtime`             | none (single-node) | `"native"` — `ds4-server` solo; `world_size()` pinned to 1 (see below)                      |
 
 Runtimes must implement `generate_command()` and `resolve_container()`. The `cluster_strategy()` return value determines
 which orchestration path the base class uses.
+
+**ds4 (`runtimes/ds4.py`)** serves DeepSeek V4 Flash/PRO and GLM 5.2 GGUFs
+through `ds4-server` from the first-party `ghcr.io/spark-arena/dgx-ds4` image
+(built by the `spark-arena/dgx-ds4` repo). Four upstream properties drive its
+shape, each verified against `ds4_server.c`'s argument parser rather than the
+help text — the help is shared with the `ds4` CLI binary and over-promises:
+
+- **Single node, and not by choice.** `ds4-server` does not parse `--role` /
+  `--layers` / `--listen` / `--coordinator` / `--tensor-parallel`; those belong
+  to the `ds4` CLI, which has no HTTP server. An unknown option is `exit(2)`.
+  `world_size()` returns 1, like `modular-max`. `--cuda-tensor-parallel` is an
+  *intra-host* multi-GPU path and so does not apply to a one-GB10 Spark.
+- **No authentication at all** — no `--api-key`, no `Authorization` handling.
+  `resolve_api_key` inherits the base `None`, and `validate_recipe` *rejects* a
+  recipe `api_key` instead of ignoring it, because ignoring it silently leaves
+  the user believing an endpoint is protected.
+- **The served name is a compiled-in allowlist** (`deepseek-v4-flash`,
+  `deepseek-v4-pro`, `glm-5.2*`) with no flag to change it, so a recipe must
+  *declare* the matching alias. Nothing is auto-injected: `served_model_name`
+  feeds `generate_intent_id`, so supplying one silently would make the recorded
+  job identity differ from the recipe the user wrote. `validate_recipe` names
+  the right alias instead (`infer_model_alias`).
+- **No `/health`** — `GET /v1/models` is the readiness probe, and a 60–160 GB
+  GGUF takes minutes to load.
+
+The default image tag is `:stable`, not `:latest`: upstream ships no tags or
+releases and self-describes as beta, so `:latest` tracks raw `main` HEAD while
+`:stable` moves only after a smoke test on hardware.
 
 **Node-command template** (`RuntimePlugin._make_node_command_args`): native
 multi-node runtimes (`vllm-distributed`, `sglang`, `trtllm`) emit rank-specific
