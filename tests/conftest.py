@@ -49,6 +49,11 @@ def isolate_stateful(tmp_path: Path, monkeypatch):
     # so the CLI tests that exercise it keep passing (the gate itself is tested
     # explicitly in test_k8s_setup with the env override cleared).
     monkeypatch.setenv("SPARKRUN_FEATURE_CLI_SETUP_K8S", "1")
+    # Same for the uv-venv builder (off on stable, on for beta/alpha): SAF
+    # decides is_multi_extension once at registration, so a test cannot un-hide
+    # a builder the process already registered as gated. Enable it here and
+    # exercise the gate itself in the clean subprocesses of test_uv_venv.py.
+    monkeypatch.setenv("SPARKRUN_FEATURE_BUILDER_UV_VENV", "1")
     # Point the user config dir at the sandbox too. STATEFUL_ROOT alone does
     # not cover it: DEFAULT_CONFIG_DIR is computed from Path.home() at import
     # time, so without this a test silently reads the developer's real
@@ -372,3 +377,87 @@ def log_sources_spy(monkeypatch):
 
     monkeypatch.setattr("sparkrun.orchestration.logs.print_log_sources", _capture)
     return calls
+
+
+@pytest.fixture
+def deepseek_v4_config() -> dict[str, Any]:
+    """Return an abridged DeepSeek-V4-Flash-0731 ``config.json``.
+
+    Carries the fields the VRAM estimator reads for a Multi-head Latent
+    Attention model: ``head_dim`` holds the compressed latent (V2/V3 name it
+    ``kv_lora_rank`` instead), and ``compress_ratios`` gives 21 layers at ratio
+    4 and 20 at ratio 128.  The ratio-0 layers are sliding-window and hold no
+    latent cache.
+
+    Returns:
+        Dictionary of HuggingFace config fields.
+    """
+    return {
+        "model_type": "deepseek_v4",
+        "torch_dtype": "bfloat16",
+        "num_hidden_layers": 43,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "hidden_size": 4096,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
+        "sliding_window": 128,
+        "compress_ratios": [0, 0] + [4, 128] * 20 + [4, 0, 0, 0],
+        # Sparse attention: a second cache the estimator does not size.
+        "index_head_dim": 128,
+        "index_topk": 512,
+    }
+
+
+@pytest.fixture
+def deepseek_v3_config() -> dict[str, Any]:
+    """Return an abridged DeepSeek-V3 ``config.json``.
+
+    The other MLA shape: V2/V3 name the compressed latent ``kv_lora_rank``
+    explicitly and cache ``qk_rope_head_dim`` *in addition* to it, so the KV
+    width is ``512 + 64`` elements.  There is no top-level ``head_dim`` — it is
+    derived as ``hidden_size // num_attention_heads`` — and no
+    ``compress_ratios``.
+
+    Returns:
+        Dictionary of HuggingFace config fields.
+    """
+    return {
+        "model_type": "deepseek_v3",
+        "torch_dtype": "bfloat16",
+        "num_hidden_layers": 61,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "hidden_size": 7168,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+    }
+
+
+@pytest.fixture
+def deepseek_v32_config() -> dict[str, Any]:
+    """Return an abridged DeepSeek-V3.2-Exp ``config.json``.
+
+    The shape that exposed the auxiliary-cache warning gap: sparse attention
+    (``index_head_dim``) with **no** ``compress_ratios``, so a warning keyed on
+    per-layer compression alone would never fire for it — even though its
+    indexer cache is a full KV peer worth roughly 132 B per token per layer.
+
+    Returns:
+        Dictionary of HuggingFace config fields.
+    """
+    return {
+        "model_type": "deepseek_v32",
+        "torch_dtype": "bfloat16",
+        "num_hidden_layers": 61,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "hidden_size": 7168,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "index_head_dim": 128,
+        "index_n_heads": 64,
+        "index_topk": 2048,
+    }

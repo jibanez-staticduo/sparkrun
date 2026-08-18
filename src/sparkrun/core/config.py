@@ -102,6 +102,19 @@ class SparkrunConfig:
         return Path(self._data.get("hf_cache_dir", str(DEFAULT_HF_CACHE_DIR)))
 
     @property
+    def runtime_cache(self) -> dict[str, Any]:
+        """User-level ``runtime_cache:`` block (compilation/autotune cache).
+
+        Top-level rather than nested under a ``cache:`` section because
+        ``cache_dir`` / ``hf_cache_dir`` are already top-level scalars — a
+        ``cache:`` block would straddle two spellings of the same idea.  See
+        :func:`sparkrun.core.runtime_cache.resolve_runtime_cache_settings` for
+        the layered chain this participates in.
+        """
+        raw = self._data.get("runtime_cache")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    @property
     def default_benchmark_output_dir(self) -> Path:
         defaults = self._data.get("defaults", {})
         dir_val = defaults.get("benchmark_output_dir")
@@ -283,6 +296,31 @@ class SparkrunConfig:
         except (TypeError, ValueError):
             return DEFAULT_MAX_PARALLEL_SSH
         return val if val > 0 else DEFAULT_MAX_PARALLEL_SSH
+
+    @property
+    def jobs_autoprune(self) -> bool:
+        """Whether ``sparkrun run`` prunes stale job metadata as it launches.
+
+        The job metadata cache is append-only — only an explicit ``stop``
+        removes an entry — so crashed jobs accumulate indefinitely and make
+        the cache useless as a completion source.  ``run`` already holds a
+        live status snapshot (``api.plan`` takes exactly one), so it can prune
+        safely and for free: nothing currently running is ever touched.
+
+        Set ``jobs.autoprune: false`` in ``config.yaml`` to keep every job
+        metadata file forever and prune only via
+        ``sparkrun setup prune-job-metadata-cache``.
+        """
+        from scitrera_app_framework import ext_parse_bool
+
+        jobs = self._data.get("jobs", {})
+        raw = jobs.get("autoprune") if isinstance(jobs, dict) else None
+        if raw is None:
+            return True
+        parsed = ext_parse_bool(raw)
+        # `ext_parse_bool` returns None for anything it doesn't recognise;
+        # an unparseable value must not silently disable pruning.
+        return True if parsed is None else parsed
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get a config value by dot-separated key path."""

@@ -926,3 +926,159 @@ def test_wait_for_serve_ready_multinode_uses_head_container(monkeypatch):
 
     assert readiness.container == "sparkrun_lifecyclecid_node_0"
     assert readiness.head_host == "h1"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (builder) error handling
+# ---------------------------------------------------------------------------
+#
+# The builder phase tolerates exactly one failure: an *unknown* builder, which
+# warns and skips. A gated builder and a failing prepare() must both abort the
+# launch — for an environment builder (a venv the serve command depends on),
+# "skipping" means serving under the wrong interpreter.
+
+
+def _builder_phase_harness(monkeypatch, tmp_path):
+    """Mock just enough of launch_inference's preamble to reach phase 2."""
+    from sparkrun.core import launcher
+
+    monkeypatch.setattr(
+        "sparkrun.orchestration.distribution.resolve_auto_transfer_mode",
+        lambda *a, **kw: type("R", (), {"mode": "local"})(),
+    )
+    monkeypatch.setattr("sparkrun.orchestration.primitives.build_ssh_kwargs", lambda *a, **kw: {})
+    monkeypatch.setattr("sparkrun.orchestration.job_metadata.derive_cluster_id", lambda *a, **kw: "sparkrun_test00000000")
+    monkeypatch.setattr(launcher, "resolve_effective_cache_dir", lambda *a, **kw: str(tmp_path))
+
+    class _Cfg:
+        hf_cache_dir = tmp_path / "hf"
+        cache_dir = tmp_path / "cache"
+
+        def get_registry_manager(self):
+            return None
+
+    class _Runtime:
+        runtime_name = "stub"
+
+        def resolve_container(self, recipe, overrides):
+            return "stub:latest"
+
+        def get_family(self):
+            return "stub"
+
+        def run(self, *a, **kw):
+            return type("R", (), {"containers": {}, "head_host": "h1"})()
+
+    class _Recipe:
+        runtime = "stub"
+        model = "stub-model"
+        env = {}
+        builder = "some-builder"
+        builder_config = {}
+        mods = []
+        source_registry = None
+        source_registry_url = None
+        defaults = {"port": 8000}
+        pre_exec = []
+        post_exec = []
+        post_commands = []
+        layout = None
+        stop_after_post = False
+        executor = ""
+        executor_config = None
+        is_url_sourced = False
+        cluster_config = None
+        qualified_name = "stub-recipe"
+        name = "stub-recipe"
+        container = "stub:latest"
+        model_revision = None
+
+        def build_config_chain(self, overrides=None):
+            merged = dict(self.defaults)
+            merged.update(overrides or {})
+
+            class _CC:
+                def get(self, k, default=None):
+                    return merged.get(k, default)
+
+            return _CC()
+
+        def __getstate__(self):
+            return {}
+
+    def _launch():
+        from sparkrun.core.launcher import launch_inference
+
+        return launch_inference(
+            recipe=_Recipe(),
+            runtime=_Runtime(),
+            host_list=["h1"],
+            overrides={},
+            config=_Cfg(),
+            cluster=None,
+            is_solo=True,
+            dry_run=True,
+            sync_tuning=False,
+        )
+
+    return _launch
+
+
+def test_builder_phase_reraises_a_gated_builder(monkeypatch, tmp_path):
+    """A recipe naming a real-but-disabled builder aborts rather than warning."""
+    from sparkrun.builders.base import BuilderUnavailableError
+
+    launch = _builder_phase_harness(monkeypatch, tmp_path)
+
+    def _gated(name, v=None):
+        raise BuilderUnavailableError("Builder %r is disabled by feature flag 'x'." % name)
+
+    monkeypatch.setattr("sparkrun.core.bootstrap.get_builder", _gated)
+    with pytest.raises(BuilderUnavailableError):
+        launch()
+
+
+def test_builder_phase_does_not_swallow_a_prepare_failure(monkeypatch, tmp_path):
+    """A ValueError out of prepare() is a build failure, not "builder not
+    found" — reporting it as the latter launched the workload anyway."""
+    launch = _builder_phase_harness(monkeypatch, tmp_path)
+
+    class _Boom:
+        def prepare(self, *a, **kw):
+            raise ValueError("bad builder_config")
+
+    monkeypatch.setattr("sparkrun.core.bootstrap.get_builder", lambda name, v=None: _Boom())
+    with pytest.raises(ValueError, match="bad builder_config"):
+        launch()
+
+
+class _PastPhase2(Exception):
+    """Sentinel: execution reached the step after the builder phase."""
+
+
+def test_builder_phase_still_skips_an_unknown_builder(monkeypatch, tmp_path, caplog):
+    """Back-compat: an unknown builder warns and the launch continues.
+
+    Asserted with a sentinel raised from the first call *after* phase 2 rather
+    than by completing a launch — the point is only that phase 2 neither
+    raised nor aborted, and stubbing the whole runtime protocol to prove it
+    would test the stub.
+    """
+    import logging
+
+    from sparkrun.core import launcher
+
+    launch = _builder_phase_harness(monkeypatch, tmp_path)
+
+    def _unknown(name, v=None):
+        raise ValueError("Unknown builder: %r" % name)
+
+    def _sentinel(*a, **kw):
+        raise _PastPhase2()
+
+    monkeypatch.setattr("sparkrun.core.bootstrap.get_builder", _unknown)
+    monkeypatch.setattr(launcher, "apply_platform_runtime_flag_defaults", _sentinel)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(_PastPhase2):
+        launch()
+    assert "not found, skipping" in caplog.text

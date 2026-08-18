@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import socket
+from collections.abc import Iterable
 from pathlib import Path
 
 from sparkrun.core.cluster_manager import ClusterError, ClusterManager
@@ -124,6 +125,30 @@ def parse_hosts_file(path: str | Path) -> list[str]:
     return hosts
 
 
+def parse_host_list(hosts: str | Iterable[str] | None) -> list[str]:
+    """Normalize a ``--hosts``-shaped value into a list of host strings.
+
+    Accepts either the comma-separated string Click hands us or an already
+    split iterable, so a caller can normalize without knowing which form it
+    holds.  Blank entries are dropped.
+
+    Passing the string straight to ``tuple()`` / ``list()`` is the trap this
+    exists to close: it iterates *characters*, and ``"spark1,spark2"`` becomes
+    twelve single-letter hostnames rather than two real ones — a failure that
+    surfaces far downstream as ``Could not resolve hostname s``.
+    """
+    if not hosts:
+        return []
+    if isinstance(hosts, str):
+        return [h.strip() for h in hosts.split(",") if h.strip()]
+    # Already-split iterable: still honour embedded commas so a caller that
+    # passed ``["a,b"]`` gets the same answer as one that passed ``"a,b"``.
+    out: list[str] = []
+    for item in hosts:
+        out.extend(h.strip() for h in str(item).split(",") if h.strip())
+    return out
+
+
 def resolve_hosts(
     hosts: str | None = None,
     hosts_file: str | None = None,
@@ -153,7 +178,7 @@ def resolve_hosts(
     """
     # Priority 1: CLI hosts arg
     if hosts:
-        resolved = [h.strip() for h in hosts.split(",") if h.strip()]
+        resolved = parse_host_list(hosts)
         logger.debug("Resolved %d hosts from CLI arg", len(resolved))
         return resolved
 

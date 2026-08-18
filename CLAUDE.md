@@ -60,8 +60,9 @@ src/sparkrun/
 ├── models/             # HuggingFace model download, distribution, and VRAM estimation
 ├── containers/         # Container image distribution (docker save/load over SSH)
 ├── tuning/             # Triton fused MoE kernel tuning for SGLang and vLLM
-├── builders/           # Container image builder plugins (docker-pull, eugr)
+├── builders/           # Image + environment builder plugins (docker-pull, eugr, uv-venv)
 ├── diagnostics/        # Host and run diagnostic collection (NDJSON output)
+├── plugins/            # In-tree cross-cutting integrations
 ├── proxy/              # Inference gateway (LiteLLM engine + gateway selection seam)
 ├── benchmarking/       # Benchmark framework plugins and result export (llama-benchy)
 ├── utils/              # Shared helpers (coerce_value, suppress_noisy_loggers, etc.)
@@ -102,7 +103,7 @@ The CLI was split from a single `cli.py` into a package for maintainability. The
 | `_common.py`      | Shared infrastructure: logging setup, Click parameter types (`RECIPE_NAME`, `REGISTRY_NAME`, `RUNTIME_NAME`, `CLUSTER_NAME`, `PROFILE_NAME`), decorators (`host_options`, `dry_run_option`), and reusable helpers (host resolution, recipe loading, VRAM display) |
 | `_run.py`         | `run` command — launch inference workloads                                                                                                                                                                                                                        |
 | `_stop_logs.py`   | `stop` and `logs` commands — stop workloads and stream container logs                                                                                                                                                                                             |
-| `_setup.py`       | `setup` command group — shell completion, SSH mesh, model/container sync, permissions, cache, networking                                                                                                                                                          |
+| `_setup.py`       | `setup` command group — shell completion, SSH mesh, model/container sync, permissions, cache, networking, GPU clock throttling                                                                                                                                                          |
 | `_cluster.py`     | `cluster` command group — create/list/show/delete/update saved cluster definitions, cluster status                                                                                                                                                                |
 | `_recipe.py`      | `recipe` command group — list/show/search recipes across registries                                                                                                                                                                                               |
 | `_registry.py`    | `registry` command group — add/remove/enable/disable/update registries, list/show benchmark profiles                                                                                                                                                              |
@@ -171,6 +172,48 @@ can target a family without enumerating variants; exact name wins over family.
 Today DGX Spark uses this for `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 on vllm/sglang and `gpu_access_mode: gpus` (classic `--gpus` rather than CDI,
 whose `/etc/cdi/nvidia.yaml` goes stale across driver upgrades).
+
+### In-Tree Plugins (`plugins/` + `core/in_tree_plugins.py`)
+
+`sparkrun.plugins` is the **mate of the out-of-tree plugin system**: same
+registration path (`external_plugins.load_plugin_module` — SAF subclass scan,
+then the `register(v)` hook), different source. A first-party integration
+therefore has no capability an external one lacks.
+
+It is for **cross-cutting integrations only** — things that span several
+extension points and are only coherent as one removable unit: an integration
+contributing a backend implementation, a hidden CLI command and the wire
+protocol that backend calls back through, none of which is "a runtime" or "an
+executor" on its own. Packages that map cleanly onto one extension point
+(`runtimes`, `transports`, `executors`, `schedulers`, `builders`,
+`benchmarking`) stay where they are with their own `find_types_in_modules` scan
+in `core/bootstrap.py`.
+
+**Every in-tree plugin is gated by a feature flag** — the same reason
+`executor.docker` and `gateway.litellm` carry one despite shipping on. The flag
+is checked *before* the import, so turning a plugin off costs nothing at all:
+no import, no commands, no registrations. It is the plugin's **own** flag, not
+a separate presence flag — a dual-flag scheme was considered and rejected as
+incoherent (no point loading a plugin whose capability won't be used, and none
+in enabling that capability without the plugin).
+
+The binding lives in `in_tree_plugins.IN_TREE_PLUGIN_FEATURES` (data, not a
+plugin attribute) because the flag must resolve *without importing* the module
+it gates. A plugin missing an entry or a registered flag is skipped loudly,
+since unknown flags fail closed and the silent version would put the symptom
+far from its cause.
+
+One consequence worth knowing: `PluggableGroup` attaches plugin commands once
+per process, so the gate is effectively read once per CLI invocation (the test
+suite resets `_cli_ext_loaded`).
+
+**Layering trap.** `init_sparkrun` runs on the console-free `sparkrun.api` path,
+and plugin scanning imports *every* submodule of a plugin package. So the CLI
+registry lives in `core/cli_registry.py` (Click-free; `cli/ext.py` re-exports it
+and owns attachment), and a plugin registers a **loader** that *builds* its
+command with `import click` inside the function. Registering lazily is not
+enough on its own. `test_api_sctx_threading.py::test_sctx_layer_does_not_import_click`
+guards this.
 
 ### External Plugins (`core/external_plugins.py`)
 
@@ -245,6 +288,82 @@ through `_cluster_ops.resolve_comm_env(ctx, comm_env, backends)`. When
 `backends` is `None`, `resolve_comm_env` falls back to the legacy NCCL
 generator (byte-identical for NVIDIA hosts).
 
+### Environment Builders (`builders/uv_venv.py`)
+
+A builder's canonical hook is `prepare()`, and it does not have to prepare an
+*image*. `uv-venv` is the first **environment** builder: it provisions a
+`uv`-created Python venv on each target host and writes a shell `env_file` that
+activates it, returning the image ref untouched. It pairs with `executor: local`
+(native, no container) — the answer to hosts where nested `docker run` doesn't
+work (Thunder's proot/fastvfs sandbox).
+
+The builder→executor coupling is a **core seam, not a special case**:
+`BuilderPlugin.default_env_file(recipe)` contributes `{"env_file": …}` as one
+layer of `resolve_executor`'s chain (`orchestration/executor.py:_builder_exec_dict`).
+It sits below the recipe layer (an explicit `executor_config.env_file` wins) but
+*above* cluster/runtime/config, because an environment builder's env_file is
+essential to running the workload at all — a cluster's generic one must not
+silently suppress it and leave the serve command under the wrong interpreter.
+
+Four properties are load-bearing and easy to break:
+
+- **Idempotency is content-addressed.** `dep_hash()` covers python,
+  torch_backend, inline requirements *and the contents* of any
+  `requirements_file`/`pyproject` — which are read control-side and embedded in
+  the provisioning script, never transferred. With no `venv_path`, the venv
+  lives at `$HOME/.cache/sparkrun/uv-venv/<dep-hash>`, so recipes with identical
+  deps share one venv and editing a requirements file re-provisions.
+- **The marker guards the venv, not the env_file.** `cuda_home` deliberately
+  stays *out* of `dep_hash` (it doesn't change the installed packages, and
+  including it would rebuild a multi-GB venv to edit one `export`), so the
+  env_file is rewritten on every run while the expensive half stays behind the
+  marker. Guarding the whole script on the marker — as the original did — made
+  adding `cuda_home` to a recipe whose venv already existed a *silent no-op*.
+- **Quoting is split deliberately, and what can't be quoted is validated.**
+  `venv_path`/`env_file`/`cuda_home` are emitted double-quoted so bash expands
+  `$HOME` *on the host*, which rules out `shlex`-quoting them — so they are
+  validated against a strict charset instead (`$HOME`/`~` prefix + `[A-Za-z0-9_./+-]`).
+  This is not optional: `builder_config` is recipe content, recipes come from
+  registries, and unlike `executor_config` it has **no trust gate**. Requirements
+  and python are `shlex`-quoted; a requirement may not begin with `-`, because
+  `--index-url=…` survives `shlex.quote` untouched and would reach `uv` as a
+  flag that repoints the package index.
+- **Heredoc delimiters are content-derived.** Staged requirement files are
+  written through a quoted heredoc whose delimiter is seeded from a hash of the
+  content (and extended on collision). A fixed delimiter is an injection
+  vector — a requirements file containing that line closes the heredoc early
+  and everything after it executes as shell.
+
+`prepare()` fans out with `run_remote_scripts_parallel(..., allow_local=True,
+session_guard=True)`. The guard is not optional for this payload: a first-time
+vllm+torch install is minutes of network per host, and without it a Ctrl-C on
+the control node leaves `uv pip install` running on every host with nothing left
+to observe or stop it (issue #240).
+
+**Gating** is `builder.uv_venv` — off on `stable`, on for `beta`/`alpha` via
+`channel_defaults`. Unlike an image builder it mutates the host (creating venvs,
+installing packages), so stable requires an explicit opt-in.
+`BuilderPlugin.required_feature_flag` + the `is_multi_extension` self-gate is
+the same mechanism `Executor`/`Transport`/`TelemetryProvider` use.
+
+Two consequences of gating a *builder* specifically:
+
+- `get_builder` must distinguish **disabled** from **unknown**, or a stable user
+  running an alpha recipe is told their recipe is wrong when their channel is.
+  A gated builder is hidden from `get_extensions`, so the distinction is
+  recorded at discovery in `bootstrap._BUILDER_GATES` (the one point where both
+  are visible) and raises `BuilderUnavailableError`.
+- The launcher's builder phase **must not skip it**. Phase 2 warns-and-continues
+  for an *unknown* builder only; `BuilderUnavailableError` is re-raised, and the
+  `try` now wraps `get_builder` alone — a `ValueError` out of `prepare()` is a
+  build failure, and reporting it as "builder not found, skipping" launched the
+  workload without the environment it asked for.
+
+**Aliases**: `builder_aliases` lets one builder answer to several spellings
+(`venv` → `uv-venv`). `list_builders()` returns canonical names only — an alias
+is another spelling of one builder, and listing it would imply a second exists
+and put a phantom name in every "Available: […]".
+
 ### Orchestration Layer (`orchestration/`)
 
 All remote operations use **SSH stdin piping** — scripts are generated as Python strings and piped to `ssh <host> bash -s`. No files are ever copied to remote hosts.
@@ -256,7 +375,7 @@ All remote operations use **SSH stdin piping** — scripts are generated as Pyth
 - **`infiniband.py`** — IB detection script generation, NCCL env var computation, IB IP mapping for fast transfers
 - **`networking.py`** — ConnectX-7 NIC detection, IP assignment planning, CX7 configuration script generation, host key distribution
 - **`primitives.py`** — Higher-level composition: `build_ssh_kwargs()`, `build_volumes()`, `merge_env()`, `detect_infiniband()`, `run_script_on_host()`, `cleanup_containers()`
-- **`job_metadata.py`** — Persistent job metadata (cluster_id → recipe mapping) stored in `~/.cache/sparkrun/jobs/`
+- **`job_metadata.py`** — Persistent job metadata (cluster_id → recipe mapping) stored in `~/.cache/sparkrun/jobs/` (see Job Metadata Lifecycle below)
 - **`executor.py`** — Public facade. Re-exports `Executor`, `ExecutorConfig`, `EXT_EXECUTOR`. `resolve_executor()` is the single sanctioned executor entry point; `query_status_for_cluster()` is the single status source (see Status Discovery below).
 - **`executors/`** — Executor plugin package. `_base.py` (ABC + dataclass), `docker.py` (default), `local.py` (experimental, no container), `k8s.py` (experimental draft, `kubectl run`-driven). Discovered via SAF. Each declares a `status_scope` (default `"host"`).
 - **`collectives/`** — `CollectiveBackend` ABC + implementations: `nccl.py` (default; wraps `infiniband.py`), `rccl.py` (AMD scaffold), `hccl.py` (Intel Gaudi scaffold). `get_backend(vendor)` is the lookup.
@@ -397,6 +516,22 @@ workloads a user runs side by side, and while the image was excluded, launching
 the second silently evicted the first (observed live on a 4-host cluster).
 `--image` writes through to `recipe.container`, so overrides are covered.
 
+**The served name has two resolutions, deliberately.** The supported spelling is
+`defaults.served_model_name`, which every runtime reconciles into the rendered
+command via `RuntimePlugin._augment_served_model_name`. A recipe may instead
+hardcode `--served-model-name` in its `command:` template, which bypasses that
+and is invisible to the config chain — so
+`core/recipe.py:resolve_served_model_name` (declared → `command:` →
+model id, via `extract_served_model_name_from_command`) is the shared last
+resort for everything that needs the name for **display or routing**: the
+benchmark's request target (this was issue #257 — llama-benchy asked for the
+model id, HTTP 404, whole sweep dead), proxy-discovery metadata, and container
+labels. `generate_intent_id` is the **non**-consumer: it still hashes only the
+*declared* name, because widening it would change the intent id of every recipe
+that hardcodes the flag and orphan already-running workloads from `stop` /
+`logs` / `--ensure`, which recompute it. Precedent for parsing the template at
+all: `kv_cache_dtype` (issue #248).
+
 It stays narrow otherwise — serve arguments are **not** hashed — because
 `stop` / `logs` / `--ensure` recompute it from the recipe without the flags the
 user typed at launch. Three reasons not to widen it to the fingerprint:
@@ -448,6 +583,138 @@ Under the hood, `api.status` calls
 Each `Executor.query_status(hosts, …)` inspects its own backend (docker `docker
 ps`, local pidfile scan, k8s/modal control plane) and returns a `ClusterStatus`.
 There is no separate status extension point.
+
+**Post-mortem** (`Executor.describe_terminated(sources, …) -> {(host, container):
+TerminationInfo}`) is the *dead* peer of `query_status`: that reports what is
+running; this reports, for something that is **not**, whether its remains are
+still on the substrate and how the operator inspects them. `query_status` runs
+`docker ps` (running only), so it structurally cannot make that distinction —
+which is why `api.logs`'s liveness precheck needs a second question rather than
+a wider answer to the first.
+
+Every part of the answer is substrate-specific, including the remediation
+wording: `docker logs` is wrong advice on a k8s cluster and meaningless for a
+`local` job (a native process whose output is a host logfile). So
+`TerminationInfo` carries `investigate_hints` supplied by the executor;
+`api/_logs.py` lays them out and never authors them. Keyed by `(host,
+container)` because a container name is unique only per host — Ray worker
+containers share one name across nodes.
+
+Three rules, all of which exist because a `False` verdict is what **deletes**
+cached job metadata:
+
+- `exists=None` / an absent entry means *cannot tell* (unreachable host, no
+  container engine, an executor with no post-mortem support) and must never be
+  read as "gone". The base-class default is `{}`, so an unimplemented executor
+  degrades to preserving metadata.
+- Best-effort throughout: it never raises, exactly like `query_status` and the
+  `verify_*` preflights.
+- **`--rm` is why this is not a plain existence check.** `auto_remove` defaults
+  to `True`, so the daemon deletes a container the moment it exits: absence is
+  the *normal* outcome of a crash, not evidence a workload never ran. The Docker
+  executor knows its own config, so it reports *which* it was and hints at `-o
+  auto_remove=false` for the next attempt, instead of reporting the most
+  interesting failure as stale bookkeeping.
+
+### Job Metadata Lifecycle ("what have I launched?")
+
+`~/.cache/sparkrun/jobs/<digest>.yaml` is written by every launch and read by
+`stop` / `logs` / proxy discovery / `--ensure`. It is **append-only in
+practice**: only an explicit `stop` (or the `logs` staleness path) removes an
+entry, and a job that crashed under `auto_remove` is gone from docker before
+anything asks about it. Left alone this reaches hundreds of dead entries
+against a couple of dozen live intents.
+
+Three pieces keep it usable:
+
+- **`started_at`** is stamped at launch. The read side (`api.list_jobs`) always
+  looked for it but nothing wrote it, so every job was untimed and the
+  documented "most recent first" ordering silently degraded to alphabetical by
+  hex digest. `_resolve_started_at` backfills from file mtime for entries
+  predating the field — on any existing cache that is nearly all of them, so
+  without the backfill the fix would do nothing for anyone.
+- **`list_jobs(limit=N)`** pre-ranks by mtime (a stat per file) and parses only
+  the top N. Each file embeds a full serialized recipe state, so an unpruned
+  cache is ~1.7 MB and ~1.5 s to load — fine for a report, far too slow for
+  shell completion, which runs on every TAB.
+- **`prune_job_metadata`** keeps an entry only when it is *both* among the
+  newest `keep_per_intent` (3) for its `intent_id` *and* younger than
+  `max_age_days` (30). The per-intent window is deliberately not a global
+  count: "keep newest N overall" would erase every trace of a rarely-run
+  workload. Nothing in `protected_cluster_ids` is ever deleted.
+
+**Pruning runs from `run`, and only from `run`,** because that is the one
+command that both grows the cache and already holds a live occupancy snapshot —
+the eviction sweep's, which `_evict_superseded_deployments` now returns
+alongside the evictions. Age alone is *not* a sufficient guard: a long-lived
+server easily outlives the cutoff, and deleting its metadata strands the
+deployment. Where that snapshot is absent (`--dry-run`, or a failed status
+query) the prune is skipped entirely — `None` vs. an empty set is the
+difference between "couldn't look" and "looked, nothing there". Opt out with
+`jobs.autoprune: false`; sweep manually with the advanced-only
+`sparkrun setup prune-job-metadata-cache` (which has no snapshot, and says so).
+
+**`running.json`** is the completion half. Completion filters to what is
+*actually running*, which means a live `api.status` sweep — a deliberate
+choice: a list of dozens of dead hex digests is not worth having. The cost is
+managed rather than avoided:
+
+- **Cache first.** A recorded snapshot is reused for `COMPLETION_CACHE_TTL_S`
+  (60s), so a burst of TABs costs one sweep, not one per keystroke. Measured:
+  1.15s cold, 0.08s warm. The TTL is far shorter than the file's own
+  `RUNNING_SNAPSHOT_MAX_AGE_S` (600s) because the point here is to make a burst
+  cheap — the longer window would keep offering a workload for ten minutes
+  after it was stopped. The long window is still honoured as a *fallback* when
+  a sweep fails: stale beats nothing.
+- **A snapshot is only reused when it covers the target's hosts.** One left by
+  a sweep of some other cluster says nothing about this one, and treating its
+  hosts as unobserved would put every dead job back in the list.
+- **Hard-bounded.** `COMPLETION_STATUS_TIMEOUT_S` (5s) is a per-host subprocess
+  timeout with the hosts swept in parallel, so an unreachable host costs that
+  ceiling once instead of hanging the shell. `completion.status_timeout_s: 0`
+  disables the sweep entirely for anyone on a flaky link.
+- `api.status` records every sweep it performs, so the sweep completion
+  triggers is what makes the next TAB instant — and any other command's sweep
+  primes it too.
+
+The recorded *hosts* matter as much as the cluster_ids. A sweep is frequently
+partial (placement queries a candidate subset), and without knowing what was
+covered a reader cannot tell "not running" from "not looked at" — it would hide
+live workloads on unswept hosts. So an unswept host's workloads are *unknown*
+and kept — **except** when the job lies entirely outside the target cluster.
+Those are the leftovers of clusters that no longer exist (a torn-down cloud
+instance keeps its jobs forever and its hostnames stop resolving, so they can
+never be verified); verifying them would mean sweeping every cluster any recent
+job touched, paying a full connect timeout for each dead one. Naming that
+cluster sweeps it. A stale or absent snapshot still means show everything.
+
+**Completion targets** (`cli/_common.py:_complete_targets`) offer **recipe
+names first, cluster_ids second**, because on bash there is no way to annotate
+a completion — `BashComplete.format_completion` emits `type,value` and drops
+the help text entirely (zsh and fish render it). The value has to carry the
+meaning, and a recipe name does while a hex digest does not. The split is
+forced by how each form resolves: `logs <recipe>` goes through
+`resolve_cluster`, so recipe names are scoped to the cluster the invocation
+targets; `logs <cluster_id>` reads its hosts from the metadata and so stays
+valid regardless.
+
+The **target** is the `--cluster` / `--hosts` already on the command line
+(completion runs after Click has parsed the options it has seen), else whatever
+`resolve_cluster()` returns with no arguments. It is never *guessed* — inferring
+one from, say, the most recent job would point completion's SSH sweep at a
+cluster the user never named. With no target nothing can be confirmed dead, so
+everything cached is offered.
+
+That makes `resolve_cluster`'s chain load-bearing here, and it was missing a
+step. **The default cluster** (`sparkrun cluster set-default`, stored in a
+marker file the `ClusterManager` owns rather than in `config.yaml`) is now
+consulted between `hosts_input` and `config.default_hosts` — the ordering
+`core/hosts.py:resolve_hosts` has always used. The two resolvers disagreed, so
+a user whose only host source was a default cluster got `HostsUnreachable` from
+every `api.*` entry point that resolves without an explicit cluster. It returns
+the whole definition rather than just the hosts, so the cluster's SSH user /
+executor / scheduler come with it; a dangling default (naming a deleted
+cluster) falls through to the next source instead of raising.
 
 **Mount-source preflight** (`Executor.verify_mount_sources(paths, hosts, …)`) is
 the substrate peer of `query_status` on the *write* path: "do these identity-mount
@@ -771,8 +1038,93 @@ Before launching, sparkrun can pre-sync models and container images from the con
 - **Containers** (`containers/`): Pulls image locally (`containers/registry.py`), then streams via
   `docker save | ssh docker load` (`containers/distribute.py`, `containers/sync.py`). Checks image IDs to skip hosts
   that already have the correct image.
-- **VRAM estimation** (`models/vram.py`): Estimates VRAM usage based on model parameter count, dtype, and quantization.
-  Supports HuggingFace model auto-detection to resolve parameter counts.
+- **VRAM estimation** (`models/vram.py`): Model weights, the GPU memory budget, and the arithmetic that combines them
+  with a KV cache estimate. Supports HuggingFace model auto-detection to resolve parameter counts.
+  `Recipe.estimate_vram()` writes every detected field back into `metadata`, which is what lets later calls skip the
+  HF fetch. `kv_cache_dtype` is resolved CLI → metadata → HF quant config → `defaults.kv_cache_dtype` →
+  `--kv-cache-dtype` parsed from the `command:` template (last resort, with a warning). When no dtype is resolved, the
+  estimator computes with `bfloat16` but leaves `VRAMEstimate.kv_dtype` as `None` so the CLI formatter can show
+  `bfloat16 (default)` rather than silently reporting a guessed value. Element widths live in the `models/dtypes.py`
+  leaf (weights and KV are separate tables — NVFP4's KV packing carries block scales its weight packing does not).
+
+#### KV Cache Sizing (`models/kv/`)
+
+Sizing the KV cache is architecture-specific, so it is a seam rather than a branch. `vram.py` names no attention
+architecture; it resolves a strategy and asks it. See `.slop/kv-cache-sizing-design.md` for the rationale.
+
+A `KVCacheStrategy` (`kv/_base.py`) answers three questions — *how big at length L* (`size`), *how big per token*
+(`KVSizing.per_token_bytes`, for display), and *how long fits in a budget* (`tokens_for_budget`). **Sizing is a total
+for a requested length, not a per-token figure multiplied out.** Per-token is the special case: it holds for dense and
+MLA but not for a sliding-window layer (caches `min(max_model_len, window)`) or a Mamba/SSM layer (state is per
+*sequence*). Making the total primitive is what keeps those addable.
+
+| Strategy | Module | Priority | Sizing |
+|----------|--------|----------|--------|
+| `mla`    | `kv/mla.py`   | 10   | DeepSeek V2/V3/V4 compressed latent — one latent per token per layer, **replicated across TP ranks** (only PP divides it). Selected by `kv_lora_rank`/`qk_rope_head_dim`, by an `*_ds_mla` packed layout in `kv_dtype`, or by a `deepseek_v*`/`kimiko*` `model_type`. `mla_latent_dim()` normalizes V2/V3 (latent + RoPE tail on top) and V4 (both folded into `head_dim`) to the NoPE width, so the tail counts once. |
+| `dense`  | `kv/dense.py` | 1000 | `2 * layers * kv_heads * head_dim * bytes`. Claims everything, so resolution always terminates. |
+
+Resolution is **order-sensitive** (most specific `detect()` first), which is why the registry is in-process rather
+than SAF — the `platforms/` precedent. Out-of-tree plugins call `register_kv_strategy()` from their `register(v)`
+hook.
+
+Two rules the seam exists to enforce:
+
+- **Detection is separate from sizing.** A strategy that recognises a model but cannot size it returns
+  `KVSizing(total_bytes=None, unsizable_reason=…)` — it does *not* fall through to dense, whose formula would
+  overestimate a latent cache by ~100x. `VRAMEstimate.kv_arch` therefore reports the detected architecture even when
+  the estimate is unavailable; relabelling it dense would misreport it to `to_dict()` (benchmark export) and flip the
+  replication rule a `kv_vram_per_token` override still depends on.
+- **A strategy *declares* the architecture fields it reads** (`ArchField`: canonical name, HF config keys, kind,
+  validation, docs). That declaration is the single source of truth for HF extraction (`extract_arch_fields`), recipe
+  `metadata` keys, their validation, and the post-estimate write-back — four sites that were four hand-maintained
+  copies of the same list, where omitting one silently reverted the estimate on the path that decides placement.
+  `estimate_vram(arch={...})` takes them as a mapping, never as per-architecture keyword arguments.
+
+`tests/test_kv_strategies.py` registers a sliding-window strategy at runtime and asserts it reaches extraction,
+estimation, recipe write-back and validation with **no core edit** — the executable form of that claim.
+
+### Runtime Cache (`core/runtime_cache.py` + `orchestration/runtime_cache.py`)
+
+Containers are `--rm`, so every launch discarded its compilation and autotune output — torch.compile /
+Inductor graphs, Triton cubins, FlashInfer JIT modules, and the TRT-LLM autotuner, which was never
+written at all (issue #256). A host directory is now mounted at `/cache/runtime`, sibling of
+`/cache/huggingface` and the same convention.
+
+**The load-bearing invariant is that directory keying is hygiene, never correctness.** The host path
+is `<root>/<family>/[<image-key>/][<model-key>/]`, and `key_by_image` defaults **off** — so nothing
+may depend on the key to avoid loading a stale artifact. torch.compile / Inductor / Triton /
+FlashInfer are content-addressed internally and are correct (and far more useful) in a tree shared
+across image versions. TRT-LLM's autotuner is the exception in both directions: it holds tactics for
+exactly one configuration, so it carries `derive_recipe_fingerprint` **in its filename** regardless
+of the directory key; and it validates neither the version nor the GPU it records, so `trtllm`
+returns `{"key_by_image": True}` from `runtime_cache_defaults()` — the runtime tier, so every TRT-LLM
+recipe including a user's own is safe without a `runtime_cache:` block.
+
+The container path is **constant**; all keying is host-side, so recipes and serve commands never
+spell a key.
+
+| Piece | Role |
+|-------|------|
+| `RuntimePlugin.runtime_cache_paths(fingerprint=)` | env var → `CachePath` **relative** to the mount (`file=True` ⇒ only the parent is created) |
+| `RuntimePlugin.runtime_cache_defaults()` | runtime tier of the settings chain — same slot `default_executor()` holds in `resolve_executor` |
+| `resolve_runtime_cache_settings` | recipe → CLI → cluster → config → runtime → baseline; `SPARKRUN_NO_RUNTIME_CACHE` beats all |
+| `build_runtime_cache_mounts` | volumes + env + dirs, or `None` (⇒ byte-identical to pre-feature) |
+| `Executor.ensure_runtime_cache` | write-path peer of `verify_mount_sources`; base no-op, docker/local share the SSH impl |
+
+Two env rules are load-bearing and fail *silently* if broken (both have regression tests):
+
+- **`XDG_CACHE_HOME` is the catch-all, so `HF_HOME`/`HF_HUB_CACHE` must stay explicitly set** —
+  `huggingface_hub` honors XDG, and losing that ordering relocates the model cache off its own mount
+  and re-downloads the weights on every launch.
+- **The cache env is injected at the *lowest* tier**, not through `get_extra_env` (which wins over
+  `recipe.env` and would clobber a recipe that points `VLLM_CACHE_ROOT` itself).
+
+`ensure_runtime_cache` does mkdir + marker-touch + prune in **one** SSH round-trip. The `mkdir` is not
+optional — Docker materializes a missing `-v` source **root-owned**, breaking rootless and breaking
+`local` outright. Pruning ages trees by the `.sparkrun-last-used` marker rather than directory mtime,
+because reading a cache never touches the directory: an mtime-aged sweep would delete exactly the warm
+trees it should keep. Best-effort throughout — a cache that could not be prepared costs a recompile,
+never a launch. Manual sweep: `sparkrun setup prune-runtime-cache`. Design: `.slop/runtime-cache-design.md`.
 
 ### Kernel Tuning (`tuning/`)
 
@@ -821,7 +1173,9 @@ experimental executors), `cli.setup.k8s` (gating the entire `sparkrun setup
 k8s` command group), `cli.setup.tailscale` (gating the `sparkrun setup
 tailscale` group), and `transports.thunder` (gating the Thunder Compute
 transport + `cluster import thunder`) — are off by default on **every** channel;
-enable them explicitly per-flag. The `setup k8s` group self-gates in its Click
+enable them explicitly per-flag. `builder.uv_venv` is the first flag to use
+`channel_defaults` for a *plugin* rather than for visibility: off on `stable`,
+on for `beta`/`alpha` (see Environment Builders below). The `setup k8s` group self-gates in its Click
 callback (raises pointing at `setup features enable cli.setup.k8s`) and hides
 itself from `setup --help` unless the flag resolves on at import; `setup
 tailscale` and `cluster import thunder` gate the same way

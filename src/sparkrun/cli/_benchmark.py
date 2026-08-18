@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Callable, NoReturn, TYPE_CHECKING
 
 import click
 
@@ -186,6 +186,13 @@ def _shared_run_options(f):
         click.option("--sync-tuning", is_flag=True, help="Sync tuning configs from registries before benchmarking"),
         click.option("--rootful", is_flag=True, help="Run with --privileged as root inside container (legacy behavior)"),
         click.option(
+            "--trust",
+            is_flag=True,
+            default=False,
+            hidden=HIDE_ADVANCED_OPTIONS,
+            help="Trust recipe hooks (pre_exec/post_exec/post_commands) from third-party registries without confirmation",
+        ),
+        click.option(
             "--timeout",
             "bench_timeout",
             type=int,
@@ -301,6 +308,7 @@ def _invoke_benchmark(ctx, *, category, **kwargs):
         skip_run=kwargs.pop("skip_run"),
         sync_tuning=kwargs.pop("sync_tuning"),
         rootful=kwargs.pop("rootful"),
+        trust=kwargs.pop("trust", False),
         bench_timeout=kwargs.pop("bench_timeout"),
         dry_run=kwargs.pop("dry_run"),
         executor_args=kwargs.pop("executor_args"),
@@ -391,6 +399,26 @@ def benchmark_resume(ctx, benchmark_id, dry_run):
     _resume_benchmark_run(ctx, benchmark_id, dry_run, sctx=sctx)
 
 
+def _echo_benchmark_failure(e) -> "NoReturn":
+    """Render a ``BenchmarkFailed`` and exit with its code.  Never returns.
+
+    The single rendering point for both benchmark entry points (``_run_benchmark``
+    and ``_resume_benchmark_run``), which previously disagreed: one printed the
+    message, the other exited silently.
+
+    ``exit_code`` 0 is the "already complete, nothing to do" case, so its message
+    goes to stdout as ordinary output rather than to stderr as an error.  The
+    ``"Error: "`` prefix is stripped because most raise sites already embed one
+    and we add our own.
+    """
+    msg = str(e).removeprefix("Error: ")
+    if e.exit_code == 0:
+        click.echo(msg)
+        sys.exit(0)
+    click.echo("Error: %s" % msg, err=True)
+    sys.exit(e.exit_code if e.exit_code is not None else 1)
+
+
 def _resume_benchmark_run(ctx, benchmark_id: str, dry_run: bool, *, sctx=None):
     """Thin CLI shell over ``sparkrun.api._benchmark.resume_benchmark``.
 
@@ -424,13 +452,7 @@ def _resume_benchmark_run(ctx, benchmark_id: str, dry_run: bool, *, sctx=None):
     except KeyboardInterrupt:
         sys.exit(130)
     except BenchmarkFailed as e:
-        # exit_code 0 is the "already complete" case — print the message on
-        # stdout (not stderr) to preserve the prior CLI behaviour.
-        if e.exit_code == 0:
-            click.echo(str(e).removeprefix("Error: "))
-            sys.exit(0)
-        click.echo("Error: %s" % str(e).removeprefix("Error: "), err=True)
-        sys.exit(e.exit_code if e.exit_code is not None else 1)
+        _echo_benchmark_failure(e)
     except NoResumableState as e:
         click.echo("Error: %s" % e, err=True)
         sys.exit(1)
@@ -468,6 +490,7 @@ def _run_benchmark(
     dry_run,
     executor_args,
     extra_args,
+    trust: bool = False,
     export_results_files=True,
     fresh: bool = False,
     resume_mode: "ResumeMode | None" = None,
@@ -495,6 +518,7 @@ def _run_benchmark(
         NoResumableState,
         SparkrunError,
     )
+    from sparkrun.core.hosts import parse_host_list
 
     sctx = _get_context(ctx)
 
@@ -544,11 +568,10 @@ def _run_benchmark(
         _overrides_from_flags["image"] = image
     if port:
         _overrides_from_flags["port"] = port
-    # Handle the options tuple (tensor_parallel, pipeline_parallel, etc.) by
-    # running _apply_recipe_overrides if there are any recipe-override args.
-    # We need a recipe object for this — but we delay recipe loading to the API.
-    # Instead, thread the raw CLI overrides through options.overrides so the API
-    # can apply them itself.
+    # Recipe loading is deferred to the API, so the recipe-override flags can't
+    # be applied here.  Thread them through ``options.overrides`` instead; the
+    # API feeds the whole dict to ``apply_recipe_overrides``, which is what maps
+    # ``gpu_mem`` onto ``gpu_memory_utilization`` and resolves the runtime.
     if tensor_parallel is not None:
         _overrides_from_flags["tensor_parallel"] = tensor_parallel
     if pipeline_parallel is not None:
@@ -559,11 +582,19 @@ def _run_benchmark(
         _overrides_from_flags["gpu_mem"] = gpu_mem
     if max_model_len is not None:
         _overrides_from_flags["max_model_len"] = max_model_len
-    # Apply options tuple (list of key=value strings from --option/-o flags)
+    # Apply options tuple (list of key=value strings from --option/-o flags).
+    # Values go through ``coerce_value`` and malformed entries are rejected —
+    # both matching ``apply_recipe_overrides``, which parses this same form on
+    # the ``sparkrun run`` path.
+    from sparkrun.utils import coerce_value
+
     for opt_str in options or ():
-        if "=" in opt_str:
-            k2, _, v2 = opt_str.partition("=")
-            _overrides_from_flags[k2.strip()] = v2.strip()
+        k2, sep, v2 = opt_str.partition("=")
+        k2 = k2.strip()
+        if not sep or not k2:
+            click.echo("Error: --option must be key=value, got: %s" % opt_str, err=True)
+            sys.exit(1)
+        _overrides_from_flags[k2] = coerce_value(v2.strip())
 
     state_extras: dict = {}
     if submission_id_for_extras:
@@ -575,7 +606,11 @@ def _run_benchmark(
         framework=framework,
         profile=profile,
         bench_args=bench_args_dict,
-        hosts=tuple(host_list) if host_list else (tuple(hosts) if hosts else ()),
+        # ``host_list`` is the resolved list from ``with_host_context``; ``hosts``
+        # is the raw ``--hosts`` value, which is a comma-separated *string*.
+        # Both go through ``parse_host_list`` so neither form can reach
+        # ``BenchmarkOptions.hosts`` (a ``tuple[str, ...]``) as a character split.
+        hosts=tuple(parse_host_list(host_list or hosts)),
         cluster=cluster_name,
         overrides=_overrides_from_flags,
         resume=resume_mode,
@@ -591,6 +626,7 @@ def _run_benchmark(
         dry_run=dry_run,
         scheduler=scheduler_name,
         rootful=rootful,
+        trust=bool(trust),
         sync_tuning=bool(sync_tuning),
         extra_docker_opts=tuple(executor_args) if executor_args else None,
         progress_callback=None,
@@ -637,9 +673,13 @@ def _run_benchmark(
         click.echo("Interrupted.")
         sys.exit(130)
     except BenchmarkFailed as e:
-        if e.exit_code is not None:
-            sys.exit(e.exit_code)
-        sys.exit(1)
+        # Print before exiting.  This used to `sys.exit(e.exit_code)` without
+        # rendering the message, so every failure carried up from the launch —
+        # including the full "inference launch failed: <reason>" chain — exited
+        # rc=1 with *no output at all*, on stdout, stderr or the log, at any -v
+        # level.  Kept identical to the `_resume_benchmark_run` handler so the
+        # two entry points can't diverge again.
+        _echo_benchmark_failure(e)
     except NoResumableState as e:
         click.echo("Error: %s" % e, err=True)
         sys.exit(1)

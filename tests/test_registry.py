@@ -222,10 +222,14 @@ class TestDefaultRegistries:
         from sparkrun.builders.eugr import EUGR_REPO_URL
 
         eugr_registry = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "eugr")
-        assert _normalize_registry_url(EUGR_REPO_URL) == "https://github.com/eugr/spark-vllm-docker"
+        # Compare canonical-to-canonical rather than against a literal: the
+        # normalizer's output form is an implementation detail (it dropped the
+        # scheme when it learned to match SSH remotes), while "these two URLs
+        # are the same repo" is the property under test.
+        assert _normalize_registry_url(EUGR_REPO_URL) == _normalize_registry_url("https://github.com/eugr/spark-vllm-docker")
         assert _normalize_registry_url(EUGR_REPO_URL) != _normalize_registry_url(eugr_registry.url)
         # And the builder URL must never be swept up by the registry migration.
-        assert _normalize_registry_url(EUGR_REPO_URL) in MIGRATED_REGISTRY_URLS
+        assert any(_normalize_registry_url(old) == _normalize_registry_url(EUGR_REPO_URL) for old in MIGRATED_REGISTRY_URLS)
         assert "spark-arena" not in EUGR_REPO_URL
 
     def test_old_eugr_url_is_migrated_not_deprecated(self):
@@ -2270,3 +2274,61 @@ class TestStaleCacheOnUrlChange:
         assert not (cache / "eugr").exists()
         # The shared clone itself survives — another registry may still use it.
         assert (shared / ".git").exists()
+
+
+class TestBackfillDefaultSubpaths:
+    """A shipped default that gained an asset subpath must reach existing configs.
+
+    Nothing re-reads a registry's ``.sparkrun/registry.yaml`` once
+    ``registries.yaml`` exists, so a file written from
+    ``FALLBACK_DEFAULT_REGISTRIES`` keeps whatever that list spelled at the
+    time.  A blank subpath is not a benign default: ``asset_dir`` returns
+    nothing, so ``--profile <name>`` reports "not found" however it is spelled,
+    and the path is dropped from the sparse checkout so ``registry update``
+    never fetches it either.
+    """
+
+    def test_blank_subpath_is_filled_from_shipped_default(self, mgr):
+        shipped = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "community")
+        assert shipped.benchmark_subpath, "fixture assumes community ships a benchmark_subpath"
+
+        entry = RegistryEntry(name="community", url=shipped.url, subpath="recipes")
+        assert mgr._backfill_default_subpaths([entry]) is True
+        assert entry.benchmark_subpath == shipped.benchmark_subpath
+        assert entry.tuning_subpath == shipped.tuning_subpath
+
+    def test_user_customised_subpath_is_preserved(self, mgr):
+        shipped = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "community")
+        entry = RegistryEntry(
+            name="community",
+            url=shipped.url,
+            subpath="recipes",
+            benchmark_subpath="my-own-profiles",
+        )
+        mgr._backfill_default_subpaths([entry])
+        assert entry.benchmark_subpath == "my-own-profiles"
+
+    def test_unknown_registry_is_untouched(self, mgr):
+        entry = RegistryEntry(name="mine", url="https://example.com/mine.git", subpath="recipes")
+        assert mgr._backfill_default_subpaths([entry]) is False
+        assert entry.benchmark_subpath == ""
+
+    def test_already_complete_entry_reports_no_change(self, mgr):
+        """No change means no rewrite of registries.yaml on every load."""
+        shipped = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "community")
+        entry = RegistryEntry(
+            name="community",
+            url=shipped.url,
+            subpath="recipes",
+            tuning_subpath=shipped.tuning_subpath,
+            benchmark_subpath=shipped.benchmark_subpath,
+            mods_subpath=shipped.mods_subpath,
+        )
+        assert mgr._backfill_default_subpaths([entry]) is False
+
+    def test_community_default_matches_its_manifest(self):
+        """The shipped fallback must mirror the repo's own manifest keys."""
+        shipped = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "community")
+        assert shipped.subpath == "recipes"
+        assert shipped.tuning_subpath == "tuning"
+        assert shipped.benchmark_subpath == "benchmarking"

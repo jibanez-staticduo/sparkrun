@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sparkrun.core.config import SparkrunConfig
     from sparkrun.core.parallelism import ParallelismConfig
     from sparkrun.core.recipe import Recipe
+    from sparkrun.core.runtime_cache import CachePath, RuntimeCacheMounts
     from sparkrun.orchestration.comm_env import ClusterCommEnv
     from sparkrun.orchestration.executor import Executor
 
@@ -132,9 +133,17 @@ class RuntimePlugin(Plugin):
             is_cluster: Whether running in multi-node mode
             num_nodes: Total number of nodes in the cluster
             head_ip: Head node IP (only set for cluster mode)
-            skip_keys: Config keys to omit from the generated command.
-                Used by the benchmark flow to suppress ``served_model_name``
-                so the server responds to the raw HF model ID.
+            skip_keys: Config keys to omit from the generated command, whether
+                the runtime synthesizes the flags or the recipe supplied a
+                ``command:`` template (the rendered string is post-filtered).
+
+                Note this is a *caller-supplied* facility with no in-tree
+                caller today: ``launch_inference`` used to thread it so the
+                benchmark flow could suppress ``served_model_name`` and make
+                the server answer to the raw HF model id.  That was replaced by
+                telling the benchmark the served name instead (see
+                ``LlamaBenchyFramework.prepare_benchmark_args``), which leaves
+                the workload identical whether or not it is being benchmarked.
 
         Returns:
             The full command string to execute inside the container
@@ -527,6 +536,41 @@ class RuntimePlugin(Plugin):
         """
         return {"HF_HOME": "/cache/huggingface", "HF_HUB_CACHE": "/cache/huggingface/hub"}
 
+    def runtime_cache_paths(self, *, fingerprint: str = "") -> "dict[str, CachePath]":
+        """Declare env vars pointing at persistent compilation/autotune caches.
+
+        Keys are environment variable names; values are :class:`CachePath`
+        entries **relative** to the runtime-cache mount point.  The runtime
+        never spells a host path — all keying is host-side, so the container
+        path is constant (see :mod:`sparkrun.core.runtime_cache`).
+
+        Declaring nothing is fine and is the base default: every enabled launch
+        still gets ``XDG_CACHE_HOME`` pointed at the mount, which catches the
+        libraries that honor it.  Override to name the ones that don't.
+
+        Args:
+            fingerprint: The recipe's serve-configuration digest
+                (:func:`sparkrun.orchestration.job_metadata.derive_recipe_fingerprint`).
+                Only needed by caches that are a *single file* with no internal
+                keying of their own — TRT-LLM's autotuner is the motivating
+                case; it records its version and GPU but validates neither, so
+                the fingerprint goes in the filename.
+        """
+        return {}
+
+    def runtime_cache_defaults(self) -> dict[str, object]:
+        """Runtime-specific defaults for the runtime-cache settings chain.
+
+        Sits where :meth:`default_executor` sits in
+        :func:`sparkrun.orchestration.executor.resolve_executor`'s chain —
+        below config/cluster/recipe, above the shipped baseline.  A runtime
+        whose cache cannot be safely shared across container images returns
+        ``{"key_by_image": True}`` here rather than relying on the global
+        default (which is off, because the content-addressed caches that
+        dominate do not need it).
+        """
+        return {}
+
     def finalize_host_comm_env(self, host_env: dict[str, str]) -> dict[str, str]:
         """Final per-host adjustment of the resolved comm env before launch.
 
@@ -652,7 +696,7 @@ class RuntimePlugin(Plugin):
             config: Config chain (must support ``.get(key)``).
             flag: The CLI flag to use (e.g. ``"--served-model-name"``
                 or ``"--alias"`` for llama.cpp).
-            skip_keys: Keys being suppressed (e.g. by benchmark flow).
+            skip_keys: Keys being suppressed by the caller.
 
         Returns:
             The command string, possibly with the flag appended.
@@ -980,6 +1024,7 @@ class RuntimePlugin(Plugin):
         extra_docker_opts: list[str] | None = None,
         backends: "dict[str, BackendBundle] | None" = None,
         trust: bool = False,
+        runtime_cache: "RuntimeCacheMounts | None" = None,
         **kwargs,
     ) -> int:
         """Launch a workload -- delegates to solo or cluster implementation.
@@ -1056,6 +1101,7 @@ class RuntimePlugin(Plugin):
                 extra_docker_opts=extra_docker_opts,
                 backends=backends,
                 trust=trust,
+                runtime_cache=runtime_cache,
                 # TODO: kwargs?
             )
         return self._run_cluster(
@@ -1078,6 +1124,7 @@ class RuntimePlugin(Plugin):
             extra_docker_opts=extra_docker_opts,
             backends=backends,
             trust=trust,
+            runtime_cache=runtime_cache,
             **kwargs,
         )
 
@@ -1163,6 +1210,7 @@ class RuntimePlugin(Plugin):
         extra_docker_opts: list[str] | None = None,
         backends: "dict[str, BackendBundle] | None" = None,
         trust: bool = False,
+        runtime_cache: "RuntimeCacheMounts | None" = None,
     ) -> int:
         """Launch a single-node inference workload.
 
@@ -1194,8 +1242,21 @@ class RuntimePlugin(Plugin):
         ssh_kwargs = build_ssh_kwargs(config)
         is_local = should_run_locally(host, ssh_kwargs.get("ssh_user"))
         container_name = self._resolve_executor().container_name(cluster_id, "solo")
-        volumes = build_volumes(cache_dir, extra={**self.get_extra_volumes(), **resolved_model_volume(recipe)})
+        volumes = build_volumes(
+            cache_dir,
+            extra={
+                **(runtime_cache.volumes if runtime_cache else {}),
+                **self.get_extra_volumes(),
+                **resolved_model_volume(recipe),
+            },
+        )
         all_env = merge_env(
+            # The runtime cache sits at the *bottom*: `recipe.env` (and the
+            # `-e` overrides folded into it) must be able to repoint any of
+            # these, and `get_extra_env` carries HF_HOME/HF_HUB_CACHE, which
+            # have to beat the XDG_CACHE_HOME catch-all or the model cache
+            # would silently relocate off its own mount.
+            runtime_cache.env if runtime_cache else {},
             self.get_common_env(),  # base env
             self.get_solo_env(),  # solo-specific
             env,  # recipe
@@ -1360,14 +1421,15 @@ class RuntimePlugin(Plugin):
             should_run_locally,
         )
 
-        container_name = self._resolve_executor().container_name(cluster_id, "solo")
+        executor = self._resolve_executor()
+        container_name = executor.container_name(cluster_id, "solo")
         ssh_kwargs = build_ssh_kwargs(config)
         is_local = should_run_locally(host, ssh_kwargs.get("ssh_user"))
 
         if is_local:
-            cleanup_containers_local([container_name], dry_run=dry_run)
+            cleanup_containers_local([container_name], dry_run=dry_run, executor=executor)
         else:
-            cleanup_containers([host], [container_name], ssh_kwargs=ssh_kwargs, dry_run=dry_run)
+            cleanup_containers([host], [container_name], ssh_kwargs=ssh_kwargs, dry_run=dry_run, executor=executor)
 
         logger.info("Solo workload '%s' stopped on %s", cluster_id, host)
         return 0
@@ -1553,6 +1615,7 @@ class RuntimePlugin(Plugin):
         topology = kwargs.pop("topology", None)
         cluster = kwargs.pop("cluster", None)
         placement = kwargs.pop("placement", None)
+        runtime_cache = kwargs.pop("runtime_cache", None)
         ctx = ClusterContext.build(
             runtime=self,
             hosts=hosts,
@@ -1566,6 +1629,7 @@ class RuntimePlugin(Plugin):
             cluster=cluster,
             recipe=recipe,
             placement=placement,
+            runtime_cache=runtime_cache,
         )
         return run_native_cluster(
             runtime=self,

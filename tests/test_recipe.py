@@ -6,6 +6,7 @@ import json
 import shlex
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 import yaml
@@ -1002,6 +1003,25 @@ def test_recipe_get_default():
     assert recipe.get_default("nonexistent", "fallback") == "fallback"
 
 
+def test_extract_kv_cache_dtype_from_command():
+    """The command-template parser picks up --kv-cache-dtype in space and equals forms."""
+    from sparkrun.core.recipe import extract_kv_cache_dtype_from_command
+
+    # Space-separated
+    assert extract_kv_cache_dtype_from_command("vllm serve {model} --kv-cache-dtype fp8_ds_mla --port 8000") == "fp8_ds_mla"
+    # Equals-separated
+    assert extract_kv_cache_dtype_from_command("vllm serve {model} --kv-cache-dtype=fp8 --port 8000") == "fp8"
+    # tokenary's --kvcache-dtype (no dash between kv and cache)
+    assert extract_kv_cache_dtype_from_command("tokenary --m {model} --kvcache-dtype nvfp4") == "nvfp4"
+    # auto is treated as absent
+    assert extract_kv_cache_dtype_from_command("vllm serve {model} --kv-cache-dtype auto") is None
+    # No flag present
+    assert extract_kv_cache_dtype_from_command("vllm serve {model} --port 8000") is None
+    # None / empty
+    assert extract_kv_cache_dtype_from_command(None) is None
+    assert extract_kv_cache_dtype_from_command("") is None
+
+
 def test_recipe_load_nonexistent_file():
     """Verify that Recipe.load() raises RecipeError for non-existent files.
 
@@ -1211,6 +1231,18 @@ class TestRecipeMetadata:
         issues = recipe.validate()
         assert any("kv_dtype" in i for i in issues)
 
+    @pytest.mark.parametrize("kv_dtype", ["nvfp4_ds_mla", "fp8_ds_mla", "nvfp4"])
+    def test_validate_accepts_mla_kv_layouts(self, kv_dtype):
+        """MLA layouts are packed uint8 slots, not per-element dtypes, but are valid."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {"kv_dtype": kv_dtype},
+            }
+        )
+        assert not any("kv_dtype" in i for i in recipe.validate())
+
     def test_validate_good_metadata(self):
         """Test that valid metadata passes validation without issues."""
         recipe = Recipe.from_dict(
@@ -1392,6 +1424,154 @@ class TestRecipeMetadata:
         )
         est = recipe.estimate_vram(auto_detect=False)
         assert est.kv_dtype == "fp8"
+
+    def test_estimate_vram_kv_dtype_from_command_template(self):
+        """--kv-cache-dtype in command: is parsed when no defaults/metadata value exists.
+
+        Issue #248: the flag was silently ignored, falling back to bfloat16 and
+        doubling the KV cache estimate for MLA models using fp8_ds_mla.
+        """
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096},
+                "command": "vllm serve {model} --kv-cache-dtype fp8 --max-model-len {max_model_len}",
+            }
+        )
+        est = recipe.estimate_vram(auto_detect=False)
+        assert est.kv_dtype == "fp8"
+        # The estimate should match an explicit fp8 kv_dtype
+        assert est.kv_cache_per_token_bytes == pytest.approx(2.0 * 32 * 32 * 128 * 1)
+        # A warning should fire so the user knows it was inferred from the template
+        assert any("inferred from command" in w for w in est.warnings)
+
+    def test_estimate_vram_kv_dtype_from_command_equals_form(self):
+        """--kv-cache-dtype=fp8 (equals form) is also parsed from command:."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096},
+                "command": "vllm serve {model} --kv-cache-dtype=fp8 --max-model-len {max_model_len}",
+            }
+        )
+        est = recipe.estimate_vram(auto_detect=False)
+        assert est.kv_dtype == "fp8"
+
+    def test_estimate_vram_kv_dtype_command_ignored_when_defaults_present(self):
+        """When defaults.kv_cache_dtype is set, command: parsing is skipped (no warning)."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096, "kv_cache_dtype": "fp8"},
+                "command": "vllm serve {model} --kv-cache-dtype bfloat16",
+            }
+        )
+        est = recipe.estimate_vram(auto_detect=False)
+        # defaults wins over command:
+        assert est.kv_dtype == "fp8"
+        # no "inferred from command" warning since defaults provided the value
+        assert not any("inferred from command" in w for w in est.warnings)
+
+    def test_estimate_vram_kv_dtype_command_auto_is_ignored(self):
+        """--kv-cache-dtype auto in command: is treated as absent (no dtype inferred)."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096},
+                "command": "vllm serve {model} --kv-cache-dtype auto --max-model-len {max_model_len}",
+            }
+        )
+        est = recipe.estimate_vram(auto_detect=False)
+        # auto is treated as absent — est.kv_dtype stays None (defaulted to bfloat16)
+        assert est.kv_dtype is None
+        # no "inferred from command" warning
+        assert not any("inferred from command" in w for w in est.warnings)
+
+    def test_estimate_vram_kv_dtype_from_command_writeback_idempotent(self):
+        """The command-inferred dtype is written back to metadata so the second call doesn't re-parse."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "test-model",
+                "metadata": {
+                    "model_params": "7B",
+                    "model_dtype": "float16",
+                    "num_layers": 32,
+                    "num_kv_heads": 32,
+                    "head_dim": 128,
+                },
+                "defaults": {"max_model_len": 4096},
+                "command": "vllm serve {model} --kv-cache-dtype fp8 --max-model-len {max_model_len}",
+            }
+        )
+        est1 = recipe.estimate_vram(auto_detect=False)
+        assert est1.kv_dtype == "fp8"
+        assert any("inferred from command" in w for w in est1.warnings)
+        # metadata was written back
+        assert recipe.metadata["kv_dtype"] == "fp8"
+        # second call: metadata provides the value, no command parsing, no warning
+        est2 = recipe.estimate_vram(auto_detect=False)
+        assert est2.kv_dtype == "fp8"
+        assert not any("inferred from command" in w for w in est2.warnings)
+
+    def test_estimate_vram_nvfp4_ds_mla_from_defaults(self, deepseek_v4_config):
+        """kv_cache_dtype: nvfp4_ds_mla plus an auto-detected MLA config sizes the latent cache.
+
+        The generic 2 * layers * kv_heads * head_dim formula reads 86 GB for this
+        model at 1M context, which would refuse any placement; MLA reads ~3 GB.
+        """
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0},
+                "defaults": {"max_model_len": 1048576, "kv_cache_dtype": "nvfp4_ds_mla", "tensor_parallel": 2},
+            }
+        )
+        with (
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=deepseek_v4_config),
+            mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+        ):
+            est = recipe.estimate_vram()
+
+        assert est.kv_arch == "mla"
+        assert est.kv_dtype == "nvfp4_ds_mla"
+        assert est.kv_cache_per_token_bytes == pytest.approx(3157.25)
+        assert est.kv_cache_total_gb == pytest.approx(3.08, abs=0.01)
+        # Weights shard across the 2 ranks; the MLA latent cache does not.
+        assert est.total_per_gpu_gb == pytest.approx(340.0 / 2 + est.kv_cache_total_gb)
 
     def test_estimate_vram_gpu_memory_utilization(self):
         """Test that gpu_memory_utilization from defaults flows through."""
@@ -3188,3 +3368,459 @@ class TestRecipeSerialization:
         restored = Recipe._deserialize(original.__getstate__())
         restored.resolve({"distributed_executor_backend": "ray"})
         assert restored.runtime == "vllm-ray"
+
+
+class TestEstimateVramIdempotency:
+    """`Recipe.estimate_vram()` must return the same answer on every call.
+
+    The method writes auto-detected architecture back into ``self.metadata`` so
+    later calls skip the HuggingFace fetch.  Any field read on the way in but
+    not written back is silently lost on call two — and a single ``sparkrun
+    run`` estimates three times on one Recipe (host resolution, the displayed
+    banner, then the scheduling pass inside ``api.run`` that builds the
+    placement's ``ResourceRequest``).
+    """
+
+    def _estimate_repeatedly(self, recipe, hf_config, times=3):
+        """Call estimate_vram *times* on one object; return results + fetch count."""
+        with (
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=hf_config) as fetch,
+            mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_size", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_params", return_value=None),
+        ):
+            results = [recipe.estimate_vram() for _ in range(times)]
+        return results, fetch.call_count
+
+    @staticmethod
+    def _signature(est):
+        return (est.kv_arch, est.kv_cache_per_token_bytes, est.kv_cache_total_gb, est.total_per_gpu_gb)
+
+    def test_fixed_slot_mla_is_stable(self, deepseek_v4_config):
+        """V4 + nvfp4_ds_mla on defaults: model_type and compress_ratios come from
+        detection; without the full write-back a repeat call keeps mla=True but
+        silently falls back to 43 x 656 B/token (model_type/compress_ratios
+        lost). The estimate must be identical on every call."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0},
+                "defaults": {"max_model_len": 1048576, "kv_cache_dtype": "nvfp4_ds_mla", "tensor_parallel": 2},
+            }
+        )
+        results, fetches = self._estimate_repeatedly(recipe, deepseek_v4_config)
+
+        assert all(e.kv_arch == "mla" for e in results)
+        assert {self._signature(e) for e in results} == {self._signature(results[0])}
+        assert results[0].kv_cache_per_token_bytes == pytest.approx(3157.25)
+        # The write-back exists to avoid re-fetching; it must still do that.
+        assert fetches == 1
+
+    def test_generic_dtype_mla_is_stable(self, deepseek_v3_config):
+        """DeepSeek-V3 with an ordinary KV dtype: losing kv_lora_rank drops MLA
+        entirely and reverts to the 2 * layers * kv_heads * head_dim formula."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V3",
+                "metadata": {"model_vram": 350.0},
+                "defaults": {"max_model_len": 32768, "tensor_parallel": 4},
+            }
+        )
+        results, fetches = self._estimate_repeatedly(recipe, deepseek_v3_config)
+
+        assert all(e.kv_arch == "mla" for e in results)
+        assert {self._signature(e) for e in results} == {self._signature(results[0])}
+        assert results[0].kv_cache_per_token_bytes == 70_272
+        assert fetches == 1
+
+    def test_non_mla_model_is_stable(self):
+        """A model with no MLA markers re-derives the same non-MLA verdict."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "Qwen/Qwen3-32B",
+                "metadata": {"model_vram": 60.0},
+                "defaults": {"max_model_len": 32768, "tensor_parallel": 2},
+            }
+        )
+        hf_config = {
+            "model_type": "qwen3",
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 64,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "hidden_size": 5120,
+            "head_dim": 128,
+        }
+        results, fetches = self._estimate_repeatedly(recipe, hf_config)
+
+        assert not any(e.kv_arch == "mla" for e in results)
+        assert {self._signature(e) for e in results} == {self._signature(results[0])}
+        assert fetches == 1
+
+    def test_mla_fields_are_written_back(self, deepseek_v4_config):
+        """The four MLA fields must land in metadata, like the other detected ones."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0},
+                "defaults": {"max_model_len": 1048576, "kv_cache_dtype": "nvfp4_ds_mla"},
+            }
+        )
+        self._estimate_repeatedly(recipe, deepseek_v4_config, times=1)
+
+        # V4's NoPE width: head_dim (512) minus the RoPE tail (64).
+        assert recipe.metadata["kv_lora_rank"] == 448
+        assert recipe.metadata["qk_rope_head_dim"] == 64
+        assert recipe.metadata["model_type"] == "deepseek_v4"
+        assert recipe.metadata["compress_ratios"] == deepseek_v4_config["compress_ratios"]
+        assert recipe.metadata["index_head_dim"] == 128
+
+    def test_metadata_overrides_are_not_clobbered(self, deepseek_v4_config):
+        """An explicit metadata value outranks the detected one, on every call."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0, "model_type": "deepseek_v32"},
+                "defaults": {"max_model_len": 1048576, "kv_cache_dtype": "nvfp4_ds_mla"},
+            }
+        )
+        results, _ = self._estimate_repeatedly(recipe, deepseek_v4_config)
+
+        assert recipe.metadata["model_type"] == "deepseek_v32"
+        # deepseek_v32 is not in the V4 slot table, so it takes the 656 B fallback.
+        assert {self._signature(e) for e in results} == {self._signature(results[0])}
+        assert results[0].kv_cache_per_token_bytes == pytest.approx(656 * 5.40625)
+
+
+class TestMlaMetadataValidation:
+    """The MLA fields are documented as user-overridable, so they must validate.
+
+    `estimate_vram` coerces them with `int()`. Unchecked, a bad value is a raw
+    traceback out of `recipe show --json`, and on the launch path it is caught,
+    logged at debug, and the memory claim is dropped — silently skipping the
+    fit check for that run.
+    """
+
+    @staticmethod
+    def _issues(metadata):
+        recipe = Recipe.from_dict({"name": "Test", "model": "test-model", "metadata": metadata})
+        return [i for i in recipe.validate() if "metadata." in i]
+
+    @pytest.mark.parametrize(
+        ("metadata", "expected_key"),
+        [
+            pytest.param({"compress_ratios": 4}, "compress_ratios", id="ratios-scalar"),
+            pytest.param({"compress_ratios": "4,128"}, "compress_ratios", id="ratios-string"),
+            pytest.param({"compress_ratios": []}, "compress_ratios", id="ratios-empty"),
+            pytest.param({"compress_ratios": [4, "128"]}, "compress_ratios", id="ratios-mixed"),
+            pytest.param({"kv_lora_rank": "big"}, "kv_lora_rank", id="latent-string"),
+            pytest.param({"kv_lora_rank": -1}, "kv_lora_rank", id="latent-negative"),
+            pytest.param({"qk_rope_head_dim": 0}, "qk_rope_head_dim", id="rope-zero"),
+            pytest.param({"index_head_dim": 1.5}, "index_head_dim", id="index-float"),
+            pytest.param({"model_type": 4}, "model_type", id="model-type-int"),
+        ],
+    )
+    def test_rejects_malformed_values(self, metadata, expected_key):
+        issues = self._issues(metadata)
+        assert any(expected_key in i for i in issues), issues
+
+    def test_accepts_well_formed_values(self):
+        assert (
+            self._issues(
+                {
+                    "kv_lora_rank": 448,
+                    "qk_rope_head_dim": 64,
+                    "index_head_dim": 128,
+                    "model_type": "deepseek_v4",
+                    "compress_ratios": [0, 0, 4, 128],
+                }
+            )
+            == []
+        )
+
+    def test_bools_are_not_integers(self):
+        """`True` is an int in Python; it is not a valid dimension."""
+        assert self._issues({"kv_lora_rank": True})
+        assert self._issues({"compress_ratios": [True, 4]})
+
+    def test_absent_fields_are_fine(self):
+        assert self._issues({}) == []
+
+    def test_validation_catches_what_would_otherwise_traceback(self):
+        """The same value that validate() now rejects used to reach int()."""
+        recipe = Recipe.from_dict({"name": "Test", "model": "m", "metadata": {"compress_ratios": 4}})
+        assert recipe.validate()
+        with pytest.raises(TypeError):
+            recipe.estimate_vram(auto_detect=False)
+
+
+class TestOverrideDoesNotSuppressMlaDetection:
+    """Pinning kv_vram_per_token replaces KV *sizing*, not the *sharding rule*.
+
+    The override delegates the bytes-per-token to the user, but the sharding
+    rule still depends on the architecture: an MLA latent is replicated across
+    TP ranks (divided by PP only), an ordinary KV cache shards by TP*PP. If
+    pinning the override also suppressed HF detection, a DeepSeek model would
+    silently default to the ordinary rule and TP-divide the override — an
+    under-claim that lets the scheduler over-commit (OOM) a placement.
+    """
+
+    def _run(self, recipe, hf_config):
+        with (
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=hf_config) as fetch,
+            mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_size", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_params", return_value=None),
+        ):
+            est = recipe.estimate_vram()
+        return est, fetch.call_count
+
+    def test_mla_override_is_pp_divided_not_tp(self, deepseek_v4_config):
+        """The override on a DeepSeek V4 model must be /pp, not /(tp*pp)."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0, "kv_vram_per_token": 1e-5},
+                "defaults": {"max_model_len": 100000, "tensor_parallel": 4, "pipeline_parallel": 2},
+            }
+        )
+        est, fetches = self._run(recipe, deepseek_v4_config)
+        per_gpu_kv = est.total_per_gpu_gb - est.model_weights_gb / 8
+        # KV override = 1e-5 * 100000 = 1.0 GB; /pp(2) = 0.5, not /(tp*pp)=0.125
+        assert est.kv_arch == "mla"
+        assert est.kv_cache_replicated
+        assert per_gpu_kv == pytest.approx(0.5)
+        assert fetches == 1
+
+    def test_detection_runs_despite_pinned_architecture(self, deepseek_v4_config):
+        """Pinning num_layers/num_kv_heads/head_dim must not suppress MLA detection here."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {
+                    "model_vram": 340.0,
+                    "kv_vram_per_token": 1e-5,
+                    "num_layers": 43,
+                    "num_kv_heads": 1,
+                    "head_dim": 512,
+                },
+                "defaults": {"max_model_len": 100000, "tensor_parallel": 4, "pipeline_parallel": 2},
+            }
+        )
+        est, fetches = self._run(recipe, deepseek_v4_config)
+        assert est.kv_arch == "mla" and est.kv_cache_replicated
+        assert fetches == 1
+
+    def test_pinned_mla_markers_skip_the_fetch(self, deepseek_v4_config):
+        """Explicit MLA markers are enough; do not re-fetch."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0, "kv_vram_per_token": 1e-5, "kv_lora_rank": 448, "qk_rope_head_dim": 64},
+                "defaults": {"max_model_len": 100000, "tensor_parallel": 4, "pipeline_parallel": 2},
+            }
+        )
+        _, fetches = self._run(recipe, deepseek_v4_config)
+        assert fetches == 0
+
+    def test_non_mla_override_fetches_once_then_is_stable(self):
+        hf = {
+            "model_type": "qwen3",
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 64,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "hidden_size": 5120,
+            "head_dim": 128,
+        }
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "Qwen/Qwen3-32B",
+                "metadata": {"model_vram": 60.0, "kv_vram_per_token": 1e-5},
+                "defaults": {"max_model_len": 100000, "tensor_parallel": 2},
+            }
+        )
+        first, n1 = self._run(recipe, hf)
+        second, n2 = self._run(recipe, hf)
+        assert first.kv_arch != "mla"
+        assert n1 == 1 and n2 == 0  # model_type written back stops the refetch
+        assert first.total_per_gpu_gb == second.total_per_gpu_gb
+
+
+class TestPinnedModelTypeIsMla:
+    """A pinned model_type that *means* MLA must render a real MLA verdict.
+
+    The kv_vram_per_token detection clause short-circuits on a pinned
+    model_type; that is only safe if the sizing path agrees that an MLA
+    model_type is MLA. Without this, pinning model_type: deepseek_v4 +
+    kv_vram_per_token + architecture (but no latent markers) skipped detection,
+    is_mla resolved False, and the override was divided by TP*PP instead of PP —
+    the exact mis-sharding R2-P2 set out to remove.
+    """
+
+    def _run(self, recipe, hf_config):
+        with (
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=hf_config) as fetch,
+            mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_size", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_params", return_value=None),
+        ):
+            est = recipe.estimate_vram()
+        return est, fetch.call_count
+
+    def test_pinned_mla_model_type_shards_pp_only(self, deepseek_v4_config):
+        """model_type: deepseek_v4 + override -> PP division, no HF fetch needed."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {
+                    "model_vram": 340.0,
+                    "kv_vram_per_token": 1e-5,
+                    "model_type": "deepseek_v4",
+                    "num_layers": 43,
+                    "num_kv_heads": 1,
+                    "head_dim": 512,
+                },
+                "defaults": {"max_model_len": 100000, "tensor_parallel": 4, "pipeline_parallel": 2},
+            }
+        )
+        est, fetches = self._run(recipe, deepseek_v4_config)
+        per_gpu_kv = est.total_per_gpu_gb - est.model_weights_gb / 8
+        assert est.kv_arch == "mla" and est.kv_cache_replicated
+        assert per_gpu_kv == pytest.approx(0.5)  # PP-only, not TP*PP (0.125)
+        assert fetches == 0
+
+    def test_pinned_non_mla_model_type_shards_tp_pp(self):
+        """A genuinely non-MLA model_type keeps the ordinary rule."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "Qwen/Qwen3-32B",
+                "metadata": {"model_vram": 60.0, "kv_vram_per_token": 1e-5, "model_type": "qwen3"},
+                "defaults": {"max_model_len": 100000, "tensor_parallel": 4, "pipeline_parallel": 2},
+            }
+        )
+        est, _ = self._run(
+            recipe,
+            {
+                "model_type": "qwen3",
+                "torch_dtype": "bfloat16",
+                "num_hidden_layers": 64,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 8,
+                "hidden_size": 5120,
+                "head_dim": 128,
+            },
+        )
+        assert est.kv_arch != "mla"
+        per_gpu_kv = est.total_per_gpu_gb - est.model_weights_gb / 8
+        assert per_gpu_kv == pytest.approx(1e-5 * 100000 / 8)  # /(tp*pp)
+
+    def test_auto_detected_mla_model_type_still_works(self, deepseek_v4_config):
+        """No pinned model_type -> detection runs and fills it in."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0, "kv_vram_per_token": 1e-5},
+                "defaults": {"max_model_len": 100000, "tensor_parallel": 4, "pipeline_parallel": 2},
+            }
+        )
+        est, fetches = self._run(recipe, deepseek_v4_config)
+        assert est.kv_arch == "mla" and est.kv_cache_replicated
+        assert fetches == 1
+
+
+class TestConfigChainKvDtypeIsExported:
+    """A kv_cache_dtype from defaults/cli must reach metadata for export.
+
+    benchmark export and telemetry read only recipe.metadata["kv_dtype"], and
+    the exporter's docstring promises "values written back by Recipe.
+    estimate_vram" — so dropping config-chain dtypes from the write-back made
+    the exported record omit the KV dtype the run actually used.
+    """
+
+    def test_defaults_kv_cache_dtype_is_persisted(self):
+        hf = {
+            "model_type": "qwen3",
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 64,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "hidden_size": 5120,
+            "head_dim": 128,
+        }
+        recipe = Recipe.from_dict(
+            {"name": "Test", "model": "Qwen/Qwen3-32B", "metadata": {"model_vram": 60.0}, "defaults": {"kv_cache_dtype": "fp8_e5m2"}}
+        )
+        with (
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=hf),
+            mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+        ):
+            est = recipe.estimate_vram()
+        assert est.kv_dtype == "fp8_e5m2"
+        assert recipe.metadata.get("kv_dtype") == "fp8_e5m2"
+
+    def test_cli_override_wins_over_auto_written_metadata(self, deepseek_v4_config):
+        """The anti-shadowing read: a fresh cli override beats a frozen metadata value."""
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                "metadata": {"model_vram": 340.0},
+                "defaults": {"max_model_len": 32768},
+            }
+        )
+
+        def est(**overrides):
+            with (
+                mock.patch("sparkrun.models.vram.fetch_model_config", return_value=deepseek_v4_config),
+                mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+                mock.patch("sparkrun.models.vram.fetch_safetensors_size", return_value=None),
+                mock.patch("sparkrun.models.vram.fetch_safetensors_params", return_value=None),
+            ):
+                return recipe.estimate_vram(cli_overrides=overrides or None)
+
+        first = est(kv_cache_dtype="nvfp4_ds_mla")
+        second = est(kv_cache_dtype="bfloat16")
+        assert first.kv_dtype == "nvfp4_ds_mla"
+        assert second.kv_dtype == "bfloat16"
+        assert second.kv_cache_per_token_bytes == pytest.approx(5536.0)
+
+    def test_metadata_pin_beats_defaults(self):
+        """An explicit metadata kv_dtype outranks a defaults value."""
+        hf = {
+            "model_type": "qwen3",
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 64,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "hidden_size": 5120,
+            "head_dim": 128,
+        }
+        recipe = Recipe.from_dict(
+            {
+                "name": "Test",
+                "model": "Qwen/Qwen3-32B",
+                "metadata": {"model_vram": 60.0, "kv_dtype": "fp8"},
+                "defaults": {"kv_cache_dtype": "bfloat16"},
+            }
+        )
+        with (
+            mock.patch("sparkrun.models.vram.fetch_model_config", return_value=hf),
+            mock.patch("sparkrun.models.quantization.fetch_hf_quant_config", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_size", return_value=None),
+            mock.patch("sparkrun.models.vram.fetch_safetensors_params", return_value=None),
+        ):
+            est = recipe.estimate_vram()
+        assert est.kv_dtype == "fp8"

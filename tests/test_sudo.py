@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import patch
 
-from sparkrun.orchestration.sudo import run_indirect_sudo_script
+from sparkrun.orchestration.sudo import run_indirect_sudo_script, run_sudo_script_on_host
 from sparkrun.orchestration.ssh import RemoteResult
 
 
@@ -81,3 +81,47 @@ def test_dry_run_skips_ssh_but_still_validates(mock_run):
             sudo_password="pw",
             dry_run=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# NOPASSWD (password=None) handling
+# ---------------------------------------------------------------------------
+
+
+@patch("sparkrun.orchestration.ssh._run_subprocess")
+def test_remote_host_accepts_none_password(mock_run):
+    """A remote host with password=None runs non-interactively instead of crashing.
+
+    ``ensure_sudo_password`` returns None once every host answers ``sudo -n
+    true``, so None reaches this path on a fully NOPASSWD cluster.  The local
+    dispatch has always handled it (``sudo -n``); the remote one used to
+    concatenate it onto the script and raise TypeError.
+    """
+    mock_run.return_value = RemoteResult(host="192.168.1.42", returncode=0, stdout="ok", stderr="")
+
+    res = run_sudo_script_on_host(
+        "192.168.1.42",
+        "apt update",
+        None,
+        ssh_kwargs={"ssh_user": "bob"},
+    )
+
+    assert res.success
+    assert res.host == "192.168.1.42"
+    cmd = mock_run.call_args[0][0]
+    assert cmd[-4:] == ["sudo", "-n", "bash", "-s"]
+
+
+@patch("sparkrun.orchestration.sudo.subprocess.run")
+def test_local_host_accepts_none_password(mock_run):
+    """The local dispatch keeps using ``sudo -n`` for password=None."""
+    mock_run.return_value.returncode = 0
+    mock_run.return_value.stdout = "ok"
+    mock_run.return_value.stderr = ""
+
+    res = run_sudo_script_on_host("localhost", "apt update", None)
+
+    assert res.success
+    assert res.host == "localhost"
+    assert mock_run.call_args[0][0] == ["sudo", "-n", "bash", "-s"]
+    assert mock_run.call_args[1]["input"] == "apt update"

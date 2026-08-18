@@ -8,6 +8,12 @@ e.g.::
     register_cli_command(my_command)                          # top-level: `sparkrun my-command`
     register_cli_command(import_foo, parent=("cluster", "import"))  # `sparkrun cluster import foo`
 
+The registry itself lives in :mod:`sparkrun.core.cli_registry`, deliberately
+free of Click: a plugin that also loads on the console-free ``sparkrun.api``
+path should import *that* and register a **loader** rather than a built
+command, so registering costs no Click import.  This module re-exports the
+registry API and owns the attach half, which needs Click.
+
 **Timing.** The CLI command tree is built at import of :mod:`sparkrun.cli`, but
 external plugins load later, during :func:`sparkrun.core.bootstrap.init_sparkrun`.
 :class:`PluggableGroup` bridges the gap: the top-level ``main`` group is a
@@ -26,42 +32,17 @@ gating (feature flags, ``hidden=``) is the command's own concern.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 
 import click
 
+# Re-exported so ``sparkrun.cli.ext`` remains the documented entry point.
+from sparkrun.core.cli_registry import (  # noqa: F401 - re-export
+    CliCommandSpec,
+    register_cli_command,
+    registered_cli_commands,
+)
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class CliCommandSpec:
-    """A plugin command plus the group path it attaches under."""
-
-    command: click.Command
-    parent: tuple[str, ...] = ()
-
-
-_CLI_EXTENSIONS: list[CliCommandSpec] = []
-
-
-def register_cli_command(command: click.Command, *, parent: "tuple[str, ...] | list[str]" = ()) -> None:
-    """Register *command* to attach under the group path *parent*.
-
-    ``parent=()`` attaches to the top-level ``sparkrun`` group;
-    ``parent=("cluster", "import")`` attaches under ``sparkrun cluster import``.
-    Idempotent by ``(parent, command name)`` so repeated plugin loads (e.g. in
-    tests) don't double-register.
-    """
-    spec = CliCommandSpec(command=command, parent=tuple(parent))
-    for existing in _CLI_EXTENSIONS:
-        if existing.parent == spec.parent and existing.command.name == command.name:
-            return
-    _CLI_EXTENSIONS.append(spec)
-
-
-def registered_cli_commands() -> list[CliCommandSpec]:
-    """Return a copy of the registered command specs (introspection/tests)."""
-    return list(_CLI_EXTENSIONS)
 
 
 def _resolve_group(root: click.Group, path: tuple[str, ...]) -> "click.Group | None":
@@ -88,18 +69,23 @@ def attach_cli_extensions(root: click.Group) -> None:
     whose name already exists on the target group is left as-is (built-in wins,
     and re-attach passes are no-ops).
     """
-    for spec in _CLI_EXTENSIONS:
+    for spec in registered_cli_commands():
         parent = _resolve_group(root, spec.parent)
         if parent is None:
             logger.warning(
                 "Cannot attach plugin CLI command %r: parent group %r not found",
-                spec.command.name,
+                spec.name,
                 "/".join(spec.parent) or "<root>",
             )
             continue
-        if spec.command.name in parent.commands:
+        if spec.name in parent.commands:
             continue
-        parent.add_command(spec.command)
+        try:
+            command = spec.resolve()
+        except Exception:  # noqa: BLE001 - one bad loader must not break the CLI
+            logger.exception("Could not build plugin CLI command %r", spec.name)
+            continue
+        parent.add_command(command)
 
 
 def ensure_cli_extensions(root: click.Group) -> None:

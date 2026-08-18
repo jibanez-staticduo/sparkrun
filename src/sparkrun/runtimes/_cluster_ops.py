@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sparkrun.core.config import SparkrunConfig
     from sparkrun.core.scheduler import RankAssignment
     from sparkrun.core.recipe import Recipe
+    from sparkrun.core.runtime_cache import RuntimeCacheMounts
     from sparkrun.orchestration.comm_env import ClusterCommEnv
     from sparkrun.orchestration.executor import Executor
     from sparkrun.runtimes.base import RuntimePlugin
@@ -95,6 +96,7 @@ class ClusterContext:
         cluster: ClusterDefinition | None = None,
         recipe: Recipe | None = None,
         placement: "RankAssignment | None" = None,
+        runtime_cache: "RuntimeCacheMounts | None" = None,
     ) -> ClusterContext:
         """Build context from runtime hooks and config.
 
@@ -113,9 +115,18 @@ class ClusterContext:
 
         num_nodes = len(hosts)
         ssh_kwargs = build_ssh_kwargs(config)
-        volumes = build_volumes(cache_dir, extra={**runtime.get_extra_volumes(), **resolved_model_volume(recipe)})
+        volumes = build_volumes(
+            cache_dir,
+            extra={
+                **(runtime_cache.volumes if runtime_cache else {}),
+                **runtime.get_extra_volumes(),
+                **resolved_model_volume(recipe),
+            },
+        )
         runtime_env = runtime.get_cluster_env(head_ip="<pending>", num_nodes=num_nodes)
         all_env = merge_env(
+            # Lowest tier — see the matching comment in ``RuntimePlugin._run_solo``.
+            runtime_cache.env if runtime_cache else {},
             runtime.get_common_env(),
             runtime_env,
             env,
@@ -263,11 +274,11 @@ def cleanup_ranked_containers(ctx: ClusterContext, executor: Executor) -> list[s
     return _stop_ranked_containers_parallel(ctx, executor, list(ctx.hosts))
 
 
-def cleanup_named_containers(ctx: ClusterContext, container_names: list[str]) -> None:
-    """Stop named containers on all hosts."""
+def cleanup_named_containers(ctx: ClusterContext, container_names: list[str], executor: Executor | None = None) -> None:
+    """Stop named containers on all hosts, via *executor*'s substrate."""
     from sparkrun.orchestration.primitives import cleanup_containers
 
-    cleanup_containers(ctx.hosts, container_names, ssh_kwargs=ctx.ssh_kwargs, dry_run=ctx.dry_run)
+    cleanup_containers(ctx.hosts, container_names, ssh_kwargs=ctx.ssh_kwargs, dry_run=ctx.dry_run, executor=executor)
 
 
 def cleanup_after_failure(
@@ -310,6 +321,7 @@ def cleanup_after_failure(
                 ssh_kwargs=ctx.ssh_kwargs,
                 dry_run=ctx.dry_run,
                 max_workers=_config_ssh_cap(ctx.config),
+                executor=executor,
             )
             return
         # Ranked cleanup. Use the supplied host subset when provided so we

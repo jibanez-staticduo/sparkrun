@@ -215,6 +215,23 @@ class BenchmarkingPlugin(Plugin):
         """
         return None
 
+    # noinspection PyMethodMayBeStatic,PyUnusedLocal
+    def measured_nothing(self, parsed: dict[str, Any]) -> bool:
+        """Whether *parsed* results contain no actual measurement.
+
+        A benchmark tool that exits 0 having failed every request is not a
+        hypothetical: llama-benchy prints each failure and carries on, writing a
+        result row per test with every metric ``null``.  sparkrun then exported
+        that, rendered a table of ``…``, and said "Benchmark complete" — a run
+        indistinguishable from a real one to anything downstream.  The tool's
+        exit code cannot be the only check.
+
+        Default ``False`` — "no opinion", so a framework that has not
+        implemented this keeps the previous behaviour rather than being failed
+        on a shape this base class cannot read.
+        """
+        return False
+
     def build_task_list(
         self,
         base_args: dict[str, Any],

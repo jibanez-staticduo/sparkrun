@@ -33,6 +33,18 @@ class ContainerDetail:
     role: str
     status: str
     image: str
+    executor: str = ""
+    """Registered name of the executor that observed this container/process.
+
+    Stamped by ``query_status_for_cluster`` on each executor's snapshot before
+    the merge, so it survives the docker+local fold.  This is what lets
+    teardown reach the *right* substrate: ``stop --all`` discovers workloads
+    across every executor sharing a status scope, and a container reported by
+    ``docker ps`` must be removed with ``docker rm`` while a native process
+    reported from a pidfile must be signalled.  Empty means unattributed
+    (a snapshot built directly in a test, or a pre-existing serialization) —
+    callers fall back to the cluster's default executor.
+    """
 
 
 @dataclass(frozen=True)
@@ -69,6 +81,45 @@ class RunningWorkload:
     Optional (default empty for back-compat).  Populated by executors
     that can observe per-container detail (docker ``Names``/``Status``/
     ``Image``, local pidfiles); consumed by the ``sparkrun status`` CLI.
+    """
+
+
+@dataclass(frozen=True)
+class TerminationInfo:
+    """What became of a workload that :class:`ClusterStatus` no longer reports.
+
+    The post-mortem peer of :class:`RunningWorkload`.  ``query_status`` answers
+    "what is running"; this answers, for something that is *not*, whether its
+    remains are still on the substrate and how the operator inspects them.
+
+    Produced by
+    :meth:`~sparkrun.orchestration.executors._base.Executor.describe_terminated`,
+    because every part of the answer is substrate-specific: a stopped Docker
+    container, a `local` pidfile whose process is gone, a Failed k8s Pod.
+    """
+
+    exists: bool | None
+    """Whether the workload's remains are still present on the substrate.
+
+    - ``True`` — still there (a stopped container, a leftover pidfile, a Failed
+      Pod), so there is something to inspect.
+    - ``False`` — **confirmed** gone.
+    - ``None`` — could not be determined.
+
+    Callers must treat ``None`` as inconclusive and never as ``False``: the
+    difference decides whether cached job metadata is deleted, and an
+    unreachable host must not be able to trigger that.
+    """
+
+    detail: str | None = None
+    """Substrate-native state, e.g. ``"Exited (137) 3 minutes ago"``."""
+
+    investigate_hints: tuple[str, ...] = field(default_factory=tuple)
+    """Substrate-native commands the operator can run next.
+
+    The executor owns the wording because it owns the substrate — ``docker
+    logs`` is wrong advice on a k8s cluster and meaningless for a ``local``
+    job.  Callers render these; they never author them.
     """
 
 
@@ -254,6 +305,43 @@ class ClusterStatus:
                 continue
             merged_errors[host] = msg
         return ClusterStatus(hosts=tuple(merged), queried_at=self.queried_at, executor=self.executor, errors=merged_errors)
+
+
+def attribute_executor(status: "ClusterStatus", executor_name: str) -> "ClusterStatus":
+    """Return *status* with each container attributed to *executor_name*.
+
+    Applied to every executor's snapshot before
+    :meth:`ClusterStatus.merge` folds them, because after the fold a single
+    workload can carry containers from two substrates (docker + local share
+    the ``"host"`` scope) and only the producing executor can tear its own
+    down.  Containers that already name an executor are left alone, so an
+    executor that attributes its own output stays authoritative.
+
+    Returns the same object when there is nothing to stamp.
+    """
+    if not executor_name:
+        return status
+
+    changed = False
+    hosts: list[HostOccupancy] = []
+    for entry in status.hosts:
+        workloads: list[RunningWorkload] = []
+        for w in entry.workloads:
+            if any(not c.executor for c in w.containers):
+                workloads.append(
+                    replace(
+                        w,
+                        containers=tuple(c if c.executor else replace(c, executor=executor_name) for c in w.containers),
+                    )
+                )
+                changed = True
+            else:
+                workloads.append(w)
+        hosts.append(replace(entry, workloads=tuple(workloads)))
+
+    if not changed:
+        return status
+    return replace(status, hosts=tuple(hosts))
 
 
 def _union_containers(

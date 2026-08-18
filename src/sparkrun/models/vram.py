@@ -1,76 +1,44 @@
-"""VRAM estimation for inference workloads on DGX Spark systems."""
+"""VRAM estimation for inference workloads on DGX Spark systems.
+
+Model weights, the GPU memory budget, and the arithmetic that combines them with
+a KV cache estimate.  The KV estimate itself is architecture-specific and comes
+from :mod:`sparkrun.models.kv` — nothing in this module names an attention
+architecture.
+"""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from sparkrun.models.dtypes import bytes_per_element, kv_bytes_per_element, normalize_dtype
+from sparkrun.models.kv import ArchInfo, KVSizing, arch_marker_names, extract_arch_fields, resolve_kv_strategy
+
 logger = logging.getLogger(__name__)
 
-# Bytes per element for common dtypes
-_DTYPE_BYTES: dict[str, float] = {
-    "float32": 4.0,
-    "fp32": 4.0,
-    "float16": 2.0,
-    "fp16": 2.0,
-    "bfloat16": 2.0,
-    "bf16": 2.0,
-    "int8": 1.0,
-    "fp8": 1.0,
-    "fp8_e5m2": 1.0,
-    "fp8_e4m3": 1.0,
-    "mxfp8": 1.0,
-    "int4": 0.5,
-    "awq": 0.5,
-    "nvfp4": 0.5,
-    "awq4": 0.5,
-    "fp4": 0.5,
-    "w4a16_awq": 0.5,
-    "w4a16_nvfp4": 0.5,
-    "awq8": 1.0,
-    "gptq": 0.5,
-    "mxfp4": 0.5,
-    # GGUF quants — bytes per weight from llama.cpp ggml type_size / block_size.
-    # Basic quants
-    "q4_0": 0.5625,
-    "q4_1": 0.625,
-    "q5_0": 0.6875,
-    "q5_1": 0.75,
-    "q8_0": 1.0625,
-    "q8_1": 1.125,
-    # K-quants (base types — dominant tensor type in K-quant mixes)
-    "q2_k": 0.3125,
-    "q3_k": 0.4375,
-    "q4_k": 0.5625,
-    "q5_k": 0.6875,
-    "q6_k": 0.8125,
-    "q8_k": 1.0625,
-    # K-quant mixes (suffixed names used by llama.cpp quantize CLI).
-    # The _s/_m suffix selects which layers use the base vs higher-precision quant;
-    # bytes-per-element is the same as the base type for estimation purposes.
-    # Uncommon _l variants fall back to the base via _gguf_normalize_quant().
-    "q2_k_s": 0.3125,
-    "q3_k_s": 0.4375,
-    "q3_k_m": 0.4375,
-    "q4_k_s": 0.5625,
-    "q4_k_m": 0.5625,
-    "q5_k_s": 0.6875,
-    "q5_k_m": 0.6875,
-    # IQ (importance-matrix quants)
-    "iq1_s": 0.1875,
-    "iq1_m": 0.1875,
-    "iq2_xxs": 0.25,
-    "iq2_xs": 0.3125,
-    "iq2_s": 0.3125,
-    "iq3_xxs": 0.4063,
-    "iq3_s": 0.4375,
-    "iq4_nl": 0.5625,
-    "iq4_xs": 0.5625,
-    # Ternary
-    "tq1_0": 0.1875,
-    "tq2_0": 0.3125,
-}
+# Re-exported so ``from sparkrun.models.vram import bytes_per_element`` keeps
+# working; the tables themselves live in the dtypes leaf so a KV strategy can
+# ask for an element width without importing the estimator that calls it.
+__all__ = [
+    "DEFAULT_VRAM_GB",
+    "DGX_SPARK_VRAM_GB",
+    "MODEL_VISIBILITY_PRIVATE",
+    "MODEL_VISIBILITY_PUBLIC",
+    "MODEL_VISIBILITY_UNKNOWN",
+    "VRAMEstimate",
+    "bytes_per_element",
+    "estimate_vram",
+    "extract_model_info",
+    "fetch_model_config",
+    "fetch_model_visibility",
+    "fetch_safetensors_params",
+    "fetch_safetensors_size",
+    "kv_bytes_per_element",
+    "normalize_dtype",
+    "parse_param_count",
+]
 
 # Shorthand suffixes for parameter counts
 _PARAM_SUFFIXES = {
@@ -115,6 +83,30 @@ class VRAMEstimate:
     num_kv_heads: int | None = None
     head_dim: int | None = None
 
+    # KV cache architecture (see sparkrun.models.kv)
+    kv_arch: str = "dense"
+    """Name of the :class:`~sparkrun.models.kv.KVCacheStrategy` that sized the cache.
+
+    Reports the architecture that was *detected*, independently of whether it
+    could be sized — an incomplete config yields ``kv_arch="mla"`` with a
+    ``None`` KV estimate, not a model relabelled as dense.
+    """
+
+    kv_arch_label: str | None = None
+    """Human-readable architecture line for display, or ``None`` for the generic
+    layers/heads/head_dim summary."""
+
+    kv_cache_replicated: bool = False
+    """Whether the KV cache is duplicated on every tensor-parallel rank.
+
+    True for MLA: the compressed latent has no head dimension to shard, so each
+    TP rank holds the full cache and ``tensor_parallel`` does not reduce the
+    per-GPU KV footprint (pipeline parallelism still splits it by layer).
+    """
+
+    kv_estimate_is_floor: bool = False
+    """Whether auxiliary caches exist that this estimate does not count."""
+
     # GPU memory budget fields
     gpu_memory_utilization: float | None = None
     total_gpu_memory_gb: float | None = None
@@ -141,29 +133,6 @@ class VRAMEstimate:
         result = asdict(self)
         result["fits_dgx_spark"] = self.fits_dgx_spark
         return result
-
-
-_DTYPE_CANONICAL: dict[str, str] = {
-    "fp32": "float32",
-    "fp16": "float16",
-    "bf16": "bfloat16",
-}
-
-
-def normalize_dtype(dtype: str) -> str:
-    """Normalize a dtype string to its canonical form.
-
-    Maps common short aliases (``bf16`` → ``bfloat16``, ``fp16`` → ``float16``,
-    ``fp32`` → ``float32``) to full names.  Unknown dtypes are returned
-    lower-cased but otherwise unchanged.
-    """
-    key = dtype.lower().strip().replace("-", "_")
-    return _DTYPE_CANONICAL.get(key, key)
-
-
-def bytes_per_element(dtype: str) -> float | None:
-    """Return bytes per element for a dtype string, or None if unknown."""
-    return _DTYPE_BYTES.get(dtype.lower().strip().replace("-", "_"))
 
 
 def parse_param_count(value: int | float | str) -> int | None:
@@ -534,7 +503,25 @@ def _extract_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 info["head_dim"] = cfg["hidden_size"] // cfg[key]
                 break
 
+    # Architecture-specific fields (MLA's latent markers, and whatever a future
+    # strategy declares).  Each KV strategy owns its own extraction, so this
+    # module never learns an architecture's config keys.  The universal fields
+    # resolved above are passed along because a derivation may need them — MLA
+    # resolves its cached width partly from ``head_dim``.
+    info.update(extract_arch_fields(cfg, info))
+
+    # Extracted here rather than only at the top level so a multimodal wrapper's
+    # *text* model_type is reachable — it is the one that selects the KV slot
+    # layout, and it lives in the nested config alongside the architecture markers.
+    if cfg.get("model_type"):
+        info["model_type"] = cfg["model_type"]
+
     return info
+
+
+# Architecture keys that make an estimate possible at all.  Their absence is
+# what sends :func:`extract_model_info` looking in a nested sub-config.
+_CORE_ARCH_KEYS = frozenset({"model_dtype", "num_layers", "num_kv_heads", "head_dim"})
 
 
 def extract_model_info(hf_config: dict[str, Any]) -> dict[str, Any]:
@@ -546,15 +533,23 @@ def extract_model_info(hf_config: dict[str, Any]) -> dict[str, Any]:
     as a fallback when top-level extraction yields incomplete results.
 
     Returns:
-        Dict with keys: model_dtype, num_layers, num_kv_heads, head_dim (present only if found).
+        Dict with keys: model_dtype, num_layers, num_kv_heads, head_dim,
+        model_type, plus whichever architecture markers a KV strategy declares
+        (:func:`sparkrun.models.kv.arch_marker_names`) and found — e.g.
+        kv_lora_rank / qk_rope_head_dim / compress_ratios for MLA.
     """
     info = _extract_from_config(hf_config)
 
-    # For multimodal / composite models the text architecture lives in a
-    # nested sub-config.  Check common nesting keys when the top-level
-    # extraction is missing architecture fields.
-    _NEEDED = {"model_dtype", "num_layers", "num_kv_heads", "head_dim"}
-    if not _NEEDED.issubset(info.keys()):
+    # For multimodal / composite models the text architecture lives in a nested
+    # sub-config.  Consult it when the top level is missing core architecture
+    # fields *or* carries no architecture markers — a wrapper around an MLA text
+    # model can be complete for the core keys while hiding every MLA field
+    # below, and gating on the core keys alone would silently size it as
+    # ordinary attention (a ~14x overestimate that refuses placements).
+    markers = arch_marker_names()
+    needs_core = not _CORE_ARCH_KEYS.issubset(info.keys())
+    needs_arch = markers.isdisjoint(info.keys())
+    if needs_core or needs_arch:
         for nested_key in ("text_config", "llm_config", "language_config"):
             nested = hf_config.get(nested_key)
             if isinstance(nested, dict):
@@ -563,7 +558,16 @@ def extract_model_info(hf_config: dict[str, Any]) -> dict[str, Any]:
                 for k, v in nested_info.items():
                     if k not in info:
                         info[k] = v
+                # The KV slot layout is a property of the *text* model, so when
+                # the architecture markers came from the nested config its
+                # model_type outranks the wrapper's (deepseek_v4, not
+                # deepseek_vl_v2).
+                if nested_info.get("model_type") and not markers.isdisjoint(nested_info.keys()):
+                    info["model_type"] = nested_info["model_type"]
                 break  # only use the first matching nested config
+
+    if not info.get("model_type") and hf_config.get("model_type"):
+        info["model_type"] = hf_config["model_type"]
 
     # Extract quantization dtype from quantization_config if present.
     # This is more accurate than torch_dtype for quantized models (e.g.
@@ -595,13 +599,18 @@ def estimate_vram(
     kv_vram_per_token: float | None = None,
     gpu_memory_utilization: float | None = None,
     total_gpu_memory_gb: float | None = None,
+    model_type: str | None = None,
+    arch: Mapping[str, Any] | None = None,
 ) -> VRAMEstimate:
     """Estimate VRAM usage for an inference workload.
 
     Args:
         model_params: Total parameter count.
         model_dtype: Weight dtype (e.g. "float16", "int4", "fp8").
-        kv_dtype: KV cache dtype (default: "bfloat16").
+        kv_dtype: KV cache dtype. ``None`` means "unset" — the estimator falls
+            back to ``"bfloat16"`` for computation but leaves ``VRAMEstimate.kv_dtype``
+            as ``None`` so display code can distinguish an explicit dtype from a
+            defaulted one (issue #248).
         num_layers: Number of transformer layers.
         num_kv_heads: Number of KV attention heads.
         head_dim: Dimension per attention head.
@@ -609,17 +618,32 @@ def estimate_vram(
         tensor_parallel: Tensor parallelism degree.
         pipeline_parallel: Pipeline parallelism degree.
         model_vram: Direct override for model weight VRAM in GB (not scaled by TP/PP).
-        kv_vram_per_token: Direct override for KV cache in GB per token (scaled by max_model_len and TP*PP).
+        kv_vram_per_token: Direct override for KV cache in GB per token (scaled by max_model_len,
+            then divided by TP*PP — or by PP alone when the architecture replicates its cache
+            across TP ranks, as MLA does).
         gpu_memory_utilization: Fraction of GPU memory the runtime is allowed to use (e.g. 0.9).
         total_gpu_memory_gb: Per-GPU memory of the *target* accelerator (e.g. 48 for an
             RTX A6000). Defaults to the DGX Spark figure when unset, preserving the
             legacy single-platform estimate.
+        model_type: HuggingFace ``model_type``. A strong prior for which KV architecture
+            a model uses, and what selects a family-specific slot layout.
+        arch: Architecture-specific parameters, keyed by
+            :attr:`~sparkrun.models.kv.ArchField.name` — e.g.
+            ``{"kv_lora_rank": 512, "qk_rope_head_dim": 64}`` for MLA. Which keys
+            are meaningful is declared by the registered KV strategies
+            (:func:`sparkrun.models.kv.arch_fields`), never by this signature.
 
     Returns:
         VRAMEstimate with per-GPU totals and any warnings.
     """
     warnings: list[str] = []
-    kv_dtype = kv_dtype or "bfloat16"
+    # Apply the bfloat16 fallback only at computation sites, not on the value
+    # returned in VRAMEstimate.kv_dtype.  Keeping the original (possibly None)
+    # lets the CLI formatter distinguish an explicit dtype from a defaulted one
+    # and show "bfloat16 (default)" — without this, the fallback was baked into
+    # est.kv_dtype itself and the display code's (default) branch never fired
+    # (issue #248).
+    kv_dtype_effective = kv_dtype or "bfloat16"
     tp = max(tensor_parallel, 1)
     pp = max(pipeline_parallel, 1)
     shard_factor = tp * pp
@@ -641,39 +665,54 @@ def estimate_vram(
         warnings.append("model_dtype not available; model weight estimate is zero")
 
     # --- KV cache VRAM ---
-    kv_cache_per_token_bytes: float | None = None
-    kv_cache_total_gb: float | None = None
+    # Which architecture this model uses, and therefore how its cache is sized
+    # and sharded, is decided once here and owned by sparkrun.models.kv.
+    #
+    # Detection is separate from sizing on purpose.  A model whose config is too
+    # incomplete to size is still that architecture: reporting it as dense
+    # instead would mislabel it in `to_dict()` and the CLI, and would flip the
+    # sharding rule that a `kv_vram_per_token` override still depends on.
+    arch_info = ArchInfo(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        model_type=model_type,
+        kv_dtype=kv_dtype_effective,
+        extra=dict(arch or {}),
+    )
+    strategy, detection = resolve_kv_strategy(arch_info)
+    warnings.extend(detection.warnings)
 
     if kv_vram_per_token is not None:
-        # Direct override: user provides GB per token
-        kv_cache_per_token_bytes = kv_vram_per_token * (1024**3)  # convert to bytes for display
-        if max_model_len:
-            kv_cache_total_gb = kv_vram_per_token * max_model_len
-    elif num_layers and num_kv_heads and head_dim:
-        kv_bpe = bytes_per_element(kv_dtype)
-        if kv_bpe is not None:
-            # Per token: 2 (K+V) * num_layers * num_kv_heads * head_dim * bytes
-            kv_cache_per_token_bytes = 2.0 * num_layers * num_kv_heads * head_dim * kv_bpe
-            if max_model_len:
-                kv_cache_total_gb = kv_cache_per_token_bytes * max_model_len / (1024**3)
-        else:
-            warnings.append("Unknown KV cache dtype %r" % kv_dtype)
+        # Direct override: the user supplies GB per token, so sizing is theirs.
+        # The *sharding* rule is not — it is a property of the architecture, and
+        # TP-dividing a replicated cache under-claims memory and lets the
+        # scheduler over-commit the placement.
+        per_token_bytes = kv_vram_per_token * (1024**3)
+        sizing = KVSizing(
+            total_bytes=per_token_bytes * max_model_len if max_model_len else None,
+            per_token_bytes=per_token_bytes,
+            replicated_across_tp=strategy.replicates_kv,
+        )
     else:
-        missing = []
-        if not num_layers:
-            missing.append("num_layers")
-        if not num_kv_heads:
-            missing.append("num_kv_heads")
-        if not head_dim:
-            missing.append("head_dim")
-        warnings.append("Missing architecture info (%s); KV cache estimate unavailable" % ", ".join(missing))
+        sizing = strategy.size(arch_info, max_model_len=max_model_len)
+
+    warnings.extend(sizing.warnings)
+    if sizing.unsizable_reason:
+        warnings.append(sizing.unsizable_reason)
+
+    kv_cache_per_token_bytes = sizing.per_token_bytes
+    kv_cache_total_gb = sizing.total_bytes / (1024**3) if sizing.total_bytes is not None else None
 
     # --- Per-GPU total ---
     # Model weights split across TP * PP GPUs
     per_gpu_weights_gb = model_weights_gb / shard_factor
 
-    # KV heads also split across TP * PP GPUs
-    per_gpu_kv_gb = (kv_cache_total_gb / shard_factor) if kv_cache_total_gb else 0.0
+    # KV heads also split across TP * PP GPUs — except for an architecture whose
+    # cache is replicated per rank (MLA's compressed latent has no head dimension
+    # to shard).  Pipeline parallelism still splits it by layer either way.
+    kv_shard_factor = pp if sizing.replicated_across_tp else shard_factor
+    per_gpu_kv_gb = (kv_cache_total_gb / kv_shard_factor) if kv_cache_total_gb else 0.0
 
     total_per_gpu_gb = per_gpu_weights_gb + per_gpu_kv_gb
 
@@ -700,14 +739,15 @@ def estimate_vram(
             )
             available_kv_gb = 0.0
 
-        # Estimate max context tokens that fit in available KV space
-        if kv_cache_per_token_bytes and kv_cache_per_token_bytes > 0:
-            per_gpu_kv_per_token_gb = (kv_cache_per_token_bytes / shard_factor) / (1024**3)
-            if per_gpu_kv_per_token_gb > 0:
-                max_context_tokens = int(available_kv_gb / per_gpu_kv_per_token_gb)
-
-                if max_model_len and max_model_len > 0:
-                    context_multiplier = max_context_tokens / max_model_len
+        # Estimate max context tokens that fit in available KV space.  The
+        # strategy owns the inversion: linear by default, but a windowed or
+        # per-sequence cache must not be extrapolated as if it were.  The budget
+        # handed over is the whole (unsharded) cache's share, since that is what
+        # the strategy sizes.
+        whole_cache_budget_bytes = available_kv_gb * kv_shard_factor * (1024**3)
+        max_context_tokens = strategy.tokens_for_budget(arch_info, sizing, whole_cache_budget_bytes)
+        if max_context_tokens is not None and max_model_len and max_model_len > 0:
+            context_multiplier = max_context_tokens / max_model_len
 
     return VRAMEstimate(
         model_weights_gb=model_weights_gb,
@@ -724,6 +764,10 @@ def estimate_vram(
         num_layers=num_layers,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        kv_arch=strategy.name,
+        kv_arch_label=strategy.label,
+        kv_cache_replicated=sizing.replicated_across_tp,
+        kv_estimate_is_floor=sizing.is_floor,
         gpu_memory_utilization=gpu_memory_utilization,
         total_gpu_memory_gb=_total_gpu_gb,
         usable_gpu_memory_gb=usable_gpu_memory_gb,

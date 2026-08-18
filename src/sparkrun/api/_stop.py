@@ -54,8 +54,8 @@ def stop(
         resolve_cluster,
         resolve_recipe,
     )
-    from sparkrun.orchestration.docker import parse_teardown_removed
     from sparkrun.orchestration.executor import resolve_executor
+    from sparkrun.orchestration.teardown import parse_teardown_removed
     from sparkrun.orchestration.job_metadata import (
         generate_intent_id,
         load_job_metadata,
@@ -138,6 +138,20 @@ def stop(
         if not cli_overrides:
             cli_overrides = None
 
+    if not (cli_overrides or {}).get("executor"):
+        # No metadata (or none naming an executor) — ask the cluster what is
+        # actually running instead of defaulting.  Without this a job whose
+        # metadata is gone gets the *default* executor, and a teardown aimed
+        # at the wrong substrate exits 0 having done nothing: docker
+        # truthfully reports no such container, so the workload survives and
+        # its record is dropped as a confirmed stop.  Metadata does go
+        # missing — an interrupted launch, a manually cleared cache, or the
+        # very bug this guards against.
+        discovered_exec = _discover_executor_name(cluster_id, target_hosts, cluster_def=cluster_def, sctx=sctx)
+        if discovered_exec:
+            cli_overrides = dict(cli_overrides or {})
+            cli_overrides["executor"] = discovered_exec
+
     executor = resolve_executor(
         cluster=cluster_def,
         cli_overrides=cli_overrides,
@@ -149,8 +163,12 @@ def stop(
     container_names = executor.enumerate_containers(cluster_id, len(target_hosts))
 
     # ``cleanup_containers_by_host`` is the shared teardown primitive: it
-    # dispatches local-vs-SSH per host, verifies the containers are
-    # actually gone, and reports what it removed per host.
+    # dispatches local-vs-SSH per host, verifies the workloads are actually
+    # gone, and reports what it removed per host.  The executor resolved
+    # above is threaded in so the teardown speaks the substrate that
+    # launched this job — without it every stop emitted ``docker rm -f``,
+    # which a ``local`` executor's native process truthfully answers "no
+    # such container" to while continuing to serve.
     from sparkrun.orchestration.primitives import build_ssh_kwargs, cleanup_containers_by_host
 
     config = sctx.config if sctx is not None else _maybe_load_config()
@@ -167,6 +185,7 @@ def stop(
         results = cleanup_containers_by_host(
             {host: list(container_names) for host in target_hosts},
             ssh_kwargs=ssh_kwargs,
+            executor=executor,
         )
     except Exception as e:  # pragma: no cover - defensive; the primitive absorbs per-host failures
         errors.append(str(e))
@@ -201,6 +220,42 @@ def stop(
         errors=tuple(errors),
         hosts_failed=hosts_failed,
     )
+
+
+def _discover_executor_name(
+    cluster_id: str,
+    hosts: list[str],
+    *,
+    cluster_def,
+    sctx: "SparkrunContext | None",
+) -> str | None:
+    """Return the executor currently reporting *cluster_id*, or ``None``.
+
+    The live peer of the metadata lookup: ``api.status`` sweeps every executor
+    on the cluster's substrate and stamps each container with the one that
+    saw it, so a running workload can always name its own teardown mechanism
+    even when nothing was written down.
+
+    Returns ``None`` — "fall back to the resolution chain" — when the sweep
+    fails or finds nothing.  A workload that isn't running needs no
+    substrate-specific teardown, and a failed sweep must not block a stop.
+    """
+    try:
+        from sparkrun.api._status import status
+
+        snapshot = status(list(hosts), cluster=cluster_def, sctx=sctx)
+    except Exception:
+        logger.debug("Executor discovery sweep failed for %s", cluster_id, exc_info=True)
+        return None
+
+    for entry in snapshot.hosts:
+        for workload in entry.workloads:
+            if workload.cluster_id != cluster_id:
+                continue
+            for container in workload.containers:
+                if container.executor:
+                    return container.executor
+    return None
 
 
 def _maybe_load_config():

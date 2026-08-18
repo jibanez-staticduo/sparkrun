@@ -233,6 +233,7 @@ def distribute_image_from_local(
     timeout: int | None = None,
     dry_run: bool = False,
     transfer_hosts: list[str] | None = None,
+    force_pull: bool = False,
 ) -> list[str]:
     """Pull an image locally then stream it to all hosts via docker save/load.
 
@@ -255,6 +256,10 @@ def distribute_image_from_local(
             ``transfer_hosts[i]`` is used for SSH connections while
             ``hosts[i]`` is used for identification and error reporting.
             Falls back to *hosts* when ``None``.
+        force_pull: Re-pull the image locally even when a copy is already
+            present (``sparkrun run --rebuild``).  Unlike the default
+            best-effort refresh, a failed forced pull aborts distribution —
+            see :func:`~sparkrun.containers.registry.ensure_image`.
 
     Returns:
         List of hostnames (from *hosts*) where distribution failed
@@ -262,8 +267,10 @@ def distribute_image_from_local(
     """
     logger.debug("Distributing image '%s' from local to %d host(s)", image, len(hosts))
 
-    # Step 1: ensure image exists locally
-    rc = ensure_image(image, dry_run=dry_run)
+    # Step 1: ensure image exists locally.  The identity check in step 2 runs
+    # *after* this, so a forced pull is reflected in the comparison and hosts
+    # that already carry the freshly-pulled image are still skipped.
+    rc = ensure_image(image, dry_run=dry_run, force_pull=force_pull)
     if rc != 0:
         logger.error("Failed to ensure local image '%s' — aborting distribution", image)
         return list(hosts)
@@ -324,6 +331,7 @@ def distribute_image_from_head(
     timeout: int | None = None,
     dry_run: bool = False,
     worker_transfer_hosts: list[str] | None = None,
+    force_pull: bool = False,
 ) -> list[str]:
     """Pull an image on the head node then distribute to remaining hosts.
 
@@ -342,6 +350,8 @@ def distribute_image_from_head(
         worker_transfer_hosts: Optional IB/fast-network IPs for workers
             (``hosts[1:]``).  Used as targets in the distribution script
             running on the head.  Falls back to ``hosts[1:]`` when ``None``.
+        force_pull: Re-pull the image on the head even when a copy is already
+            present (``sparkrun run --rebuild``).
 
     Returns:
         List of hostnames where distribution failed (empty = full success).
@@ -354,8 +364,15 @@ def distribute_image_from_head(
     head = hosts[0]
     logger.debug("Distributing image '%s' from head (%s) to %d host(s)", image, head, len(hosts))
 
-    # Pre-check image status on all hosts to avoid unnecessary work
-    if not dry_run:
+    # Pre-check image status on all hosts to avoid unnecessary work.
+    #
+    # Skipped entirely under force_pull: this check runs *before* the head
+    # pulls, so its verdict describes the image being replaced.  Honoring it
+    # would let "every host already agrees" short-circuit the very pull
+    # --rebuild was passed to force.  The cost is that workers are all re-synced
+    # rather than filtered — correct for an explicit override, since the head's
+    # post-pull identity isn't known here without a second round trip.
+    if not dry_run and not force_pull:
         remote_identities = _check_remote_image_identities(
             image,
             hosts,
@@ -393,7 +410,7 @@ def distribute_image_from_head(
                 worker_transfer_hosts = None
 
     # Build ensure script (pull image on head)
-    ensure_script = read_script("image_sync.sh").format(image=quote(image))
+    ensure_script = read_script("image_sync.sh").format(image=quote(image), force_pull="1" if force_pull else "0")
 
     # Build distribute script (stream from head to workers)
     targets = worker_transfer_hosts or hosts[1:]

@@ -364,6 +364,37 @@ def _verify_image_command_passthrough(
     )
 
 
+def resolve_effective_runtime_cache_dir(
+    host_list: list[str],
+    ssh_kwargs: dict,
+    config: SparkrunConfig,
+    dry_run: bool = False,
+) -> str:
+    """Resolve the target hosts' sparkrun cache dir for the runtime cache.
+
+    Same shape and the same reasoning as :func:`resolve_effective_cache_dir`:
+    the compilation cache lives on the *targets*, so its root must resolve
+    against their ``$HOME``, not the control machine's.  A probe failure
+    degrades to the control machine's path rather than raising — the runtime
+    cache is an optimization, and a wrong guess costs a recompile (the
+    directory simply won't pre-exist) while an exception would cost the launch.
+    """
+    from sparkrun.utils import is_local_host
+    from sparkrun.orchestration.primitives import probe_remote_sparkrun_cache
+
+    head = host_list[0] if host_list else None
+    ssh_user = ssh_kwargs.get("ssh_user")
+    cross_user = ssh_user is not None and ssh_user != os.environ.get("USER", "root")
+
+    if head and not dry_run and (not is_local_host(head) or cross_user):
+        try:
+            return probe_remote_sparkrun_cache(head, **ssh_kwargs)
+        except Exception:
+            logger.debug("runtime_cache: cache-dir probe failed on %s; using local default", head, exc_info=True)
+
+    return str(config.cache_dir)
+
+
 def resolve_effective_cache_dir(
     cache_dir: str | None,
     host_list: list[str],
@@ -541,7 +572,6 @@ def launch_inference(
     registry_mgr: RegistryManager | None = None,
     auto_port: bool = False,
     sync_tuning: bool = True,
-    skip_keys: set[str] | frozenset[str] = frozenset(),
     dry_run: bool = False,
     detached: bool = True,
     follow: bool = True,
@@ -580,6 +610,11 @@ def launch_inference(
     # down a running workload it never got close to replacing.  Not called on
     # ``dry_run``.
     before_start: "Callable[[], None] | None" = None,
+    # Highest-precedence layer of the runtime-cache settings chain (the CLI's
+    # --runtime-cache / --no-runtime-cache lands here as ``{"enabled": bool}``).
+    # ``None`` means "nothing was asked for" and defers to recipe / cluster /
+    # config / runtime defaults.
+    runtime_cache_override: dict | None = None,
 ) -> LaunchResult:
     """Launch an inference workload.
 
@@ -612,7 +647,6 @@ def launch_inference(
         registry_mgr: Registry manager for tuning config sync.
         auto_port: If True, auto-increment port when the desired port is in use.
         sync_tuning: Whether to sync tuning configs from registries.
-        skip_keys: Keys to suppress in serve command generation.
         dry_run: Show what would be done without executing.
         detached: Run containers in detached mode.
         follow: whether to follow logs
@@ -808,10 +842,23 @@ def launch_inference(
     if recipe.builder:
         if p:
             p.phase(2)
+        from sparkrun.builders.base import BuilderUnavailableError
         from sparkrun.core.bootstrap import get_builder
 
+        # Only *lookup* is tolerated failing here. A ValueError out of
+        # prepare() is a real build failure, and reporting it as "builder not
+        # found, skipping" would launch the workload without the environment
+        # it asked for. A gated builder is likewise never skipped: the user
+        # named one that exists (see BuilderUnavailableError).
         try:
             builder = get_builder(recipe.builder, v)
+        except BuilderUnavailableError:
+            raise
+        except ValueError:
+            builder = None
+            logger.warning("Builder '%s' not found, skipping", recipe.builder)
+
+        if builder is not None:
             container_image = builder.prepare(
                 container_image,
                 recipe,
@@ -821,8 +868,6 @@ def launch_inference(
                 transfer_mode=effective_transfer_mode,
                 ssh_kwargs=ssh_kwargs,
             )
-        except ValueError:
-            logger.warning("Builder '%s' not found, skipping", recipe.builder)
         if p:
             p.phase_end()
     else:
@@ -1124,7 +1169,6 @@ def launch_inference(
         is_cluster=not is_solo,
         num_nodes=len(host_list),
         head_ip=None,  # determined during launch
-        skip_keys=skip_keys,
     )
 
     # Best-effort page cache clear
@@ -1185,6 +1229,73 @@ def launch_inference(
         v=v,
     )
 
+    # -- Runtime (compilation / autotune) cache --
+    #
+    # Mount a persistent host dir at /cache/runtime so torch.compile, Inductor,
+    # Triton, FlashInfer and the TRT-LLM autotuner survive the `--rm` container
+    # (issue #256).  Resolution order and the keying rules live in
+    # :mod:`sparkrun.core.runtime_cache`; the short version is that the
+    # directory key is *hygiene* (disk footprint, hit rate) and never
+    # correctness, so a disabled or mis-keyed cache costs a recompile at worst.
+    #
+    # Wholly best-effort: any failure here degrades to "no cache" rather than
+    # failing a launch that would otherwise work.
+    runtime_cache_mounts = None
+    try:
+        from sparkrun.core.runtime_cache import (
+            build_runtime_cache_mounts,
+            probe_image_identity,
+            resolve_runtime_cache_root,
+            resolve_runtime_cache_settings,
+            runtime_cache_disabled_by_env,
+        )
+        from sparkrun.orchestration.job_metadata import derive_recipe_fingerprint
+
+        _rc_settings = resolve_runtime_cache_settings(
+            runtime=runtime,
+            config=config,
+            cluster=cluster,
+            recipe=recipe,
+            cli_override=runtime_cache_override,
+            env_disabled=runtime_cache_disabled_by_env(),
+        )
+        if _rc_settings.enabled:
+            _rc_root = resolve_runtime_cache_root(
+                _rc_settings,
+                resolve_effective_runtime_cache_dir(host_list, ssh_kwargs, config, dry_run=dry_run),
+            )
+            # Derived *after* apply_platform_runtime_flag_defaults, deliberately.
+            # The fingerprint then reflects the platform flags this hardware
+            # actually gets — which is what a per-configuration autotuner cache
+            # wants, since those tactics are hardware-specific anyway.  It is
+            # stable across relaunches on the same cluster, so hits still land.
+            runtime_cache_mounts = build_runtime_cache_mounts(
+                runtime=runtime,
+                recipe=recipe,
+                settings=_rc_settings,
+                root=_rc_root,
+                image=container_image,
+                # Only probed when the key needs it — see probe_image_identity.
+                image_identity=(
+                    probe_image_identity(container_image, host_list, ssh_kwargs, dry_run=dry_run) if _rc_settings.key_by_image else None
+                ),
+                fingerprint=derive_recipe_fingerprint(recipe, overrides),
+            )
+    except Exception:
+        logger.debug("runtime_cache: resolution failed; launching without it", exc_info=True)
+        runtime_cache_mounts = None
+
+    if runtime_cache_mounts is not None:
+        logger.debug("runtime cache: %s -> /cache/runtime", runtime_cache_mounts.leaf)
+        if not dry_run:
+            # Create + stamp + sweep on the substrate.  Docker would otherwise
+            # materialize a missing -v source as root-owned, and `local` has no
+            # daemon to create it at all.
+            try:
+                executor.ensure_runtime_cache(runtime_cache_mounts, host_list, ssh_kwargs=ssh_kwargs)
+            except Exception:
+                logger.debug("runtime_cache: host preparation failed; continuing", exc_info=True)
+
     # Container env tiers, lowest first:
     #   platform (hardware tuning, e.g. PYTORCH_CUDA_ALLOC_CONF on GB10)
     #   < cluster env_file (e.g. CONTAINER_* imported from a legacy
@@ -1216,7 +1327,6 @@ def launch_inference(
         comm_env=comm_env,
         ib_ip_map=ib_ip_map,
         ib_iface_map=ib_iface_map,
-        skip_keys=skip_keys,
         executor=executor,
         progress=progress,
         extra_docker_opts=extra_docker_opts,
@@ -1224,6 +1334,7 @@ def launch_inference(
         placement=placement,
         backends=backends or None,
         trust=recipe_trusted,
+        runtime_cache=runtime_cache_mounts,
         **run_kwargs,
     )
 

@@ -28,9 +28,10 @@ from sparkrun.utils.shell import args_list_to_shell_str, assert_safe_mount_sourc
 
 if TYPE_CHECKING:
     from sparkrun.containers.entrypoint import EntrypointProbe
-    from sparkrun.core.cluster_status import ClusterStatus
+    from sparkrun.core.cluster_status import ClusterStatus, TerminationInfo
     from sparkrun.core.hardware import HostHardware
     from sparkrun.core.log_source import LogSource
+    from sparkrun.core.runtime_cache import RuntimeCacheMounts
 
 logger = logging.getLogger(__name__)
 
@@ -518,6 +519,32 @@ class DockerExecutor(Executor):
         filter_arg = quote("name=^%s$" % container_name)
         return "[ -n \"$(docker ps --filter %s --format '{{.ID}}')\" ]" % filter_arg
 
+    def exists_cmd(self, container_name: str) -> str:
+        """Exit 0 iff the container is present — **running or exited**.
+
+        Diverges from :meth:`status_cmd` (``docker ps``) because a container
+        that exited without ``--rm`` still occupies its name and must still be
+        removed by teardown.
+        """
+        filter_arg = quote("name=^%s$" % container_name)
+        return "[ -n \"$(docker ps -a --filter %s --format '{{.ID}}')\" ]" % filter_arg
+
+    def teardown_script(self, container_names: list[str] | tuple[str, ...]) -> str:
+        """Remove *container_names* via docker, verifying the daemon answered.
+
+        Overrides the ABC's generic composition because Docker's substrate can
+        be *unavailable* rather than merely empty: a stopped daemon, a
+        permission error or an absent binary makes every ``exists_cmd`` probe
+        report "not present", which the generic verification would read as a
+        successful teardown.  :func:`~sparkrun.orchestration.docker.docker_teardown_script`
+        checks that ``docker ps`` itself succeeded and fails the teardown when
+        it did not.  It also does the census in one call instead of one per
+        candidate name.
+        """
+        from sparkrun.orchestration.docker import docker_teardown_script
+
+        return docker_teardown_script(list(container_names))
+
     def inspect_exists_cmd(self, image: str) -> str:
         """Generate a command to check if a docker image exists locally."""
         return "docker image inspect %s >/dev/null 2>&1" % quote(image)
@@ -605,6 +632,106 @@ class DockerExecutor(Executor):
             errors=errors,
         )
 
+    def describe_terminated(
+        self,
+        sources: "list[LogSource]",
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> "dict[str, TerminationInfo]":
+        """Look for stopped containers behind *sources* via ``docker ps -a``.
+
+        ``query_status`` runs ``docker ps`` (running only), so it structurally
+        cannot distinguish "stopped but still inspectable" from "gone".  This
+        does the ``-a`` pass, batched one script per host through the same
+        parallel SSH fan-out ``query_status`` uses.
+
+        **``--rm`` is the reason this is not just an existence check.**
+        :attr:`~sparkrun.orchestration.executors._base.ExecutorConfig.auto_remove`
+        defaults to ``True``, so the daemon deletes a container the moment it
+        exits: absence is then the *normal* outcome of a crash, not evidence
+        that a workload never ran.  Reporting it as a bare ``exists=False``
+        invites the caller to treat the most interesting failure as stale
+        bookkeeping.  We know our own config, so we say which it was and point
+        at the setting that would have preserved the evidence next time.
+        """
+        from sparkrun.orchestration.ssh import run_remote_scripts_parallel
+
+        if not sources:
+            return {}
+
+        ssh_kwargs = ssh_kwargs or {}
+        by_host: dict[str, list[str]] = {}
+        for source in sources:
+            by_host.setdefault(source.host, []).append(source.container)
+
+        hosts = list(by_host)
+        # One script for every host (the fan-out helper takes a single script),
+        # probing the union of the names.  Attribution stays per-host below, so
+        # a name that legitimately exists on several hosts — Ray worker
+        # containers share one name across nodes — is never cross-reported.
+        script = self._terminated_probe_script(sorted({s.container for s in sources}))
+        try:
+            results = run_remote_scripts_parallel(
+                hosts,
+                script,
+                ssh_user=ssh_kwargs.get("ssh_user"),
+                ssh_key=ssh_kwargs.get("ssh_key"),
+                ssh_options=ssh_kwargs.get("ssh_options"),
+                timeout=ssh_kwargs.get("timeout", 15),
+                quiet=True,
+                allow_local=True,
+            )
+        except Exception:  # noqa: BLE001 — best-effort, exactly like query_status
+            logger.debug("describe_terminated: probe failed", exc_info=True)
+            return {}
+
+        found: dict[tuple[str, str], TerminationInfo] = {}
+        result_by_host = {r.host: r for r in results}
+        for host in hosts:
+            r = result_by_host.get(host)
+            # Any non-zero rc (255 SSH failure, 127 no docker, timeout) is
+            # inconclusive, not "gone" — leave those containers unreported so
+            # the caller keeps the metadata.
+            if r is None or r.returncode != 0:
+                logger.debug("describe_terminated: inconclusive for %r (rc=%s)", host, getattr(r, "returncode", "n/a"))
+                continue
+            states = _parse_terminated_probe(r.stdout)
+            for container in by_host[host]:
+                found[(host, container)] = self._termination_info(container, states.get(container))
+        return found
+
+    def _terminated_probe_script(self, containers: list[str]) -> str:
+        """One ``docker ps -a`` per container, emitting ``<name>\\t<status>``.
+
+        Anchored name filters (``^name$``) so ``foo`` cannot match ``foo_solo``
+        — the same anchoring :meth:`status_cmd` uses.  A container that no
+        longer exists contributes no line at all.
+        """
+        fmt = quote("{{.Names}}\t{{.Status}}")
+        lines = ["docker ps -a --filter %s --format %s 2>/dev/null || true" % (quote("name=^%s$" % c), fmt) for c in containers]
+        return "\n".join(lines) + "\n"
+
+    def _termination_info(self, container: str, status: str | None) -> "TerminationInfo":
+        """Shape one container's ``docker ps -a`` result into a verdict."""
+        from sparkrun.core.cluster_status import TerminationInfo
+
+        if status is not None:
+            return TerminationInfo(
+                exists=True,
+                detail=status,
+                investigate_hints=(
+                    "docker logs %s" % container,
+                    "docker inspect %s" % container,
+                ),
+            )
+        if self.config.auto_remove:
+            return TerminationInfo(
+                exists=False,
+                detail="container auto-removed on exit (executor_config.auto_remove is on, so docker run used --rm)",
+                investigate_hints=("relaunch with `-o auto_remove=false` to keep the container for inspection",),
+            )
+        return TerminationInfo(exists=False, detail="no container by that name exists on the host")
+
     def verify_mount_sources(
         self,
         paths: list[str],
@@ -618,10 +745,39 @@ class DockerExecutor(Executor):
 
         return verify_host_paths(hosts, list(paths), ssh_kwargs)
 
+    def ensure_runtime_cache(
+        self,
+        mounts: "RuntimeCacheMounts",
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> None:
+        """Docker bind-mounts the cache from the host FS, so create/stamp/sweep it
+        there (shared host-substrate impl)."""
+        from sparkrun.orchestration.runtime_cache import ensure_runtime_cache_on_hosts
+
+        ensure_runtime_cache_on_hosts(mounts, hosts, ssh_kwargs)
+
 
 # --------------------------------------------------------------------------
 # query_status helpers (module-level so they're unit-testable)
 # --------------------------------------------------------------------------
+
+
+def _parse_terminated_probe(stdout: str) -> dict[str, str]:
+    """Parse ``<name>\\t<status>`` lines from the ``docker ps -a`` probe.
+
+    A container that no longer exists contributes no line, so absence from the
+    returned mapping is what "gone" looks like.
+    """
+    states: dict[str, str] = {}
+    for line in (stdout or "").splitlines():
+        name, sep, status = line.partition("\t")
+        name = name.strip()
+        if not name or not sep:
+            continue
+        states[name] = status.strip()
+    return states
 
 
 def _parse_docker_labels(raw: str) -> dict[str, str]:

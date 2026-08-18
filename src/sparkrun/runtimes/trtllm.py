@@ -320,6 +320,43 @@ class TrtllmRuntime(RuntimePlugin):
         """Return ulimit flags required by TRT-LLM."""
         return list(_TRTLLM_EXTRA_DOCKER_OPTS)
 
+    def runtime_cache_paths(self, *, fingerprint: str = "") -> dict:
+        """Persist the TRT-LLM autotuner output plus the torch-path JIT caches.
+
+        The autotuner is the reason issue #256 exists: without
+        ``TLLM_AUTOTUNER_CACHE_PATH`` the MoE tactic profiling is redone on
+        every launch, minutes at a time on a large model.
+
+        It is also the one cache in the codebase that cannot key itself.  The
+        file records the TRT-LLM version and GPU but validates neither on load,
+        and holds tactics for exactly one model/parallelism/dtype — so the
+        recipe fingerprint goes in the *filename*, independent of whatever the
+        directory key happens to be.  ``key_by_image`` (see
+        :meth:`runtime_cache_defaults`) handles the version axis; this handles
+        the configuration axis.
+        """
+        from sparkrun.core.runtime_cache import CachePath
+
+        paths = {
+            "TORCHINDUCTOR_CACHE_DIR": CachePath("inductor"),
+            "TRITON_CACHE_DIR": CachePath("triton"),
+        }
+        if fingerprint:
+            paths["TLLM_AUTOTUNER_CACHE_PATH"] = CachePath("autotune/%s.cache" % fingerprint, file=True)
+        return paths
+
+    def runtime_cache_defaults(self) -> dict[str, object]:
+        """Opt TRT-LLM into image-keyed cache directories.
+
+        The global default is off because the content-addressed caches that
+        dominate (inductor / Triton / FlashInfer) do not need it.  TRT-LLM's
+        autotuner does: it happily loads a file written by a different
+        container image, which is precisely the staleness the issue reporter
+        observed.  Declaring it here rather than in each recipe means every
+        TRT-LLM recipe — including ones users write — is safe by default.
+        """
+        return {"key_by_image": True}
+
     def get_extra_volumes(self) -> dict[str, str]:
         """Mount SSH keys for mpirun inter-node communication."""
         ssh_dir = Path.home() / ".ssh"
@@ -463,6 +500,7 @@ class TrtllmRuntime(RuntimePlugin):
         cluster = kwargs.pop("cluster", None)
         backends = kwargs.pop("backends", None)
         placement = kwargs.pop("placement", None)
+        runtime_cache = kwargs.pop("runtime_cache", None)
 
         ctx = ClusterContext.build(
             self,
@@ -476,6 +514,7 @@ class TrtllmRuntime(RuntimePlugin):
             cluster=cluster,
             recipe=recipe,
             placement=placement,
+            runtime_cache=runtime_cache,
         )
         extra_docker_opts = self.get_extra_docker_opts()
 

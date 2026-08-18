@@ -31,6 +31,18 @@ logger = logging.getLogger(__name__)
 _TRAILING_SPACE_CONTINUATION_RE = re.compile(r"\\ +\n")
 
 _RAY_BACKEND_RE = re.compile(r"--distributed-executor-backend\s+ray\b")
+# --kv-cache-dtype (vllm/sglang/atlas: --kv-cache-dtype) or tokenary (--kvcache-dtype),
+# space- or =-separated. Captured so a recipe that sets the flag only inside the
+# free-form command: template is still picked up by the VRAM estimator (issue #248).
+_KV_CACHE_DTYPE_FLAG_RE = re.compile(r"--kv-?cache-dtype[=\s]+(\S+)", re.IGNORECASE)
+# The name a workload is *served under*, spelled differently per runtime:
+# vllm / sglang / modular-max use --served-model-name, atlas --model-name,
+# llama.cpp --alias.  (llama.cpp's short "-a" is deliberately excluded: a bare
+# short flag is too easy to collide with another tool's option.)  Captured so a
+# recipe that sets the name only inside the free-form command: template is still
+# visible to the benchmark, the proxy and the container labels — see
+# :func:`extract_served_model_name_from_command`.
+_SERVED_MODEL_NAME_FLAG_RE = re.compile(r"--(?:served-model-name|model-name|alias)[=\s]+(\S+)", re.IGNORECASE)
 _CMD_VLLM_RE = re.compile(r"^vllm\s+serve\b")
 _CMD_SGLANG_RE = re.compile(r"^(?:sglang\s+serve|python3?\s+-m\s+sglang\.launch_server)\b")
 _CMD_LLAMA_CPP_RE = re.compile(r"^llama-server\b")
@@ -70,6 +82,7 @@ _KNOWN_KEYS = {
     "distribution_config",
     "layout",
     "cluster_config",
+    "runtime_cache",
 }
 
 
@@ -308,6 +321,87 @@ def _sort_dict_by_patterns(data: dict[str, Any], patterns: list[str]) -> dict[st
         ordered[k] = data[k]
 
     return ordered
+
+
+def extract_kv_cache_dtype_from_command(command: str | None) -> str | None:
+    """Extract a ``--kv-cache-dtype`` value from a free-form command template.
+
+    Recipes sometimes set the KV cache dtype only inside ``command:`` rather
+    than in ``defaults.kv_cache_dtype`` or ``metadata.kv_dtype``.  Without
+    parsing it, the VRAM estimator silently falls back to ``bfloat16`` and
+    (for MLA models using ``fp8_ds_mla`` / ``nvfp4_ds_mla``) sizes the KV cache
+    with the wrong formula — a ~10x over-estimate (issue #248).
+
+    Returns the first match's value (``"auto"`` treated as absent), or ``None``.
+    """
+    if not command:
+        return None
+    m = _KV_CACHE_DTYPE_FLAG_RE.search(command)
+    if not m:
+        return None
+    value = m.group(1)
+    if value.lower() in ("auto", ""):
+        return None
+    return value
+
+
+def extract_served_model_name_from_command(command: str | None) -> str | None:
+    """Extract the served-model name from a free-form command template.
+
+    The supported spelling is ``defaults.served_model_name`` — every runtime
+    reconciles that into the rendered command via
+    ``RuntimePlugin._augment_served_model_name``.  A recipe that instead writes
+    ``--served-model-name <name>`` straight into ``command:`` bypasses that
+    machinery, and the name becomes invisible to the config chain — so the
+    benchmark asks the endpoint for the *model id*, which the server does not
+    answer to, and every task fails with ``404 ... does not exist`` (issue #257).
+    The proxy and the container labels have the same blind spot.
+
+    Two guards on the captured value:
+
+    * A ``{placeholder}`` is rejected — an unrendered template means the value
+      really does live in the config chain, which resolves it properly; the
+      literal ``{served_model_name}`` would be worse than no answer.
+    * vLLM accepts several names after the flag (``--served-model-name a b c``)
+      and reports the first as the canonical id, so only the first is taken.
+
+    Returns the name, or ``None`` when the flag is absent or unusable.
+
+    This is deliberately a *last resort*, never a replacement for the config
+    chain: callers consult their own resolved value first.
+
+    Non-string input yields ``None`` rather than raising: callers reach this
+    via ``getattr(recipe, "command", None)`` on objects that only duck-type as
+    recipes, and this sits on the launch path's best-effort metadata write,
+    where a ``TypeError`` would fail a launch that was otherwise fine.
+    """
+    if not command or not isinstance(command, str):
+        return None
+    m = _SERVED_MODEL_NAME_FLAG_RE.search(command)
+    if not m:
+        return None
+    value = m.group(1).strip("\"'")
+    if not value or "{" in value or "}" in value:
+        return None
+    return value
+
+
+def resolve_served_model_name(recipe: "Recipe", declared: Any = None) -> str:
+    """The name a workload is actually served under: *declared* → command → model.
+
+    The single resolution order shared by every consumer that needs the served
+    name for *display or routing* (benchmark target, proxy discovery, container
+    labels).  ``declared`` is the caller's own already-resolved value — a config
+    chain lookup, a CLI override, a ``defaults`` read — and always wins.
+
+    Note the deliberate non-consumer: :func:`~sparkrun.orchestration.job_metadata.generate_intent_id`
+    still hashes only the *declared* name.  Widening it would change the intent
+    id of every recipe that hardcodes the flag, orphaning workloads already
+    running under the old id from ``stop`` / ``logs`` / ``--ensure``.
+    """
+    if declared is not None and str(declared):
+        return str(declared)
+    return extract_served_model_name_from_command(recipe.command) or recipe.model
 
 
 def _resolve_runtime_from_command_hint(recipe: Recipe) -> None:
@@ -953,6 +1047,13 @@ class Recipe:
         # Internal, undocumented launch overrides (see :class:`LaunchOverrides`).
         self.cluster_config: LaunchOverrides | None = LaunchOverrides.from_dict(data.get("cluster_config"))
 
+        # Compilation/autotune cache knobs — highest layer of the chain in
+        # :func:`sparkrun.core.runtime_cache.resolve_runtime_cache_settings`.
+        raw_rt_cache = data.get("runtime_cache")
+        if isinstance(raw_rt_cache, bool):
+            raw_rt_cache = {"enabled": raw_rt_cache}
+        self.runtime_cache: dict[str, Any] = dict(raw_rt_cache) if isinstance(raw_rt_cache, dict) else {}
+
         # Applied overrides (populated by resolve())
         self._applied_overrides: dict[str, Any] = {}
 
@@ -1025,13 +1126,18 @@ class Recipe:
 
     @property
     def effective_served_model_name(self) -> str:
-        """Resolved served-model name: CLI override → recipe default → model id.
+        """Resolved served-model name: CLI override → recipe default → ``command:`` → model id.
 
         Mirrors the runtime serve-argument resolution (``--served-model-name``
         falls back to the model id when unset) so observers can read the name a
         workload is actually served under off the container labels.
+
+        The ``command:`` step is the last resort described in
+        :func:`resolve_served_model_name`: without it, a recipe that hardcodes
+        the flag in its command template labels its containers with the model id
+        while the server answers only to the hardcoded name.
         """
-        return self._effective_default("served_model_name") or self.model
+        return resolve_served_model_name(self, self._effective_default("served_model_name"))
 
     def build_config_chain(self, cli_overrides: dict[str, Any] | None = None, user_config: dict[str, Any] | None = None) -> Variables:
         """Build cascading config: CLI overrides -> user config -> recipe defaults.
@@ -1114,6 +1220,7 @@ class Recipe:
 
         # Validate metadata if present
         if self.metadata:
+            from sparkrun.models.kv import arch_fields, is_valid_kv_dtype
             from sparkrun.models.vram import parse_param_count, bytes_per_element
 
             mp = self.metadata.get("model_params")
@@ -1123,8 +1230,23 @@ class Recipe:
             if md is not None and bytes_per_element(str(md)) is None:
                 issues.append("metadata.model_dtype %r is not a recognized dtype" % md)
             kd = self.metadata.get("kv_dtype")
-            if kd is not None and bytes_per_element(str(kd)) is None:
+            # Accepts either a per-element dtype or a packed slot layout a KV
+            # strategy claims (nvfp4_ds_mla, ...), which is why this asks the
+            # registry rather than enumerating architectures here.
+            if kd is not None and not is_valid_kv_dtype(str(kd)):
                 issues.append("metadata.kv_dtype %r is not a recognized dtype" % kd)
+            # Architecture fields declared by the KV strategies. These are
+            # documented as user-overridable and are coerced in estimate_vram, so
+            # an unchecked bad value surfaces as a traceback from `recipe show
+            # --json` — or, on the launch path, as a debug-level log and a
+            # silently dropped memory claim, which skips the fit check.
+            for _field in arch_fields():
+                _issue = _field.validate(self.metadata.get(_field.name))
+                if _issue:
+                    issues.append(_issue)
+            mt = self.metadata.get("model_type")
+            if mt is not None and not isinstance(mt, str):
+                issues.append("metadata.model_type %r must be a string" % mt)
             mq = self.metadata.get("quantization")
             if mq is not None:
                 _KNOWN_QUANT_METHODS = {
@@ -1200,6 +1322,7 @@ class Recipe:
         Returns:
             VRAMEstimate dataclass with estimation results.
         """
+        from sparkrun.models.kv import arch_fields, is_kv_layout
         from sparkrun.models.vram import (
             bytes_per_element,
             estimate_vram as _estimate_vram,
@@ -1224,63 +1347,110 @@ class Recipe:
         model_dtype = normalize_dtype(str(_raw_dtype)) if _raw_dtype else None
         model_params_raw = self.metadata.get("model_params")
         _raw_kv = self.metadata.get("kv_dtype")
-        kv_dtype = normalize_dtype(str(_raw_kv)) if _raw_kv else None
+        # An explicit CLI kv_cache_dtype override always wins over a metadata
+        # value, which may be an auto-write from a previous estimate on this
+        # object.  Without this, a value frozen into metadata on call one
+        # shadows a different override passed on call two — a frozen MLA slot
+        # layout vs generic KV dtype is a ~10x switch.
+        _cli_kv = (cli_overrides or {}).get("kv_cache_dtype")
+        if _cli_kv and str(_cli_kv) not in ("auto", ""):
+            kv_dtype = str(_cli_kv)
+        else:
+            kv_dtype = normalize_dtype(str(_raw_kv)) if _raw_kv else None
         num_layers = self.metadata.get("num_layers")
         num_kv_heads = self.metadata.get("num_kv_heads")
         head_dim = self.metadata.get("head_dim")
         model_vram = self.metadata.get("model_vram")
         kv_vram_per_token = self.metadata.get("kv_vram_per_token")
+        model_type = self.metadata.get("model_type")
+        # Architecture fields declared by the KV strategies — auto-detected
+        # below, overridable in metadata.  Read as a sweep over the declaration
+        # rather than a hand-written list, so a new architecture's fields reach
+        # the estimator (and the write-back at the bottom) without an edit here.
+        arch_extra: dict[str, Any] = {f.name: self.metadata.get(f.name) for f in arch_fields()}
         quant_info: QuantizationInfo | None = None
         _storage_dtype: str | None = None  # raw torch_dtype before quant override
         effective_recipe_quant: str | None = None  # recipe-level quantization override
 
-        # Auto-detect from HF if fields are missing and model is specified
-        if auto_detect and self.model:
-            needs_detection = (model_vram is None and (not model_dtype or model_params_raw is None)) or (
-                kv_vram_per_token is None and (not num_layers or not num_kv_heads or not head_dim)
+        # Auto-detect from HF if fields are missing and model is specified.
+        needs_detection = (model_vram is None and (not model_dtype or model_params_raw is None)) or (
+            kv_vram_per_token is None and (not num_layers or not num_kv_heads or not head_dim)
+        )
+        # Even with kv_vram_per_token pinned we must still learn which KV
+        # architecture the model uses.  The override replaces the KV *sizing*
+        # (the user supplies the exact bytes-per-token), but the *sharding rule*
+        # only depends on the architecture: an MLA latent is replicated across TP
+        # ranks (divided by PP only), an ordinary KV cache shards by TP*PP.
+        # Defaulting to the ordinary rule silently TP-divides the override of a
+        # DeepSeek model, which under-claims memory and lets the scheduler
+        # over-commit a placement.  This cannot be short-circuited by pinned
+        # architecture: pinning num_layers/num_kv_heads/head_dim is exactly how
+        # a user suppresses detection, and they may not have pinned the
+        # architecture markers while delegating KV sizing.  Detection is cheap
+        # and write-back stops it recurring, so always run it here.
+        #
+        # The three signals that identify an architecture without HF are asked
+        # for generically — a pinned marker any strategy declared, a packed KV
+        # layout any strategy claims, or a model_type (which this method writes
+        # back unconditionally, so its presence means detection already ran).
+        # Note this must not ask *which* strategy applies: dense is the answer
+        # for most models and is never a positive identification, so gating on
+        # it would refetch on every call forever.
+        needs_detection = needs_detection or (
+            kv_vram_per_token is not None and not model_type and not any(arch_extra.values()) and not is_kv_layout(str(kv_dtype or ""))
+        )
+        if auto_detect and self.model and needs_detection:
+            hf_config = fetch_model_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
+            hf_quant_config = fetch_hf_quant_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
+
+            # Resolve quantization from all sources (works even without hf_config for GGUF)
+            recipe_quant_meta = self.metadata.get("quantization")
+            recipe_quant_default = config.get("quantization")
+            effective_recipe_quant = recipe_quant_meta or (str(recipe_quant_default) if recipe_quant_default else None)
+            quant_info = resolve_quantization(
+                hf_config=hf_config,
+                hf_quant_config=hf_quant_config,
+                recipe_quant=effective_recipe_quant,
+                model_id=self.model,
             )
-            if needs_detection:
-                hf_config = fetch_model_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
-                hf_quant_config = fetch_hf_quant_config(self.model, revision=self.model_revision, cache_dir=cache_dir)
 
-                # Resolve quantization from all sources (works even without hf_config for GGUF)
-                recipe_quant_meta = self.metadata.get("quantization")
-                recipe_quant_default = config.get("quantization")
-                effective_recipe_quant = recipe_quant_meta or (str(recipe_quant_default) if recipe_quant_default else None)
-                quant_info = resolve_quantization(
-                    hf_config=hf_config,
-                    hf_quant_config=hf_quant_config,
-                    recipe_quant=effective_recipe_quant,
-                    model_id=self.model,
-                )
+            if hf_config:
+                hf_info = extract_model_info(hf_config)
 
-                if hf_config:
-                    hf_info = extract_model_info(hf_config)
+                # use quant_config to capture on disk storage as quantized if it exists
+                # but otherwise fall back to the model dtype
+                _storage_dtype = hf_info.get("quant_dtype") or hf_info.get("model_dtype")
 
-                    # use quant_config to capture on disk storage as quantized if it exists
-                    # but otherwise fall back to the model dtype
-                    _storage_dtype = hf_info.get("quant_dtype") or hf_info.get("model_dtype")
-
-                    # Fill in missing fields (metadata takes precedence)
-                    if not model_dtype:
-                        if quant_info:
-                            model_dtype = quant_info.weight_dtype
-                        else:
-                            model_dtype = _storage_dtype
-                    if not num_layers:
-                        num_layers = hf_info.get("num_layers")
-                    if not num_kv_heads:
-                        num_kv_heads = hf_info.get("num_kv_heads")
-                    if not head_dim:
-                        head_dim = hf_info.get("head_dim")
-
-                    # Use kv_cache_quant from hf_quant_config to inform kv_dtype
-                    if not kv_dtype and quant_info and quant_info.kv_cache_quant:
-                        kv_dtype = quant_info.kv_cache_quant
-                else:
-                    # No HF config (e.g. GGUF models) — still use quant_info if available
-                    if not model_dtype and quant_info:
+                # Fill in missing fields (metadata takes precedence)
+                if not model_dtype:
+                    if quant_info:
                         model_dtype = quant_info.weight_dtype
+                    else:
+                        model_dtype = _storage_dtype
+                if not num_layers:
+                    num_layers = hf_info.get("num_layers")
+                if not num_kv_heads:
+                    num_kv_heads = hf_info.get("num_kv_heads")
+                if not head_dim:
+                    head_dim = hf_info.get("head_dim")
+
+                # Architecture markers (MLA's compressed-latent dims, and
+                # whatever a future strategy declares).  extract_model_info
+                # returns them under the same names the strategies declare, so
+                # the fill-in is a sweep, not a per-field list.
+                for _name, _value in arch_extra.items():
+                    if not _value:
+                        arch_extra[_name] = hf_info.get(_name)
+                if not model_type:
+                    model_type = hf_info.get("model_type")
+
+                # Use kv_cache_quant from hf_quant_config to inform kv_dtype
+                if not kv_dtype and quant_info and quant_info.kv_cache_quant:
+                    kv_dtype = quant_info.kv_cache_quant
+            else:
+                # No HF config (e.g. GGUF models) — still use quant_info if available
+                if not model_dtype and quant_info:
+                    model_dtype = quant_info.weight_dtype
 
         # Parse model_params
         model_params = parse_param_count(model_params_raw) if model_params_raw is not None else None
@@ -1340,11 +1510,24 @@ class Recipe:
         pp_val = config.get("pipeline_parallel")
         pipeline_parallel = int(pp_val) if pp_val is not None else 1
 
-        # Check for kv_cache_dtype in defaults (runtime-specific)
+        # Check for kv_cache_dtype in defaults (runtime-specific).
         if not kv_dtype:
             kv_cache_default = config.get("kv_cache_dtype")
             if kv_cache_default and str(kv_cache_default) != "auto":
                 kv_dtype = str(kv_cache_default)
+
+        # Last resort: parse --kv-cache-dtype out of the free-form command
+        # template.  Recipes that set the flag only in command: (rather than
+        # in defaults) would otherwise silently fall back to bfloat16 — for
+        # MLA models using fp8_ds_mla / nvfp4_ds_mla that's a ~10x KV-cache
+        # over-estimate (issue #248).  Warn so the user knows the estimate
+        # depends on a command-template parse and is encouraged to pin the
+        # value in defaults/metadata instead.
+        _kv_from_command: str | None = None
+        if not kv_dtype:
+            _kv_from_command = extract_kv_cache_dtype_from_command(self.command)
+            if _kv_from_command:
+                kv_dtype = _kv_from_command
 
         # GPU memory utilization (runtime budget fraction)
         gpu_mem_val = config.get("gpu_memory_utilization")
@@ -1364,10 +1547,25 @@ class Recipe:
             kv_vram_per_token=float(kv_vram_per_token) if kv_vram_per_token is not None else None,
             gpu_memory_utilization=gpu_memory_utilization,
             total_gpu_memory_gb=total_gpu_memory_gb,
+            model_type=str(model_type) if model_type else None,
+            arch={f.name: f.coerce(arch_extra[f.name]) for f in arch_fields() if arch_extra.get(f.name)},
         )
+        if _kv_from_command:
+            result.warnings.append(
+                "kv_cache_dtype %r inferred from command: template; pin it in "
+                "defaults.kv_cache_dtype or metadata.kv_dtype for a stable estimate" % _kv_from_command
+            )
 
         # Write back auto-detected values so downstream consumers
         # (e.g. benchmark result export) can use them without re-fetching.
+        #
+        # This must stay complete: the written-back architecture fields satisfy
+        # ``needs_detection`` above, so anything omitted here is lost on the
+        # second call.  A single ``sparkrun run`` estimates three times on one
+        # Recipe (host resolution, the displayed banner, then the scheduling
+        # pass inside ``api.run``), and the last one feeds the placement's
+        # ``ResourceRequest`` — so a partial write-back silently reverts the
+        # estimate on the path that decides where ranks land.
         if model_dtype:
             self.metadata["model_dtype"] = normalize_dtype(str(model_dtype))
         if num_layers is not None and "num_layers" not in self.metadata:
@@ -1382,8 +1580,24 @@ class Recipe:
             self.metadata["quantization"] = quant_info.method
         if quant_info and quant_info.bits and "quant_bits" not in self.metadata:
             self.metadata["quant_bits"] = quant_info.bits
-        if kv_dtype:
+        # Persist the resolved dtype so benchmark export and telemetry (which
+        # read only metadata) record the KV cache configuration that actually
+        # ran.  The read side now prefers a fresh cli override over this
+        # metadata value, so persisting it cannot shadow a later override the
+        # way it did before.
+        if kv_dtype and "kv_dtype" not in self.metadata:
             self.metadata["kv_dtype"] = normalize_dtype(str(kv_dtype))
+        if model_type and "model_type" not in self.metadata:
+            self.metadata["model_type"] = str(model_type)
+        # Architecture markers.  A model whose architecture declares none of
+        # them leaves these unset on every call, which re-derives the same
+        # (correct) verdict.  Sweeping the declaration is what makes the
+        # completeness requirement above structural rather than a convention:
+        # a field cannot be read at the top and forgotten here.
+        for _field in arch_fields():
+            _value = arch_extra.get(_field.name)
+            if _value and _field.name not in self.metadata:
+                self.metadata[_field.name] = _field.coerce(_value)
 
         return result
 
@@ -1437,6 +1651,7 @@ class Recipe:
             "distribution_config": dataclass_asdict(self.distribution_config),
             "layout": self.layout.to_dict() if self.layout else None,
             "cluster_config": self.cluster_config.to_dict() if self.cluster_config else None,
+            "runtime_cache": dict(self.runtime_cache),
             "_applied_overrides": dict(self._applied_overrides),
             "_raw": dict(self._raw),
         }
@@ -1482,6 +1697,7 @@ class Recipe:
         layout_state = state.get("layout")
         self.layout = RecipeLayout.from_dict(layout_state) if isinstance(layout_state, dict) else None
         self.cluster_config = LaunchOverrides.from_dict(state.get("cluster_config"))
+        self.runtime_cache = dict(state.get("runtime_cache") or {})
 
     @classmethod
     def _deserialize(cls, data: dict[str, Any]) -> Recipe:
@@ -1589,6 +1805,10 @@ class Recipe:
             cc_dict = self.cluster_config.to_dict()
             if cc_dict:
                 d["cluster_config"] = cc_dict
+
+        # -- Runtime (compilation/autotune) cache knobs --
+        if self.runtime_cache:
+            d["runtime_cache"] = dict(self.runtime_cache)
 
         # -- Metadata (absorb promoted keys) --
         d["metadata"] = meta = dict(self.metadata)

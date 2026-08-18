@@ -158,7 +158,7 @@ def test_arena_benchmark_run_uses_same_arena_flow_helpers():
         patch("sparkrun.cli._arena_flow.preflight_arena", side_effect=_fake_preflight),
         patch("sparkrun.cli._arena_flow.finalize_arena", side_effect=_fake_finalize),
     ):
-        runner.invoke(arena_benchmark, ["run", "my-recipe", "--local-test"], catch_exceptions=False)
+        runner.invoke(arena_benchmark, ["run", "my-recipe", "--local-test", "--hosts", "h1"], catch_exceptions=False)
 
     assert order == ["preflight", "run_benchmark", "finalize"]
 
@@ -182,7 +182,7 @@ def test_arena_benchmark_run_threads_dry_run_to_benchmark():
     ):
         runner.invoke(
             arena_benchmark,
-            ["my-recipe", "--local-test", "--dry-run", "--tp", "2"],
+            ["my-recipe", "--local-test", "--dry-run", "--tp", "2", "--hosts", "h1"],
             catch_exceptions=False,
         )
 
@@ -215,7 +215,7 @@ def test_arena_benchmark_run_no_finalize_on_failure():
         patch("sparkrun.cli._arena_flow.preflight_arena", return_value=("s", None)),
         patch("sparkrun.cli._arena_flow.finalize_arena", side_effect=_fake_finalize),
     ):
-        runner.invoke(arena_benchmark, ["run", "my-recipe", "--local-test"], catch_exceptions=False)
+        runner.invoke(arena_benchmark, ["run", "my-recipe", "--local-test", "--hosts", "h1"], catch_exceptions=False)
 
     assert not finalize_called
 

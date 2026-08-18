@@ -23,6 +23,8 @@ from unittest.mock import patch
 import pytest
 
 import sparkrun.api as api
+from sparkrun.orchestration.executors.docker import DockerExecutor
+from sparkrun.orchestration.ssh import RemoteResult
 
 
 # --------------------------------------------------------------------------
@@ -327,6 +329,239 @@ def test_logs_rejects_unknown_scope(tmp_path):
 def test_logs_requires_cluster_id_or_recipe():
     with pytest.raises(api.SparkrunError):
         api.logs()
+
+
+def _make_status(host_workloads, errors=None):
+    """Build a ClusterStatus for precheck tests.
+
+    ``host_workloads`` maps host → list of (cluster_id, container_names).
+    A host with no entry is unreachable (goes into ``errors``).
+    """
+    from sparkrun.core.cluster_status import ClusterStatus, ContainerDetail, HostOccupancy, RunningWorkload
+
+    hosts = []
+    for host, workloads in host_workloads.items():
+        ws = []
+        for cid, container_names in workloads:
+            containers = tuple(ContainerDetail(name=n, role="solo", status="Up", image="img") for n in container_names)
+            ws.append(RunningWorkload(cluster_id=cid, containers=containers))
+        hosts.append(HostOccupancy(host=host, workloads=tuple(ws)))
+    return ClusterStatus(hosts=tuple(hosts), executor="docker", errors=dict(errors or {}))
+
+
+def test_logs_stopped_container_preserves_metadata(tmp_path):
+    """Container stopped but still exists → JobNotFound + metadata preserved.
+
+    ``query_status`` reports only running workloads, so the precheck asks
+    ``executor.describe_terminated`` what became of this one.  The container is
+    still on the host, so metadata is kept and the executor's own investigation
+    hints are rendered.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata, load_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cluster_id, recipe, ["h1"], cache_dir=str(tmp_path))
+
+    # query_status → host reachable, no workloads (container not running)
+    # describe_terminated probe → docker ps -a lists it, still stopped on the host
+    empty_snapshot = _make_status({"h1": []})
+    probe = [RemoteResult(host="h1", returncode=0, stdout="%s_solo\tExited (1) 2 minutes ago\n" % cluster_id, stderr="")]
+    with (
+        patch.object(DockerExecutor, "query_status", return_value=empty_snapshot),
+        patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=probe),
+    ):
+        with pytest.raises(api.JobNotFound) as exc:
+            api.logs(cluster_id, hosts=("h1",), cache_dir=str(tmp_path), tail=10)
+
+    msg = str(exc.value)
+    assert "not currently running" in msg
+    assert cluster_id in msg
+    assert "Exited (1) 2 minutes ago" in msg
+    # Hints come from the executor, not from this module.
+    assert "docker logs" in msg
+    assert "docker inspect" in msg
+    assert "sparkrun stop" in msg
+    # Metadata is preserved for investigation.
+    assert load_job_metadata(cluster_id, cache_dir=str(tmp_path)) is not None
+
+
+def test_logs_removed_container_cleans_metadata(tmp_path):
+    """Container fully gone (auto-removed) → JobNotFound + metadata removed.
+
+    When the executor confirms nothing remains, the metadata is stale and is
+    removed so ``logs <TAB>`` stops suggesting the dead workload.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata, load_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cluster_id, recipe, ["h1"], cache_dir=str(tmp_path))
+
+    # query_status → host reachable, no workloads (container not running)
+    # describe_terminated probe → docker ps -a lists nothing (container gone)
+    empty_snapshot = _make_status({"h1": []})
+    gone = [RemoteResult(host="h1", returncode=0, stdout="", stderr="")]
+    with (
+        patch.object(DockerExecutor, "query_status", return_value=empty_snapshot),
+        patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=gone),
+    ):
+        with pytest.raises(api.JobNotFound) as exc:
+            api.logs(cluster_id, hosts=("h1",), cache_dir=str(tmp_path), tail=10)
+
+    msg = str(exc.value)
+    assert "nothing remains to read" in msg
+    assert cluster_id in msg
+    assert "stale job metadata has been removed" in msg
+    # auto_remove defaults on, so absence is `--rm` doing its job rather than a
+    # workload that never ran — say which, and how to keep it next time.
+    assert "auto-removed on exit" in msg
+    assert "auto_remove=false" in msg
+    # Metadata was cleaned up.
+    assert load_job_metadata(cluster_id, cache_dir=str(tmp_path)) is None
+
+
+def test_logs_precheck_worker_alive_when_head_dead(tmp_path):
+    """Head dead but workers alive → helpful error pointing to --all-sources.
+
+    In a multi-node job the head may crash while workers are still alive.
+    The precheck detects this via the status snapshot (head host has no
+    matching workload, worker host does) and raises a JobNotFound with a
+    pointer to ``--all-sources`` rather than letting the reader fail on
+    the dead head container with a raw docker error.  Metadata is preserved.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata, load_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cluster_id, recipe, ["h1", "h2"], cache_dir=str(tmp_path))
+
+    # h1: reachable but no workloads (head dead)
+    # h2: has the worker container running
+    snapshot = _make_status(
+        {
+            "h1": [],
+            "h2": [(cluster_id, [cluster_id + "_node_1"])],
+        }
+    )
+    with patch.object(DockerExecutor, "query_status", return_value=snapshot):
+        with pytest.raises(api.JobNotFound) as exc:
+            api.logs(cluster_id, hosts=("h1", "h2"), cache_dir=str(tmp_path), tail=10)
+
+    msg = str(exc.value)
+    assert "partially running" in msg
+    assert "h2" in msg
+    assert "--all-sources" in msg
+    # Metadata is preserved.
+    assert load_job_metadata(cluster_id, cache_dir=str(tmp_path)) is not None
+
+
+def test_logs_precheck_all_sources_proceeds_when_head_dead(tmp_path):
+    """With --all-sources, head dead + worker alive → proceed (don't raise).
+
+    When the user passes ``--all-sources`` (scope=SCOPE_ALL), the reader
+    can read from the surviving workers, so the precheck should let it
+    through rather than raising the "partially running" error.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cluster_id, recipe, ["h1", "h2"], cache_dir=str(tmp_path))
+
+    # h1: reachable but no workloads (head dead)
+    # h2: has the worker container running
+    snapshot = _make_status(
+        {
+            "h1": [],
+            "h2": [(cluster_id, [cluster_id + "_node_1"])],
+        }
+    )
+    with patch.object(DockerExecutor, "query_status", return_value=snapshot):
+        gen = api.logs(cluster_id, hosts=("h1", "h2"), cache_dir=str(tmp_path), tail=10, scope="all")
+        # With --all-sources, worker is alive → proceed (no JobNotFound).
+        assert isinstance(gen, Iterator)
+
+
+def test_logs_skips_precheck_on_ssh_failure(tmp_path):
+    """Host unreachable (in ClusterStatus.errors) → precheck skipped.
+
+    When ``query_status`` can't reach a host, it records it in
+    ``ClusterStatus.errors`` and omits it from ``hosts``.  The precheck
+    treats this as inconclusive (``for_host()`` returns ``None``) and
+    skips, letting the log reader surface its own error.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cluster_id, recipe, ["h1"], cache_dir=str(tmp_path))
+
+    # query_status → h1 unreachable (in errors, absent from hosts)
+    snapshot = _make_status({}, errors={"h1": "unreachable"})
+    with patch.object(DockerExecutor, "query_status", return_value=snapshot):
+        gen = api.logs(cluster_id, hosts=("h1",), cache_dir=str(tmp_path), tail=10)
+        # Precheck skipped → returns a lazy iterator (no JobNotFound raised).
+        assert isinstance(gen, Iterator)
+
+
+def test_logs_precheck_skips_on_query_exception(tmp_path):
+    """If executor.query_status raises, precheck is skipped (best-effort).
+
+    The precheck must never crash — a broken query_status should let the
+    log reader surface its own error rather than preempting with a
+    misleading 'not running' message.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cluster_id, recipe, ["h1"], cache_dir=str(tmp_path))
+
+    with patch.object(DockerExecutor, "query_status", side_effect=RuntimeError("internal error")):
+        gen = api.logs(cluster_id, hosts=("h1",), cache_dir=str(tmp_path), tail=10)
+        assert isinstance(gen, Iterator)
+
+
+def test_logs_precheck_exists_cmd_failure_preserves_metadata(tmp_path):
+    """An inconclusive ``describe_terminated`` probe → preserve metadata.
+
+    After the status snapshot shows nothing running, the precheck asks the
+    executor what became of the workload.  When that probe cannot answer (SSH
+    failure rc=255, no container engine rc=127, timeout), the executor reports
+    nothing for that source — and "cannot tell" must never be read as
+    "confirmed gone", because that is the verdict that deletes metadata.
+    """
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata, load_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+    cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cluster_id, recipe, ["h1"], cache_dir=str(tmp_path))
+
+    # query_status → host reachable, no workloads (container not running)
+    # describe_terminated probe → rc=255 (SSH failure), so no verdict at all
+    empty_snapshot = _make_status({"h1": []})
+    ssh_fail_followup = [RemoteResult(host="h1", returncode=255, stdout="", stderr="ssh: connection refused")]
+    with (
+        patch.object(DockerExecutor, "query_status", return_value=empty_snapshot),
+        patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=ssh_fail_followup),
+    ):
+        with pytest.raises(api.JobNotFound) as exc:
+            api.logs(cluster_id, hosts=("h1",), cache_dir=str(tmp_path), tail=10)
+
+    msg = str(exc.value)
+    # Inconclusive must not read as "gone" — that verdict deletes metadata.
+    assert "not currently running" in msg
+    assert "nothing remains to read" not in msg
+    # Metadata preserved.
+    assert load_job_metadata(cluster_id, cache_dir=str(tmp_path)) is not None
 
 
 # --------------------------------------------------------------------------
