@@ -29,7 +29,7 @@ def test_sglang_resolve_container():
 
 
 def test_sglang_generate_command_structured():
-    """Generates python3 -m sglang.launch_server with --tp-size, etc."""
+    """Generates `sglang serve` with --tp-size, etc."""
     recipe_data = {
         "name": "test-recipe",
         "model": "meta-llama/Llama-2-7b-hf",
@@ -43,10 +43,77 @@ def test_sglang_generate_command_structured():
     runtime = SglangRuntime()
 
     cmd = runtime.generate_command(recipe, {}, is_cluster=False)
-    assert cmd.startswith("python3 -m sglang.launch_server")
+    assert cmd.startswith("sglang serve")
+    assert "sglang.launch_server" not in cmd
     assert "--model-path meta-llama/Llama-2-7b-hf" in cmd
     assert "--tp-size 2" in cmd
     assert "--port 30000" in cmd
+
+
+def test_sglang_legacy_launch_server_command_still_honored():
+    """A recipe pinning the legacy entrypoint keeps it verbatim.
+
+    Switching the *generated* entrypoint to ``sglang serve`` must not rewrite
+    recipes that spell ``python3 -m sglang.launch_server`` in their own
+    ``command:`` template — older pinned images may only have that form.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "legacy-recipe",
+            "model": "meta-llama/Llama-2-7b-hf",
+            "runtime": "sglang",
+            "defaults": {"port": 30000},
+            "command": "python3 -m sglang.launch_server --model-path {model} --port {port}",
+        }
+    )
+
+    cmd = SglangRuntime().generate_command(recipe, {}, is_cluster=False)
+    assert cmd.startswith("python3 -m sglang.launch_server")
+
+
+def test_sglang_serve_flags_emitted_without_command_template():
+    """Serving-behaviour keys reach the generated command (no `command:` block).
+
+    Regression guard for the flag-map gaps: these were previously absent from
+    ``_SGLANG_FLAG_MAP``, so a command-less recipe silently served a
+    differently-configured server — no parsers, default attention backend and
+    no speculative decoding — with nothing reported.
+    """
+    recipe = Recipe.from_dict(
+        {
+            "name": "flags-recipe",
+            "model": "Qwen/Qwen3.8-27B-FP8",
+            "runtime": "sglang",
+            "defaults": {
+                "port": 8000,
+                "attention_backend": "flashinfer",
+                "load_format": "instanttensor",
+                "reasoning_parser": "qwen3",
+                "tool_call_parser": "qwen3_coder",
+                "speculative_algorithm": "NEXTN",
+                "speculative_num_steps": 3,
+                "speculative_eagle_topk": 1,
+                "speculative_num_draft_tokens": 4,
+                "enable_torch_compile": True,
+                "disable_prefill_cuda_graph": True,
+            },
+        }
+    )
+
+    cmd = SglangRuntime().generate_command(recipe, {}, is_cluster=False)
+    for expected in (
+        "--attention-backend flashinfer",
+        "--load-format instanttensor",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--enable-torch-compile",
+        "--disable-prefill-cuda-graph",
+    ):
+        assert expected in cmd, "missing %r in: %s" % (expected, cmd)
 
 
 def test_sglang_generate_command_cluster():
@@ -419,3 +486,11 @@ def test_sglang_pp_size_override_in_command():
     cmd = runtime.generate_command(recipe, {"pipeline_parallel": 3}, is_cluster=False)
     assert "--pp-size 3" in cmd
     assert "--tp-size 2" in cmd
+
+
+def test_sglang_bool_flags_are_all_reachable():
+    """Every boolean key must also appear in the flag map (see vLLM twin)."""
+    from sparkrun.runtimes.sglang import _SGLANG_BOOL_FLAGS, _SGLANG_FLAG_MAP
+
+    unreachable = sorted(k for k in _SGLANG_BOOL_FLAGS if k not in _SGLANG_FLAG_MAP)
+    assert not unreachable, "bool keys missing from _SGLANG_FLAG_MAP: %s" % unreachable

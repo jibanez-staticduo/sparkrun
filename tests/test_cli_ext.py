@@ -7,12 +7,18 @@ import pytest
 from click.testing import CliRunner
 
 from sparkrun.cli import ext
+from sparkrun.core import cli_registry
 
 
 @pytest.fixture
 def clean_registry(monkeypatch):
-    """Isolate the module-global CLI-extension registry per test."""
-    monkeypatch.setattr(ext, "_CLI_EXTENSIONS", [])
+    """Isolate the module-global CLI-extension registry per test.
+
+    The registry lives in ``core.cli_registry`` (Click-free, so plugins can
+    register without dragging the CLI onto the ``api`` import path);
+    ``cli.ext`` re-exports its API and owns attachment.
+    """
+    monkeypatch.setattr(cli_registry, "_CLI_EXTENSIONS", [])
     yield
 
 

@@ -414,15 +414,48 @@ def test_list_jobs_sorted_most_recent_first(tmp_path: Path):
     assert [j.started_at for j in jobs] == [300.0, 200.0, 100.0]
 
 
-def test_list_jobs_untimed_entries_come_last(tmp_path: Path):
+def test_list_jobs_backfills_missing_started_at_from_mtime(tmp_path: Path):
+    """A file predating the ``started_at`` field is timed by its mtime.
+
+    Previously such an entry resolved to ``None`` and was banished to the end
+    of the list.  On a real long-lived cache *every* job looks like this, so
+    that rule sent all of them to the back and ordered them alphabetically —
+    the very bug ``started_at`` exists to fix.  Here the untimed file was just
+    written, so it is genuinely the newest and must sort first.
+    """
     jobs_dir = tmp_path / "jobs"
     _write_job_meta(jobs_dir, "withtime0000", started_at=100.0)
     _write_job_meta(jobs_dir, "notime000000")  # no started_at field
 
     jobs = api.list_jobs(cache_dir=tmp_path)
     assert len(jobs) == 2
-    assert jobs[0].cluster_id == "sparkrun_withtime0000"
-    assert jobs[1].cluster_id == "sparkrun_notime000000"
+    assert jobs[0].cluster_id == "sparkrun_notime000000"
+    assert jobs[0].started_at is not None
+    assert jobs[1].cluster_id == "sparkrun_withtime0000"
+
+
+def test_resolve_started_at_returns_none_when_unstattable(tmp_path: Path):
+    """The one case that stays untimed: no record *and* no usable mtime."""
+    from sparkrun.api._jobs import _resolve_started_at
+
+    assert _resolve_started_at(None, tmp_path / "gone.yaml") is None
+
+
+def test_list_jobs_untimed_entries_come_last(tmp_path: Path):
+    """A job we truly cannot time still sorts last, behind every timed one."""
+    jobs_dir = tmp_path / "jobs"
+    _write_job_meta(jobs_dir, "withtime0000", started_at=100.0)
+    _write_job_meta(jobs_dir, "notime000000")
+
+    real = api._jobs._resolve_started_at
+
+    def _fake(raw, meta_path):
+        return None if "notime" in meta_path.name else real(raw, meta_path)
+
+    with patch("sparkrun.api._jobs._resolve_started_at", side_effect=_fake):
+        jobs = api.list_jobs(cache_dir=tmp_path)
+
+    assert [j.cluster_id for j in jobs] == ["sparkrun_withtime0000", "sparkrun_notime000000"]
     assert jobs[1].started_at is None
 
 

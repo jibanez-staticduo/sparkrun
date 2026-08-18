@@ -5258,7 +5258,7 @@ class TestClusterUserInCLICommands:
 
         captured_kwargs = {}
 
-        def mock_cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None):
+        def mock_cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None, *, executor=None):
             from sparkrun.orchestration.ssh import RemoteResult
 
             captured_kwargs.update(ssh_kwargs or {})
@@ -5314,6 +5314,17 @@ class TestClusterUserInCLICommands:
         )
         # Prevent real git clones when ensure_initialized sees empty cache
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock.Mock(returncode=1, stderr="mocked"))
+        # Skip the liveness precheck — this test is about SSH user propagation,
+        # not container liveness.  query_status will fail on the fake host
+        # (10.0.0.1) and the precheck will skip (inconclusive → skip).
+        # The run_command_on_host mock covers the docker ps -a follow-up
+        # if it's ever reached.
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        monkeypatch.setattr(
+            "sparkrun.orchestration.primitives.run_command_on_host",
+            lambda *a, **kw: RemoteResult(host="10.0.0.1", returncode=0, stdout="", stderr=""),
+        )
 
         result = runner.invoke(
             main,

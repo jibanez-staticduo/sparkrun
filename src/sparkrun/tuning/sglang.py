@@ -126,6 +126,11 @@ class SglangTuner(BaseTuner):
             self.host,
             patch_script,
             ssh_kwargs=self.ssh_kwargs,
+            # A fixed step guard, deliberately not --timeout: this is a
+            # sub-second best-effort `docker exec`, and the job budget is the
+            # ceiling for the tuning run in _run_tune_for_tp.  Sharing one knob
+            # would mean the default ("no ceiling") lets a wedged container
+            # hang the patch step forever.
             timeout=15,
             dry_run=self.dry_run,
         )

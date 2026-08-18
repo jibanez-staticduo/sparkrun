@@ -31,6 +31,7 @@ from ._phases import (
 )
 from ._ssh import _run_ssh_mesh
 from ._sudo import _record_setup_phase
+from sparkrun.orchestration.job_metadata import PRUNE_KEEP_PER_INTENT, PRUNE_MAX_AGE_DAYS
 
 
 @setup.command("completion", hidden=True)
@@ -2151,195 +2152,6 @@ def setup_earlyoom(ctx, hosts, hosts_file, cluster_name, user, extra_prefer, ext
 
 
 # ---------------------------------------------------------------------------
-# Founders Edition System Update
-# ---------------------------------------------------------------------------
-
-
-_FE_UPDATE_STEPS = [
-    ("Updating package lists", "apt update"),
-    ("Upgrading packages", "DEBIAN_FRONTEND=noninteractive apt dist-upgrade -y"),
-    ("Refreshing firmware metadata", "fwupdmgr refresh --force"),
-    ("Upgrading firmware", "fwupdmgr upgrade -y --no-reboot-check"),
-]
-
-
-@setup.command("fe-system-update", hidden=True)
-@host_options
-@click.option("--user", default=None, help="SSH user (default: cluster user or $USER)")
-@dry_run_option
-@click.pass_context
-def setup_fe_system_update(ctx, hosts, hosts_file, cluster_name, user, dry_run):
-    """Run a full system update on DGX Spark Founders Edition hosts.
-
-    Updates system packages (apt), firmware (fwupdmgr), and reboots.
-    Can target the local machine, cluster hosts, or both.
-
-    \b
-    Steps performed (as root):
-      1. apt update
-      2. apt dist-upgrade
-      3. fwupdmgr refresh
-      4. fwupdmgr upgrade
-      5. reboot
-    """
-    from .._common import _get_context, _resolve_setup_context
-    from ._sudo import ensure_sudo_password
-
-    sctx = _get_context(ctx)
-    config = sctx.config
-
-    # --- Step 1: Determine target hosts ---
-    # If explicit hosts/cluster provided, use those directly
-    explicit_hosts = hosts or hosts_file or cluster_name
-    if explicit_hosts:
-        host_list, user, ssh_kwargs = _resolve_setup_context(hosts, hosts_file, cluster_name, config, user)
-    else:
-        # Interactive: ask local vs cluster
-        click.echo("Where would you like to run the system update?")
-        click.echo()
-        click.echo("  1) Local machine only")
-
-        # Try to list cluster hosts
-        mgr = _get_cluster_manager(sctx=sctx)
-        default_cluster = mgr.get_default()
-        cluster_hosts = []
-        if default_cluster:
-            try:
-                cdata = mgr.get(default_cluster)
-                cluster_hosts = cdata.hosts
-            except Exception:
-                pass
-
-        if cluster_hosts:
-            click.echo("  2) Cluster hosts (%s): %s" % (default_cluster, ", ".join(cluster_hosts)))
-            click.echo("  3) All (local + cluster hosts)")
-            choice = click.prompt("Selection", type=click.IntRange(1, 3), default=2)
-        else:
-            click.echo("  (No default cluster configured — cluster option unavailable)")
-            choice = click.prompt("Selection", type=click.IntRange(1, 1), default=1)
-
-        click.echo()
-
-        import socket
-
-        if choice == 1:
-            host_list = [socket.gethostname()]
-        elif choice == 2:
-            host_list = list(cluster_hosts)
-        else:
-            local = socket.gethostname()
-            host_list = [local] + [h for h in cluster_hosts if h != local]
-
-        import os
-
-        if user is None:
-            user = config.ssh_user or os.environ.get("USER", "root")
-        from sparkrun.orchestration.primitives import build_ssh_kwargs
-
-        ssh_kwargs = build_ssh_kwargs(config)
-        if user:
-            ssh_kwargs["ssh_user"] = user
-
-    # TODO: guard to detect non-founders edition hosts and block them
-
-    # --- Step 2: Confirm the activity ---
-    click.echo("Founders Edition System Update")
-    click.echo("=" * 40)
-    click.echo("Target hosts: %s" % ", ".join(host_list))
-    click.echo()
-    click.echo("The following will be executed as root:")
-    for desc, cmd in _FE_UPDATE_STEPS:
-        click.echo("  - %s  (%s)" % (desc, cmd))
-    click.echo("  - Reboot")
-    click.echo()
-
-    if not dry_run:
-        if not click.confirm("Proceed?", default=False):
-            click.echo("Aborted.")
-            return
-
-    # --- Step 3: Get sudo access ---
-    sudo_password, indirect_user = ensure_sudo_password(
-        host_list,
-        user,
-        ssh_kwargs,
-        dry_run=dry_run,
-        allow_indirect=True,
-        default_user=user,
-    )
-    sudo_ssh_kwargs = dict(ssh_kwargs)
-    if indirect_user:
-        sudo_ssh_kwargs["ssh_user"] = indirect_user
-
-    # --- Step 4: Run update steps ---
-    from sparkrun.orchestration.sudo import run_sudo_script_on_host
-
-    failed_hosts: set[str] = set()
-    for desc, cmd in _FE_UPDATE_STEPS:
-        active_hosts = [h for h in host_list if h not in failed_hosts]
-        if not active_hosts:
-            click.echo("All hosts failed — aborting remaining steps.")
-            break
-
-        click.echo()
-        click.echo("[%s]" % desc)
-        for h in active_hosts:
-            click.echo("  %-30s ..." % h, nl=False)
-            r = run_sudo_script_on_host(
-                h,
-                cmd,
-                password=sudo_password,
-                ssh_kwargs=sudo_ssh_kwargs,
-                timeout=600,
-                dry_run=dry_run,
-            )
-            if r.success:
-                click.echo(" OK")
-                if r.stdout.strip():
-                    # Show last few lines of output for visibility
-                    for line in r.stdout.strip().splitlines()[-3:]:
-                        click.echo("    %s" % line)
-            else:
-                click.echo(" FAILED")
-                click.echo("    %s" % r.stderr.strip()[:200], err=True)
-                failed_hosts.add(h)
-
-    # --- Step 5: Reboot ---
-    reboot_hosts = [h for h in host_list if h not in failed_hosts]
-    if reboot_hosts:
-        click.echo()
-        click.echo("[Reboot]")
-        if dry_run:
-            click.echo("  [dry-run] Would reboot: %s" % ", ".join(reboot_hosts))
-        else:
-            if not click.confirm("Updates complete. Reboot %d host(s) now?" % len(reboot_hosts), default=True):
-                click.echo("Skipping reboot. Remember to reboot manually for updates to take effect.")
-            else:
-                for h in reboot_hosts:
-                    click.echo("  %-30s rebooting..." % h)
-                    run_sudo_script_on_host(
-                        h,
-                        "nohup bash -c 'sleep 2 && reboot' &>/dev/null &",
-                        password=sudo_password,
-                        ssh_kwargs=sudo_ssh_kwargs,
-                        timeout=10,
-                        dry_run=dry_run,
-                    )
-                click.echo()
-                click.echo("Reboot initiated on %d host(s)." % len(reboot_hosts))
-
-    # --- Summary ---
-    click.echo()
-    ok = len([h for h in host_list if h not in failed_hosts])
-    fail = len(failed_hosts)
-    if fail:
-        click.echo("Results: %d updated, %d failed (%s)" % (ok, fail, ", ".join(sorted(failed_hosts))))
-        sys.exit(1)
-    else:
-        click.echo("Results: %d host(s) updated successfully." % ok)
-
-
-# ---------------------------------------------------------------------------
 # Diagnose
 # ---------------------------------------------------------------------------
 
@@ -2463,3 +2275,176 @@ def setup_diagnose(ctx, hosts, hosts_file, cluster_name, dry_run, output_file, o
 
     if fail:
         sys.exit(1)
+
+
+@setup.command("prune-runtime-cache", hidden=HIDE_ADVANCED_OPTIONS)
+@host_options
+@click.option(
+    "--older-than",
+    "older_than_days",
+    type=int,
+    default=None,
+    help="Age cutoff in days (default: the resolved runtime_cache.prune.max_age_days).",
+)
+@click.option("--all", "purge_all", is_flag=True, default=False, help="Remove every cached tree, ignoring the age cutoff.")
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would be removed, with sizes, without removing it.")
+@click.pass_context
+def setup_prune_runtime_cache(ctx, hosts, hosts_file, cluster_name, older_than_days, purge_all, dry_run):
+    """Reclaim disk from the compilation/autotune cache on cluster hosts.
+
+    The runtime cache (~/.cache/sparkrun/runtime-cache/ on each host) holds
+    torch.compile, Inductor, Triton, FlashInfer and TRT-LLM autotuner output so
+    a relaunch skips minutes of recompilation.  It lives on the TARGETS, not on
+    this machine, so this command fans out over SSH.
+
+    'sparkrun run' already sweeps the trees it can see on every launch (disable
+    with 'runtime_cache.prune.enabled: false').  This is the manual sweep, for
+    reclaiming space without launching something — and the only way to clear
+    trees for a model or image you no longer run at all.
+
+    A tree is aged by its last-used marker, which every launch re-stamps, so a
+    cache you use daily never ages out no matter how long ago it was written.
+
+    Examples:
+
+      sparkrun setup prune-runtime-cache --cluster mylab --dry-run
+
+      sparkrun setup prune-runtime-cache --cluster mylab --older-than 7
+
+      sparkrun setup prune-runtime-cache --cluster mylab --all
+    """
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.hosts import resolve_hosts
+    from sparkrun.core.runtime_cache import (
+        resolve_runtime_cache_root,
+        resolve_runtime_cache_settings,
+    )
+    from sparkrun.orchestration.primitives import build_ssh_kwargs, probe_remote_sparkrun_cache
+    from sparkrun.orchestration.runtime_cache import generate_runtime_cache_sweep_script
+    from sparkrun.orchestration.ssh import run_remote_scripts_parallel
+
+    config = SparkrunConfig()
+    cluster_mgr = _get_cluster_manager()
+    cluster_def = cluster_mgr.get_cluster(cluster_name) if cluster_name else None
+    host_list = resolve_hosts(hosts=hosts, hosts_file=hosts_file, cluster_name=cluster_name, cluster_mgr=cluster_mgr, config=config)
+    if not host_list:
+        raise click.UsageError("No hosts resolved. Pass --hosts or --cluster.")
+
+    settings = resolve_runtime_cache_settings(config=config, cluster=cluster_def)
+    max_age = older_than_days if older_than_days is not None else settings.prune_max_age_days
+    ssh_kwargs = build_ssh_kwargs(config)
+
+    if purge_all and not dry_run:
+        click.confirm("Remove ALL runtime cache trees on %d host(s)?" % len(host_list), abort=True)
+
+    total_kb = 0
+    total_trees = 0
+    for host in host_list:
+        # Each host resolves its own root: $HOME differs, and an explicit
+        # runtime_cache.dir applies everywhere.
+        try:
+            root = resolve_runtime_cache_root(settings, probe_remote_sparkrun_cache(host, **ssh_kwargs))
+            script = generate_runtime_cache_sweep_script(root, max_age_days=max_age, dry_run=dry_run, purge_all=purge_all)
+        except Exception as exc:
+            click.echo("  %s: skipped (%s)" % (host, exc))
+            continue
+
+        results = run_remote_scripts_parallel(
+            [host],
+            script,
+            ssh_user=ssh_kwargs.get("ssh_user"),
+            ssh_key=ssh_kwargs.get("ssh_key"),
+            ssh_options=ssh_kwargs.get("ssh_options"),
+            timeout=120,
+            quiet=True,
+            allow_local=True,
+        )
+        for r in results:
+            if r.returncode != 0:
+                click.echo("  %s: unreachable or sweep failed" % host)
+                continue
+            for line in r.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) != 3:
+                    continue
+                verb, size_kb, tree = parts
+                total_trees += 1
+                total_kb += int(size_kb) if size_kb.isdigit() else 0
+                click.echo("  %s  %6.1f GB  %s:%s" % (verb, int(size_kb) / 1048576 if size_kb.isdigit() else 0.0, host, tree))
+
+    click.echo()
+    if not total_trees:
+        click.echo("Nothing to prune.")
+        return
+    click.echo("%s %d tree(s), %.1f GB." % ("Would remove" if dry_run else "Removed", total_trees, total_kb / 1048576))
+    if dry_run:
+        click.echo("Re-run without --dry-run to apply.")
+
+
+@setup.command("prune-job-metadata-cache", hidden=HIDE_ADVANCED_OPTIONS)
+@click.option(
+    "--older-than",
+    "older_than_days",
+    type=int,
+    default=None,
+    help="Age cutoff in days (default: %d). Use 0 to ignore age." % PRUNE_MAX_AGE_DAYS,
+)
+@click.option(
+    "--keep-per-intent",
+    type=int,
+    default=None,
+    help="Keep this many most recent jobs per workload identity (default: %d)." % PRUNE_KEEP_PER_INTENT,
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would be removed without removing it.")
+def setup_prune_job_metadata_cache(older_than_days, keep_per_intent, dry_run):
+    """Delete stale entries from the local job metadata cache.
+
+    Job metadata (~/.cache/sparkrun/jobs/) records the recipe, hosts and
+    container image behind every launch, so stop/logs/proxy discovery can find
+    a workload later.  Only an explicit 'stop' removes an entry, so a job that
+    crashed — the norm when auto_remove is on and the container is gone before
+    anything asks about it — stays cached forever.  Left alone this reaches
+    hundreds of dead entries and makes 'logs <TAB>' unusable.
+
+    'sparkrun run' prunes automatically using the occupancy snapshot it
+    already has (disable with 'jobs.autoprune: false' in config.yaml).  This
+    command is the manual sweep, for when you want to reclaim the cache
+    without launching something.
+
+    An entry is KEPT when it is both among the most recent for its workload
+    identity AND newer than the age cutoff.
+
+    WARNING: this command has no live cluster snapshot to check against, so —
+    unlike the automatic prune — it cannot protect a running workload whose
+    metadata has aged out.  Run 'sparkrun status' first if you have long-lived
+    deployments, or pass --dry-run to review the list.
+
+    Examples:
+
+      sparkrun setup prune-job-metadata-cache --dry-run
+
+      sparkrun setup prune-job-metadata-cache --older-than 90
+
+      sparkrun setup prune-job-metadata-cache --keep-per-intent 1
+    """
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+    config = SparkrunConfig()
+    kwargs = {"cache_dir": str(config.cache_dir), "dry_run": dry_run}
+    if older_than_days is not None:
+        kwargs["max_age_days"] = older_than_days
+    if keep_per_intent is not None:
+        kwargs["keep_per_intent"] = keep_per_intent
+
+    removed = prune_job_metadata(**kwargs)
+    if not removed:
+        click.echo("Nothing to prune.")
+        return
+
+    for cluster_id in removed:
+        click.echo("  %s %s" % ("would remove" if dry_run else "removed", cluster_id))
+    click.echo()
+    click.echo("%s %d job metadata entrie(s)." % ("Would remove" if dry_run else "Removed", len(removed)))
+    if dry_run:
+        click.echo("Re-run without --dry-run to apply.")

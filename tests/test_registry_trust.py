@@ -71,14 +71,22 @@ class TestTrustedRoundTrip:
 
 
 class TestSaveOmitsDefaultTrust:
-    """``trusted: false`` should not be emitted (mirrors enabled/visible behavior)."""
+    """``trusted`` is written in both directions, unlike ``enabled``/``visible``."""
 
-    def test_save_omits_trusted_false(self, mgr):
+    def test_save_emits_trusted_false(self, mgr):
+        """Was ``test_save_omits_trusted_false``; the omission was the bug.
+
+        The convention is "omit the field default", and for ``enabled`` /
+        ``visible`` absence is unambiguous.  For trust it was not: a file with
+        nothing trusted was byte-identical to one written before the trust
+        model existed, which made the one-shot migration re-fire on every load
+        and silently reverted an explicit ``registry untrust``.
+        """
         entry = RegistryEntry(name="r", url="https://example.com", subpath="recipes", trusted=False)
         mgr._save_registries([entry])
         with open(mgr._registries_path) as f:
             raw = yaml.safe_load(f)
-        assert "trusted" not in raw["registries"][0]
+        assert raw["registries"][0]["trusted"] is False
 
     def test_save_emits_trusted_true(self, mgr):
         entry = RegistryEntry(name="r", url="https://example.com", subpath="recipes", trusted=True)
@@ -305,8 +313,10 @@ class TestTrustMigration:
         mgr._load_registries()
         post_second = mgr._registries_path.read_text()
         assert post_first == post_second
-        # And _needs_trust_migration returns False post-migration.
-        assert mgr._needs_trust_migration() is False
+        # And the file is stamped, so the migration pass cannot re-fire.
+        from sparkrun.core.registry import CONFIG_VERSION
+
+        assert mgr._read_config_version() >= CONFIG_VERSION
 
     def test_migration_trusts_defaults_outside_bootstrap_urls(self, mgr):
         """A trusted default that isn't a bootstrap-discovery URL still migrates trusted.
@@ -340,7 +350,15 @@ class TestTrustMigration:
         assert entries["official-variant"].trusted is True
 
     def test_no_migration_when_field_present(self, mgr):
-        """If every entry already has 'trusted', migration must NOT fire."""
+        """A marker-less file whose entries carry 'trusted' is already migrated.
+
+        This is the fallback inference in ``_read_config_version`` — the case
+        of a file written after the trust model landed but before the
+        ``config_version`` marker did.  It is sound only because
+        ``_save_registries`` now writes ``trusted`` in both directions.
+        """
+        from sparkrun.core.registry import CONFIG_VERSION
+
         data = {
             "registries": [
                 {
@@ -353,7 +371,7 @@ class TestTrustMigration:
         }
         with open(mgr._registries_path, "w") as f:
             yaml.safe_dump(data, f)
-        assert mgr._needs_trust_migration() is False
+        assert mgr._read_config_version() >= CONFIG_VERSION
 
 
 # ---------------------------------------------------------------------------

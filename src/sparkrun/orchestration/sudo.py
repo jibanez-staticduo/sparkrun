@@ -69,21 +69,23 @@ def _run_local_sudo_script(
 def run_sudo_script_on_host(
     host: str,
     script: str,
-    password: str,
+    password: str | None,
     ssh_kwargs: dict | None = None,
     timeout: int = 300,
     dry_run: bool = False,
 ) -> RemoteResult:
     """Run a sudo script on a single host, dispatching local vs SSH.
 
-    For local hosts (localhost, 127.0.0.1), executes via ``sudo -S bash -s``
+    For local hosts (localhost, 127.0.0.1), executes via ``sudo bash -s``
     directly.  For remote hosts, delegates to
     :func:`~sparkrun.orchestration.ssh.run_remote_sudo_script`.
+
+    Both paths accept ``password=None`` (NOPASSWD) and run non-interactively.
 
     Args:
         host: Target hostname or IP.
         script: Bash script content to execute as root.
-        password: Sudo password (fed via stdin).
+        password: Sudo password (fed via stdin), or None for NOPASSWD hosts.
         ssh_kwargs: SSH connection parameters (forwarded for remote hosts).
         timeout: Execution timeout in seconds.
         dry_run: If True, skip actual execution.
@@ -221,7 +223,7 @@ def run_indirect_sudo_script(
 def dispatch_sudo_script(
     host: str,
     script: str,
-    sudo_password: str,
+    sudo_password: str | None,
     ssh_kwargs: dict | None = None,
     indirect_sudo_user: str | None = None,
     timeout: int = 300,

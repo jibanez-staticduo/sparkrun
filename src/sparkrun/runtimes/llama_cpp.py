@@ -508,6 +508,7 @@ class LlamaCppRuntime(RuntimePlugin):
         backends = kwargs.pop("backends", None)
         trust = kwargs.pop("trust", False)
         placement = kwargs.pop("placement", None)
+        runtime_cache = kwargs.pop("runtime_cache", None)
 
         ctx = ClusterContext.build(
             self,
@@ -521,6 +522,7 @@ class LlamaCppRuntime(RuntimePlugin):
             cluster=cluster,
             recipe=recipe,
             placement=placement,
+            runtime_cache=runtime_cache,
         )
         head_container = self._container_name(cluster_id, "head")
         worker_container_name = self._container_name(cluster_id, "worker")
@@ -543,7 +545,7 @@ class LlamaCppRuntime(RuntimePlugin):
             progress.step("Cleaning up existing containers")
         else:
             logger.info("Step 1/6: Cleaning up existing containers for cluster '%s'...", cluster_id)
-        cleanup_named_containers(ctx, [head_container, worker_container_name])
+        cleanup_named_containers(ctx, [head_container, worker_container_name], self._resolve_executor())
         logger.info("Step 1/6: Cleanup done (%.1fs)", time.monotonic() - t0)
 
         # Step 2: InfiniBand detection (also resolves IB IPs for RPC routing)

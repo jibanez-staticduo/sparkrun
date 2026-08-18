@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -362,6 +363,15 @@ FALLBACK_DEFAULT_REGISTRIES = [
         url="https://github.com/spark-arena/community-recipe-registry.git",
         subpath="recipes",
         description="Community recipe registry",
+        # Must mirror the repo's own .sparkrun/registry.yaml manifest
+        # (recipes / tuning / benchmarks). The manifest is only consulted on
+        # first-run discovery, so a registries.yaml written from this fallback
+        # keeps whatever is spelled here forever — and an omitted subpath is
+        # not merely a default, it makes that asset kind *unresolvable*
+        # (``asset_dir`` returns nothing) and drops the path from the sparse
+        # checkout, so `registry update` never fetches it either.
+        tuning_subpath="tuning",
+        benchmark_subpath="benchmarking",
         visible=False,
         trusted=True,
     ),
@@ -376,12 +386,73 @@ FALLBACK_DEFAULT_REGISTRIES = [
 ]
 
 
+#: scp-style SSH remote — ``[user@]host:org/repo``.  The ``[^/]`` on the path
+#: is what keeps this from also matching ``https://host/...``, where the
+#: character after the colon is a slash.
+_SCP_LIKE_SSH_RE = re.compile(r"^(?:[^@/\s]+@)?(?P<host>[A-Za-z0-9._-]+):(?P<path>[^/].*)$")
+
+
 def _normalize_registry_url(url: str) -> str:
-    """Canonicalize a git URL for comparison (drop trailing ``/`` and ``.git``)."""
-    normalized = (url or "").rstrip("/")
-    if normalized.endswith(".git"):
-        normalized = normalized[:-4]
-    return normalized
+    """Canonicalize a git URL so two spellings of one repo compare equal.
+
+    Drops the scheme, any ``user@`` credentials, and a trailing ``/`` or
+    ``.git``; rewrites the scp-style SSH form (``git@github.com:org/repo``) to
+    the same ``host/org/repo`` shape as an https URL; and lowercases the
+    result.
+
+    Stripping only ``/`` and ``.git`` — as this did — meant `official` spelled
+    ``git@github.com:spark-arena/recipe-registry.git``, ``http://…`` or with
+    any capitalisation did **not** match the shipped default, so the trust
+    backfill marked it untrusted and its recipes prompted for hook
+    confirmation forever (issue #257).  A non-TTY has no way to answer that
+    prompt.
+
+    The bound on how far to canonicalize: **never merge two URLs git would
+    resolve to different repos.** Scheme, credentials and case are all things
+    git ignores when picking the repo, so folding them is safe. Query strings
+    and fragments are deliberately *not* stripped — they are not part of a git
+    URL, so anything carrying one simply fails to match, which fails closed.
+
+    Lowercasing the path is safe for the comparison sets this feeds — the
+    trusted / deprecated / migrated URL lists are all GitHub, which is
+    case-insensitive — so a case-only difference cannot smuggle in a repo
+    other than the one we ship.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+
+    if "://" in raw:
+        rest = raw.split("://", 1)[1]
+    elif (m := _SCP_LIKE_SSH_RE.match(raw)) is not None:
+        rest = "%s/%s" % (m.group("host"), m.group("path").lstrip("/"))
+    else:
+        rest = raw
+
+    # Drop ``user[:pass]@`` from the authority only — a later ``@`` belongs to
+    # the path and is part of the repo's identity.
+    authority, sep, tail = rest.partition("/")
+    if "@" in authority:
+        rest = authority.rpartition("@")[2] + sep + tail
+
+    rest = rest.strip().lower().rstrip("/")
+    if rest.endswith(".git"):
+        rest = rest[:-4]
+    return rest.rstrip("/")
+
+
+#: Schema/migration revision stamped into ``registries.yaml`` as
+#: ``config_version``.  Bump when adding a **one-shot** migration below.
+#:
+#: A plain integer rather than the sparkrun version: it tracks the config
+#: format, not the release cadence, and a downgrade must not read as "needs
+#: migrating".
+CONFIG_VERSION = 1
+
+#: Version implied by a file that carries no ``config_version`` key but does
+#: carry an explicit per-entry ``trusted`` field — i.e. one written after the
+#: trust model landed but before the marker did.
+_IMPLIED_VERSION_TRUST_PRESENT = 1
 
 
 def _default_trusted_urls() -> set[str]:
@@ -392,6 +463,38 @@ def _default_trusted_urls() -> set[str]:
     default reaches upgrading users and not just fresh installs.
     """
     return {_normalize_registry_url(e.url) for e in FALLBACK_DEFAULT_REGISTRIES if e.trusted}
+
+
+def _migration_v1_backfill_trust(entries: list["RegistryEntry"]) -> None:
+    """v1 — populate ``trusted`` on a file that predates the trust model.
+
+    An entry is marked trusted when its URL matches a registry that
+    :data:`FALLBACK_DEFAULT_REGISTRIES` ships as trusted; everything else stays
+    untrusted.
+
+    Deriving this from the default registry list (rather than from
+    :data:`BOOTSTRAP_REGISTRY_URLS`, which exists for manifest discovery) keeps
+    a single source of truth for "which registries ship trusted" — otherwise
+    adding a trusted default silently fails to reach users upgrading from a
+    pre-trust ``registries.yaml``.
+    """
+    trusted_urls = _default_trusted_urls()
+    for entry in entries:
+        entry.trusted = _normalize_registry_url(entry.url) in trusted_urls
+
+
+#: One-shot migrations, ascending: ``(version, name, fn(entries))``.
+#:
+#: **Only** migrations that cannot detect their own applicability from file
+#: content belong here.  Rewrites that *can* — following a moved URL, dropping
+#: a deprecated registry, refreshing a stale shipped description — stay
+#: unconditional in :meth:`RegistryManager._load_registries`, because running
+#: them on every load is what repairs a file that arrived from a backup,
+#: another machine, a hand-edit or a fork.  Version-gating those would make
+#: them strictly weaker in exchange for saving a handful of string compares.
+#:
+#: To add one: append it here and bump :data:`CONFIG_VERSION` to match.
+_MIGRATIONS: tuple[tuple[int, str, "Callable[[list[RegistryEntry]], None]"], ...] = ((1, "backfill_trust", _migration_v1_backfill_trust),)
 
 
 # List of git URLs for registries that have been superseded and should be cleaned up.
@@ -419,6 +522,29 @@ DEPRECATED_REGISTRIES: list[str] = [
 MIGRATED_REGISTRY_URLS: dict[str, str] = {
     "https://github.com/eugr/spark-vllm-docker": "https://github.com/spark-arena/eugr-recipes",
 }
+
+
+def _migrated_url_for(url: str) -> str | None:
+    """New URL for *url* if it names a moved registry, else ``None``.
+
+    Normalizes **both sides** rather than indexing the dict directly. The keys
+    above are written in their natural https form, so a direct lookup only
+    worked while the raw key and the canonicalized entry URL happened to
+    coincide — they stopped coinciding the moment the normalizer learned to
+    drop the scheme, which silently disabled every URL migration.
+
+    Evaluated per call against the live dict rather than cached into a
+    canonical-key map at import: a module-level snapshot ignores any later
+    edit to :data:`MIGRATED_REGISTRY_URLS`, which is both a testing footgun and
+    a trap for anyone who assumes the constant is the source of truth. The dict
+    holds a handful of entries, so the scan costs nothing.
+    """
+    canonical = _normalize_registry_url(url)
+    for old, new in MIGRATED_REGISTRY_URLS.items():
+        if _normalize_registry_url(old) == canonical:
+            return new
+    return None
+
 
 # Reserved name prefixes — only URLs from allowed GitHub orgs may use these.
 # This prevents third-party registries from impersonating official sources.
@@ -805,7 +931,16 @@ class RegistryManager:
         combined = list(discovered)
         for fallback in FALLBACK_DEFAULT_REGISTRIES:
             if fallback.name not in seen_names:
-                combined.append(fallback)
+                # Copy — never hand out the module-level entry itself.  Callers
+                # mutate what they get back (``untrust_registry`` flips
+                # ``trusted``, ``disable_registry`` flips ``enabled``), and on a
+                # fresh install this is the only path that produces entries, so
+                # aliasing rewrote the shipped defaults process-wide.  Harmless
+                # enough in a one-shot CLI; in the long-lived desktop sidecar it
+                # silently moved the trust baseline that
+                # :func:`_default_trusted_urls` — and so every later
+                # migration — is derived from.
+                combined.append(_dataclass_replace(fallback))
                 seen_names.add(fallback.name)
 
         # Persist so subsequent _load_registries() reads from file
@@ -893,52 +1028,137 @@ class RegistryManager:
             for r in registries
         ]
 
-    def _needs_trust_migration(self) -> bool:
-        """Check whether the on-disk registries.yaml predates per-entry trust.
+    def _read_config_version(self) -> int:
+        """Migration revision of the on-disk registries.yaml.
 
-        Returns True when the file exists, contains at least one entry, and
-        **no** entry carries a ``trusted`` key in the raw YAML.  A single
-        entry with ``trusted`` set (in either direction) signals a
-        post-migration file written by this version of sparkrun and
-        suppresses the one-time backfill — necessary because
-        :meth:`_save_registries` omits ``trusted: false`` by design
-        (mirroring the ``enabled``/``visible`` pattern).
+        Reads the ``config_version`` marker.  When it is absent — a file
+        written before the marker existed — the revision is *inferred* from
+        whether the entries carry an explicit ``trusted`` field, which is the
+        only pre-marker evidence available.
+
+        That inference is sound only because :meth:`_save_registries` now
+        writes ``trusted`` on **every** entry, in both directions.  It used to
+        omit ``trusted: false``, so "no trusted key anywhere" meant either
+        *pre-trust file* or *everything is untrusted* — indistinguishable.
+        That ambiguity is what made the one-shot migration re-fire on every
+        load, and what silently reverted a user who had untrusted every
+        registry (issue #257 follow-up).  The two mechanisms deliberately back
+        each other up: the marker is authoritative, and the explicit field
+        keeps this fallback correct if the marker is ever lost to a hand-edit,
+        a merge, or a tool that rewrites the file.
+
+        Returns 0 for a file that predates both.
         """
         try:
             data = read_yaml(self._registries_path)
         except Exception:
-            return False
+            return CONFIG_VERSION  # unreadable: never "migrate" what we can't see
         if not isinstance(data, dict):
-            return False
+            return CONFIG_VERSION
+
+        raw_version = data.get("config_version")
+        if isinstance(raw_version, int) and not isinstance(raw_version, bool):
+            return raw_version
+
         registries = data.get("registries") or []
         if not isinstance(registries, list) or not registries:
+            # No entries to migrate; treat as current so nothing re-fires.
+            return CONFIG_VERSION
+        if any(isinstance(raw, dict) and "trusted" in raw for raw in registries):
+            return _IMPLIED_VERSION_TRUST_PRESENT
+        return 0
+
+    def _load_entries_for_mutation(self) -> list[RegistryEntry]:
+        """Raw entries, with any pending one-shot migration already applied.
+
+        For the mutating commands (``restore_missing_defaults``,
+        ``cleanup_deprecated``).  They end in a save, and a save stamps
+        ``config_version`` — so reading a file that still has migrations
+        pending would mark it done and skip those migrations forever.
+
+        Deliberately returns the **raw** list rather than
+        :meth:`_load_registries`'s: that one filters deprecated entries out,
+        and ``cleanup_deprecated`` has to see them to report them and drop
+        their caches.
+        """
+        if self._registries_path.exists() and self._read_config_version() < CONFIG_VERSION:
+            self._load_registries()  # side effect: apply and persist migrations
+        try:
+            return self._load_registries_from_file()
+        except Exception:
+            return self._load_registries()
+
+    def _run_one_shot_migrations(self, entries: list[RegistryEntry]) -> bool:
+        """Apply every one-shot migration newer than the file's revision.
+
+        Always returns True when a migration pass ran, even if no entry
+        changed: the point is to stamp the marker so it never runs again.
+        Persisting only on a content change is what left a file with nothing
+        to backfill looking un-migrated forever.
+
+        A file stamped *ahead* of this build is left alone — we never migrate
+        backwards, and an unknown future revision is not an error.
+        """
+        from_version = self._read_config_version()
+        if from_version >= CONFIG_VERSION:
+            if from_version > CONFIG_VERSION:
+                logger.debug(
+                    "registries.yaml is at config_version %d, newer than this sparkrun (%d); leaving it alone",
+                    from_version,
+                    CONFIG_VERSION,
+                )
             return False
-        for raw in registries:
-            if isinstance(raw, dict) and "trusted" in raw:
-                return False
+
+        for version, name, fn in _MIGRATIONS:
+            if version <= from_version:
+                continue
+            fn(entries)
+            logger.info("Applied registries.yaml migration v%d (%s)", version, name)
         return True
 
-    def _migrate_trust_field(self, entries: list[RegistryEntry]) -> list[RegistryEntry]:
-        """Backfill the ``trusted`` field for legacy registries.yaml files.
+    @staticmethod
+    def _backfill_default_subpaths(entries: list[RegistryEntry]) -> bool:
+        """Fill in asset subpaths a shipped default gained after this file was written.
 
-        An entry is marked ``trusted=True`` when it matches a registry that
-        :data:`FALLBACK_DEFAULT_REGISTRIES` ships as trusted; everything else
-        retains ``trusted=False``.  The migrated list is then persisted via
-        :meth:`_save_registries` so the next load sees an explicit ``trusted``
-        field on every entry and the migration does not repeat.
+        An omitted subpath is not a harmless default — it makes that asset kind
+        **unresolvable**.  ``asset_dir`` returns nothing when the field is
+        blank, so ``--profile <name>`` reports "not found" no matter how it is
+        spelled, and ``_build_sparse_paths`` drops the directory from the sparse
+        checkout so ``registry update`` never fetches it either.  The symptom is
+        therefore a registry that appears healthy and silently cannot serve
+        benchmark profiles, tuning configs or mods.
 
-        Deriving this from the default registry list (rather than from
-        :data:`BOOTSTRAP_REGISTRY_URLS`, which exists for manifest discovery)
-        keeps a single source of truth for "which registries ship trusted" —
-        otherwise adding a trusted default silently fails to reach users
-        upgrading from a pre-trust ``registries.yaml``.
+        Nothing re-reads a registry's ``.sparkrun/registry.yaml`` manifest once
+        ``registries.yaml`` exists — manifests are consulted only on first-run
+        discovery — so a file written from :data:`FALLBACK_DEFAULT_REGISTRIES`
+        (which happens whenever discovery was offline) keeps whatever that list
+        spelled at the time, forever.
+
+        Only ever *adds*: a user who deliberately blanked a subpath gets it
+        back, which is the accepted trade for repairing the far more common
+        case, but a subpath the user has customised is never overwritten.
+        Matching is by URL, so a renamed registry is still repaired.
+
+        Returns:
+            True when any entry was modified (caller re-saves the file).
         """
-        trusted_urls = _default_trusted_urls()
+        by_url = {_normalize_registry_url(e.url): e for e in FALLBACK_DEFAULT_REGISTRIES}
+        changed = False
         for entry in entries:
-            entry.trusted = _normalize_registry_url(entry.url) in trusted_urls
-        self._save_registries(entries)
-        logger.info("Migrated registries.yaml to per-registry trust model")
-        return entries
+            shipped = by_url.get(_normalize_registry_url(entry.url))
+            if shipped is None:
+                continue
+            for field in ("tuning_subpath", "benchmark_subpath", "mods_subpath"):
+                if not getattr(entry, field) and getattr(shipped, field):
+                    setattr(entry, field, getattr(shipped, field))
+                    logger.info(
+                        "Backfilled %s=%r on registry %r from shipped default",
+                        field,
+                        getattr(shipped, field),
+                        entry.name,
+                    )
+                    changed = True
+        return changed
 
     @staticmethod
     def _migrate_registry_urls(entries: list[RegistryEntry]) -> bool:
@@ -975,7 +1195,7 @@ class RegistryManager:
         changed = False
         trusted_urls = _default_trusted_urls()
         for entry in entries:
-            new_url = MIGRATED_REGISTRY_URLS.get(_normalize_registry_url(entry.url))
+            new_url = _migrated_url_for(entry.url)
             if not new_url or _normalize_registry_url(entry.url) == _normalize_registry_url(new_url):
                 continue
             logger.info("Registry %r moved: %s -> %s", entry.name, entry.url, new_url)
@@ -998,17 +1218,16 @@ class RegistryManager:
             logger.debug("No registries.yaml found, using defaults")
             return self._default_registries()
 
-        # One-time migration: if the file predates the per-entry ``trusted``
-        # field, backfill trust based on whether each entry's URL is in
-        # ``BOOTSTRAP_REGISTRY_URLS`` and persist the result.  Re-checks the
-        # raw YAML so repeated calls within a process don't re-trigger.
-        needs_migration = self._needs_trust_migration()
+        # Read the file's revision BEFORE anything writes, since a write stamps
+        # the marker and would make the file look already-migrated.
+        pending_migrations = self._read_config_version() < CONFIG_VERSION
 
         try:
             entries = self._load_registries_from_file()
 
+            # --- Convergent rewrites: content-detected, run on every load. ---
             # Follow moved registries BEFORE anything else inspects the URL.
-            # Ordering is load-bearing for the trust backfill below: it marks an
+            # Ordering is load-bearing for the trust backfill: that marks an
             # entry trusted by matching its URL against `_default_trusted_urls()`,
             # which holds the *new* URLs — a pre-trust config still carrying an
             # old URL would otherwise be backfilled as untrusted.
@@ -1025,10 +1244,15 @@ class RegistryManager:
                     )
                 else:
                     filtered.append(entry)
-            if needs_migration:
-                # Persists as part of the trust migration; no second write.
-                self._migrate_trust_field(filtered)
-            elif urls_migrated:
+
+            # Backfill asset subpaths a shipped default has gained since this
+            # file was written.  Content-detected, so it runs on every load.
+            subpaths_backfilled = self._backfill_default_subpaths(filtered)
+
+            # --- One-shot migrations: version-gated, run at most once ever. ---
+            migrated = self._run_one_shot_migrations(filtered) if pending_migrations else False
+
+            if migrated or urls_migrated or subpaths_backfilled:
                 self._save_registries(filtered)
             return filtered
         except Exception as e:
@@ -1056,11 +1280,22 @@ class RegistryManager:
                 d["benchmark_subpath"] = e.benchmark_subpath
             if e.mods_subpath:
                 d["mods_subpath"] = e.mods_subpath
-            if e.trusted:
-                d["trusted"] = True
+            # ``trusted`` is written in BOTH directions, unlike the other flags.
+            # The convention here is "omit the field default" — ``enabled`` /
+            # ``visible`` default True so only False is written, and ``trusted``
+            # defaults False so only True used to be.  For those two, absence is
+            # unambiguous; for trust it was not, because a file with nothing
+            # trusted was byte-identical to one written before the trust model
+            # existed.  Writing it always is what makes
+            # :meth:`_read_config_version`'s fallback sound and keeps an explicit
+            # ``registry untrust`` from being read as "never migrated".
+            d["trusted"] = bool(e.trusted)
             data_list.append(d)
 
-        data = {"registries": data_list}
+        # Stamped on every write, not just by the migration runner: this method
+        # rebuilds the document from scratch, so anything it didn't re-emit
+        # would be silently dropped.
+        data = {"config_version": CONFIG_VERSION, "registries": data_list}
         with open(self._registries_path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
         logger.debug("Saved registries to %s", self._registries_path)
@@ -1554,19 +1789,13 @@ class RegistryManager:
     def _is_deprecated_url(url: str) -> bool:
         """Check whether a registry URL matches a deprecated entry.
 
-        Strips trailing ``.git`` from the URL before comparison so that
-        ``https://github.com/org/repo.git`` matches ``https://github.com/org/repo``.
+        Shares :func:`_normalize_registry_url` with the trust and migrated-URL
+        comparisons.  This used to inline its own weaker copy of that logic, so
+        a deprecated registry spelled as an SSH remote (or with a different
+        scheme or capitalisation) was never cleaned up.
         """
-        normalized = url.rstrip("/")
-        if normalized.endswith(".git"):
-            normalized = normalized[:-4]
-        for dep_url in DEPRECATED_REGISTRIES:
-            dep_normalized = dep_url.rstrip("/")
-            if dep_normalized.endswith(".git"):
-                dep_normalized = dep_normalized[:-4]
-            if normalized == dep_normalized:
-                return True
-        return False
+        normalized = _normalize_registry_url(url)
+        return any(normalized == _normalize_registry_url(dep_url) for dep_url in DEPRECATED_REGISTRIES)
 
     def restore_missing_defaults(self) -> list[str]:
         """Add default registry entries that are missing from the config.
@@ -1578,17 +1807,14 @@ class RegistryManager:
         Returns:
             List of registry names that were added.
         """
-        try:
-            entries = self._load_registries_from_file()
-        except Exception:
-            entries = self._load_registries()
+        entries = self._load_entries_for_mutation()
 
         existing_names = {e.name for e in entries}
         added: list[str] = []
 
         for default in FALLBACK_DEFAULT_REGISTRIES:
             if default.name not in existing_names:
-                entries.append(default)
+                entries.append(_dataclass_replace(default))  # copy — see _default_registries
                 added.append(default.name)
                 logger.info("Restored missing default registry: %s", default.name)
 
@@ -1608,10 +1834,7 @@ class RegistryManager:
         if not DEPRECATED_REGISTRIES:
             return []
 
-        try:
-            entries = self._load_registries_from_file()
-        except Exception:
-            entries = self._load_registries()
+        entries = self._load_entries_for_mutation()
         cleaned = []
         remaining = []
 

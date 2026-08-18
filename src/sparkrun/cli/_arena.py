@@ -14,6 +14,7 @@ from ._common import (
     dry_run_option,
     host_options,
     recipe_override_options,
+    with_host_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,12 @@ def arena_benchmark(ctx):
 @click.option("--skip-run", is_flag=True, help="Skip launching inference (benchmark existing instance)", hidden=True)
 @click.option("--sync-tuning", is_flag=True, help="Sync tuning configs from registries before benchmarking", hidden=True)
 @click.option("--rootful", is_flag=True, help="Run with --privileged as root inside container", hidden=True)
+@click.option(
+    "--trust",
+    is_flag=True,
+    default=False,
+    help="Trust recipe hooks (pre_exec/post_exec/post_commands) from third-party registries without confirmation",
+)
 @click.option("--timeout", "bench_timeout", type=int, default=None, help="Benchmark timeout in seconds (default: 14400)")
 @click.option("--local-test", is_flag=True, hidden=True, help="Smoke test: skip profile and simulate upload without sending")
 @click.option(
@@ -150,6 +157,7 @@ def arena_benchmark(ctx):
 )
 @dry_run_option
 @click.pass_context
+@with_host_context
 def arena_benchmark_run(
     ctx,
     recipe_name,
@@ -171,10 +179,13 @@ def arena_benchmark_run(
     skip_run,
     sync_tuning,
     rootful,
+    trust,
     bench_timeout,
     local_test,
     resume_flag,
     dry_run,
+    host_list=None,
+    cluster_mgr=None,
 ):
     """Benchmark a recipe and submit results to Spark Arena.
 
@@ -232,6 +243,7 @@ def arena_benchmark_run(
         skip_run=skip_run,
         sync_tuning=sync_tuning,
         rootful=rootful,
+        trust=trust,
         bench_timeout=bench_timeout,
         dry_run=dry_run,
         executor_args=None,
@@ -239,6 +251,8 @@ def arena_benchmark_run(
         export_results_files=False,
         resume_mode=_resume_mode,
         submission_id_for_extras=submission_id,
+        host_list=host_list,
+        cluster_mgr=cluster_mgr,
     )
 
     # require result and success; launch_result may be absent with --skip-run

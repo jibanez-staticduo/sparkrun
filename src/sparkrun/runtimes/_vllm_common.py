@@ -34,6 +34,32 @@ class VllmMixin:
         env.update(get_vllm_tuning_env() or {})
         return env
 
+    def runtime_cache_paths(self, *, fingerprint: str = "") -> dict:
+        """Persist vLLM's compile / JIT caches across container restarts.
+
+        All four are content-addressed internally (torch.compile hashes its
+        config, Triton and FlashInfer key by kernel signature), which is why
+        vLLM does not need ``key_by_image`` — see
+        :mod:`sparkrun.core.runtime_cache`.
+
+        ``VLLM_CACHE_ROOT`` and ``FLASHINFER_CACHE_DIR`` are named explicitly
+        rather than left to the ``XDG_CACHE_HOME`` catch-all because both
+        libraries expand ``~/.cache/...`` directly instead of consulting XDG.
+
+        ``FLASHINFER_CACHE_DIR`` — not ``FLASHINFER_WORKSPACE_BASE``: the
+        workspace holds build intermediates that are worthless across runs and
+        would grow the tree for nothing.  The cache dir is the compiled output
+        worth keeping.
+        """
+        from sparkrun.core.runtime_cache import CachePath
+
+        return {
+            "VLLM_CACHE_ROOT": CachePath("vllm"),
+            "TORCHINDUCTOR_CACHE_DIR": CachePath("inductor"),
+            "TRITON_CACHE_DIR": CachePath("triton"),
+            "FLASHINFER_CACHE_DIR": CachePath("flashinfer"),
+        }
+
     def finalize_host_comm_env(self, host_env: dict[str, str]) -> dict[str, str]:
         """Advertise vLLM on the host's resolved ``NODE_IP``.
 
@@ -201,12 +227,37 @@ VLLM_FLAG_MAP = {
     "kv_cache_dtype": "--kv-cache-dtype",
     "otlp_traces_endpoint": "--otlp-traces-endpoint",
     "api_key": "--api-key",
+    # Serving-behaviour flags. These are spelled in nearly every real recipe's
+    # ``command:`` template; without them a command-less recipe silently serves
+    # a differently-configured server (no tool parsing, default attention
+    # backend, default weight loader).
+    "attention_backend": "--attention-backend",
+    "load_format": "--load-format",
+    "reasoning_parser": "--reasoning-parser",
+    "tool_call_parser": "--tool-call-parser",
+    "chat_template": "--chat-template",
+    "speculative_config": "--speculative-config",
+    "tokenizer_mode": "--tokenizer-mode",
+    "mm_encoder_tp_mode": "--mm-encoder-tp-mode",
+    "block_size": "--block-size",
+    "seed": "--seed",
+    # NOTE: ``enable_auto_tool_choice`` / ``enable_chunked_prefill`` /
+    # ``async_scheduling`` are booleans, but they must ALSO appear here.
+    # ``build_flags_from_map`` iterates this map and consults ``bool_keys``
+    # only to decide how to *render* a key it has already found, so a key
+    # listed solely in VLLM_BOOL_FLAGS is unreachable. Keep the two in sync.
+    "enable_auto_tool_choice": "--enable-auto-tool-choice",
+    "enable_chunked_prefill": "--enable-chunked-prefill",
+    "async_scheduling": "--async-scheduling",
 }
 
-# Boolean flags (present = True, absent = False)
+# Boolean flags (present = True, absent = False).
+# Every entry here MUST also have an entry in VLLM_FLAG_MAP — see the note above.
 VLLM_BOOL_FLAGS = {
     "enforce_eager",
     "enable_prefix_caching",
     "trust_remote_code",
     "enable_auto_tool_choice",
+    "enable_chunked_prefill",
+    "async_scheduling",
 }

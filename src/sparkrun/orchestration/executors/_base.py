@@ -18,15 +18,17 @@ from typing import ClassVar, Mapping, TYPE_CHECKING
 
 from scitrera_app_framework import Plugin, Variables, ext_parse_bool, get_extensions
 
+from sparkrun.orchestration.teardown import TEARDOWN_REMOVED_MARKER
 from sparkrun.scripts import read_script
 from sparkrun.utils import merge_env
 from sparkrun.utils.shell import b64_encode_cmd, quote
 
 if TYPE_CHECKING:
     from sparkrun.containers.entrypoint import EntrypointProbe
-    from sparkrun.core.cluster_status import ClusterStatus
+    from sparkrun.core.cluster_status import ClusterStatus, TerminationInfo
     from sparkrun.core.hardware import HostHardware
     from sparkrun.core.log_source import LogSource
+    from sparkrun.core.runtime_cache import RuntimeCacheMounts
 
 logger = logging.getLogger(__name__)
 
@@ -478,6 +480,84 @@ class Executor(Plugin):
         """Generate a command that exits 0 iff *container_name* is alive."""
         ...
 
+    def exists_cmd(self, container_name: str) -> str:
+        """Generate a command that exits 0 iff *container_name* is **present**.
+
+        The teardown peer of :meth:`status_cmd`, which asks the narrower
+        question "is it *running*?".  Present means anything teardown must
+        still remove — for Docker that includes an exited-but-not-removed
+        container, which ``status_cmd``'s ``docker ps`` cannot see and
+        ``docker rm -f`` must still delete.
+
+        The default is :meth:`status_cmd`, correct for every substrate where
+        a workload's only state *is* its liveness (the ``local`` executor: a
+        pidfile whose process is gone leaves nothing to remove).  Executors
+        with a separate dead-but-present state override.
+        """
+        return self.status_cmd(container_name)
+
+    def teardown_script(self, container_names: list[str] | tuple[str, ...]) -> str:
+        """Generate a script that removes *container_names* here, and **verifies it**.
+
+        The one seam through which every teardown path runs — ``sparkrun
+        stop``, ``stop --all``, and post-launch-failure cleanup — so a
+        workload is always torn down by the substrate that started it.  Before
+        this existed, teardown emitted ``docker rm -f`` unconditionally, which
+        meant a ``local`` executor's native process was asked about via Docker,
+        truthfully reported as absent, and left running while the caller
+        printed success.
+
+        The generated script must:
+
+        - remove every name in *container_names* (idempotently: a name that
+          isn't there is not a failure, and any residue such as a stale
+          pidfile is still cleaned up),
+        - exit non-zero, naming survivors on stderr, if anything is still
+          present afterwards,
+        - print :data:`~sparkrun.orchestration.teardown.TEARDOWN_REMOVED_MARKER`
+          with the number of workloads that were **actually present** before
+          the removal — not the number of names attempted.
+
+        The default composes :meth:`exists_cmd` and :meth:`stop_cmd`, so an
+        executor gets a correct teardown from the primitives it already
+        defines (this is the whole of the ``local`` and ``k8s`` implementations).
+
+        Executors whose substrate can be *unavailable* rather than merely empty
+        — a daemon or CLI that may be down, where "not present" and "cannot
+        tell" are different answers — must override to check substrate health
+        first, or an unreachable backend reads as a successful teardown.  That
+        is exactly why :class:`~sparkrun.orchestration.executors.docker.DockerExecutor`
+        overrides it.
+        """
+        from sparkrun.orchestration.teardown import format_teardown_removed
+
+        if not container_names:
+            return "echo %s\n" % quote(format_teardown_removed(0))
+
+        lines = ["_sr_removed=0"]
+        for name in container_names:
+            # Count what was there *before* removing it, so a candidate name
+            # that never existed isn't reported as a container we stopped.
+            lines.append("if %s; then _sr_removed=$((_sr_removed + 1)); fi" % self.exists_cmd(name))
+            # Runs unconditionally: teardown is idempotent, and for substrates
+            # that leave residue behind a dead workload (a `local` pidfile) the
+            # stop is what prunes it.
+            lines.append(self.stop_cmd(name))
+
+        lines.append('_sr_left=""')
+        for name in container_names:
+            lines.append('if %s; then _sr_left="$_sr_left "%s; fi' % (self.exists_cmd(name), quote(name)))
+        lines.extend(
+            [
+                'if [ -n "$_sr_left" ]; then',
+                '  echo "workloads still present:$_sr_left" >&2',
+                "  exit 1",
+                "fi",
+                'echo "%s$_sr_removed"' % TEARDOWN_REMOVED_MARKER,
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
     @abstractmethod
     def inspect_exists_cmd(self, image: str) -> str:
         """Generate a command to check if an image exists locally."""
@@ -512,6 +592,40 @@ class Executor(Plugin):
 
         return empty_status(hosts, executor=self.executor_name)
 
+    def describe_terminated(
+        self,
+        sources: "list[LogSource]",
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> "dict[tuple[str, str], TerminationInfo]":
+        """Report on workloads :meth:`query_status` no longer reports as running.
+
+        The post-mortem peer of :meth:`query_status`: that answers "what is
+        running"; this answers, for something that is *not*, whether its remains
+        are still on this substrate and how the operator inspects them.
+
+        Keyed by ``(host, container)`` rather than by name alone, because a name
+        is only unique per host — Ray worker containers share one name across
+        every node.  A source this executor cannot speak for (unreachable host,
+        no container engine, an inconclusive probe) is simply absent from the
+        mapping, which callers must read as "cannot tell".
+
+        Every part of the answer is substrate-specific — a stopped Docker
+        container, a leftover ``local`` pidfile, a Failed Pod — which is why it
+        belongs here rather than in the caller.  Notably the
+        :attr:`~sparkrun.core.cluster_status.TerminationInfo.investigate_hints`:
+        ``docker logs`` is wrong advice on a k8s cluster and meaningless for a
+        native process.
+
+        Best-effort, like :meth:`query_status` and the ``verify_*`` preflights:
+        it must never raise, and it reports
+        :attr:`~sparkrun.core.cluster_status.TerminationInfo.exists` as ``None``
+        rather than guessing.  The base implementation returns ``{}`` — "cannot
+        tell" — so an executor that does not implement it degrades to preserving
+        cached job metadata rather than deleting it.
+        """
+        return {}
+
     # --- Preflight ---
 
     def verify_mount_sources(
@@ -545,6 +659,41 @@ class Executor(Plugin):
         """
         del paths, hosts, ssh_kwargs  # base is a no-op; substrate-aware executors override
         return {}
+
+    def ensure_runtime_cache(
+        self,
+        mounts: "RuntimeCacheMounts",
+        hosts: list[str],
+        *,
+        ssh_kwargs: dict | None = None,
+    ) -> None:
+        """Prepare the persistent compilation/autotune cache on this substrate.
+
+        Write-path peer of :meth:`verify_mount_sources`: that one asks "do the
+        paths I will mount already exist?", this one *makes* the paths it is
+        about to mount.  Three things in one pass — create the directories,
+        stamp the last-used marker, sweep aged sibling trees (see
+        :mod:`sparkrun.orchestration.runtime_cache`).
+
+        Creating them explicitly is not optional on a bind-mount substrate:
+        Docker materializes a missing ``-v`` source as a **root-owned**
+        directory, which breaks rootless docker and breaks the ``local``
+        executor outright.
+
+        The default is the safe no-op — a provider executor whose cache lives
+        in a managed volume overrides (or legitimately does nothing).
+        Best-effort by contract, like :meth:`verify_mount_sources` and
+        :meth:`query_status`: this must never raise, because a cache we could
+        not prepare costs a recompile while a raised exception costs the
+        launch.
+
+        Args:
+            mounts: The resolved plan from
+                :func:`sparkrun.core.runtime_cache.build_runtime_cache_mounts`.
+            hosts: Target hosts for the launch.
+            ssh_kwargs: Connection settings for host-substrate executors.
+        """
+        del mounts, hosts, ssh_kwargs  # base is a no-op; substrate-aware executors override
 
     def verify_command_passthrough(
         self,

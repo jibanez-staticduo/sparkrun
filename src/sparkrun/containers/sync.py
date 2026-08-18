@@ -31,7 +31,10 @@ def sync_image_to_hosts(
     Returns:
         List of hostnames where the image sync failed.
     """
-    script = read_script("image_sync.sh").format(image=image)
+    # force_pull="0": this path is the per-host "pull it if you don't have it"
+    # sync, not the `--rebuild` override (which runs through
+    # containers.distribute).
+    script = read_script("image_sync.sh").format(image=image, force_pull="0")
 
     return sync_resource_to_hosts(
         script,

@@ -233,6 +233,20 @@ FEATURE_EXECUTOR_K8S = register_feature(
     )
 )
 
+# The uv-venv builder provisions a Python venv on the target hosts (running
+# `uv` and installing packages there) instead of preparing a container image.
+# That is real host-side mutation outside a container, so stable keeps it off;
+# beta/alpha get it by default since it is the only way to run vllm-class
+# runtimes where nested `docker run` doesn't work.
+FEATURE_BUILDER_UV_VENV = register_feature(
+    FeatureFlag(
+        name="builder.uv_venv",
+        description="uv-venv environment builder (provisions a host-side Python venv; pairs with executor: local)",
+        channel_defaults={CHANNEL_BETA: True, CHANNEL_ALPHA: True},
+        default=False,
+    )
+)
+
 FEATURE_CLI_SETUP_K8S = register_feature(
     FeatureFlag(
         name="cli.setup.k8s",

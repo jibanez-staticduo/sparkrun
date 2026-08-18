@@ -8,8 +8,9 @@ their particular launch and teardown flows.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
-from sparkrun.core.config import SparkrunConfig, resolve_hf_cache_home
+from sparkrun.core.config import DEFAULT_CACHE_DIR, SparkrunConfig, resolve_hf_cache_home
 from sparkrun.utils import is_valid_ip
 from sparkrun.orchestration.ssh import (
     DEFAULT_MAX_PARALLEL_SSH,
@@ -27,7 +28,9 @@ from sparkrun.orchestration.infiniband import (
     parse_ib_detect_output,
     generate_nccl_env,
 )
-from sparkrun.orchestration.docker import docker_stop_cmd
+
+if TYPE_CHECKING:
+    from sparkrun.orchestration.executors._base import Executor
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +107,71 @@ def resolved_model_volume(recipe) -> dict[str, str]:
 
     assert_safe_mount_source(path)
     return {path: path}
+
+
+def probe_remote_path(
+    host: str,
+    expr: str,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    timeout: int = 10,
+) -> str:
+    """SSH-probe *host*, echoing shell expression *expr*, and validate the result.
+
+    The generic form behind :func:`probe_remote_hf_cache`: any path sparkrun
+    needs on a target must be resolved in the *login user's* environment, not
+    the control machine's — ``$HOME`` differs, and on a cross-user or remote
+    launch the control machine's answer is simply wrong.
+
+    *expr* is embedded in a double-quoted ``echo`` so parameter expansion
+    happens on the host.  It is caller-supplied and never user input; the
+    *result* is validated against shell metacharacters because callers feed it
+    to ``shlex.quote``-aware code (volume mounts, generated scripts) that would
+    silently break on ``$``/``{``/``}``.
+    """
+    from sparkrun.utils.shell import assert_safe_path
+
+    result = run_remote_command(
+        host,
+        'echo "%s"' % expr,
+        ssh_user=ssh_user,
+        ssh_key=ssh_key,
+        ssh_options=ssh_options,
+        timeout=timeout,
+    )
+    if not result.success or not result.stdout.strip():
+        raise RuntimeError(
+            "Could not resolve remote path on %s (rc=%d): %s" % (host, result.returncode, result.stderr.strip() or "no output")
+        )
+    return assert_safe_path(result.stdout.strip())
+
+
+def probe_remote_sparkrun_cache(
+    host: str,
+    ssh_user: str | None = None,
+    ssh_key: str | None = None,
+    ssh_options: list[str] | None = None,
+    timeout: int = 10,
+    dry_run: bool = False,
+) -> str:
+    """SSH-probe *host* for its sparkrun cache directory (``~/.cache/sparkrun``).
+
+    The runtime-cache peer of :func:`probe_remote_hf_cache`.  Honors
+    ``SPARKRUN_CACHE_DIR`` / ``XDG_CACHE_HOME`` on the target so a host that
+    relocates its caches is respected.
+    """
+    if dry_run:
+        return str(DEFAULT_CACHE_DIR)
+
+    return probe_remote_path(
+        host,
+        "${SPARKRUN_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sparkrun}",
+        ssh_user=ssh_user,
+        ssh_key=ssh_key,
+        ssh_options=ssh_options,
+        timeout=timeout,
+    )
 
 
 def probe_remote_hf_cache(
@@ -401,15 +469,20 @@ def cleanup_containers_by_host(
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
     max_workers: int | None = None,
+    *,
+    executor: "Executor | None" = None,
 ) -> dict[str, RemoteResult]:
     """Tear down a *different* container set per host, in parallel.
 
     The shared teardown primitive: one dispatching, verifying removal per
-    host.  Unlike a bare ``docker rm -f ... || true`` chain, the script
-    (:func:`~sparkrun.orchestration.docker.docker_teardown_script`)
-    confirms the containers are actually gone and reports how many it
-    removed, so callers can report a truthful count instead of assuming
-    the command that returned 0 did anything.
+    host.  The script comes from
+    :meth:`~sparkrun.orchestration.executors._base.Executor.teardown_script`,
+    so a workload is torn down by the substrate that started it — ``docker rm
+    -f`` for a container, a process-group kill for a ``local`` native process,
+    a Pod delete for k8s.  Unlike a bare ``docker rm -f ... || true`` chain it
+    confirms the workloads are actually gone and reports how many were there,
+    so callers can report a truthful count instead of assuming the command
+    that returned 0 did anything.
 
     Best-effort per host: an exception or a failed teardown on one host
     is recorded, never raised, so it can't block or mask cleanup of the
@@ -421,18 +494,29 @@ def cleanup_containers_by_host(
         dry_run: Log without executing.
         max_workers: Cap on concurrent cleanup workers (defaults to the
             shared SSH fan-out cap).
+        executor: The executor that owns these workloads.  ``None`` falls
+            back to Docker, preserving the historical behaviour for callers
+            that have no executor in hand — but a caller that *does* know
+            must pass it: asking Docker about a ``local`` executor's native
+            process gets a truthful "no such container" and leaves the
+            workload running.  Hosts needing more than one executor are
+            handled by calling this once per executor and folding the results
+            with :func:`merge_teardown_results`.
 
     Returns:
         Mapping of host → :class:`RemoteResult`.  ``result.success`` is
         the per-host verdict; the removed count is recoverable via
-        :func:`~sparkrun.orchestration.docker.parse_teardown_removed`.
+        :func:`~sparkrun.orchestration.teardown.parse_teardown_removed`.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from sparkrun.orchestration.docker import docker_teardown_script
-
     if not host_containers:
         return {}
+
+    if executor is None:
+        from sparkrun.orchestration.executors.docker import DockerExecutor
+
+        executor = DockerExecutor()
 
     results: dict[str, RemoteResult] = {}
     with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(host_containers), max_workers)) as pool:
@@ -440,7 +524,7 @@ def cleanup_containers_by_host(
             pool.submit(
                 run_command_on_host,
                 host,
-                docker_teardown_script(names),
+                executor.teardown_script(names),
                 ssh_kwargs=ssh_kwargs,
                 timeout=30,
                 dry_run=dry_run,
@@ -472,12 +556,14 @@ def cleanup_containers(
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
     max_workers: int | None = None,
+    *,
+    executor: "Executor | None" = None,
 ) -> list[str]:
     """Stop and remove the same named containers on every host, in parallel.
 
     Thin wrapper over :func:`cleanup_containers_by_host` for the common
     "same candidate names everywhere" case (see it for the dispatch and
-    verification semantics).
+    verification semantics, and for what ``executor`` means).
 
     Args:
         hosts: Target hosts.
@@ -486,6 +572,7 @@ def cleanup_containers(
         dry_run: Log without executing.
         max_workers: Cap on concurrent cleanup workers (defaults to the
             shared SSH fan-out cap).
+        executor: The executor that owns these workloads (``None`` → Docker).
 
     Returns:
         List of hosts where the teardown did not confirm (empty on full
@@ -499,6 +586,7 @@ def cleanup_containers(
         ssh_kwargs=ssh_kwargs,
         dry_run=dry_run,
         max_workers=max_workers,
+        executor=executor,
     )
     if dry_run:
         return []
@@ -509,10 +597,65 @@ def cleanup_containers(
 def cleanup_containers_local(
     container_names: list[str],
     dry_run: bool = False,
+    *,
+    executor: "Executor | None" = None,
 ) -> None:
-    """Stop and remove named containers locally."""
-    cmds = "; ".join(docker_stop_cmd(name) for name in container_names)
-    run_local_script("#!/bin/bash\n" + cmds, dry_run=dry_run)
+    """Stop and remove named workloads on the local machine.
+
+    Uses the executor's own teardown script (``None`` → Docker) for the same
+    reason the remote path does: the local dispatch is a different *transport*,
+    not a different substrate.
+    """
+    if executor is None:
+        from sparkrun.orchestration.executors.docker import DockerExecutor
+
+        executor = DockerExecutor()
+    run_local_script("#!/bin/bash\n" + executor.teardown_script(list(container_names)), dry_run=dry_run)
+
+
+def merge_teardown_results(*result_maps: dict[str, RemoteResult]) -> dict[str, RemoteResult]:
+    """Fold several per-host teardown result maps into one.
+
+    A single host can need more than one executor — ``docker`` and ``local``
+    share the ``"host"`` status scope and are merged into one status snapshot,
+    so ``stop --all`` on a mixed cluster legitimately discovers both kinds of
+    workload on the same machine.  Each executor is dispatched separately (its
+    teardown script speaks only for its own substrate); this recombines them
+    so callers keep seeing one verdict per host.
+
+    Per host: the result is successful only if *every* map's result was, the
+    output streams are concatenated, and the removed counts are **summed** and
+    re-emitted as a single trailing marker line — otherwise
+    :func:`~sparkrun.orchestration.teardown.parse_teardown_removed`, which
+    reads the last marker it finds, would report only the final executor's
+    count.
+    """
+    from sparkrun.orchestration.teardown import format_teardown_removed, parse_teardown_removed
+
+    merged: dict[str, RemoteResult] = {}
+    for results in result_maps:
+        for host, result in results.items():
+            existing = merged.get(host)
+            if existing is None:
+                merged[host] = result
+                continue
+            total = parse_teardown_removed(existing.stdout) + parse_teardown_removed(result.stdout)
+            merged[host] = RemoteResult(
+                host=host,
+                returncode=existing.returncode or result.returncode,
+                stdout="".join(
+                    part
+                    for part in (
+                        existing.stdout,
+                        "" if existing.stdout.endswith("\n") or not existing.stdout else "\n",
+                        result.stdout,
+                        "" if result.stdout.endswith("\n") or not result.stdout else "\n",
+                        format_teardown_removed(total) + "\n",
+                    )
+                ),
+                stderr="".join(s for s in (existing.stderr, result.stderr) if s),
+            )
+    return merged
 
 
 # ---------------------------------------------------------------------------

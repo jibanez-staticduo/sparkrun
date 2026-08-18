@@ -286,6 +286,35 @@ def test_run_remote_sudo_script_mocks_subprocess(mock_run):
 
 
 @patch("sparkrun.orchestration.ssh.subprocess.run")
+def test_run_remote_sudo_script_nopasswd(mock_run):
+    """password=None uses ``sudo -n`` and pipes only the script.
+
+    The sudo helpers return None once NOPASSWD is confirmed on every host
+    (``ensure_sudo_password``), so this is a normal input, not an error —
+    concatenating it onto the script raised TypeError on the first genuinely
+    remote host.
+    """
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.stdout = "OK"
+    mock_proc.stderr = ""
+    mock_run.return_value = mock_proc
+
+    script = "apt update"
+    result = run_remote_sudo_script("192.168.1.100", script, None, ssh_user="testuser")
+
+    cmd = mock_run.call_args[0][0]
+    assert cmd[0] == "ssh"
+    assert cmd[-4:] == ["sudo", "-n", "bash", "-s"]
+    assert "-S" not in cmd
+
+    # Only the script — no leading blank line for bash to read as a command.
+    assert mock_run.call_args[1]["input"] == script.encode()
+
+    assert result.success
+
+
+@patch("sparkrun.orchestration.ssh.subprocess.run")
 def test_run_remote_sudo_script_timeout(mock_run):
     """Test timeout handling for sudo script."""
     mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ssh"], timeout=60)

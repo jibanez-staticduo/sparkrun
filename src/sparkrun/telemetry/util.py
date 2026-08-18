@@ -9,7 +9,7 @@ from pathlib import PurePath
 import platform
 
 from sparkrun.core.parallelism import PARALLELISM_KEYS, extract_parallelism
-from sparkrun.core.registry import BOOTSTRAP_REGISTRY_URLS, FALLBACK_DEFAULT_REGISTRIES
+from sparkrun.core.registry import BOOTSTRAP_REGISTRY_URLS, FALLBACK_DEFAULT_REGISTRIES, _normalize_registry_url
 
 from .types import TelemetryEvent
 
@@ -17,8 +17,15 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_url(url: str) -> str:
-    """Normalize a registry URL for default-registry comparisons."""
-    return url.strip().rstrip("/").removesuffix(".git")
+    """Normalize a registry URL for default-registry comparisons.
+
+    Delegates to the canonical registry normalizer rather than keeping a
+    weaker copy: this only ever decides whether a registry is one we ship (a
+    count in :func:`registry_summary`, a ``source_kind`` label), so a spelling
+    it failed to recognise inflated ``non_default_registry_count`` for users
+    whose URLs are perfectly ordinary. No URL is emitted either way.
+    """
+    return _normalize_registry_url(url)
 
 
 _DEFAULT_REGISTRY_NAMES = {entry.name for entry in FALLBACK_DEFAULT_REGISTRIES}

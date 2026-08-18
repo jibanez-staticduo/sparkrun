@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 def list_jobs(
     *,
     cache_dir: str | Path | None = None,
+    limit: int | None = None,
     sctx: "SparkrunContext | None" = None,
 ) -> list[JobInfo]:
     """Return a list of :class:`JobInfo` for every persisted job metadata file.
@@ -32,12 +33,30 @@ def list_jobs(
             precedence when set.  Otherwise falls back to
             ``sctx.config.cache_dir`` (when *sctx* is provided), then
             to :data:`sparkrun.core.config.DEFAULT_CACHE_DIR`.
+        limit: Return at most this many of the most recent jobs, and —
+            crucially — only parse that many files.  See below.
         sctx: Optional shared :class:`SparkrunContext`.
 
     Returns:
         :class:`JobInfo` entries sorted by ``started_at`` descending
         (most recent first); entries without a timestamp come last,
         ordered by ``cluster_id``.
+
+    **On ``limit`` and why it exists.** Each metadata file embeds the full
+    serialized recipe state (command template, env, metadata, hooks), so the
+    cost here is dominated by YAML parsing, not by the directory walk: an
+    unpruned cache of ~740 jobs is ~1.7 MB and takes ~1.5 s to load. That is
+    fine for a report and far too slow for shell completion, which runs on
+    every TAB.
+
+    So ``limit`` pre-ranks by file **mtime** — a stat per file, no parsing —
+    and parses only the top N, then re-sorts that subset by the resolved
+    ``started_at``. mtime is a proxy: a job whose file was rewritten later
+    than it was launched could in principle rank above a newer job and
+    displace it from the window. That is the deliberate trade, and it is the
+    same proxy :func:`_resolve_started_at` already falls back to, so a cache
+    written before ``started_at`` existed ranks identically either way.
+    Callers that need exactness omit ``limit``.
     """
     if cache_dir is None and sctx is not None:
         try:
@@ -53,8 +72,14 @@ def list_jobs(
     if not jobs_dir.is_dir():
         return []
 
+    paths = list(jobs_dir.glob("*.yaml"))
+    if limit is not None:
+        if limit <= 0:
+            return []
+        paths = _newest_by_mtime(paths, limit)
+
     entries: list[JobInfo] = []
-    for meta_path in jobs_dir.glob("*.yaml"):
+    for meta_path in paths:
         info = _job_info_from_file(meta_path)
         if info is not None:
             entries.append(info)
@@ -65,6 +90,48 @@ def list_jobs(
 
     entries.sort(key=_sort_key)
     return entries
+
+
+def _newest_by_mtime(paths: list[Path], limit: int) -> list[Path]:
+    """The *limit* most recently modified paths, by stat alone.
+
+    Files that vanish between the glob and the stat (a concurrent prune, a
+    ``stop`` racing us) are dropped rather than raising — this is a
+    best-effort ranking, and completion must never fail on a race.
+    """
+    stamped: list[tuple[float, Path]] = []
+    for path in paths:
+        try:
+            stamped.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    stamped.sort(key=lambda item: -item[0])
+    return [path for _, path in stamped[:limit]]
+
+
+def _resolve_started_at(raw, meta_path: Path) -> float | None:
+    """Resolve a job's launch time, falling back to the file's mtime.
+
+    ``started_at`` was added to the metadata after the fact, so every job
+    written by an earlier sparkrun lacks it — on a long-lived cache that is
+    most of them.  Without a fallback those all sort as "no timestamp", which
+    is exactly the ordering bug the field was added to fix: the sort key sends
+    untimed entries to the back and orders them alphabetically by cluster_id.
+
+    The file's mtime is a good proxy — it is when the launch wrote the
+    metadata — and it is only ever consulted when the recorded value is absent
+    or unparseable, so a real ``started_at`` always wins over a mtime that a
+    later rewrite (backup restore, cache rsync) may have moved.
+    """
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            logger.debug("list_jobs: unparseable started_at %r in %s", raw, meta_path)
+    try:
+        return meta_path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def _job_info_from_file(meta_path: Path) -> JobInfo | None:
@@ -86,12 +153,7 @@ def _job_info_from_file(meta_path: Path) -> JobInfo | None:
     hosts_raw = data.get("hosts") or ()
     hosts = tuple(str(h) for h in hosts_raw) if isinstance(hosts_raw, (list, tuple)) else ()
 
-    started_raw = data.get("started_at")
-    started_at: float | None
-    try:
-        started_at = float(started_raw) if started_raw is not None else None
-    except (TypeError, ValueError):
-        started_at = None
+    started_at = _resolve_started_at(data.get("started_at"), meta_path)
 
     # Decompose the cluster_id when the metadata didn't already record
     # intent_id / placement_token (e.g. a job metadata file written by

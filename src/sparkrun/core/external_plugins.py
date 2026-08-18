@@ -122,7 +122,13 @@ def _scan_module_for_plugins(module, base: type) -> list[type]:
     return list(found.values())
 
 
-def _load_plugin_module(module, v: "Variables") -> None:
+def load_plugin_module(module, v: "Variables") -> None:
+    """Register everything *module* contributes: SAF subclasses, then ``register(v)``.
+
+    Shared with :mod:`sparkrun.core.in_tree_plugins` — in-tree and out-of-tree
+    plugins differ only in where their modules come from, so they must not
+    differ in what counts as a registration.
+    """
     # 1) Register SAF-scanned plugin subclasses (runtimes/executors/transports/…).
     for base in _plugin_base_types():
         for cls in _scan_module_for_plugins(module, base):
@@ -203,7 +209,7 @@ def load_external_plugins(v: "Variables", paths: "list[Path] | None" = None) -> 
             except Exception:  # noqa: BLE001 - one broken plugin shouldn't kill the CLI
                 logger.exception("Failed to import external plugin module %r from %s", name, path)
                 continue
-            _load_plugin_module(module, v)
+            load_plugin_module(module, v)
             loaded.append(name)
 
     if loaded:

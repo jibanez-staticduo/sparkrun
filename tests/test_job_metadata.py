@@ -3,6 +3,10 @@ plus identifier-model coverage (intent_id / placement_token split)."""
 
 from __future__ import annotations
 
+import yaml
+
+import time
+
 import re
 from pathlib import Path
 from unittest import mock
@@ -520,3 +524,266 @@ class TestParseContainerName:
         assert parse_container_name("sparkrun_%s_%s_head" % ("a" * 15, self.PLACE)) is None
         # Wrong placement length (11 instead of 12).
         assert parse_container_name("sparkrun_%s_%s_head" % (self.INTENT, "a" * 11)) is None
+
+
+# --------------------------------------------------------------------------
+# started_at — launch time, and the ordering that depends on it
+# --------------------------------------------------------------------------
+
+
+class TestStartedAt:
+    """``list_jobs`` documents "most recent first"; nothing recorded a time.
+
+    ``_job_info_from_file`` has always read ``started_at``, but
+    ``save_job_metadata`` never wrote it — so every job resolved to ``None``
+    and the sort key silently degraded to alphabetical by cluster_id.
+    """
+
+    def _recipe(self):
+        from sparkrun.core.recipe import Recipe
+
+        return Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": "test/m"})
+
+    def test_save_records_launch_time(self, tmp_path):
+        import time
+
+        from sparkrun.orchestration.job_metadata import load_job_metadata, save_job_metadata
+
+        before = time.time()
+        cluster_id = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+        save_job_metadata(cluster_id, self._recipe(), ["h1"], cache_dir=str(tmp_path))
+        after = time.time()
+
+        meta = load_job_metadata(cluster_id, cache_dir=str(tmp_path))
+        assert before <= meta["started_at"] <= after
+
+    def test_list_jobs_reads_it(self, tmp_path):
+        from sparkrun.api import list_jobs
+        from sparkrun.orchestration.job_metadata import save_job_metadata
+
+        save_job_metadata("sparkrun_aaaaaaaaaaaaaaaa_111111111111", self._recipe(), ["h1"], cache_dir=str(tmp_path))
+        (job,) = list_jobs(cache_dir=str(tmp_path))
+        assert job.started_at is not None
+
+    def test_orders_most_recent_first(self, tmp_path, monkeypatch):
+        from sparkrun.api import list_jobs
+        from sparkrun.orchestration.job_metadata import save_job_metadata
+
+        # Launch order is deliberately the *reverse* of alphabetical order, so
+        # the assertion fails under the old (alphabetical) behaviour rather
+        # than passing by coincidence.  cluster_ids are hex — `parse_cluster_id`
+        # rejects anything else — so the two differ only in a/f.
+        clock = iter([1_700_000_000.0, 1_700_000_500.0])
+        monkeypatch.setattr("sparkrun.orchestration.job_metadata.time.time", lambda: next(clock))
+
+        for cid in ("sparkrun_aaaaaaaaaaaaaaaa_111111111111", "sparkrun_ffffffffffffffff_222222222222"):
+            save_job_metadata(cid, self._recipe(), ["h1"], cache_dir=str(tmp_path))
+
+        ordered = [j.cluster_id for j in list_jobs(cache_dir=str(tmp_path))]
+        assert ordered[0].startswith("sparkrun_ffff"), "newest launch must sort first, not the alphabetical winner"
+
+
+class TestStartedAtBackfill:
+    """Jobs written before the field existed must still order correctly.
+
+    On a long-lived cache that is most of them, and leaving those as "no
+    timestamp" reproduces the exact ordering bug the field was added to fix.
+    """
+
+    def _write(self, tmp_path, name: str, body: str, mtime: float | None = None):
+        import os
+
+        jobs = tmp_path / "jobs"
+        jobs.mkdir(parents=True, exist_ok=True)
+        path = jobs / name
+        path.write_text(body)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_missing_started_at_falls_back_to_mtime(self, tmp_path):
+        from sparkrun.api import list_jobs
+
+        self._write(
+            tmp_path,
+            "aaaaaaaaaaaaaaaa_111111111111.yaml",
+            "cluster_id: sparkrun_aaaaaaaaaaaaaaaa_111111111111\nhosts: [h1]\n",
+            mtime=1_700_000_000.0,
+        )
+        (job,) = list_jobs(cache_dir=str(tmp_path))
+        assert job.started_at == 1_700_000_000.0
+
+    def test_recorded_value_beats_mtime(self, tmp_path):
+        """A rewrite (backup restore, cache rsync) moves mtime; the record doesn't."""
+        from sparkrun.api import list_jobs
+
+        self._write(
+            tmp_path,
+            "aaaaaaaaaaaaaaaa_111111111111.yaml",
+            "cluster_id: sparkrun_aaaaaaaaaaaaaaaa_111111111111\nstarted_at: 1600000000.0\nhosts: [h1]\n",
+            mtime=1_700_000_000.0,
+        )
+        (job,) = list_jobs(cache_dir=str(tmp_path))
+        assert job.started_at == 1_600_000_000.0
+
+    def test_unparseable_value_falls_back_to_mtime(self, tmp_path):
+        from sparkrun.api import list_jobs
+
+        self._write(
+            tmp_path,
+            "aaaaaaaaaaaaaaaa_111111111111.yaml",
+            "cluster_id: sparkrun_aaaaaaaaaaaaaaaa_111111111111\nstarted_at: not-a-number\nhosts: [h1]\n",
+            mtime=1_700_000_000.0,
+        )
+        (job,) = list_jobs(cache_dir=str(tmp_path))
+        assert job.started_at == 1_700_000_000.0
+
+    def test_mixed_recorded_and_backfilled_sort_together(self, tmp_path):
+        """A cache mid-migration holds both shapes; one ordering must cover both."""
+        from sparkrun.api import list_jobs
+
+        self._write(
+            tmp_path,
+            "aaaaaaaaaaaaaaaa_111111111111.yaml",
+            "cluster_id: sparkrun_aaaaaaaaaaaaaaaa_111111111111\nhosts: [h1]\n",
+            mtime=1_600_000_000.0,  # old, backfilled from mtime
+        )
+        self._write(
+            tmp_path,
+            "bbbbbbbbbbbbbbbb_222222222222.yaml",
+            "cluster_id: sparkrun_bbbbbbbbbbbbbbbb_222222222222\nstarted_at: 1700000000.0\nhosts: [h1]\n",
+            mtime=1_500_000_000.0,  # mtime is older, but the record is newer
+        )
+        ordered = [j.cluster_id for j in list_jobs(cache_dir=str(tmp_path))]
+        assert ordered == [
+            "sparkrun_bbbbbbbbbbbbbbbb_222222222222",
+            "sparkrun_aaaaaaaaaaaaaaaa_111111111111",
+        ]
+
+
+# --------------------------------------------------------------------------
+# prune_job_metadata
+# --------------------------------------------------------------------------
+
+
+class TestPruneJobMetadata:
+    """The cache is append-only, so without a prune it grows without bound.
+
+    Keep = among the newest ``keep_per_intent`` for its intent AND younger
+    than ``max_age_days``.  Everything else goes.
+    """
+
+    def _write(self, tmp_path, intent: str, token: str, age_days: float, recipe="r"):
+        import os
+
+        from sparkrun.core.recipe import Recipe
+        from sparkrun.orchestration.job_metadata import save_job_metadata
+
+        cid = "sparkrun_%s_%s" % (intent, token)
+        recipe_obj = Recipe({"sparkrun_version": "2", "runtime": "vllm-distributed", "model": recipe})
+        save_job_metadata(cid, recipe_obj, ["h1"], cache_dir=str(tmp_path))
+        # Rewrite started_at so age is deterministic, and match mtime to it.
+        path = tmp_path / "jobs" / ("%s_%s.yaml" % (intent, token))
+        data = yaml.safe_load(path.read_text())
+        stamp = time.time() - age_days * 86400
+        data["started_at"] = stamp
+        path.write_text(yaml.safe_dump(data))
+        os.utime(path, (stamp, stamp))
+        return cid
+
+    def test_age_rule_prunes_even_the_only_job_of_an_intent(self, tmp_path):
+        """Both conditions must hold to keep, so age alone is enough to prune.
+
+        An "or" here would keep the newest entry of every intent ever launched,
+        leaving a cache that never shrinks.
+        """
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        fresh = self._write(tmp_path, "a" * 16, "1" * 12, age_days=1)
+        old = self._write(tmp_path, "b" * 16, "2" * 12, age_days=90)
+
+        removed = set(prune_job_metadata(cache_dir=str(tmp_path)))
+        assert old in removed
+        assert fresh not in removed
+
+    def test_per_intent_rule_keeps_a_short_history(self, tmp_path):
+        """Among *recent* jobs, each intent keeps its newest few relaunches."""
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        jobs = [self._write(tmp_path, "c" * 16, "%012d" % i, age_days=i) for i in range(5)]
+
+        removed = set(prune_job_metadata(cache_dir=str(tmp_path), keep_per_intent=3))
+        assert removed == {jobs[3], jobs[4]}
+
+    def test_per_intent_window_is_not_a_global_cap(self, tmp_path):
+        """A rarely-run intent must not be erased by a busy one's relaunches."""
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        busy = [self._write(tmp_path, "a" * 16, "%012d" % i, age_days=i) for i in range(5)]
+        rare = self._write(tmp_path, "b" * 16, "9" * 12, age_days=6)
+
+        removed = set(prune_job_metadata(cache_dir=str(tmp_path), keep_per_intent=2))
+        assert rare not in removed
+        assert set(busy[2:]) <= removed
+
+    def test_never_deletes_a_running_workload(self, tmp_path):
+        """Age is not a sufficient guard — a server can outlive the cutoff.
+
+        Its metadata is load-bearing for stop/logs/proxy discovery, so deleting
+        it would strand the deployment.
+        """
+        from sparkrun.orchestration.job_metadata import load_job_metadata, prune_job_metadata
+
+        ancient = self._write(tmp_path, "d" * 16, "3" * 12, age_days=400)
+        removed = prune_job_metadata(cache_dir=str(tmp_path), protected_cluster_ids={ancient})
+        assert removed == []
+        assert load_job_metadata(ancient, cache_dir=str(tmp_path)) is not None
+
+    def test_dry_run_deletes_nothing(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import load_job_metadata, prune_job_metadata
+
+        old = self._write(tmp_path, "e" * 16, "4" * 12, age_days=90)
+        removed = prune_job_metadata(cache_dir=str(tmp_path), dry_run=True)
+        assert removed == [old]
+        assert load_job_metadata(old, cache_dir=str(tmp_path)) is not None
+
+    def test_age_zero_disables_the_age_test(self, tmp_path):
+        """Then keep_per_intent is the only rule — useful for a hard compaction."""
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        recent = [self._write(tmp_path, "f" * 16, "%012d" % i, age_days=i) for i in range(3)]
+        removed = prune_job_metadata(cache_dir=str(tmp_path), max_age_days=0, keep_per_intent=1)
+        assert set(removed) == {recent[1], recent[2]}
+
+    def test_empty_cache_is_a_noop(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import prune_job_metadata
+
+        assert prune_job_metadata(cache_dir=str(tmp_path)) == []
+
+
+class TestRunningSnapshot:
+    def test_round_trip(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import load_running_snapshot, save_running_snapshot
+
+        save_running_snapshot({"sparkrun_a_b"}, ["h1", "h2"], cache_dir=str(tmp_path))
+        running, covered = load_running_snapshot(cache_dir=str(tmp_path))
+        assert running == {"sparkrun_a_b"}
+        assert covered == {"h1", "h2"}
+
+    def test_absent_snapshot_is_none(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import load_running_snapshot
+
+        assert load_running_snapshot(cache_dir=str(tmp_path)) is None
+
+    def test_stale_snapshot_is_none(self, tmp_path):
+        """Used to *hide* things, so it must expire rather than mislead."""
+        from sparkrun.orchestration.job_metadata import load_running_snapshot, save_running_snapshot
+
+        save_running_snapshot({"sparkrun_a_b"}, ["h1"], cache_dir=str(tmp_path))
+        assert load_running_snapshot(cache_dir=str(tmp_path), max_age_s=-1) is None
+
+    def test_corrupt_snapshot_is_none(self, tmp_path):
+        from sparkrun.orchestration.job_metadata import RUNNING_SNAPSHOT_FILE, load_running_snapshot
+
+        (tmp_path / RUNNING_SNAPSHOT_FILE).write_text("{not json")
+        assert load_running_snapshot(cache_dir=str(tmp_path)) is None

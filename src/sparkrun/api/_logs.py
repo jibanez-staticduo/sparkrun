@@ -150,13 +150,189 @@ def logs(
         is_solo=len(target_hosts) <= 1,
         scope=scope,
     )
+
+    ssh_kwargs = build_ssh_kwargs(config) if config else {}
+
+    # Liveness precheck: check ALL nodes (not just the head log source) —
+    # in a multi-node job the head may have crashed while workers are still
+    # running, and the user should still be able to read logs from surviving
+    # nodes.  Uses ``executor.query_status`` (one parallel SSH sweep) — the
+    # same source of truth as ``api.status`` and ``check_job_running``.
+    # See ``_verify_log_source_alive`` for the full decision tree.
+    #
+    # Substrate knowledge stays behind the executor throughout: this module
+    # asks *what is running* and *what became of it*, never *how to look*.
+    all_sources = (
+        sources
+        if scope == SCOPE_ALL
+        else runtime.log_sources(
+            cluster_id,
+            target_hosts,
+            is_solo=len(target_hosts) <= 1,
+            scope=SCOPE_ALL,
+        )
+    )
+    _verify_log_source_alive(executor, all_sources, ssh_kwargs, cluster_id, cache_dir, scope=scope)
+
     return read_log_sources(
         executor,
         sources,
         follow=follow,
         tail=tail,
-        ssh_kwargs=build_ssh_kwargs(config) if config else {},
+        ssh_kwargs=ssh_kwargs,
     )
+
+
+def _verify_log_source_alive(
+    executor, sources, ssh_kwargs: dict, cluster_id: str, cache_dir: str | None, *, scope: str = SCOPE_HEAD
+) -> None:
+    """Raise :class:`JobNotFound` if the workload isn't running.
+
+    Uses :meth:`Executor.query_status` — the same source of truth as
+    ``api.status``, ``check_job_running``, and the monitor TUI — to do
+    one parallel SSH sweep across all hosts, rather than probing each
+    source sequentially.
+
+    Three outcomes:
+
+    1. **Head alive** (container in the status snapshot) → proceed.
+    2. **Head dead, some workers alive** → raise with a pointer to
+       ``--all-sources`` so the user can read from surviving nodes.
+       With ``scope=SCOPE_ALL`` the reader can handle this, so proceed.
+    3. **All sources dead** (none in the snapshot) →
+       :meth:`Executor.describe_terminated` distinguishes
+       **stopped-but-inspectable** (preserve metadata, render the executor's
+       investigation hints) from **fully gone** (clean up stale metadata).
+       ``query_status`` reports only what is *running*, so it structurally
+       cannot make that distinction itself.
+
+    Every substrate-specific question — is anything left behind, what state is
+    it in, what should the operator run next — is answered by the executor.
+    This function contributes only sparkrun-level guidance (``--all-sources``,
+    ``sparkrun stop``), so it reads the same on docker, local and k8s.
+
+    Best-effort: if the status query fails or a host is unreachable
+    (in ``ClusterStatus.errors``), the precheck is skipped so a network
+    blip never causes a false "not running" verdict.
+    """
+    if not sources:
+        return
+
+    head = sources[0]
+
+    # One parallel SSH sweep via the status API — same source of truth
+    # as `api.status`, `check_job_running`, and the monitor TUI.
+    all_hosts = list(dict.fromkeys(s.host for s in sources))
+    try:
+        snapshot = executor.query_status(all_hosts, ssh_kwargs=ssh_kwargs)
+    except Exception:  # noqa: BLE001 — best-effort; let log reader surface its own error
+        return
+
+    def _container_status(host: str, container_name: str) -> bool | None:
+        """True if running, False if confirmed absent, None if host unreachable."""
+        occ = snapshot.for_host(host)
+        if occ is None:
+            return None  # host in errors / unreachable → inconclusive
+        for w in occ.workloads:
+            if w.cluster_id == cluster_id:
+                for c in w.containers:
+                    if c.name == container_name:
+                        return True
+                # The cluster_id is here but this container isn't named.
+                # ``RunningWorkload.containers`` is optional — an executor that
+                # doesn't populate it can't answer per-container questions at
+                # all, so this is *inconclusive*, not "alive".  The difference
+                # only shows on workers: counting one alive by mistake reports
+                # "partially running, try --all-sources" for a workload that is
+                # entirely dead.
+                if not w.containers:
+                    return None
+        return False  # host reachable, container not in snapshot
+
+    head_status = _container_status(head.host, head.container)
+    if head_status is None:
+        return  # inconclusive → skip precheck
+    if head_status:
+        return  # head is alive → proceed normally
+
+    # Head is confirmed dead.  Check workers — if any are still alive,
+    # point the user at ``--all-sources`` rather than letting the reader
+    # fail on the dead head container with a raw docker error.
+    alive_worker_hosts = []
+    for source in sources[1:]:
+        status = _container_status(source.host, source.container)
+        if status is None:
+            return  # inconclusive → skip precheck
+        if status:
+            alive_worker_hosts.append(source.host)
+
+    if alive_worker_hosts:
+        # With ``--all-sources`` the reader can read from the surviving
+        # workers, so proceed.  With the default (head-only) scope the
+        # reader would fail on the dead head container — raise a helpful
+        # error pointing at ``--all-sources`` instead.
+        if scope == SCOPE_ALL:
+            return
+        raise JobNotFound(
+            "Workload %s is partially running — the head container on %s has stopped, "
+            "but worker containers are still alive on %s.\n"
+            "Try `sparkrun logs %s --all-sources` to read from surviving nodes, "
+            "or `sparkrun stop %s` to clean up." % (cluster_id, head.host, ", ".join(alive_worker_hosts), cluster_id, cluster_id)
+        )
+
+    # Every source is confirmed dead.  Ask the executor what became of the head
+    # — whether anything is left to inspect, and how to inspect it.  A missing
+    # entry means "cannot tell" (unreachable host, an executor with no
+    # post-mortem support), which must not be read as "gone": that verdict is
+    # what deletes cached metadata.
+    try:
+        terminated = executor.describe_terminated([head], ssh_kwargs=ssh_kwargs)
+    except Exception:  # noqa: BLE001 — best-effort, like the status sweep above
+        logger.debug("describe_terminated failed for %s", cluster_id, exc_info=True)
+        terminated = {}
+    info = terminated.get((head.host, head.container))
+
+    if info is None or info.exists is not False:
+        raise JobNotFound(
+            "Workload %s is not currently running on %s%s.\n"
+            "The job metadata has been preserved so you can investigate.%s\n"
+            "Run `sparkrun stop %s` to clean up when ready." % (cluster_id, head.host, _detail_suffix(info), _hint_block(info), cluster_id)
+        )
+
+    # Confirmed gone — the cached metadata is stale.  Remove it so
+    # ``logs <TAB>`` stops suggesting this dead workload.
+    try:
+        from sparkrun.orchestration.job_metadata import remove_job_metadata
+
+        remove_job_metadata(cluster_id, cache_dir=cache_dir)
+    except Exception:
+        logger.debug("Failed to remove stale metadata for %s", cluster_id, exc_info=True)
+
+    raise JobNotFound(
+        "Workload %s is not running on %s and nothing remains to read%s.\n"
+        "The stale job metadata has been removed. Run `sparkrun status` to see running workloads.%s"
+        % (cluster_id, head.host, _detail_suffix(info), _hint_block(info))
+    )
+
+
+def _detail_suffix(info) -> str:
+    """Render an executor's substrate-native state as a parenthetical, if any."""
+    detail = getattr(info, "detail", None)
+    return " (%s)" % detail if detail else ""
+
+
+def _hint_block(info) -> str:
+    """Render an executor's investigation hints as an indented block.
+
+    The commands are the executor's — ``docker logs`` on a Docker host,
+    ``kubectl logs`` on k8s, a plain ``cat`` for a ``local`` job — so this only
+    lays them out.  An executor with nothing useful to suggest contributes
+    nothing rather than a heading with an empty list under it.
+    """
+    hints = getattr(info, "investigate_hints", ()) or ()
+    if not hints:
+        return ""
+    return "\n" + "\n".join("  %s" % h for h in hints)
 
 
 def _resolve_runtime_for_job(meta: dict | None, cluster_id: str, *, recipe=None, sctx: "SparkrunContext | None"):
