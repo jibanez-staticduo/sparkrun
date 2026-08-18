@@ -813,7 +813,9 @@ command: |
 GGUF runner: only the DeepSeek V4 Flash/PRO and GLM 5.2 layouts published at
 [`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf)
 will load. Images come from [`spark-arena/dgx-ds4`](https://github.com/spark-arena/dgx-ds4)
-and default to `ghcr.io/spark-arena/dgx-ds4:stable`.
+and default to `ghcr.io/spark-arena/dgx-ds4:latest`. Upstream ships no releases
+and moves fast, so pin an immutable `<date>-<sha7>-cu131` tag in `container:`
+for anything that has to be reproducible.
 
 ```yaml
 name: ds4-flash-q2

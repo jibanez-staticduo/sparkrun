@@ -286,9 +286,10 @@ help text — the help is shared with the `ds4` CLI binary and over-promises:
 - **No `/health`** — `GET /v1/models` is the readiness probe, and a 60–160 GB
   GGUF takes minutes to load.
 
-The default image tag is `:stable`, not `:latest`: upstream ships no tags or
-releases and self-describes as beta, so `:latest` tracks raw `main` HEAD while
-`:stable` moves only after a smoke test on hardware.
+Image defaulting is the plain `default_image_prefix` + base-class `:latest`,
+like every other image-backed runtime — upstream's lack of releases is a reason
+to pin an immutable `<date>-<sha7>-cu131` tag in a recipe, not a reason for this
+runtime to spell its default tag differently from the rest of the fleet.
 
 **Node-command template** (`RuntimePlugin._make_node_command_args`): native
 multi-node runtimes (`vllm-distributed`, `sglang`, `trtllm`) emit rank-specific

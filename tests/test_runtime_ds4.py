@@ -37,11 +37,11 @@ def test_ds4_runtime_identity():
     assert runtime.cluster_strategy() == "native"
 
 
-def test_ds4_default_container_is_stable_not_latest():
-    """Upstream ships no releases, so ``latest`` is unvetted HEAD."""
+def test_ds4_default_container_follows_the_latest_convention():
+    """Same ``<prefix>:latest`` default every other image-backed runtime uses."""
     runtime = Ds4Runtime()
-    assert runtime.resolve_container(_recipe()) == "ghcr.io/spark-arena/dgx-ds4:stable"
-    assert runtime.default_image_for() == "ghcr.io/spark-arena/dgx-ds4:stable"
+    assert runtime.resolve_container(_recipe()) == "ghcr.io/spark-arena/dgx-ds4:latest"
+    assert runtime.default_image_for() == "ghcr.io/spark-arena/dgx-ds4:latest"
 
 
 def test_ds4_recipe_container_wins():

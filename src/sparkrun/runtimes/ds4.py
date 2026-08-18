@@ -53,12 +53,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Published by https://github.com/spark-arena/dgx-ds4.  ``stable`` rather than
-# ``latest``: upstream ships no releases and calls itself beta, so ``latest``
-# tracks raw ``main`` HEAD while ``stable`` only moves after a smoke test on
-# real hardware.
-_DS4_DEFAULT_IMAGE_TAG = "stable"
-
 # Recipe ``defaults`` key -> ``ds4-server`` CLI flag.  Every entry is a valued
 # flag consuming exactly one argument (``need_arg`` in ds4_server.c).
 _DS4_FLAG_MAP = {
@@ -163,7 +157,9 @@ class Ds4Runtime(RuntimePlugin):
 
     Launches ``ds4-server`` through the solo path (container with
     ``sleep infinity`` + ``docker exec``) from the prebuilt
-    ``ghcr.io/spark-arena/dgx-ds4`` image.
+    ``ghcr.io/spark-arena/dgx-ds4:latest`` image.  Upstream ships no releases
+    and moves fast, so pin an immutable ``<date>-<sha7>-cu131`` tag in
+    ``container:`` for anything that has to be reproducible.
 
     Weights are ordinary GGUF files: point ``model`` at
     ``antirez/deepseek-v4-gguf:<quant-marker>`` and sparkrun's existing GGUF
@@ -180,33 +176,6 @@ class Ds4Runtime(RuntimePlugin):
 
     def get_family(self) -> str:
         return "ds4"
-
-    # --- container image ---
-
-    def resolve_container(self, recipe: "Recipe", overrides: dict[str, Any] | None = None) -> str:
-        """Recipe ``container`` wins, else the first-party ``:stable`` image."""
-        if recipe.container:
-            return recipe.container
-        return "%s:%s" % (self.default_image_prefix, _DS4_DEFAULT_IMAGE_TAG)
-
-    def default_image_for(self, host_hardware=None) -> str | None:
-        """Platform-published default, else the first-party ``:stable`` image.
-
-        Overridden only to change the tag: the base implementation appends
-        ``:latest``, which for ds4 means an unvetted build of upstream HEAD.
-        """
-        if host_hardware is not None:
-            try:
-                from sparkrun.platforms import resolve_platform
-
-                platform = resolve_platform(host_hardware)
-            except Exception:
-                platform = None
-            if platform is not None:
-                img = platform.default_image(self.runtime_name)
-                if img is not None:
-                    return img
-        return "%s:%s" % (self.default_image_prefix, _DS4_DEFAULT_IMAGE_TAG)
 
     # --- placement: single node, always ---
 
