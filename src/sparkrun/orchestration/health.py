@@ -69,7 +69,18 @@ def wait_for_port(
 
     from sparkrun.orchestration.primitives import run_command_on_host
 
-    check_cmd = "nc -z localhost %d" % port
+    # Check LISTEN state instead of `nc -z`: `nc -z` opens a real TCP
+    # connection, which consumes one-shot rendezvous accepts. Atlas's NCCL
+    # bootstrap (rank 0) accepts exactly world_size-1 connections, hands out
+    # its unique NCCL ID, then closes the listener — a probe connection steals
+    # that single accept, the real worker gets "Connection refused" forever,
+    # and the head spins in ncclCommInitRank. Checking the kernel socket table
+    # is side-effect free and matches "port is listening" for every runtime.
+    check_cmd = (
+        f"ss -tln 2>/dev/null | grep -qE ':{port}(\\s|$)' "
+        f"|| ss -tln6 2>/dev/null | grep -qE ':{port}(\\s|$)' "
+        f"|| grep -qE ':{port:04X} ' /proc/net/tcp"
+    )
     for attempt in range(1, max_retries + 1):
         # Check container liveness before polling the port
         if container_name and attempt > 1:
