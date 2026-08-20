@@ -209,7 +209,17 @@ class DockerExecutor(Executor):
         if rootless:
             adjustments["privileged"] = False
             adjustments["security_opt"] = ["no-new-privileges"]
-            adjustments["cap_add"] = []
+            # NOTE: deliberately no ``cap_add`` entry.  Docker grants no extra
+            # capabilities unless asked, so ``[]`` here would be identical to
+            # ``None`` in the emitted flags — it hardened nothing.  All it did
+            # was *suppress* the three layers below this one (runtime /
+            # SparkrunConfig / platform defaults) while the four above it
+            # (CLI / recipe / builder / cluster) set ``cap_add`` freely under
+            # rootless anyway.  That asymmetry left a runtime with no way to
+            # declare a capability it genuinely needs — see
+            # ``runtimes._util.ptrace_executor_config``.  Untrusted recipes are
+            # still blocked from ``cap_add`` by the launcher's trust gate
+            # (``_TRUST_GATED_EXECUTOR_KEYS``), which is the real control here.
             adjustments["ulimit"] = [
                 "memlock=-1:-1",
                 "stack=67108864",

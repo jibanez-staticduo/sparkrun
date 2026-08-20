@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING
-from sparkrun.runtimes._util import default_env_hf_offline, resolve_api_key
+from sparkrun.runtimes._util import default_env_hf_offline, ptrace_executor_config, resolve_api_key
 
 if TYPE_CHECKING:
     from sparkrun.core.recipe import Recipe
@@ -19,6 +19,16 @@ class VllmMixin:
 
     def get_common_env(self):
         return default_env_hf_offline()
+
+    def default_executor_config(self) -> dict:
+        """Allow attaching a stack sampler to a hung vLLM engine.
+
+        vLLM's own hang-debugging guidance is ``py-spy dump --pid <EngineCore
+        pid>``, which needs ``CAP_SYS_PTRACE`` because EngineCore is a sibling
+        of whatever shell the operator execs in.  See
+        :func:`~sparkrun.runtimes._util.ptrace_executor_config`.
+        """
+        return {**super().default_executor_config(), **ptrace_executor_config()}
 
     def get_extra_volumes(self) -> dict[str, str]:
         """Mount vLLM tuning configs if available."""

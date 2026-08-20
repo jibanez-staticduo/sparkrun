@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, TYPE_CHECKING
 
-from sparkrun.runtimes._util import default_env_hf_offline, resolve_api_key
+from sparkrun.runtimes._util import default_env_hf_offline, ptrace_executor_config, resolve_api_key
 from sparkrun.runtimes.base import RuntimePlugin
 
 if TYPE_CHECKING:
@@ -356,6 +356,17 @@ class SglangRuntime(RuntimePlugin):
                 )
 
         return issues
+
+    def default_executor_config(self) -> dict[str, Any]:
+        """Allow attaching a stack sampler to a hung SGLang process.
+
+        SGLang's watchdog reports *that* a scheduler stalled but not where;
+        pinning it down means ``py-spy dump`` against the scheduler /
+        detokenizer / TP-worker process, none of which is a descendant of an
+        operator's exec shell.  See
+        :func:`~sparkrun.runtimes._util.ptrace_executor_config`.
+        """
+        return {**super().default_executor_config(), **ptrace_executor_config()}
 
     # --- Tuning config auto-mount ---
 
