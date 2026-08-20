@@ -47,19 +47,42 @@ class VllmMixin:
     def runtime_cache_paths(self, *, fingerprint: str = "") -> dict:
         """Persist vLLM's compile / JIT caches across container restarts.
 
-        All four are content-addressed internally (torch.compile hashes its
-        config, Triton and FlashInfer key by kernel signature), which is why
-        vLLM does not need ``key_by_image`` — see
-        :mod:`sparkrun.core.runtime_cache`.
+        All of these are content-addressed internally (torch.compile hashes its
+        config, Triton and FlashInfer key by kernel signature, CuTeDSL
+        fingerprints its sources and toolchain), which is why vLLM does not
+        need ``key_by_image`` — see :mod:`sparkrun.core.runtime_cache`.
 
-        ``VLLM_CACHE_ROOT`` and ``FLASHINFER_CACHE_DIR`` are named explicitly
-        rather than left to the ``XDG_CACHE_HOME`` catch-all because both
-        libraries expand ``~/.cache/...`` directly instead of consulting XDG.
+        ``VLLM_CACHE_ROOT`` and the FlashInfer pair are named explicitly rather
+        than left to the ``XDG_CACHE_HOME`` catch-all because those libraries
+        expand ``~/.cache/...`` directly instead of consulting XDG.
 
-        ``FLASHINFER_CACHE_DIR`` — not ``FLASHINFER_WORKSPACE_BASE``: the
-        workspace holds build intermediates that are worthless across runs and
-        would grow the tree for nothing.  The cache dir is the compiled output
-        worth keeping.
+        **FlashInfer needs two entries, and the one that works is the
+        workspace base.**  ``FLASHINFER_CACHE_DIR`` reads like the lever but is
+        not an environment variable at all — in ``flashinfer/jit/env.py`` it is
+        a module *attribute* derived as ``FLASHINFER_WORKSPACE_BASE /
+        ".cache" / "flashinfer"``, with the base defaulting to
+        ``Path.home()``.  So the JIT output (``cached_ops``, ``generated``)
+        followed the container's throwaway ``HOME`` and was recompiled on every
+        launch.  Verified against flashinfer 0.6.11 and 0.6.18.  Both vars
+        point at the same subtree: the base grows a ``.cache/flashinfer/...``
+        tree under it, and ``FLASHINFER_CACHE_DIR`` is kept — harmless today,
+        and correct if a later release starts honoring it.
+
+        ``CUTE_DSL_CACHE_DIR`` is NVIDIA's CuTeDSL generated-IR cache
+        (``nvidia_cutlass_dsl``), which vLLM's ``vllm_flash_attn.cute``,
+        FlashInfer's sparse kernels and the b12x kernel stack all compile
+        through.  Unset it goes to ``$TMPDIR/<user>/cutlass_python_cache`` —
+        neither XDG nor ``HOME``, so nothing else here reaches it.
+        ``FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`` is the peer used by the vendored
+        FlashAttention CuTe copies; that cache is opt-in
+        (``FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1``) but pointing it costs an
+        empty directory and makes enabling it actually persist.
+
+        b12x itself needs no entry: its compile cache resolves
+        ``B12X_COMPILE_CACHE_DIR`` → ``$XDG_CACHE_HOME/b12x/compile``, so the
+        catch-all already covers it.  Relocating these is safe with respect to
+        b12x's own cache key, which treats ``B12X_COMPILE_CACHE_DIR`` and
+        ``CUTE_DSL_CACHE_DIR`` as operational and excludes them from the digest.
         """
         from sparkrun.core.runtime_cache import CachePath
 
@@ -68,6 +91,9 @@ class VllmMixin:
             "TORCHINDUCTOR_CACHE_DIR": CachePath("inductor"),
             "TRITON_CACHE_DIR": CachePath("triton"),
             "FLASHINFER_CACHE_DIR": CachePath("flashinfer"),
+            "FLASHINFER_WORKSPACE_BASE": CachePath("flashinfer"),
+            "CUTE_DSL_CACHE_DIR": CachePath("cute_dsl"),
+            "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": CachePath("flash_attn_cute_dsl"),
         }
 
     def finalize_host_comm_env(self, host_env: dict[str, str]) -> dict[str, str]:

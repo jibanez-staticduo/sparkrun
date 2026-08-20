@@ -391,9 +391,12 @@ class SglangRuntime(RuntimePlugin):
 
         SGLang's own graph cache goes through torch.compile, so Inductor covers
         it.  All of these are content-addressed or version-keyed internally and
-        safe to share across images — see :meth:`VllmMixin.runtime_cache_paths`
-        for why FlashInfer's *cache* dir is the one persisted and not its
-        workspace.
+        safe to share across images.
+
+        ``FLASHINFER_WORKSPACE_BASE`` and the CuTeDSL pair carry the same
+        rationale they do in :meth:`VllmMixin.runtime_cache_paths`, and for the
+        same libraries — ``FLASHINFER_CACHE_DIR`` is not an env var upstream
+        reads, and the CuTeDSL generated-IR cache defaults into ``$TMPDIR``.
 
         ``SGLANG_CACHE_DIR`` is the root of everything SGLang caches *itself*,
         and is separate from ``FLASHINFER_CACHE_DIR`` even though both have
@@ -423,6 +426,9 @@ class SglangRuntime(RuntimePlugin):
             "TORCHINDUCTOR_CACHE_DIR": CachePath("inductor"),
             "TRITON_CACHE_DIR": CachePath("triton"),
             "FLASHINFER_CACHE_DIR": CachePath("flashinfer"),
+            "FLASHINFER_WORKSPACE_BASE": CachePath("flashinfer"),
+            "CUTE_DSL_CACHE_DIR": CachePath("cute_dsl"),
+            "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": CachePath("flash_attn_cute_dsl"),
             "SGLANG_CACHE_DIR": CachePath("sglang"),
             "SGLANG_JIT_CACHE_DIR": CachePath("sglang/jit"),
             "TILELANG_CACHE_DIR": CachePath("tilelang"),
