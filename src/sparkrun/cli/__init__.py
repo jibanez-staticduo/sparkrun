@@ -174,6 +174,7 @@ def update(ctx, stable, beta, alpha, yolo):
         capture_old_identity,
         channel_from_flags,
         describe_change,
+        identity_changed,
         install_argv,
         is_uv_tool_install,
         new_binary_identity,
@@ -221,7 +222,12 @@ def update(ctx, stable, beta, alpha, yolo):
             new_identity = new_binary_identity()
             new_version = new_identity[0] or new_version
             click.echo(describe_change(channel, old_identity, new_identity))
-            upgraded = True
+            # A zero exit only says uv ran: `uv tool upgrade` exits 0 on "Nothing to
+            # upgrade", and git channels reinstall with --force every time. Keying
+            # `upgraded` off the exit code therefore reported every no-op update as a
+            # successful self-upgrade *and* spawned a needless `sparkrun registry
+            # update` subprocess (a full git fetch of every registry) below.
+            upgraded = identity_changed(channel, old_identity, new_identity)
         else:
             click.echo("Warning: sparkrun upgrade failed: %s" % result.stderr.strip(), err=True)
             click.echo("Continuing with registry update...", err=True)

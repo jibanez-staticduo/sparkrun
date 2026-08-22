@@ -198,6 +198,7 @@ def setup_update(ctx, no_update_registries, stable, beta, alpha, yolo):
         capture_old_identity,
         channel_from_flags,
         describe_change,
+        identity_changed,
         install_argv,
         is_uv_tool_install,
         new_binary_identity,
@@ -274,7 +275,9 @@ def setup_update(ctx, no_update_registries, stable, beta, alpha, yolo):
                 command="sparkrun setup update",
                 old_version=old_version,
                 new_version=new_version,
-                upgraded=True,
+                # uv exits 0 whether or not anything was installed, so the identity
+                # comparison is the only evidence an upgrade actually happened.
+                upgraded=identity_changed(channel, old_identity, new_identity),
                 self_upgrade_attempted=True,
                 channel=channel,
                 requested_channel=requested,
