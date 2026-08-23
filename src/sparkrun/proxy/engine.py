@@ -118,16 +118,23 @@ def build_litellm_config(
                 continue
             seen.add(dedup_key)
 
-            model_list.append(
-                {
-                    "model_name": model_name,
-                    "litellm_params": {
-                        "model": "openai/%s" % model_name,
-                        "api_base": "http://%s:%d/v1" % (ep.host, ep.port),
-                        "api_key": ep.api_key or "not-needed",
-                    },
-                }
-            )
+            entry: dict[str, Any] = {
+                "model_name": model_name,
+                "litellm_params": {
+                    "model": "openai/%s" % model_name,
+                    "api_base": "http://%s:%d/v1" % (ep.host, ep.port),
+                    "api_key": ep.api_key or "not-needed",
+                },
+            }
+            # Advertise the model's true context window so LiteLLM exposes it to
+            # clients via /v1/models (and /model/info). Without this the gateway
+            # has no model-level context length and clients can't see the real
+            # window (only a per-key cap the gateway may enforce). ``model_info``
+            # is the supported LiteLLM field; ``max_input_tokens`` maps to the
+            # server-reported ``max_model_len``.
+            if ep.max_model_len:
+                entry["model_info"] = {"max_input_tokens": ep.max_model_len}
+            model_list.append(entry)
 
     # Alias entries are appended after the real models so the lookup below
     # only ever sees genuine backends (an alias of an alias is not a thing).

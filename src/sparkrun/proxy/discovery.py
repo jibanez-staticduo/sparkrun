@@ -57,6 +57,11 @@ class DiscoveredEndpoint:
     recipe_name: str = ""
     tensor_parallel: int = 1
     api_key: str | None = None
+    #: Max context length (tokens) of the served model, captured from the
+    #: backend's ``/v1/models`` ``max_model_len`` during the health probe.
+    #: ``None`` when unknown. Surfaces the true model window to clients so
+    #: the gateway does not advertise an arbitrary per-key cap.
+    max_model_len: int | None = None
 
 
 def discover_endpoints(
@@ -205,9 +210,10 @@ def _check_health_parallel(endpoints: list[DiscoveredEndpoint]) -> None:
         for future in as_completed(futures):
             ep = futures[future]
             try:
-                healthy, models = future.result()
+                healthy, models, max_model_len = future.result()
                 ep.healthy = healthy
                 ep.actual_models = models
+                ep.max_model_len = max_model_len
             except Exception:
                 logger.debug(
                     "Health check failed for %s:%d",
@@ -241,14 +247,17 @@ def _deduplicate_by_identity(endpoints: list[DiscoveredEndpoint]) -> list[Discov
     return list(seen.values())
 
 
-def _check_single_health(ep: DiscoveredEndpoint) -> tuple[bool, list[str]]:
+def _check_single_health(ep: DiscoveredEndpoint) -> tuple[bool, list[str], int | None]:
     """Check a single endpoint's health via GET /v1/models.
 
     Sends an ``Authorization: Bearer`` header when the endpoint has an
     ``api_key`` set, so backends that require auth still report healthy.
 
     Returns:
-        Tuple of (healthy, list_of_model_ids).
+        Tuple of (healthy, list_of_model_ids, max_model_len). ``max_model_len``
+        is the model's true context window (``max_model_len`` from the
+        backend's ``/v1/models``), or ``None`` when the backend does not
+        report it.
     """
     url = "http://%s:%d/v1/models" % (ep.host, ep.port)
     headers: dict[str, str] = {}
@@ -260,7 +269,13 @@ def _check_single_health(ep: DiscoveredEndpoint) -> tuple[bool, list[str]]:
             if resp.status == 200:
                 body = json.loads(resp.read())
                 models = [m.get("id", "") for m in body.get("data", [])]
-                return True, models
+                max_model_len = None
+                for m in body.get("data", []):
+                    mml = m.get("max_model_len")
+                    if isinstance(mml, int) and mml > 0:
+                        max_model_len = mml
+                        break
+                return True, models, max_model_len
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
         pass
-    return False, []
+    return False, [], None
