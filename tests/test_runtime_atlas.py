@@ -28,14 +28,14 @@ def test_atlas_runtime_name():
 def test_atlas_resolve_container_default():
     """No container field → public Docker Hub image."""
     runtime = AtlasRuntime()
-    assert runtime.resolve_container(_recipe()) == "avarok/atlas-gb10:latest"
+    assert runtime.resolve_container(_recipe()) == "azeezish/atlas-gb10:latest"
 
 
 def test_atlas_resolve_container_from_recipe():
     """Recipe container field wins."""
     runtime = AtlasRuntime()
-    recipe = _recipe(container="avarok/atlas-gb10:custom-tag")
-    assert runtime.resolve_container(recipe) == "avarok/atlas-gb10:custom-tag"
+    recipe = _recipe(container="azeezish/atlas-gb10:custom-tag")
+    assert runtime.resolve_container(recipe) == "azeezish/atlas-gb10:custom-tag"
 
 
 # --- Solo command generation ---

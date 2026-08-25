@@ -390,7 +390,11 @@ FALLBACK_DEFAULT_REGISTRIES = [
     ),
     RegistryEntry(
         name="atlas",
-        url="https://github.com/Avarok-Cybersecurity/atlas-recipes.git",
+        # Atlas moved its recipes from Avarok-Cybersecurity/atlas-recipes to the
+        # Atlas-Inf org.  The layout (a ``recipes`` subpath) is identical on both
+        # sides, so existing configs are rewritten in place by
+        # MIGRATED_REGISTRY_URLS rather than dropped and re-added.
+        url="https://github.com/Atlas-Inf/sparkrun-recipes.git",
         subpath="recipes",
         description="Atlas recipes",
         visible=False,
@@ -532,8 +536,13 @@ DEPRECATED_REGISTRIES: list[str] = [
 # The ``eugr`` recipes moved from eugr's container-build repo to our mirror of
 # its ``recipes/`` + ``mods/`` trees.  The layout (``recipes``/``mods``
 # subpaths) is identical on both sides, so only the URL needs rewriting.
+#
+# The ``atlas`` recipes moved with the project itself, from the
+# ``Avarok-Cybersecurity`` org to ``Atlas-Inf``.  Both repos expose the recipes
+# under a ``recipes`` subpath, so again only the URL needs rewriting.
 MIGRATED_REGISTRY_URLS: dict[str, str] = {
     "https://github.com/eugr/spark-vllm-docker": "https://github.com/spark-arena/eugr-recipes",
+    "https://github.com/Avarok-Cybersecurity/atlas-recipes": "https://github.com/Atlas-Inf/sparkrun-recipes.git",
 }
 
 
@@ -588,7 +597,7 @@ RESERVED_PREFIX_ALLOWED_ORGS = (
 # not prefix).  Org names must be lowercase to match :func:`_get_git_org`,
 # which lowercases the URL path component before returning.
 EXTERNAL_RESERVED_NAMES = {
-    "atlas": ("avarok-cybersecurity",),
+    "atlas": ("atlas-inf",),
 }
 
 

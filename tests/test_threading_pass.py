@@ -477,9 +477,9 @@ def test_default_image_for_consults_platform_registry():
 
     rt = AtlasRuntime()
     # With no host_hardware -> legacy default_image_prefix:latest
-    assert rt.default_image_for() == "avarok/atlas-gb10:latest"
+    assert rt.default_image_for() == "azeezish/atlas-gb10:latest"
     # With DGX Spark host hardware -> DgxSparkPlatform's curated default for atlas
-    assert rt.default_image_for(default_dgx_spark_hardware()) == "avarok/atlas-gb10:latest"
+    assert rt.default_image_for(default_dgx_spark_hardware()) == "azeezish/atlas-gb10:latest"
 
 
 def test_default_image_for_falls_back_when_no_platform_match():

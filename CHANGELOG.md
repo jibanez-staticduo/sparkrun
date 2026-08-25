@@ -35,6 +35,22 @@ For the long-form 0.3.0 narrative, see [`docs/RELEASE_NOTES.md`](docs/RELEASE_NO
 
 ### Changed
 
+- The `atlas` registry now points at `Atlas-Inf/sparkrun-recipes`; the recipes
+  moved there from `Avarok-Cybersecurity/atlas-recipes` along with the project
+  itself (source now at <https://github.com/Atlas-Inf/atlas>). Existing installs
+  follow the move via `MIGRATED_REGISTRY_URLS`, which rewrites the URL in place
+  and keeps each user's `enabled`/`visible`/trust state — the stale clone is
+  re-fetched by `_drop_cache_if_url_changed` on the next sync. The layout is
+  identical on both sides (a `recipes` subpath), so nothing else changes.
+  Correspondingly, `atlas-inf` replaces `avarok-cybersecurity` in
+  `EXTERNAL_RESERVED_NAMES`: the reserved `atlas` registry name now belongs to
+  the org that publishes the recipes, and a registry claiming it from the former
+  org is rejected like any other impersonation.
+- The default Atlas container image is now `azeezish/atlas-gb10:latest`
+  (previously `avarok/atlas-gb10:latest`), matching what every recipe in the
+  new Atlas-Inf registry pins. Only affects `atlas` recipes that do not set
+  `container:` themselves.
+
 - Manifest discovery clones blob-filtered and sparse (`--filter=blob:none
   --sparse` + `sparse-checkout set .sparkrun`) instead of pulling the whole
   repository: only `.sparkrun/registry.yaml` is ever read, so the recipe trees
