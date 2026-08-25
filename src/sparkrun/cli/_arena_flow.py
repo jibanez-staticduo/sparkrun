@@ -82,7 +82,10 @@ def finalize_arena(
     # Gather recipe/metadata/runtime info (works with or without launch_result)
     recipe = bench_result.launch_result.recipe if bench_result.launch_result else bench_result.recipe
     overrides = bench_result.launch_result.overrides if bench_result.launch_result else (bench_result.overrides or {})
-    metadata = bench_result.generate_metadata()
+    # Published off this machine — the host set is recorded as stable
+    # pseudonyms so a leaderboard submission never carries the user's LAN
+    # addresses or internal hostnames.
+    metadata = bench_result.generate_metadata(redact_hosts=True)
     effective_recipe = recipe.export(
         overrides=overrides,
         container_image=metadata["recipe"]["container"],

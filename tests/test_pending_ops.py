@@ -184,7 +184,7 @@ def test_pending_op_reclaims_stale_lock(tmp_path):
                 "cluster_id": "c1",
                 "operation": "model_download",
                 "pid": 2**31 - 1,
-                "host": pending_ops._hostname(),
+                "host": pending_ops.lock_hostname(),
                 "token": "old-token",
                 "started_at": time.time(),
             }
