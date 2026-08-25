@@ -49,9 +49,15 @@ class ProxyModel:
 
     model_name: str
     api_base: str = ""
+    #: Max context length (tokens) of the served model, when known (from the
+    #: backend's ``max_model_len``). ``None`` when unavailable.
+    max_model_len: int | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"model_name": self.model_name, "api_base": self.api_base or "?"}
+    def to_dict(self) -> dict[str, object]:
+        d: dict[str, object] = {"model_name": self.model_name, "api_base": self.api_base or "?"}
+        if self.max_model_len is not None:
+            d["max_model_len"] = self.max_model_len
+        return d
 
 
 @dataclass(frozen=True)
@@ -661,7 +667,15 @@ def _models_via_api(engine) -> tuple[ProxyModel, ...]:
     out: list[ProxyModel] = []
     for m in engine.list_models_via_api():
         params = m.get("litellm_params") or m.get("model_info", {}).get("litellm_params", {})
-        out.append(ProxyModel(model_name=m.get("model_name", "?"), api_base=params.get("api_base", "")))
+        info = m.get("model_info") or {}
+        mml = info.get("max_input_tokens") or info.get("max_tokens") or info.get("max_model_len")
+        out.append(
+            ProxyModel(
+                model_name=m.get("model_name", "?"),
+                api_base=params.get("api_base", ""),
+                max_model_len=mml if isinstance(mml, int) else None,
+            )
+        )
     return tuple(out)
 
 
