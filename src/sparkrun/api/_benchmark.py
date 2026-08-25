@@ -7,11 +7,11 @@ callers get the full flow with no Click / sys.exit coupling.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -679,8 +679,19 @@ def _execute_benchmark(
     cache_dir = str(config.cache_dir) if config else None
     tasks = fw.build_task_list(bench_args, bench_spec.schedule if bench_spec else None)
 
+    # Released in the ``finally`` below, and eagerly on any early raise between
+    # acquisition and that block.  Empty (and closing is a no-op) on the
+    # unscheduled path, which owns no state directory.
+    lock_stack = contextlib.ExitStack()
+
     if tasks is not None:
-        from sparkrun.benchmarking.run_state import BenchmarkRunState, derive_benchmark_id
+        from sparkrun.benchmarking.run_state import (
+            BenchmarkRunState,
+            StateDirLocked,
+            clear_state_dir,
+            derive_benchmark_id,
+            hold_state_dir,
+        )
         from sparkrun.orchestration.job_metadata import derive_recipe_fingerprint
 
         # The cluster_id's intent half — previously all derive_benchmark_id
@@ -691,6 +702,10 @@ def _execute_benchmark(
         # artifacts and placement, so the ID stays stable across relaunches.
         recipe_fingerprint = derive_recipe_fingerprint(recipe, overrides)
 
+        # ``host_list`` is the *resolved* placement (what will actually run),
+        # not the candidate set — see the module note on RunPlan.  Two runs of
+        # one recipe against different nodes are different measurements and
+        # must not share a state directory (issue #267).
         benchmark_id = derive_benchmark_id(
             cluster_id,
             fw.framework_name,
@@ -698,6 +713,7 @@ def _execute_benchmark(
             bench_args,
             [t.schedule_entry for t in tasks],
             recipe_fingerprint=recipe_fingerprint,
+            hosts=host_list,
         )
 
         state_dir = (config.cache_dir / "benchmarks" / benchmark_id) if config else None
@@ -707,99 +723,151 @@ def _execute_benchmark(
         emitter.info("State directory:       %s" % state_dir_str)
         emitter.info("")
 
-        existing_state = BenchmarkRunState.load(benchmark_id, cache_dir)
-        if existing_state is None:
-            if resume_mode == ResumeMode.REQUIRED:
-                raise NoResumableState("ResumeMode.REQUIRED but no benchmark state exists for id %s" % benchmark_id)
-        elif existing_state.is_complete(len(tasks)):
-            if resume_mode == ResumeMode.FRESH:
-                if state_dir and state_dir.exists():
-                    shutil.rmtree(state_dir)
-                    logger.debug("Deleted complete benchmark state at %s (--fresh)", state_dir)
-                existing_state = None
-            elif _should_remeasure_complete_state(resume_mode, on_complete_state, existing_state):
-                if state_dir and state_dir.exists():
-                    shutil.rmtree(state_dir)
-                    logger.debug("Deleted complete benchmark state at %s (user chose re-measure)", state_dir)
-                existing_state = None
-            else:
+        # Hold the state directory for the whole run.  The read/decide/create
+        # sequence below and the per-task artefacts it guards are keyed on
+        # task index alone, so two runs sharing this directory overwrite each
+        # other's measurements silently (issue #267).  Acquire *before* the
+        # first read: two concurrent runs that both observe "no state" would
+        # both create one.
+        try:
+            lock_stack.enter_context(hold_state_dir(benchmark_id, cache_dir))
+        except StateDirLocked as e:
+            raise BenchmarkFailed(
+                "another benchmark run (pid %s on %s) is using state directory %s.\n"
+                "Runs of the same recipe against the same hosts cannot proceed concurrently — "
+                "their per-task results would overwrite each other. Wait for it to finish, or "
+                "target different hosts." % (e.info.get("pid", "?"), e.info.get("host") or "?", state_dir_str),
+                exit_code=1,
+            ) from e
+
+        try:
+            existing_state = BenchmarkRunState.load(benchmark_id, cache_dir)
+            if existing_state is not None and not existing_state.matches_hosts(host_list):
+                # Only reachable for state written before hosts joined the ID, so
+                # this is exactly the state that may hold a *different* node's
+                # numbers.  Discard rather than warn: merging two node sets into
+                # one result is the failure being fixed, not a lesser one.
                 emitter.warning(
-                    "Prior benchmark state for %s is COMPLETE — re-emitting its recorded results; no requests will be sent. Use --fresh to re-measure."
-                    % benchmark_id
+                    "Discarding prior benchmark state %s: it was measured on %s but this run targets %s. "
+                    "Measurements from different nodes are not merged."
+                    % (
+                        benchmark_id,
+                        ", ".join(existing_state.host_list),
+                        ", ".join(host_list),
+                    )
                 )
-                bench_result.resumed = True
-        else:
-            if resume_mode == ResumeMode.FRESH:
                 if state_dir and state_dir.exists():
-                    shutil.rmtree(state_dir)
-                    logger.debug("Deleted prior benchmark state at %s (--fresh)", state_dir)
+                    clear_state_dir(benchmark_id, cache_dir)
                 existing_state = None
-            elif resume_mode in (ResumeMode.IF_EXISTS, ResumeMode.REQUIRED):
-                pass
-            else:  # AUTO
-                # Library policy: consult the caller-supplied
-                # ``on_prompt_required`` callback to decide whether to resume
-                # incomplete state.  When no callback is given, default to
-                # resume (True) — the console-free default that matches the
-                # prior non-TTY behaviour.  The CLI shell supplies a callback
-                # that renders the interactive ``click.confirm`` prompt, so
-                # the API never imports CLI/console code.
-                if on_prompt_required is not None:
-                    prompt_ok = bool(on_prompt_required(existing_state))
-                else:
-                    prompt_ok = True
-                if not prompt_ok:
+
+            if existing_state is None:
+                if resume_mode == ResumeMode.REQUIRED:
+                    raise NoResumableState("ResumeMode.REQUIRED but no benchmark state exists for id %s" % benchmark_id)
+            elif existing_state.is_complete(len(tasks)):
+                if resume_mode == ResumeMode.FRESH:
                     if state_dir and state_dir.exists():
-                        shutil.rmtree(state_dir)
-                        logger.debug("Deleted prior benchmark state at %s (user chose fresh start)", state_dir)
+                        clear_state_dir(benchmark_id, cache_dir)
+                        logger.debug("Deleted complete benchmark state at %s (--fresh)", state_dir)
                     existing_state = None
-
-        if existing_state is not None:
-            state = existing_state
-            if state.cluster_id != cluster_id:
-                logger.debug(
-                    "Refreshing state.cluster_id %s -> %s on resume (same intent, new placement)",
-                    state.cluster_id,
-                    cluster_id,
-                )
-                state.cluster_id = cluster_id
-        else:
-            state = BenchmarkRunState(
-                benchmark_id=benchmark_id,
-                cluster_id=cluster_id,
-                recipe_qualified_name=recipe.qualified_name,
-                framework=fw.framework_name,
-                profile=profile,
-                base_args=bench_args,
-                schedule=[t.schedule_entry for t in tasks],
-                completed_indices=[],
-                failed_indices=[],
-            )
-            if submission_id_for_extras:
-                state.extras["submission_id"] = submission_id_for_extras
-
-        if "framework_version" not in state.extras:
-            detected_version = fw.detect_version()
-            if detected_version:
-                state.extras["framework_version"] = detected_version
-                emitter.info("Pinned %s version: %s" % (fw.framework_name, detected_version))
+                elif _should_remeasure_complete_state(resume_mode, on_complete_state, existing_state):
+                    if state_dir and state_dir.exists():
+                        clear_state_dir(benchmark_id, cache_dir)
+                        logger.debug("Deleted complete benchmark state at %s (user chose re-measure)", state_dir)
+                    existing_state = None
+                else:
+                    emitter.warning(
+                        "Prior benchmark state for %s is COMPLETE — re-emitting its recorded results; no requests will be sent. Use --fresh to re-measure."
+                        % benchmark_id
+                    )
             else:
-                logger.debug("No framework version detected for %s; version will float", fw.framework_name)
-        else:
-            emitter.info("Using pinned %s version: %s" % (fw.framework_name, state.extras["framework_version"]))
+                if resume_mode == ResumeMode.FRESH:
+                    if state_dir and state_dir.exists():
+                        clear_state_dir(benchmark_id, cache_dir)
+                        logger.debug("Deleted prior benchmark state at %s (--fresh)", state_dir)
+                    existing_state = None
+                elif resume_mode in (ResumeMode.IF_EXISTS, ResumeMode.REQUIRED):
+                    pass
+                else:  # AUTO
+                    # Library policy: consult the caller-supplied
+                    # ``on_prompt_required`` callback to decide whether to resume
+                    # incomplete state.  When no callback is given, default to
+                    # resume (True) — the console-free default that matches the
+                    # prior non-TTY behaviour.  The CLI shell supplies a callback
+                    # that renders the interactive ``click.confirm`` prompt, so
+                    # the API never imports CLI/console code.
+                    if on_prompt_required is not None:
+                        prompt_ok = bool(on_prompt_required(existing_state))
+                    else:
+                        prompt_ok = True
+                    if not prompt_ok:
+                        if state_dir and state_dir.exists():
+                            clear_state_dir(benchmark_id, cache_dir)
+                            logger.debug("Deleted prior benchmark state at %s (user chose fresh start)", state_dir)
+                        existing_state = None
 
-        pinned_image_sha = state.extras.get("container_image_sha")
-        if pinned_image_sha:
-            if container_image != pinned_image_sha:
-                emitter.info("Using pinned image SHA: %s" % pinned_image_sha)
-                emitter.info("  (was: %s)" % container_image)
-            container_image = pinned_image_sha
-            overrides["image"] = pinned_image_sha
-            bench_result.container_image = container_image
+            if existing_state is not None:
+                state = existing_state
+                # Any reuse of prior state means some of the numbers below were
+                # measured in an earlier session — a fully COMPLETE state emits
+                # *only* recorded results.  Record both facts so the exported
+                # artifact is self-describing: ``timing`` covers this invocation,
+                # ``measured_at`` covers the data (issue #267).
+                bench_result.resumed = True
+                bench_result.measured_at = existing_state.updated_at or None
+                # Backfill on legacy state that predates the field, so the next
+                # session can answer the host question this one had to assume.
+                if not state.host_list:
+                    state.host_list = list(host_list)
+                if state.cluster_id != cluster_id:
+                    logger.debug(
+                        "Refreshing state.cluster_id %s -> %s on resume (same intent, new placement)",
+                        state.cluster_id,
+                        cluster_id,
+                    )
+                    state.cluster_id = cluster_id
+            else:
+                state = BenchmarkRunState(
+                    benchmark_id=benchmark_id,
+                    cluster_id=cluster_id,
+                    recipe_qualified_name=recipe.qualified_name,
+                    framework=fw.framework_name,
+                    profile=profile,
+                    base_args=bench_args,
+                    schedule=[t.schedule_entry for t in tasks],
+                    host_list=list(host_list),
+                    completed_indices=[],
+                    failed_indices=[],
+                )
+                if submission_id_for_extras:
+                    state.extras["submission_id"] = submission_id_for_extras
 
-        if "container_image_longterm_ref" in state.extras:
-            bench_result.longterm_image_ref = state.extras["container_image_longterm_ref"]
-            bench_result.longterm_image_pinned = bool(state.extras.get("container_image_longterm_pinned", True))
+            if "framework_version" not in state.extras:
+                detected_version = fw.detect_version()
+                if detected_version:
+                    state.extras["framework_version"] = detected_version
+                    emitter.info("Pinned %s version: %s" % (fw.framework_name, detected_version))
+                else:
+                    logger.debug("No framework version detected for %s; version will float", fw.framework_name)
+            else:
+                emitter.info("Using pinned %s version: %s" % (fw.framework_name, state.extras["framework_version"]))
+
+            pinned_image_sha = state.extras.get("container_image_sha")
+            if pinned_image_sha:
+                if container_image != pinned_image_sha:
+                    emitter.info("Using pinned image SHA: %s" % pinned_image_sha)
+                    emitter.info("  (was: %s)" % container_image)
+                container_image = pinned_image_sha
+                overrides["image"] = pinned_image_sha
+                bench_result.container_image = container_image
+
+            if "container_image_longterm_ref" in state.extras:
+                bench_result.longterm_image_ref = state.extras["container_image_longterm_ref"]
+                bench_result.longterm_image_pinned = bool(state.extras.get("container_image_longterm_pinned", True))
+        except BaseException:
+            # The outer ``finally`` that normally releases the lock is not yet
+            # in scope on this path (e.g. ResumeMode.REQUIRED with no state).
+            lock_stack.close()
+            raise
 
     try:
         # -----------------------------------------------------------------------
@@ -1128,6 +1196,8 @@ def _execute_benchmark(
                     results=results,
                     output_path=output_file,
                     runtime_info=launch_result.runtime_info if launch_result else None,
+                    resumed=bench_result.resumed,
+                    measured_at=bench_result.measured_at,
                 )
                 emitter.info("Results saved to: %s" % output_file)
                 bench_result.output_yaml = output_file
@@ -1174,6 +1244,7 @@ def _execute_benchmark(
             os.unlink(result_file)
         except OSError:
             pass
+        lock_stack.close()
 
     return bench_result
 
@@ -1257,6 +1328,47 @@ def resume_benchmark(
             detection failure, or an incomplete schedule.
         KeyboardInterrupt: Re-raised after state is preserved.
     """
+    from sparkrun.benchmarking.run_state import StateDirLocked, hold_state_dir
+
+    if emitter is None:
+        emitter = _NullProgressEmitter()
+
+    sctx = resolve_sctx(sctx)
+    config = sctx.config
+    cache_dir = str(config.cache_dir) if config else None
+
+    # Take the state directory before reading it: a resume racing a `benchmark
+    # run` for the same id would otherwise interleave into the same per-task
+    # artefacts (issue #267).  Held for the whole resume.
+    lock_stack = contextlib.ExitStack()
+    try:
+        lock_stack.enter_context(hold_state_dir(benchmark_id, cache_dir))
+    except StateDirLocked as e:
+        raise BenchmarkFailed(
+            "benchmark %s is already being run by pid %s on %s. Wait for it to finish before resuming."
+            % (benchmark_id, e.info.get("pid", "?"), e.info.get("host") or "?"),
+            exit_code=1,
+        ) from e
+
+    with lock_stack:
+        return _resume_locked(
+            benchmark_id,
+            dry_run=dry_run,
+            emitter=emitter,
+            config=config,
+            cache_dir=cache_dir,
+        )
+
+
+def _resume_locked(
+    benchmark_id: str,
+    *,
+    dry_run: bool,
+    emitter: _ProgressEmitter,
+    config,
+    cache_dir: str | None,
+) -> dict[str, Any]:
+    """Body of :func:`resume_benchmark`, run while holding the state-dir lock."""
     import yaml as _yaml
 
     from sparkrun.api._errors import NoResumableState
@@ -1270,13 +1382,6 @@ def resume_benchmark(
     from sparkrun.orchestration.primitives import build_ssh_kwargs, detect_host_ip
     from sparkrun.utils import is_local_host
 
-    if emitter is None:
-        emitter = _NullProgressEmitter()
-
-    sctx = resolve_sctx(sctx)
-    config = sctx.config
-    cache_dir = str(config.cache_dir) if config else None
-
     # Load existing state
     state = BenchmarkRunState.load(benchmark_id, cache_dir)
     if state is None:
@@ -1284,6 +1389,12 @@ def resume_benchmark(
 
     if state.is_complete(len(state.schedule)):
         raise BenchmarkFailed("Benchmark %s is already complete. Nothing to resume." % benchmark_id, exit_code=0)
+
+    # Snapshot before ``run_schedule`` starts saving: this is when the tasks
+    # already recorded in the state were measured.  Read afterwards it would
+    # be ~now for every resume, which is exactly the conflation ``measured_at``
+    # exists to prevent.
+    prior_measured_at = state.updated_at or None
 
     # Reconstruct recipe
     recipe_name = state.recipe_qualified_name
@@ -1418,6 +1529,8 @@ def resume_benchmark(
             results=results,
             output_path=output_file,
             runtime_info=None,
+            resumed=True,
+            measured_at=prior_measured_at,
         )
         emitter.info("Results saved to: %s" % output_file)
 

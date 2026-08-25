@@ -118,16 +118,23 @@ def build_litellm_config(
                 continue
             seen.add(dedup_key)
 
-            model_list.append(
-                {
-                    "model_name": model_name,
-                    "litellm_params": {
-                        "model": "openai/%s" % model_name,
-                        "api_base": "http://%s:%d/v1" % (ep.host, ep.port),
-                        "api_key": ep.api_key or "not-needed",
-                    },
-                }
-            )
+            entry: dict[str, Any] = {
+                "model_name": model_name,
+                "litellm_params": {
+                    "model": "openai/%s" % model_name,
+                    "api_base": "http://%s:%d/v1" % (ep.host, ep.port),
+                    "api_key": ep.api_key or "not-needed",
+                },
+            }
+            # Advertise the model's true context window so LiteLLM exposes it to
+            # clients via /v1/models (and /model/info). Without this the gateway
+            # has no model-level context length and clients can't see the real
+            # window (only a per-key cap the gateway may enforce). ``model_info``
+            # is the supported LiteLLM field; ``max_input_tokens`` maps to the
+            # server-reported ``max_model_len``.
+            if ep.max_model_len:
+                entry["model_info"] = {"max_input_tokens": ep.max_model_len}
+            model_list.append(entry)
 
     # Alias entries are appended after the real models so the lookup below
     # only ever sees genuine backends (an alias of an alias is not a thing).
@@ -174,19 +181,37 @@ def build_litellm_config(
     return config
 
 
-def _model_keys(config: dict[str, Any]) -> set[tuple[str, str]]:
-    """Identity of a config's model list as ``{(model_name, api_base)}``.
+def _model_keys(config: dict[str, Any]) -> set[tuple[str, str, int | None]]:
+    """Identity of a config's model list as ``{(model_name, api_base, window)}``.
 
     This is the comparison that decides whether a restart is warranted, so
     it deliberately ignores ordering and any field a restart would not
     change (``api_key`` is carried over from the same discovery source).
+
+    The advertised context window **is** such a field: LiteLLM reads
+    ``model_info`` at startup, so a backend that changed its
+    ``max_model_len`` (or one whose window we simply never captured before)
+    only reaches clients once the config is rewritten and the proxy
+    replaced.  Leaving it out made the whole ``model_info`` emission inert
+    for any already-running proxy — the model set was unchanged, so
+    ``apply_desired_state`` returned early and never wrote the window.  The
+    cost is that a *changed* window reads as one added plus one removed
+    entry rather than a modification, which is the same shape a re-homed
+    backend already produces.
     """
-    keys: set[tuple[str, str]] = set()
+    keys: set[tuple[str, str, int | None]] = set()
     for entry in config.get("model_list") or []:
         if not isinstance(entry, dict):
             continue
         params = entry.get("litellm_params") or {}
-        keys.add((str(entry.get("model_name", "")), str(params.get("api_base", ""))))
+        window = (entry.get("model_info") or {}).get("max_input_tokens")
+        keys.add(
+            (
+                str(entry.get("model_name", "")),
+                str(params.get("api_base", "")),
+                window if isinstance(window, int) else None,
+            )
+        )
     return keys
 
 
@@ -923,6 +948,15 @@ class ProxyEngine:
         Alias entries are skipped — they are regenerated from the alias map,
         and an alias is recognised by its ``litellm_params.model`` naming a
         *different* model than its own ``model_name``.
+
+        Every field the config carries must be recovered here, because this
+        is the *whole* input to the rebuild: ``sync_aliases`` feeds these
+        endpoints straight back into :func:`build_litellm_config`, so
+        anything dropped is erased from the config the moment an alias is
+        added or removed.  The advertised context window was, which meant a
+        single ``proxy alias add`` stripped ``model_info`` from every model —
+        and, because the discovery sweep only rewrites when the model set
+        itself changes, it never came back.
         """
         endpoints: list[DiscoveredEndpoint] = []
         for entry in self._load_current_config().get("model_list") or []:
@@ -936,6 +970,7 @@ class ProxyEngine:
             if hostport is None:
                 continue
             host, port = hostport
+            window = (entry.get("model_info") or {}).get("max_input_tokens")
             endpoints.append(
                 DiscoveredEndpoint(
                     cluster_id="",
@@ -947,6 +982,7 @@ class ProxyEngine:
                     healthy=True,
                     actual_models=[name],
                     api_key=params.get("api_key"),
+                    max_model_len=window if isinstance(window, int) else None,
                 )
             )
         return endpoints

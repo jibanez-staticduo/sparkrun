@@ -217,6 +217,52 @@ def test_vllm_declares_its_explicit_cache_vars():
     assert env["TRITON_CACHE_DIR"] == "/cache/runtime/triton"
 
 
+def test_flashinfer_workspace_base_is_declared_because_cache_dir_is_inert():
+    """``FLASHINFER_CACHE_DIR`` is not an env var flashinfer reads.
+
+    In ``flashinfer/jit/env.py`` it is a module *attribute* computed as
+    ``FLASHINFER_WORKSPACE_BASE / ".cache" / "flashinfer"``, the base defaulting
+    to ``Path.home()`` — verified against flashinfer 0.6.11 and 0.6.18.  So
+    declaring only ``FLASHINFER_CACHE_DIR`` left every JIT-compiled kernel in
+    the ``--rm`` container's throwaway ``HOME`` and recompiled it next launch.
+
+    Both are asserted: the base is the lever that works, the cache dir is kept
+    against a later release honoring it.  Pointing them at one subtree is
+    deliberate — the base grows ``.cache/flashinfer/<ver>/<arch>/`` beneath it.
+    """
+    for runtime in (VllmDistributedRuntime(), SglangRuntime()):
+        m = _mounts(runtime=runtime)
+        assert m.env["FLASHINFER_WORKSPACE_BASE"] == "/cache/runtime/flashinfer"
+        assert m.env["FLASHINFER_CACHE_DIR"] == "/cache/runtime/flashinfer"
+        assert "%s/flashinfer" % m.leaf in m.dirs
+
+
+def test_cute_dsl_cache_is_declared_because_it_defaults_into_tmpdir():
+    """NVIDIA's CuTeDSL generated-IR cache reaches neither XDG nor ``HOME``.
+
+    ``nvidia_cutlass_dsl``'s ``get_default_generated_ir_path()`` falls back to
+    ``$TMPDIR/<user>/cutlass_python_cache``, so the XDG catch-all cannot cover
+    it.  vLLM's ``vllm_flash_attn.cute``, FlashInfer's sparse kernels and the
+    b12x kernel stack all compile through this DSL.
+    """
+    for runtime in (VllmDistributedRuntime(), SglangRuntime()):
+        m = _mounts(runtime=runtime)
+        assert m.env["CUTE_DSL_CACHE_DIR"] == "/cache/runtime/cute_dsl"
+        assert m.env["FLASH_ATTENTION_CUTE_DSL_CACHE_DIR"] == "/cache/runtime/flash_attn_cute_dsl"
+
+
+def test_b12x_compile_cache_rides_the_xdg_catch_all():
+    """b12x resolves ``B12X_COMPILE_CACHE_DIR`` → ``$XDG_CACHE_HOME/b12x/compile``.
+
+    No explicit entry is needed, but only as long as the catch-all is set — the
+    b12x images are what the ``eugr`` / ``@official-recipes`` DeepSeek-V4 Flash
+    recipes run on, and their compile cache is minutes per launch.
+    """
+    m = _mounts()
+    assert m.env["XDG_CACHE_HOME"] == RUNTIME_CACHE_CONTAINER_PATH
+    assert "B12X_COMPILE_CACHE_DIR" not in m.env
+
+
 def test_sglang_declares_inductor_and_triton():
     env = _mounts(runtime=SglangRuntime()).env
     assert env["TORCHINDUCTOR_CACHE_DIR"] == "/cache/runtime/inductor"
@@ -429,6 +475,9 @@ def test_disabled_cache_leaves_the_env_untouched():
         "TORCHINDUCTOR_CACHE_DIR",
         "TRITON_CACHE_DIR",
         "FLASHINFER_CACHE_DIR",
+        "FLASHINFER_WORKSPACE_BASE",
+        "CUTE_DSL_CACHE_DIR",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR",
     }
 
 

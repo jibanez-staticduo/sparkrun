@@ -149,6 +149,19 @@ class RegistryEntry:
     trusted: bool = False
 
 
+#: Asset subpaths a registry may omit.  Shared with
+#: :meth:`RegistryManager._backfill_default_subpaths`, which repairs exactly
+#: these — an omitted one makes that asset kind unresolvable rather than
+#: defaulted.
+OPTIONAL_SUBPATH_FIELDS = ("tuning_subpath", "benchmark_subpath", "mods_subpath")
+
+#: Every :class:`RegistryEntry` field that names a directory inside the
+#: registry's checkout.  A new one must be added here or it escapes
+#: :func:`assert_safe_registry_entry` and becomes an unvalidated path from a
+#: remote manifest.
+SUBPATH_FIELDS = ("subpath",) + OPTIONAL_SUBPATH_FIELDS
+
+
 @dataclass(frozen=True)
 class RegistryAsset:
     """A kind of per-registry file that sparkrun resolves by file stem.
@@ -377,7 +390,11 @@ FALLBACK_DEFAULT_REGISTRIES = [
     ),
     RegistryEntry(
         name="atlas",
-        url="https://github.com/Avarok-Cybersecurity/atlas-recipes.git",
+        # Atlas moved its recipes from Avarok-Cybersecurity/atlas-recipes to the
+        # Atlas-Inf org.  The layout (a ``recipes`` subpath) is identical on both
+        # sides, so existing configs are rewritten in place by
+        # MIGRATED_REGISTRY_URLS rather than dropped and re-added.
+        url="https://github.com/Atlas-Inf/sparkrun-recipes.git",
         subpath="recipes",
         description="Atlas recipes",
         visible=False,
@@ -519,8 +536,13 @@ DEPRECATED_REGISTRIES: list[str] = [
 # The ``eugr`` recipes moved from eugr's container-build repo to our mirror of
 # its ``recipes/`` + ``mods/`` trees.  The layout (``recipes``/``mods``
 # subpaths) is identical on both sides, so only the URL needs rewriting.
+#
+# The ``atlas`` recipes moved with the project itself, from the
+# ``Avarok-Cybersecurity`` org to ``Atlas-Inf``.  Both repos expose the recipes
+# under a ``recipes`` subpath, so again only the URL needs rewriting.
 MIGRATED_REGISTRY_URLS: dict[str, str] = {
     "https://github.com/eugr/spark-vllm-docker": "https://github.com/spark-arena/eugr-recipes",
+    "https://github.com/Avarok-Cybersecurity/atlas-recipes": "https://github.com/Atlas-Inf/sparkrun-recipes.git",
 }
 
 
@@ -575,7 +597,7 @@ RESERVED_PREFIX_ALLOWED_ORGS = (
 # not prefix).  Org names must be lowercase to match :func:`_get_git_org`,
 # which lowercases the URL path component before returning.
 EXTERNAL_RESERVED_NAMES = {
-    "atlas": ("avarok-cybersecurity",),
+    "atlas": ("atlas-inf",),
 }
 
 
@@ -599,20 +621,142 @@ def _get_git_org(url: str) -> str | None:
     return None
 
 
-def validate_registry_name(name: str, url: str) -> None:
-    """Raise RegistryError if name uses a reserved prefix from a non-allowed URL.
+#: Charset for a registry name.  A name is not merely a label — it is used
+#: verbatim as a **directory name** under the cache root — so this is a
+#: filesystem-safety guard rather than a style preference.  Requiring the first
+#: character to be alphanumeric rules out three cases for free: ``.`` / ``..`` /
+#: dotfiles, a leading ``-`` (which git would read as an option), and the
+#: ``_url_`` prefix :meth:`RegistryManager._clone_dir_for_url` reserves for
+#: shared clones.
+_SAFE_REGISTRY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-    Reserved prefixes protect official registry namespaces. Only repositories
-    hosted under allowed GitHub organizations may use these prefixes.
+#: Upper bound on a registry name, so a manifest cannot produce a path that
+#: blows past ``NAME_MAX`` and fails at an arbitrary later point instead of at
+#: validation.
+_MAX_REGISTRY_NAME_LEN = 100
+
+#: Charset for one path segment of an asset subpath.  Same rule as a name, and
+#: for the same reason — each segment becomes a real directory component.
+#: Excluding ``:`` is load-bearing on Windows, where ``C:/x`` is *absolute*.
+_SAFE_SUBPATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def assert_safe_registry_name(name: str) -> None:
+    """Raise :class:`RegistryError` unless *name* is safe as a directory name.
+
+    :meth:`RegistryManager._cache_dir` resolves a registry name as
+    ``cache_root / name``, and registry names arrive from
+    ``.sparkrun/registry.yaml`` manifests in **remote repositories**.  A name
+    containing a path separator or ``..`` therefore escapes the cache root —
+    and :meth:`RegistryManager._link_registry_to_shared` goes on to ``rmtree``
+    whatever real directory it landed on, so this is a delete primitive, not
+    just an untidy path.
+
+    Two subtler cases fall out of requiring the first character to be
+    alphanumeric (see :data:`_SAFE_REGISTRY_NAME_RE`): a name that *is* a
+    shared-clone directory (``_url_<hash>``) would have the checkout its
+    siblings share deleted out from under it, and a leading ``-`` would reach
+    git as an option.
+
+    Args:
+        name: Candidate registry name.
+
+    Raises:
+        RegistryError: The name is empty, over-long, or outside the charset.
+    """
+    if not name:
+        raise RegistryError("Registry name must not be empty")
+    if len(name) > _MAX_REGISTRY_NAME_LEN:
+        raise RegistryError("Registry name %r is too long (max %d characters)" % (name, _MAX_REGISTRY_NAME_LEN))
+    if not _SAFE_REGISTRY_NAME_RE.match(name):
+        raise RegistryError(
+            "Registry name %r is not a valid directory name: it must start with a letter or digit "
+            "and contain only letters, digits, '.', '_' or '-' (a registry name is used as a cache "
+            "directory name)" % name
+        )
+
+
+def assert_safe_registry_subpath(subpath: str, field: str = "subpath") -> None:
+    """Raise :class:`RegistryError` unless *subpath* stays inside its registry.
+
+    Asset subpaths are resolved against the registry's cache directory
+    (:meth:`RegistryManager.asset_dir` is ``_cache_dir(name) / subpath``) and
+    handed to ``git sparse-checkout set``.  They come from remote manifests, so
+    ``../../..`` is an escape with teeth: :func:`iter_asset_files` would
+    ``rglob`` a directory outside the clone and
+    :func:`~sparkrun.core.recipe.find_recipe` would offer whatever YAML it
+    found there as a runnable recipe.
+
+    An empty subpath is accepted — that is how a registry declares it serves no
+    assets of that kind, and :meth:`RegistryManager.asset_dir` already returns
+    ``None`` for it.
+
+    Backslashes are rejected rather than normalized: a backslash separates
+    paths on Windows and is a legal filename character on POSIX, so treating it
+    as either is wrong on the other platform.
+
+    Args:
+        subpath: Candidate subpath, ``/``-separated and relative.
+        field: Field name, used only to make the error message locate itself.
+
+    Raises:
+        RegistryError: The subpath is absolute, contains a traversal segment,
+            or holds a character outside the segment charset.
+    """
+    if not subpath:
+        return
+    if "\\" in subpath:
+        raise RegistryError("Registry %s %r must not contain a backslash (use '/' to separate path segments)" % (field, subpath))
+    if subpath.startswith("/"):
+        raise RegistryError("Registry %s %r must be relative to the repository root, not absolute" % (field, subpath))
+
+    segments = [seg for seg in subpath.split("/") if seg]
+    if not segments:
+        raise RegistryError("Registry %s %r contains no path segments" % (field, subpath))
+    for seg in segments:
+        if not _SAFE_SUBPATH_SEGMENT_RE.match(seg):
+            raise RegistryError(
+                "Registry %s %r contains an unsafe path segment %r: each segment must start with a "
+                "letter or digit and contain only letters, digits, '.', '_' or '-'" % (field, subpath, seg)
+            )
+
+
+def assert_safe_registry_entry(entry: RegistryEntry) -> None:
+    """Validate every path-forming field on *entry*.
+
+    The single chokepoint for "this entry can be turned into filesystem paths
+    safely", so a caller cannot cover the name and forget the subpaths.  Says
+    nothing about *namespace* legitimacy — that is
+    :func:`validate_registry_name`, which is a separate question with a
+    separate answer (a name can be perfectly safe and still be an
+    impersonation).
+
+    Raises:
+        RegistryError: Any name or subpath is unsafe.
+    """
+    assert_safe_registry_name(entry.name)
+    for field in SUBPATH_FIELDS:
+        assert_safe_registry_subpath(getattr(entry, field), field=field)
+
+
+def validate_registry_name(name: str, url: str) -> None:
+    """Raise RegistryError if the name is unsafe or impersonates a reserved namespace.
+
+    Two checks, in order: the name must be usable as a cache directory name
+    (:func:`assert_safe_registry_name`), and a reserved prefix may only be
+    claimed by a repository hosted under an allowed GitHub organization.
+    Reserved prefixes protect official registry namespaces.
 
     Args:
         name: Registry name to validate.
         url: Git repository URL associated with the registry.
 
     Raises:
-        RegistryError: If the name uses a reserved prefix and the URL is not
-            from an allowed GitHub organization.
+        RegistryError: If the name is not a safe directory name, or it uses a
+            reserved prefix and the URL is not from an allowed GitHub
+            organization.
     """
+    assert_safe_registry_name(name)
     name_lower = name.lower()
 
     # check specific EXTERNAL_RESERVED_NAMES entries
@@ -1004,16 +1148,28 @@ class RegistryManager:
     def _load_registries_from_file(self) -> list[RegistryEntry]:
         """Load registries from the YAML config file without any fallback logic.
 
+        Entries whose name or subpaths are not safe to turn into filesystem
+        paths (:func:`assert_safe_registry_entry`) are **skipped with a
+        warning** rather than raising.  Skipping is deliberately narrower than
+        the enclosing ``except`` in :meth:`_load_registries`, which discards the
+        whole file and reverts to the shipped defaults: one bad entry — a
+        hand-edit, a merge, a manifest read by an older build that had no
+        charset check — must not take the user's other registries with it.  The
+        namespace check (:func:`validate_registry_name`) is deliberately *not*
+        applied here; it gates *adding* a registry, and running it on load would
+        break an existing config retroactively.
+
         Returns:
-            List of registry entries parsed from registries.yaml.
+            List of usable registry entries parsed from registries.yaml.
 
         Raises:
             Exception: If the file cannot be read or parsed.
         """
         data = read_yaml(self._registries_path)
         registries = data.get("registries", [])
-        return [
-            RegistryEntry(
+        entries: list[RegistryEntry] = []
+        for r in registries:
+            entry = RegistryEntry(
                 name=r["name"],
                 url=r["url"],
                 subpath=r["subpath"],
@@ -1025,8 +1181,13 @@ class RegistryManager:
                 mods_subpath=r.get("mods_subpath", ""),
                 trusted=r.get("trusted", False),
             )
-            for r in registries
-        ]
+            try:
+                assert_safe_registry_entry(entry)
+            except RegistryError as e:
+                logger.warning("Skipping unusable registry entry in %s: %s", self._registries_path, e)
+                continue
+            entries.append(entry)
+        return entries
 
     def _read_config_version(self) -> int:
         """Migration revision of the on-disk registries.yaml.
@@ -1148,7 +1309,7 @@ class RegistryManager:
             shipped = by_url.get(_normalize_registry_url(entry.url))
             if shipped is None:
                 continue
-            for field in ("tuning_subpath", "benchmark_subpath", "mods_subpath"):
+            for field in OPTIONAL_SUBPATH_FIELDS:
                 if not getattr(entry, field) and getattr(shipped, field):
                     setattr(entry, field, getattr(shipped, field))
                     logger.info(
@@ -1657,13 +1818,17 @@ class RegistryManager:
 
         Raises:
             RegistryError: If a registry with the same name already exists,
-                uses a reserved name prefix from a non-allowed URL, or has
-                an invalid/unsafe git URL.
+                uses a reserved name prefix from a non-allowed URL, has an
+                invalid/unsafe git URL, or carries a name/subpath that would
+                escape the registry cache.
         """
         try:
             validate_git_url(entry.url)
         except ValueError as exc:
             raise RegistryError("Invalid registry URL: %s" % exc) from exc
+        # Covers the subpaths too: validate_registry_name only sees the name,
+        # and this is the public entry point for programmatic adds.
+        assert_safe_registry_entry(entry)
         validate_registry_name(entry.name, entry.url)
         registries = self._load_registries()
         if any(r.name == entry.name for r in registries):
@@ -1677,6 +1842,14 @@ class RegistryManager:
 
         Does NOT save or add entries — purely a discovery/parsing operation.
 
+        Every declared entry is validated with
+        :func:`assert_safe_registry_entry` before it is returned.  This is a
+        **remote, untrusted document** whose names and subpaths go on to form
+        real filesystem paths, so an unsafe entry is dropped with a warning; the
+        rest of the manifest still applies, matching the per-URL partial-success
+        behavior of :meth:`_init_defaults_from_manifests`.  A manifest with no
+        usable entry left raises, so the caller never silently adds nothing.
+
         Args:
             url: Git repository URL.
 
@@ -1684,7 +1857,8 @@ class RegistryManager:
             List of RegistryEntry objects declared in the manifest.
 
         Raises:
-            RegistryError: If clone fails, no manifest found, or manifest is empty.
+            RegistryError: If clone fails, no manifest found, the manifest is
+                empty, or no declared entry survived validation.
         """
         import tempfile
 
@@ -1693,7 +1867,10 @@ class RegistryManager:
             git_env = self._git_env()
             validate_git_url(url)
             result = subprocess.run(
-                ["git", "clone", "--depth=1", "--single-branch", "--", url, str(tmp_path)],
+                # Blob-filtered + sparse: only ``.sparkrun`` is ever read here,
+                # so pulling the recipe trees would be wasted transfer — and
+                # this runs once per bootstrap URL on first run.
+                ["git", "clone", "--depth=1", "--single-branch", "--filter=blob:none", "--sparse", "--", url, str(tmp_path)],
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -1703,6 +1880,21 @@ class RegistryManager:
             )
             if result.returncode != 0:
                 raise RegistryError("Failed to clone %s: %s" % (url, result.stderr.strip()))
+
+            # ``--sparse`` checks out root-level files only, so the manifest
+            # directory has to be asked for explicitly — without this the clone
+            # succeeds and the manifest is simply absent.
+            result = subprocess.run(
+                ["git", "-C", str(tmp_path), "sparse-checkout", "set", ".sparkrun"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=git_env,
+            )
+            if result.returncode != 0:
+                raise RegistryError("Failed to check out .sparkrun/ from %s: %s" % (url, result.stderr.strip()))
 
             manifest_path = tmp_path / ".sparkrun" / "registry.yaml"
             if not manifest_path.exists():
@@ -1716,8 +1908,9 @@ class RegistryManager:
             # Support both canonical keys (subpath, tuning_subpath,
             # benchmark_subpath) used in registries.yaml and the shorter
             # keys (recipes, tuning, benchmarks) used in repo manifests.
-            return [
-                RegistryEntry(
+            entries: list[RegistryEntry] = []
+            for reg_data in registries_data:
+                entry = RegistryEntry(
                     name=reg_data["name"],
                     url=url,
                     subpath=reg_data.get("subpath", reg_data.get("recipes", "recipes")),
@@ -1728,8 +1921,16 @@ class RegistryManager:
                     benchmark_subpath=reg_data.get("benchmark_subpath", reg_data.get("benchmarks", "")),
                     mods_subpath=reg_data.get("mods_subpath", reg_data.get("mods", "")),
                 )
-                for reg_data in registries_data
-            ]
+                try:
+                    assert_safe_registry_entry(entry)
+                except RegistryError as e:
+                    logger.warning("Ignoring unsafe entry in the manifest of %s: %s", url, e)
+                    continue
+                entries.append(entry)
+
+            if not entries:
+                raise RegistryError("Manifest in %s declares no usable registries (all entries were rejected)" % url)
+            return entries
 
     def add_registry_from_url(self, url: str, trust: bool = False) -> list[RegistryEntry]:
         """Add registries by discovering them from a repo's .sparkrun/registry.yaml manifest.

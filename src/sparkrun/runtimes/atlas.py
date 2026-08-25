@@ -1,6 +1,6 @@
 """Atlas runtime for sparkrun.
 
-Atlas (https://github.com/Avarok-Cybersecurity/atlas) is a pure-Rust LLM inference
+Atlas (https://github.com/Atlas-Inf/atlas) is a pure-Rust LLM inference
 server. It bootstraps multi-rank deployments via NCCL using
 ``--rank``/``--world-size``/``--master-addr``/``--master-port`` flags,
 without Ray. This runtime therefore uses the ``"native"`` clustering
@@ -129,7 +129,7 @@ _ATLAS_BOOL_FLAGS = frozenset(
 
 
 class AtlasRuntime(RuntimePlugin):
-    """Native Atlas Spark runtime using the public ``avarok/atlas-gb10`` image.
+    """Native Atlas Spark runtime using the public ``azeezish/atlas-gb10`` image.
 
     Atlas handles its own multi-rank bootstrap via NCCL — each node runs
     the full ``atlas serve`` command with node-specific ``--rank``,
@@ -139,7 +139,7 @@ class AtlasRuntime(RuntimePlugin):
     """
 
     runtime_name = "atlas"
-    default_image_prefix = "avarok/atlas-gb10"
+    default_image_prefix = "azeezish/atlas-gb10"
 
     # Atlas's NCCL constants in get_cluster_env() are validated for the
     # DGX Spark GB10 RoCEv2 fabric.  Generalising them is its own

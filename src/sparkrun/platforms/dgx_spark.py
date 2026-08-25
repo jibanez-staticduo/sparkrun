@@ -19,7 +19,7 @@ _DGX_SPARK_DEFAULTS: dict[str, str | None] = {
     "sglang": "scitrera/dgx-spark-sglang:latest",
     "llama-cpp": "scitrera/dgx-spark-llama-cpp:latest",
     "trtllm": "nvcr.io/nvidia/tensorrt-llm/release:latest",
-    "atlas": "avarok/atlas-gb10:latest",
+    "atlas": "azeezish/atlas-gb10:latest",
 }
 
 
