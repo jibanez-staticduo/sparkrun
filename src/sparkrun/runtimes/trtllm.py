@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from sparkrun.runtimes._util import default_env_hf_offline
+from sparkrun.runtimes._util import default_env_hf_offline, ptrace_executor_config
 from sparkrun.runtimes.base import RuntimePlugin
 
 if TYPE_CHECKING:
@@ -319,6 +319,16 @@ class TrtllmRuntime(RuntimePlugin):
     def get_extra_docker_opts(self) -> list[str]:
         """Return ulimit flags required by TRT-LLM."""
         return list(_TRTLLM_EXTRA_DOCKER_OPTS)
+
+    def default_executor_config(self) -> dict[str, Any]:
+        """Allow attaching a stack sampler to a stalled ``mpirun`` rank.
+
+        A hung collective shows up as every rank sitting in the same wait, and
+        the ranks are children of ``mpirun``, not of an operator's exec shell —
+        so inspecting one needs ``CAP_SYS_PTRACE``.  See
+        :func:`~sparkrun.runtimes._util.ptrace_executor_config`.
+        """
+        return {**super().default_executor_config(), **ptrace_executor_config()}
 
     def runtime_cache_paths(self, *, fingerprint: str = "") -> dict:
         """Persist the TRT-LLM autotuner output plus the torch-path JIT caches.

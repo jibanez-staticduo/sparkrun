@@ -151,6 +151,67 @@ under approved GitHub orgs (`spark-arena`, `scitrera`, `eugr`, `dbotwinick`,
 third-party repositories from impersonating an official source by claiming a
 look-alike name.
 
+## Registry name / subpath path containment
+
+Registry names and asset subpaths arrive from `.sparkrun/registry.yaml`
+manifests in **remote repositories** (`sparkrun registry add <url>`, bootstrap
+manifest discovery), and both are then turned into real filesystem paths. Two
+distinct primitives result if they are not contained:
+
+- A **name** is used verbatim as a directory under the registry cache root
+  (`RegistryManager._cache_dir` is `cache_root / name`). An escaping name
+  (`../…`, `a/b`) resolves outside that root, and
+  `_link_registry_to_shared` goes on to `shutil.rmtree` a cache dir that is not
+  a link — so this is a *delete* primitive, not merely an untidy path. A name
+  matching the `_url_<hash>` form reserved by `_clone_dir_for_url` is the same
+  hazard aimed at the shared clone its siblings on that URL depend on.
+- A **subpath** is resolved against the registry's cache dir
+  (`asset_dir` is `_cache_dir(name) / subpath`) and handed to
+  `git sparse-checkout set`. An escaping subpath makes `iter_asset_files`
+  `rglob` a directory outside the clone, and `find_recipe` then offers whatever
+  YAML it finds there as a runnable recipe — a *read* primitive that feeds the
+  recipe loader.
+
+Three validators in `core/registry.py` contain this. Both charsets require the
+first character of every path component to be alphanumeric, which rules out
+`.`/`..`, dotfiles, a leading `-` (which git would read as an option) and the
+`_url_` prefix in one rule:
+
+| Function | Guards |
+|---|---|
+| `assert_safe_registry_name(name)` | non-empty, ≤100 chars, `[A-Za-z0-9][A-Za-z0-9._-]*` |
+| `assert_safe_registry_subpath(subpath, field=…)` | relative, no backslash, every `/`-segment in the same charset; empty means "asset kind not declared" |
+| `assert_safe_registry_entry(entry)` | the single chokepoint — name plus all four fields in `SUBPATH_FIELDS` |
+
+Enforcement points, and why each behaves differently:
+
+- `validate_registry_name()` runs `assert_safe_registry_name` **first**, so an
+  unsafe name is rejected on containment grounds before the namespace rule is
+  consulted — `../sparkrun-x` does not *start with* a reserved prefix, so the
+  namespace check alone would pass it.
+- `add_registry()` additionally runs `assert_safe_registry_entry`, since
+  `validate_registry_name` only sees the name and this is the public
+  programmatic entry point.
+- `_discover_manifest_entries()` validates every declared entry and **drops**
+  unsafe ones with a warning, keeping the rest (per-entry partial success,
+  matching the per-URL behavior of `_init_defaults_from_manifests`). A manifest
+  with nothing left raises, so a wholly hostile manifest is never reported as a
+  successful no-op add.
+- `_load_registries_from_file()` **skips** unsafe entries with a warning rather
+  than raising. This is deliberately narrower than the enclosing `except` in
+  `_load_registries`, which discards the file and reverts to the shipped
+  defaults: one bad entry — a hand-edit, a merge, a manifest read by an older
+  build with no charset check — must not take the user's other registries with
+  it. The *namespace* check is deliberately not applied on load, since it gates
+  adding a registry and would otherwise invalidate an existing config
+  retroactively.
+
+Manifest discovery clones blob-filtered and sparse (`--filter=blob:none
+--sparse` + `sparse-checkout set .sparkrun`): only the manifest is ever read, so
+the recipe trees are never fetched. A failed sparse-checkout raises rather than
+being reported as "no manifest found", so a clone whose manifest directory was
+never materialized cannot be mistaken for a repo that declares nothing.
+
 ## SSH / shell command construction
 
 `utils/shell.py` is the canonical place for shell-string assembly:

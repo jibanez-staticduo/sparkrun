@@ -20,6 +20,7 @@ from sparkrun.core.registry import (
     RegistryError,
     RegistryManager,
     _get_git_org,
+    _migrated_url_for,
     _normalize_registry_url,
     validate_registry_name,
     is_dir_link,
@@ -241,6 +242,23 @@ class TestDefaultRegistries:
         old = "https://github.com/eugr/spark-vllm-docker"
         assert old in MIGRATED_REGISTRY_URLS
         assert not any(_normalize_registry_url(u) == _normalize_registry_url(old) for u in DEPRECATED_REGISTRIES)
+
+    def test_atlas_default_url_is_the_migration_target(self):
+        """Same convergence rule as eugr: shipped URL == migration target.
+
+        The atlas recipes moved from Avarok-Cybersecurity to Atlas-Inf. If the
+        two disagreed, an upgrading install and a fresh one would point at
+        different repos and the migrated one would never converge.
+        """
+        atlas = next(e for e in FALLBACK_DEFAULT_REGISTRIES if e.name == "atlas")
+        target = MIGRATED_REGISTRY_URLS["https://github.com/Avarok-Cybersecurity/atlas-recipes"]
+        assert _normalize_registry_url(atlas.url) == _normalize_registry_url(target)
+
+    def test_old_atlas_url_is_migrated_not_deprecated(self):
+        """Moving must not delete the user's @atlas registry."""
+        old = "https://github.com/Avarok-Cybersecurity/atlas-recipes"
+        assert not any(_normalize_registry_url(u) == _normalize_registry_url(old) for u in DEPRECATED_REGISTRIES)
+        assert _migrated_url_for(old + ".git") is not None
 
     def test_seven_default_registries(self):
         """Test that there are exactly seven default registries."""
@@ -1397,11 +1415,11 @@ class TestGetGitOrg:
 
     def test_uppercase_url_lowercased(self):
         """Hostname comparison and returned org should both be lowercased."""
-        assert _get_git_org("HTTPS://GITHUB.COM/Avarok-Cybersecurity/atlas-recipes.git") == "avarok-cybersecurity"
+        assert _get_git_org("HTTPS://GITHUB.COM/Atlas-Inf/sparkrun-recipes.git") == "atlas-inf"
 
     def test_mixed_case_org_lowercased(self):
         """Mixed-case org names should be normalized to lowercase."""
-        assert _get_git_org("https://github.com/Avarok-Cybersecurity/atlas-recipes") == "avarok-cybersecurity"
+        assert _get_git_org("https://github.com/Atlas-Inf/sparkrun-recipes") == "atlas-inf"
 
     def test_non_github_url_returns_none(self):
         assert _get_git_org("https://gitlab.com/someone/repo") is None
@@ -1423,17 +1441,26 @@ class TestGetGitOrg:
 class TestExternalReservedNames:
     """Tests for `EXTERNAL_RESERVED_NAMES` exact-match validation."""
 
-    def test_atlas_allowed_for_avarok(self):
-        """The reserved 'atlas' name must be allowed for the Avarok-Cybersecurity org."""
-        validate_registry_name("atlas", "https://github.com/Avarok-Cybersecurity/atlas-recipes.git")
+    def test_atlas_allowed_for_atlas_inf(self):
+        """The reserved 'atlas' name must be allowed for the Atlas-Inf org."""
+        validate_registry_name("atlas", "https://github.com/Atlas-Inf/sparkrun-recipes.git")
 
     def test_atlas_allowed_case_insensitive_url(self):
         """URL case shouldn't matter — `_get_git_org` lowercases."""
-        validate_registry_name("atlas", "https://github.com/avarok-cybersecurity/atlas-recipes")
+        validate_registry_name("atlas", "https://github.com/atlas-inf/sparkrun-recipes")
 
     def test_atlas_allowed_case_insensitive_name(self):
         """Name case shouldn't matter."""
-        validate_registry_name("ATLAS", "https://github.com/Avarok-Cybersecurity/atlas-recipes.git")
+        validate_registry_name("ATLAS", "https://github.com/Atlas-Inf/sparkrun-recipes.git")
+
+    def test_atlas_rejected_from_the_former_org(self):
+        """Avarok-Cybersecurity no longer owns the reserved 'atlas' name.
+
+        The recipes moved to Atlas-Inf, so a registry still claiming ``atlas``
+        from the old org is now an impersonation like any other.
+        """
+        with pytest.raises(RegistryError, match="reserved"):
+            validate_registry_name("atlas", "https://github.com/Avarok-Cybersecurity/atlas-recipes.git")
 
     def test_atlas_rejected_from_other_org(self):
         """The 'atlas' name from a non-allowed org should raise."""
@@ -1443,7 +1470,7 @@ class TestExternalReservedNames:
     def test_atlas_rejected_from_non_github(self):
         """The 'atlas' name from a non-GitHub URL should raise (org cannot be verified)."""
         with pytest.raises(RegistryError, match="reserved"):
-            validate_registry_name("atlas", "https://gitlab.com/avarok-cybersecurity/atlas-recipes")
+            validate_registry_name("atlas", "https://gitlab.com/atlas-inf/sparkrun-recipes")
 
     def test_atlas_prefix_falls_through_to_prefix_check(self):
         """`atlas-foo` is not an exact match — should bypass EXTERNAL_RESERVED_NAMES.

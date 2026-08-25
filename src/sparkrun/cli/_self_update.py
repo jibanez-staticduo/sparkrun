@@ -104,6 +104,34 @@ def new_binary_identity() -> tuple[str | None, str | None]:
     return data.get("version"), data.get("commit")
 
 
+def identity_changed(
+    channel: str,
+    old: tuple[str | None, str | None],
+    new: tuple[str | None, str | None],
+) -> bool:
+    """Return whether the install actually changed, by the same rule as `describe_change`.
+
+    A zero exit from uv means the command worked, not that anything was installed:
+    ``uv tool upgrade`` prints "Nothing to upgrade" and exits 0, and git channels
+    reinstall with ``--force`` on every run regardless of whether the branch moved.
+    So the identity is the only evidence an upgrade happened.
+
+    An indeterminate new identity (the ``setup version --json`` probe failed) returns
+    False: callers use this to claim an upgrade in telemetry and to decide whether the
+    running process holds stale code, and both are better off assuming nothing changed
+    than reporting an upgrade that may not have occurred.
+    """
+    old_version, old_commit = old
+    new_version, new_commit = new
+    if is_git_channel(channel):
+        if new_commit is None:
+            return False
+        return old_commit != new_commit
+    if new_version is None:
+        return False
+    return old_version != new_version
+
+
 def describe_change(channel: str, old: tuple[str | None, str | None], new: tuple[str | None, str | None]) -> str:
     """Return a human message describing the version/commit change after update."""
     old_version, old_commit = old

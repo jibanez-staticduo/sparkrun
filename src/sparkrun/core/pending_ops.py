@@ -50,20 +50,38 @@ def _lock_path(pending_dir: Path, cluster_id: str, operation: str) -> Path:
     return pending_dir / f"{safe_cid}_{operation}.json"
 
 
-def _hostname() -> str:
-    """Best-effort short hostname for lock identity."""
+def lock_hostname() -> str:
+    """Best-effort short hostname for lock identity.
+
+    Shared with other on-disk lock schemes (see
+    :mod:`sparkrun.benchmarking.run_state`) so "was this lock written here?"
+    is answered the same way everywhere.
+    """
     try:
         return socket.gethostname() or ""
     except OSError:
         return ""
 
 
-def _is_pid_alive(pid: int) -> bool:
-    """Check whether a process is still running (Unix only)."""
+def is_pid_alive(pid: int) -> bool:
+    """Check whether a process is still running.
+
+    Only meaningful for a PID recorded on *this* host — a PID from another
+    host (e.g. an NFS-shared cache) says nothing about local processes, so
+    callers must pair this with a host comparison.
+
+    Non-positive PIDs are ``False`` rather than passed through: ``os.kill``
+    reads ``0`` as "my process group" and ``-1`` as "every process I may
+    signal", and *both succeed*.  A lock whose ``pid`` is missing or corrupt
+    reaches here as the ``-1`` default, so without this guard it would read as
+    permanently alive and the lock could never be reclaimed.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, ProcessLookupError):
+    except OSError:
         return False
 
 
@@ -87,9 +105,9 @@ def _is_stale(info: dict) -> bool:
     lock_host = info.get("host")
     # Only trust PID liveness for same-host locks (or legacy locks that
     # predate host recording, where host is absent → assume local).
-    if lock_host in (None, "", _hostname()):
+    if lock_host in (None, "", lock_hostname()):
         pid = info.get("pid", -1)
-        if not _is_pid_alive(pid):
+        if not is_pid_alive(pid):
             return True
 
     return False
@@ -136,7 +154,7 @@ def create_pending_op(
         "cluster_id": cluster_id,
         "operation": operation,
         "pid": os.getpid(),
-        "host": _hostname(),
+        "host": lock_hostname(),
         "token": token or uuid.uuid4().hex,
         "started_at": time.time(),
         "recipe": recipe,

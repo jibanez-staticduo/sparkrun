@@ -9,7 +9,12 @@ import pytest
 from click.testing import CliRunner
 
 from sparkrun.cli import main
-from sparkrun.cli._self_update import channel_from_flags, describe_change, update_argv
+from sparkrun.cli._self_update import (
+    channel_from_flags,
+    describe_change,
+    identity_changed,
+    update_argv,
+)
 from sparkrun.core import channels
 from sparkrun.core.config import SparkrunConfig
 from sparkrun.core.version import display_version
@@ -139,6 +144,35 @@ def test_describe_change_git_same_commit():
     assert "already on the latest commit" in msg and "(abcdef1)" in msg
 
 
+def test_identity_changed_stable_same_version_is_noop():
+    assert identity_changed("stable", ("0.3.5", None), ("0.3.5", None)) is False
+
+
+def test_identity_changed_stable_new_version():
+    assert identity_changed("stable", ("0.3.5", None), ("0.3.6", None)) is True
+
+
+def test_identity_changed_git_same_commit_is_noop():
+    # Git channels reinstall with --force every run, so an unchanged commit is a no-op
+    # even though uv did real work.
+    assert identity_changed("beta", ("0.3.5", "aaaaaaa1"), ("0.3.5", "aaaaaaa1")) is False
+
+
+def test_identity_changed_git_new_commit():
+    assert identity_changed("beta", ("0.3.5", "aaaaaaa1"), ("0.3.5", "bbbbbbb2")) is True
+
+
+def test_identity_changed_git_ignores_static_version():
+    # A git channel's pyproject version is static, so equal versions say nothing.
+    assert identity_changed("alpha", ("0.3.5", "aaaaaaa1"), ("0.3.5", "bbbbbbb2")) is True
+
+
+def test_identity_changed_is_false_when_new_identity_is_indeterminate():
+    # `setup version --json` failed; never claim an upgrade we cannot evidence.
+    assert identity_changed("stable", ("0.3.5", None), (None, None)) is False
+    assert identity_changed("beta", ("0.3.5", "aaaaaaa1"), (None, None)) is False
+
+
 def test_describe_change_git_new_commit():
     msg = describe_change("alpha", ("0.3.0", "aaaaaaa1"), ("0.3.0", "bbbbbbb2"))
     assert msg == "sparkrun alpha updated: commit aaaaaaa -> bbbbbbb"
@@ -245,6 +279,59 @@ def test_build_update_event_omits_channel_when_none():
     )
     assert "channel" not in event
     assert "requested_channel" not in event
+
+
+def _captured_update_event(monkeypatch, tmp_path, args, *, new_json, stored=None):
+    """Run an update command and return the telemetry event it built."""
+    import sparkrun.telemetry.emit as emit_mod
+
+    captured = {}
+
+    def capture(config, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(emit_mod, "emit_update_event", capture)
+    result, calls = _run(monkeypatch, tmp_path, args, stored=stored, new_json=new_json)
+    return result, calls, captured
+
+
+def test_update_noop_does_not_report_a_successful_self_upgrade(monkeypatch, tmp_path):
+    """`uv tool upgrade` exits 0 on "Nothing to upgrade" — that is not an upgrade.
+
+    Regression: keying `upgraded` off the exit code reported every no-op update as a
+    successful self-upgrade, which made `self_upgrade_succeeded` useless as a signal.
+    """
+    from sparkrun.core.version import installed_identity
+
+    current_version = installed_identity()[0]
+    same = '{"version": "%s", "channel": "stable", "commit": null}' % current_version
+
+    _, _, event = _captured_update_event(monkeypatch, tmp_path, ["update"], new_json=same)
+
+    assert event["upgraded"] is False
+    assert event["self_upgrade_attempted"] is True
+
+
+def test_update_noop_skips_the_registry_update_subprocess(monkeypatch, tmp_path):
+    """A no-op update must not spawn `sparkrun registry update` (a full git fetch)."""
+    from sparkrun.core.version import installed_identity
+
+    current_version = installed_identity()[0]
+    same = '{"version": "%s", "channel": "stable", "commit": null}' % current_version
+
+    _, calls, _ = _captured_update_event(monkeypatch, tmp_path, ["update"], new_json=same)
+
+    assert ["sparkrun", "registry", "update"] not in calls
+
+
+def test_update_with_a_real_upgrade_still_reports_and_shells_out(monkeypatch, tmp_path):
+    """The changed path is unaffected: report the upgrade and re-exec for registries."""
+    changed = '{"version": "99.9.9", "channel": "stable", "commit": null}'
+
+    _, calls, event = _captured_update_event(monkeypatch, tmp_path, ["update"], new_json=changed)
+
+    assert event["upgraded"] is True
+    assert ["sparkrun", "registry", "update"] in calls
 
 
 def test_top_update_survives_telemetry_failure(monkeypatch, tmp_path):

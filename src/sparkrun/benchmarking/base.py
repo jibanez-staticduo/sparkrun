@@ -292,15 +292,46 @@ class BenchmarkingPlugin(Plugin):
         return "%s(framework_name=%r)" % (self.__class__.__name__, self.framework_name)
 
 
-def _build_cluster_meta(recipe, overrides, cluster_id, host_list):
+def redact_hosts(hosts) -> list[str]:
+    """Return stable pseudonyms (``node-<8hex>``) for *hosts*.
+
+    Published results (Spark Arena) must not carry a user's LAN addresses or
+    internal hostnames, but "which node produced this row" is exactly the
+    question :func:`host_meta` exists to answer — so the identity is
+    preserved as a digest rather than dropped.  Two rows measured on the same
+    node still match; nothing else is recoverable.
+    """
+    return ["node-%s" % hashlib.sha256(str(h).encode("utf-8")).hexdigest()[:8] for h in hosts]
+
+
+def host_meta(hosts, *, redact: bool = False) -> dict[str, Any]:
+    """Build the ``hosts`` / ``node_count`` half of a result's cluster block.
+
+    Recording *which* hosts were measured is what makes a per-node comparison
+    auditable after the fact: without it a table of identical numbers from
+    different nodes is indistinguishable from a table of genuinely identical
+    nodes (issue #267).  ``hosts_redacted`` marks the pseudonymised form so a
+    consumer never mistakes a digest for a reachable address.
+    """
+    hosts = list(hosts or [])
+    meta: dict[str, Any] = {"node_count": len(hosts)}
+    if redact:
+        meta["hosts"] = redact_hosts(hosts)
+        meta["hosts_redacted"] = True
+    else:
+        meta["hosts"] = [str(h) for h in hosts]
+    return meta
+
+
+def _build_cluster_meta(recipe, overrides, cluster_id, host_list, *, redact: bool = False):
     """Build cluster metadata dict with only non-default parallelism values."""
     from sparkrun.core.parallelism import extract_parallelism_meta
 
     config_chain = recipe.build_config_chain(overrides)
     meta = {
         "cluster_id": cluster_id,
-        "node_count": len(host_list),
     }
+    meta.update(host_meta(host_list, redact=redact))
     meta.update(extract_parallelism_meta(config_chain))
     return meta
 
@@ -339,6 +370,14 @@ class BenchmarkResult:
     longterm_image_ref: Optional[str] = None
     longterm_image_pinned: bool = False
 
+    # Provenance of the numbers themselves.  ``timing`` records *this
+    # invocation*, which for a run that re-emitted recorded results is not
+    # when anything was measured — so a stale result was indistinguishable
+    # from a fresh measurement in the exported artifact (issue #267).
+    # ``measured_at`` carries the reused state's last-write time.
+    resumed: bool = False
+    measured_at: Optional[str] = None
+
     @property
     def output_csv(self):
         return self.outputs.get("csv") if self.outputs else None
@@ -369,7 +408,14 @@ class BenchmarkResult:
             self.outputs = {}
         self.outputs["yaml"] = value
 
-    def generate_metadata(self):
+    def generate_metadata(self, *, redact_hosts: bool = True):
+        """Build the provenance mapping for this result.
+
+        *redact_hosts* pseudonymises the recorded host set.  It defaults to
+        ``True`` because this mapping's consumer is the Spark Arena
+        submission — a published artifact must fail closed on host identity,
+        so a caller that genuinely wants real addresses has to ask.
+        """
         from sparkrun.models.download import parse_gguf_model_spec
         from sparkrun.utils.cli_formatters import RUNTIME_DISPLAY as _RUNTIME_DISPLAY
 
@@ -459,11 +505,13 @@ class BenchmarkResult:
                 "end": self.end_time.isoformat(),
                 "duration": (self.end_time - self.start_time).total_seconds(),
             },
-            "cluster": _build_cluster_meta(recipe, overrides, cluster_id, host_list),
+            "cluster": _build_cluster_meta(recipe, overrides, cluster_id, host_list, redact=redact_hosts),
             "benchmark": {
                 "framework": framework.framework_name if framework else "unknown",
                 "profile": profile,
                 "args": benchmark_args,
+                "resumed": bool(self.resumed),
+                **({"measured_at": self.measured_at} if self.measured_at else {}),
             },
             "model": model_meta,
             "runtime_info": runtime_info,
@@ -495,12 +543,21 @@ def export_results(
     results: dict[str, Any],
     output_path: str | Path,
     runtime_info: dict[str, str] | None = None,
+    resumed: bool = False,
+    measured_at: str | None = None,
 ) -> Path:
     """Export benchmark results to a YAML file.
 
     Args:
         recipe: The recipe that was benchmarked.
-        hosts: Hosts used for inference.
+        hosts: Hosts used for inference.  Recorded under ``cluster.hosts`` as
+            **pseudonyms** — a measurement is *of* a node set, and without any
+            node identity a per-node comparison cannot be audited after the
+            fact (issue #267), but this file embeds the full recipe and is the
+            natural thing to attach to a bug report, so it must not carry LAN
+            addresses.  The digests still distinguish node A from node B,
+            which is the property the audit needs; the real host list lives in
+            the local-only ``BenchmarkRunState``.
         tp: Tensor parallelism value.
         cluster_id: Cluster ID from the inference run.
         framework_name: Name of the benchmarking framework.
@@ -508,6 +565,11 @@ def export_results(
         args: Benchmark args that were used.
         results: Structured results from the framework.
         output_path: Path to write the YAML file.
+        resumed: ``True`` when these numbers came from recorded state rather
+            than from requests sent during this invocation.
+        measured_at: When the recorded results were actually measured.
+            ``timestamp`` below is when this file was *written*, which for a
+            resumed run is not the same thing.
 
     Returns:
         Path to the written file.
@@ -559,12 +621,15 @@ def export_results(
             "cluster": {
                 "tp": tp,
                 "cluster_id": cluster_id,
+                **host_meta(hosts, redact=True),
                 "runtime_info": runtime_info or {},
             },
             "benchmark": {
                 "framework": framework_name,
                 "profile": profile_name,
                 "args": args,
+                "resumed": bool(resumed),
+                **({"measured_at": measured_at} if measured_at else {}),
             },
             "results": results,
         },

@@ -939,8 +939,15 @@ def test_export_results_writes_yaml(tmp_path: Path):
     # Model section
     assert bench["model"]["dtype"] == "bfloat16"
 
-    # Cluster section (hosts excluded for privacy)
-    assert "hosts" not in bench["cluster"]
+    # Cluster section: the node set is recorded so a per-node comparison can
+    # be audited (issue #267), but as pseudonyms — this file is shareable, so
+    # no real hostname or LAN address may appear in it.
+    from sparkrun.benchmarking.base import redact_hosts
+
+    assert bench["cluster"]["hosts"] == redact_hosts(["host1", "host2"])
+    assert bench["cluster"]["hosts_redacted"] is True
+    assert bench["cluster"]["node_count"] == 2
+    assert "host1" not in output_path.read_text()
     assert bench["cluster"]["tp"] == 2
     assert bench["cluster"]["cluster_id"] == "test-cluster-123"
 

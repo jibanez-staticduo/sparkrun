@@ -5,6 +5,42 @@ if TYPE_CHECKING:
     from sparkrun.core.recipe import Recipe
 
 
+def ptrace_executor_config() -> dict[str, object]:
+    """Return the ``default_executor_config`` fragment that keeps a hung engine inspectable.
+
+    The one recurring way to diagnose a wedged inference server is to attach a
+    stack sampler to the stuck process (``py-spy dump --pid``, ``gdb -p``,
+    ``pystack``).  Every runtime that uses this is multi-process — vLLM's API
+    server plus its EngineCore children, SGLang's scheduler/detokenizer/TP
+    workers, TRT-LLM's ``mpirun`` ranks — so the sampler is never a
+    *descendant* of its target, and Yama's default ``ptrace_scope=1`` therefore
+    requires ``CAP_SYS_PTRACE``, which is not in Docker's default capability
+    set.
+
+    The capability is added to the **container's** set, so it is available to a
+    ``docker exec -u root <container> py-spy dump --pid N`` even though the
+    workload itself runs as an unprivileged user (``auto_user``): a non-root
+    process gets no permitted capabilities from ``--cap-add`` (Docker sets no
+    ambient caps), but an exec that *is* root draws from the container's set.
+    That exec is how an operator actually reaches a hung engine, which is why
+    this is worth carrying by default.
+
+    Notably weaker than the other privilege keys gated by the launcher:
+    ``CAP_SYS_PTRACE`` confers no access outside the container's PID namespace,
+    so it does not undo the rootless hardening the way ``privileged`` or
+    ``cap_add: [SYS_ADMIN]`` would.
+
+    Returned from :meth:`~sparkrun.runtimes.base.RuntimePlugin.default_executor_config`
+    (chain layer 7) rather than appended as a raw flag by
+    ``get_extra_docker_opts``, so that every layer above it — cluster, recipe,
+    ``-o cap_add=…`` — can override or drop it, and so it reaches any executor
+    that understands :class:`~sparkrun.orchestration.executors._base.ExecutorConfig`
+    rather than docker alone.  Note the list *replaces* rather than merges, so
+    a recipe setting ``cap_add`` must re-list ``SYS_PTRACE`` to keep it.
+    """
+    return {"cap_add": ["SYS_PTRACE"]}
+
+
 def default_env_hf_offline(env: dict[str, str] = None, **kwargs) -> dict[str, str]:
     return {
         # DEFAULT: disable online HF/transformers checks -- we've already copied all data locally!
