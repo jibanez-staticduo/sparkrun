@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from sparkrun.core.config import resolve_hf_token as _get_hf_token
 from sparkrun.core.hosts import is_control_in_cluster
 from sparkrun.utils import is_local_host
+from sparkrun.utils.images import image_has_explicit_version, parse_image_ref
 
 from sparkrun.orchestration.transfer import TransferError
 
@@ -430,6 +431,19 @@ def distribute_resources(
     from sparkrun.core.pending_ops import pending_op
 
     prefs = prefs or ModelDistributionPrefs()
+
+    # An untagged reference is not an error -- docker resolves it to the mutable
+    # `:latest` and says so ("Using default tag: latest") -- but for an inference
+    # workload it is almost always a dropped tag, and the launch then serves
+    # whatever `latest` happens to point at.  Nothing else in the pipeline
+    # remarks on it, so the only signal was docker's own line buried in a pull.
+    if not image_has_explicit_version(image):
+        logger.warning(
+            "Container image '%s' has no tag or digest; docker will resolve it to '%s:latest', "
+            "which is mutable and may not be the build this recipe expects. Pin an explicit tag.",
+            image,
+            parse_image_ref(image).repository,
+        )
 
     # Common kwargs for pending-op lock files
     _pop_kw = dict(

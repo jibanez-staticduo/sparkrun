@@ -18,6 +18,13 @@ EXT_BUILDER = "sparkrun.builder"
 
 # Fully qualified image prefixes that indicate a pullable registry image
 # (no build needed even if the image isn't present locally).
+#
+# DEPRECATED as a decision procedure -- kept only because it is importable API.
+# Prefer :func:`sparkrun.utils.images.is_pullable_image_ref`, which implements
+# Docker's actual reference grammar.  Matching on host prefixes alone rejects
+# the canonical short form of every Docker Hub image (``vllm/vllm-openai:tag``
+# carries no host), which the eugr builder then treated as a local image that
+# had gone missing and silently replaced with its own nightly.
 PULLABLE_REGISTRY_PREFIXES = (
     "docker.io/",
     "ghcr.io/",
