@@ -165,6 +165,8 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
 
     ssh_kwargs = build_ssh_kwargs(config)
 
+    # Name the target before tearing anything down on it.
+    click.echo(hctx.describe())
     click.echo("Discovering sparkrun containers on %d host(s)..." % len(host_list))
     # Status flows from the single source, ``api.status_report`` (cluster-aware
     # resolution + cross-executor merge + display classification).  The

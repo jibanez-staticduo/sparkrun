@@ -1278,6 +1278,8 @@ def launch_inference(
             skip_container=_skip_container,
             after_container_sync=_probe_image_entrypoint,
             timeline=timeline,
+            job_cluster_id=cluster_id,
+            cluster_name=getattr(cluster, "name", "") or "",
         )
         # Re-save job metadata with IP maps from IB detection
         if not dry_run and (ib_ip_map or mgmt_ip_map):

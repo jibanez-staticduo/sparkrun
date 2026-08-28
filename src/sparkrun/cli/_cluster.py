@@ -954,7 +954,7 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
 
       sparkrun cluster status --cluster mylab
     """
-    from sparkrun.utils.cli_formatters import format_job_label, format_job_commands, format_host_display
+    from sparkrun.utils.cli_formatters import format_job_label, format_job_commands, format_host_display, format_pending_op
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
     sctx = _get_context(ctx)
@@ -991,6 +991,12 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
 
     # --- Display rendering ---
 
+    # Say what is being reported on.  With no flags the host list comes from
+    # the default cluster, and without this line there was no way to tell
+    # which machines the report covers.
+    click.echo(hctx.describe())
+    click.echo()
+
     # Display grouped clusters
     if result.groups:
         for cid, group in sorted(result.groups.items()):
@@ -1026,9 +1032,17 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
         if host in result.errors:
             click.echo(f"  {host}: Error: {result.errors[host]}")
 
+    # Display hosts a launch is staging onto — free right now, but spoken for.
+    if result.preparing_hosts:
+        click.echo("Preparing (launch in progress, will consume VRAM):")
+        for h in result.preparing_hosts:
+            for op in result.pending_by_host.get(h, []):
+                click.echo(f"  {h:<20s} {format_pending_op(op, with_detail=False)}")
+        click.echo()
+
     # Display idle hosts
     if result.idle_hosts:
-        click.echo("Idle hosts (no sparkrun containers):")
+        click.echo("Idle hosts (no sparkrun containers, nothing pending):")
         for h in result.idle_hosts:
             click.echo(f"  {h}")
         click.echo()
@@ -1037,19 +1051,17 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
     if result.pending_ops:
         click.echo("Pending operations (downloads/distributions in progress):")
         for op in result.pending_ops:
-            elapsed = op.get("elapsed_seconds", 0)
-            mins, secs = divmod(int(elapsed), 60)
-            elapsed_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
-            label = op.get("recipe") or op.get("cluster_id", "?")
-            detail = op.get("operation", "unknown").replace("_", " ")
-            extra = ""
-            if op.get("model") and "model" in detail:
-                extra = f"  model={op['model']}"
-            elif op.get("image") and "image" in detail:
-                extra = f"  image={op['image']}"
-            click.echo(f"  {label}: {detail} ({elapsed_str}){extra}")
+            click.echo(f"  {format_pending_op(op)}")
+            matched = op.get("matched_hosts") or []
+            other = op.get("other_hosts") or []
+            if matched:
+                click.echo("    hosts: %s%s" % (", ".join(matched), " (+%d outside this cluster)" % len(other) if other else ""))
+            else:
+                # A lock that recorded no hosts cannot be pinned to any of
+                # them; say so rather than leaving the reader to assume.
+                click.echo("    hosts: not recorded")
         click.echo()
-        click.echo("  Note: pending operations will consume VRAM once launched.")
+        click.echo("  Note: only launches started from this machine are visible here.")
         click.echo()
 
     # Summary

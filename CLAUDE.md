@@ -727,6 +727,33 @@ tiers:
   aggregate in `core/cluster_manager.py`). Used by `cluster status` and `stop
   --all`.
 
+**Free ≠ idle.** A host that a pending model download or image distribution is
+staging onto is minutes from taking its whole GPU, so the display tier splits
+the reachable/zero-container hosts into `idle_hosts` and `preparing_hosts`
+using the pending-op locks (`core/pending_ops.py`), which have always recorded
+their `hosts` — the report simply discarded them and reported the targets as
+idle. Attribution is literal (case + `user@` normalized, no DNS): an op that
+matches nothing in the queried host list is dropped as another cluster's, while
+one that recorded *no* hosts is still shown but pinned to none — "unknown
+scope" must never read as "affects every host". Each op carries derived
+`matched_hosts` / `other_hosts`. This stays **display-only**: pending locks are
+control-node-local and best-effort, so `preparing_hosts` is a lower bound, and
+feeding it into the occupancy snapshot would let a stale lock refuse a launch
+onto a genuinely free host. Locks also carry `job_cluster_id` / `cluster`, so a
+pending op can name the job it is preparing (its lock *key* remains the
+image/model/host hash — distribution runs before the launch commits).
+
+**Which cluster is being reported** is `cli/_common.py:resolve_host_context()`
+→ `HostContext`. `resolve_hosts` consults the default cluster, so a flagless
+invocation ends up with a concrete host list; handing that to `api.status_report`
+with `cluster=None` made `resolve_cluster` short-circuit to an *anonymous*
+`ClusterDefinition` (`api/_resolve.py`: explicit hosts are checked **before**
+the default-cluster step) and silently dropped that cluster's executor pin,
+`executor_config`, `hosts_hardware` and transport from the sweep. Any command
+that pairs a resolved host list with an `api.*` cluster argument must forward
+`HostContext.cluster_name`; `HostContext.describe()` is the matching banner, so
+the report also *says* what it covers.
+
 Under the hood, `api.status` calls
 `orchestration/executor.py:query_status_for_cluster(cluster, hosts, …)`, which
 **sweeps every enabled executor on the cluster's status substrate and merges**:

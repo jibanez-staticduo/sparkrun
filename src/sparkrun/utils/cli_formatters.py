@@ -187,6 +187,32 @@ def format_job_commands(meta: dict[str, Any], cluster_id: str | None = None) -> 
     return logs_cmd, stop_cmd
 
 
+def format_elapsed(seconds: float) -> str:
+    """Format an elapsed duration as ``4m47s`` / ``12s``."""
+    mins, secs = divmod(int(seconds or 0), 60)
+    return "%dm%02ds" % (mins, secs) if mins else "%ds" % secs
+
+
+def format_pending_op(op: dict[str, Any], *, with_detail: bool = True) -> str:
+    """One-line summary of a pending-operation lock.
+
+    ``<label>: <operation> (<elapsed>)`` plus the model or image the
+    operation is moving, whichever the operation names.  *with_detail*
+    ``False`` drops that suffix, for per-host lines where the same op is
+    already spelled out in full elsewhere.
+    """
+    label = op.get("recipe") or op.get("cluster") or op.get("cluster_id", "?")
+    detail = str(op.get("operation", "unknown")).replace("_", " ")
+    line = "%s: %s (%s)" % (label, detail, format_elapsed(op.get("elapsed_seconds", 0)))
+    if not with_detail:
+        return line
+    if op.get("model") and "model" in detail:
+        return "%s  model=%s" % (line, op["model"])
+    if op.get("image") and "image" in detail:
+        return "%s  image=%s" % (line, op["image"])
+    return line
+
+
 def format_host_display(host: str, meta: dict[str, Any] | None) -> str:
     """Format host with complementary IP from job metadata if available.
 

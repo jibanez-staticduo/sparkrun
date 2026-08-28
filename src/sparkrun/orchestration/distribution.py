@@ -747,6 +747,8 @@ def distribute_from_config(
     skip_container: bool = False,
     after_container_sync: "Callable[[], None] | None" = None,
     timeline: "Timeline | None" = None,
+    job_cluster_id: str = "",
+    cluster_name: str = "",
 ) -> tuple["ClusterCommEnv | None", dict[str, str], dict[str, str]]:
     """Distribute resources based on recipe ``distribution_config``.
 
@@ -778,6 +780,10 @@ def distribute_from_config(
         timeline: Optional span collector.  Image and model transfers are the
             longest and most variable part of a launch, so each entry is timed
             separately with its mode and target count.
+        job_cluster_id: The launch's ``cluster_id``, recorded in the pending-op
+            locks so ``cluster status`` can name the job a distribution is
+            preparing.  The lock's own key stays the image/model/host hash.
+        cluster_name: Named cluster the launch targets, recorded likewise.
 
     Returns:
         Tuple of (comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map).
@@ -813,7 +819,13 @@ def distribute_from_config(
         _lock_key = hashlib.sha256("|".join(lock_parts).encode()).hexdigest()[:12]
         _lock_id = f"sparkrun_{_lock_key}"
         _pop_kw = dict(
-            recipe=recipe_name, model=_model_names[0] if _model_names else "", image=image, hosts=host_list, cache_dir=str(config.cache_dir)
+            recipe=recipe_name,
+            model=_model_names[0] if _model_names else "",
+            image=image,
+            hosts=host_list,
+            cache_dir=str(config.cache_dir),
+            job_cluster_id=job_cluster_id,
+            cluster=cluster_name,
         )
 
         if _do_local_ensure:
@@ -884,7 +896,15 @@ def distribute_from_config(
     effective_local_cache = local_cache_dir or cache_dir
     _lock_key = hashlib.sha256(f"{image}|{','.join(host_list)}".encode()).hexdigest()[:12]
     _lock_id = f"sparkrun_{_lock_key}"
-    _pop_kw = dict(recipe=recipe_name, model=image, image=image, hosts=host_list, cache_dir=str(config.cache_dir))
+    _pop_kw = dict(
+        recipe=recipe_name,
+        model=image,
+        image=image,
+        hosts=host_list,
+        cache_dir=str(config.cache_dir),
+        job_cluster_id=job_cluster_id,
+        cluster=cluster_name,
+    )
 
     # Distribute container images (skipped entirely when skip_container — e.g.
     # a container-less executor like `local` that has no image to distribute).

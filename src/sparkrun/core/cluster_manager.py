@@ -402,8 +402,25 @@ class ClusterStatusResult:
     groups: dict[str, ClusterGroup]  # cluster_id -> group
     solo_entries: list[ClusterSoloEntry]
     errors: dict[str, str]  # host -> error message
-    idle_hosts: list[str]  # hosts with no containers and no errors
-    pending_ops: list[dict[str, Any]]  # relevant pending operations
+    idle_hosts: list[str]
+    """Hosts that are reachable, running nothing, and *not* being prepared.
+
+    Narrower than "zero containers": a host that a pending download or image
+    distribution is targeting is about to consume its whole GPU, and calling
+    it idle is the one reading that leads somewhere expensive.  Those hosts
+    are in :attr:`preparing_hosts` instead — the two lists are disjoint and
+    together cover every free, reachable host.
+    """
+    pending_ops: list[dict[str, Any]]
+    """Live pending operations touching this cluster.
+
+    Each entry is the on-disk lock plus two derived keys: ``matched_hosts``
+    (targets within the queried host list, in that list's spelling) and
+    ``other_hosts`` (targets outside it — the operation spans more than the
+    cluster being looked at).  An op with **no** recorded hosts is kept but
+    attributed to nothing: "unknown scope" must not read as "affects every
+    host".
+    """
     total_containers: int
     host_count: int
     container_executors: dict[tuple[str, str], str] = field(default_factory=dict)
@@ -415,6 +432,17 @@ class ClusterStatusResult:
     tear each workload down through its own substrate; a missing entry means
     unattributed and falls back to the cluster's default executor.
     """
+    preparing_hosts: list[str] = field(default_factory=list)
+    """Reachable, container-free hosts targeted by a live pending operation.
+
+    A **lower bound**, not an authority: pending-op locks are written by the
+    control node doing the launching, so a launch driven from another machine
+    leaves no trace here.  Display-only for that reason — the occupancy
+    snapshot that drives placement and eviction is deliberately not derived
+    from it, since a stale lock would refuse a launch onto a free host.
+    """
+    pending_by_host: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    """``host`` → the entries of :attr:`pending_ops` targeting it."""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the result to a JSON-serializable dictionary."""
@@ -422,6 +450,10 @@ class ClusterStatusResult:
             "groups": {},
             "solo_entries": [],
             "idle_hosts": self.idle_hosts,
+            "preparing_hosts": self.preparing_hosts,
+            # ``pending_by_host`` is intentionally not emitted: each op already
+            # carries ``matched_hosts``, so the mapping is derivable and would
+            # only duplicate every entry.
             "pending_ops": self.pending_ops,
             "errors": self.errors,
             "total_containers": self.total_containers,
@@ -952,14 +984,15 @@ def classify_cluster_status(
     produced by :func:`sparkrun.api.status` (the single status source, which
     owns executor resolution + the cross-executor merge); this classifies its
     workloads into cluster groups vs solo entries, enriches each with cached
-    job metadata, and derives idle hosts + relevant pending ops.
+    job metadata, and splits the free hosts into idle vs *preparing* using the
+    pending-operation locks (see :attr:`ClusterStatusResult.idle_hosts`).
 
     Args:
         snapshot: The merged :class:`ClusterStatus` from ``api.status``.
         cache_dir: Cache directory for job metadata and pending ops.
-        host_list: The hosts that were queried (used to derive idle hosts and
-            filter pending ops); a host absent from ``snapshot.hosts`` and not
-            in ``snapshot.errors`` is neither reachable nor idle.
+        host_list: The hosts that were queried (used to classify free hosts and
+            attribute pending ops); a host absent from ``snapshot.hosts`` and
+            not in ``snapshot.errors`` is neither reachable nor idle.
 
     Returns:
         A :class:`ClusterStatusResult` with all collected data.
@@ -1007,15 +1040,18 @@ def classify_cluster_status(
     # Unreachable hosts (absent from the snapshot's hosts) surfaced as errors.
     errors = dict(snapshot.errors)
 
-    # Idle hosts: reachable (present in the merged snapshot) with zero
-    # containers and no error.  A host absent from the snapshot is an error
-    # (or was never reachable), not idle — matches the pre-refactor behavior.
-    idle_hosts = [h for h in host_list if h in reachable_hosts and host_container_counts.get(h, 0) == 0 and h not in errors]
+    # Pending operations, attributed to the hosts they will occupy.
+    relevant_ops, pending_by_host = _classify_pending_ops(list_pending_ops(cache_dir=cache_dir), host_list)
 
-    # Pending operations filtered to relevant hosts
-    pending = list_pending_ops(cache_dir=cache_dir)
-    host_set = set(host_list)
-    relevant_ops = [op for op in pending if not op.get("hosts") or host_set & set(op["hosts"])]
+    # Free hosts: reachable (present in the merged snapshot) with zero
+    # containers and no error.  A host absent from the snapshot is an error
+    # (or was never reachable), not free — matches the pre-refactor behavior.
+    free_hosts = [h for h in host_list if h in reachable_hosts and host_container_counts.get(h, 0) == 0 and h not in errors]
+    # ...split into "being prepared" vs genuinely idle.  A host staging a
+    # multi-GB image or model download is minutes away from taking its whole
+    # GPU; reporting it as idle is what sends the next launch at it.
+    preparing_hosts = [h for h in free_hosts if pending_by_host.get(h)]
+    idle_hosts = [h for h in free_hosts if not pending_by_host.get(h)]
 
     return ClusterStatusResult(
         groups=cluster_groups,
@@ -1026,7 +1062,56 @@ def classify_cluster_status(
         total_containers=total_containers,
         host_count=len(host_list),
         container_executors=container_executors,
+        preparing_hosts=preparing_hosts,
+        pending_by_host=pending_by_host,
     )
+
+
+def _pending_host_key(host: str) -> str:
+    """Normalize a host for pending-op ↔ cluster-host matching.
+
+    Locks record whatever spelling the launch was given, which is usually but
+    not always the spelling ``cluster status`` is asked about.  Case and an
+    ``ssh``-style ``user@`` prefix are cheap to reconcile; anything further
+    (DNS, IP-vs-name) is not attempted — an unmatched op stays visible under
+    "pending operations", it just isn't pinned to a host.
+    """
+    h = str(host).strip()
+    if "@" in h:
+        h = h.rsplit("@", 1)[1]
+    return h.lower()
+
+
+def _classify_pending_ops(
+    pending: list[dict[str, Any]],
+    host_list: list[str],
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Filter *pending* to the ops touching *host_list* and attribute them.
+
+    Returns ``(relevant_ops, pending_by_host)``.  Each returned op is a copy
+    carrying ``matched_hosts`` / ``other_hosts``; the originals are left
+    alone.  Ops recording no hosts are kept (they may well concern this
+    cluster — there is no way to tell) but attributed to none, because
+    marking every host busy on a "don't know" is unrecoverable for the
+    reader, while an unpinned line is merely less useful.
+    """
+    known = {_pending_host_key(h) for h in host_list}
+    relevant: list[dict[str, Any]] = []
+    by_host: dict[str, list[dict[str, Any]]] = {}
+
+    for op in pending:
+        op_hosts = [str(h) for h in (op.get("hosts") or [])]
+        op_keys = {_pending_host_key(h) for h in op_hosts}
+        matched = [h for h in host_list if _pending_host_key(h) in op_keys]
+        if op_hosts and not matched:
+            continue  # targets some other cluster entirely
+        other = [h for h in op_hosts if _pending_host_key(h) not in known]
+        entry = dict(op, matched_hosts=matched, other_hosts=other)
+        relevant.append(entry)
+        for h in matched:
+            by_host.setdefault(h, []).append(entry)
+
+    return relevant, by_host
 
 
 @dataclass

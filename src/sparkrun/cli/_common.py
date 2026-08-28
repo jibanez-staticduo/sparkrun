@@ -556,11 +556,29 @@ class HostContext:
     host_list: list[str]
     cluster_mgr: Any
     cluster: ResolvedClusterConfig
+    source: str = "config"
+    """Which link of the host-resolution chain supplied :attr:`host_list` —
+    one of ``hosts`` / ``hosts-file`` / ``cluster`` / ``default-cluster`` /
+    ``config``.  Commands report it so a user can tell *what* they are looking
+    at when they named nothing."""
 
     @property
     def cluster_name(self) -> str | None:
         """The effective cluster name, or ``None`` when hosts are unattached."""
         return self.cluster.name or None
+
+    def describe(self) -> str:
+        """One-line "what am I looking at?" banner for command output."""
+        n = "%d host(s)" % len(self.host_list)
+        if self.source == "cluster":
+            return "Cluster: %s — %s" % (self.cluster_name, n)
+        if self.source == "default-cluster":
+            return "Cluster: %s (default) — %s" % (self.cluster_name, n)
+        if self.source == "hosts":
+            return "Hosts: %s (--hosts)" % n
+        if self.source == "hosts-file":
+            return "Hosts: %s (--hosts-file)" % n
+        return "Hosts: %s (config default_hosts)" % n
 
 
 def resolve_host_context(hosts, hosts_file, cluster_name, config, v=None, sctx: SparkrunContext | None = None) -> HostContext:
@@ -589,7 +607,18 @@ def resolve_host_context(hosts, hosts_file, cluster_name, config, v=None, sctx: 
     cluster_cfg = resolve_cluster_config(cluster_name, hosts, hosts_file, cluster_mgr)
     if cluster_cfg.user:
         config.ssh_user = cluster_cfg.user
-    return HostContext(host_list=host_list, cluster_mgr=cluster_mgr, cluster=cluster_cfg)
+
+    if hosts:
+        source = "hosts"
+    elif hosts_file:
+        source = "hosts-file"
+    elif cluster_name:
+        source = "cluster"
+    elif cluster_cfg.name:
+        source = "default-cluster"
+    else:
+        source = "config"
+    return HostContext(host_list=host_list, cluster_mgr=cluster_mgr, cluster=cluster_cfg, source=source)
 
 
 def _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, v=None, sctx: SparkrunContext | None = None):

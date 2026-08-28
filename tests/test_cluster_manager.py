@@ -1233,6 +1233,143 @@ class TestQueryClusterStatusParsing:
         assert result.total_containers == 0
 
 
+class TestPendingOpAttribution:
+    """Pending operations are attributed to the hosts they will occupy.
+
+    A host staging a multi-GB image or model download is minutes from taking
+    its whole GPU; reporting it as "idle" is what sends the next launch at it.
+    """
+
+    @staticmethod
+    def _status(hosts, errors=None):
+        """Snapshot where every host in *hosts* is reachable and empty."""
+        from sparkrun.core.cluster_status import ClusterStatus, HostOccupancy
+
+        return ClusterStatus(
+            hosts=tuple(HostOccupancy(host=h, workloads=()) for h in hosts),
+            executor="docker",
+            errors=dict(errors or {}),
+        )
+
+    @staticmethod
+    def _lock(tmp_path, key, hosts, **kw):
+        from sparkrun.core.pending_ops import create_pending_op
+
+        create_pending_op(key, "image_distribute", hosts=hosts, cache_dir=str(tmp_path), **kw)
+
+    def _classify(self, tmp_path, host_list, snapshot=None):
+        from sparkrun.core.cluster_manager import classify_cluster_status
+
+        return classify_cluster_status(
+            snapshot if snapshot is not None else self._status(host_list),
+            cache_dir=str(tmp_path),
+            host_list=host_list,
+        )
+
+    def test_targeted_host_is_preparing_not_idle(self, tmp_path):
+        """The op's target is 'preparing'; its peer stays idle."""
+        self._lock(tmp_path, "k1", ["h1"], recipe="r1")
+
+        result = self._classify(tmp_path, ["h1", "h2"])
+
+        assert result.preparing_hosts == ["h1"]
+        assert result.idle_hosts == ["h2"]  # h1 is NOT reported idle
+        assert [op["recipe"] for op in result.pending_by_host["h1"]] == ["r1"]
+
+    def test_op_without_hosts_is_shown_but_pins_nothing(self, tmp_path):
+        """ "Unknown scope" must not read as "affects every host"."""
+        self._lock(tmp_path, "k1", [], recipe="r1")
+
+        result = self._classify(tmp_path, ["h1", "h2"])
+
+        assert result.preparing_hosts == []
+        assert result.idle_hosts == ["h1", "h2"]
+        assert len(result.pending_ops) == 1  # still surfaced
+        assert result.pending_ops[0]["matched_hosts"] == []
+
+    def test_op_for_other_hosts_is_dropped(self, tmp_path):
+        """An op targeting a different cluster entirely is not this report's."""
+        self._lock(tmp_path, "k1", ["h9"], recipe="elsewhere")
+
+        result = self._classify(tmp_path, ["h1", "h2"])
+
+        assert result.pending_ops == []
+        assert result.idle_hosts == ["h1", "h2"]
+
+    def test_spanning_op_records_hosts_outside_the_cluster(self, tmp_path):
+        """An op reaching beyond the queried hosts says so."""
+        self._lock(tmp_path, "k1", ["h1", "h9"], recipe="r1")
+
+        result = self._classify(tmp_path, ["h1", "h2"])
+
+        (op,) = result.pending_ops
+        assert op["matched_hosts"] == ["h1"]
+        assert op["other_hosts"] == ["h9"]
+        assert result.preparing_hosts == ["h1"]
+
+    def test_host_spelling_is_normalized(self, tmp_path):
+        """A lock recorded as ``user@Host`` still matches ``host``."""
+        self._lock(tmp_path, "k1", ["drew@H1"], recipe="r1")
+
+        result = self._classify(tmp_path, ["h1"])
+
+        assert result.preparing_hosts == ["h1"]  # reported in the queried spelling
+        assert result.pending_ops[0]["matched_hosts"] == ["h1"]
+
+    def test_running_host_is_not_listed_as_preparing(self, tmp_path):
+        """A host already running the workload is occupied, not preparing."""
+        from sparkrun.core.cluster_status import ClusterStatus, ContainerDetail, HostOccupancy, RunningWorkload
+
+        self._lock(tmp_path, "k1", ["h1"], recipe="r1")
+        cid = "sparkrun_221f3a3a45d7fa4d_111111111111"
+        snapshot = ClusterStatus(
+            hosts=(
+                HostOccupancy(
+                    host="h1",
+                    workloads=(RunningWorkload(cluster_id=cid, containers=(ContainerDetail(cid + "_solo", "solo", "Up 1m", "img"),)),),
+                ),
+            ),
+            executor="docker",
+        )
+
+        result = self._classify(tmp_path, ["h1"], snapshot=snapshot)
+
+        assert result.preparing_hosts == []
+        assert result.idle_hosts == []
+        assert result.total_containers == 1
+        assert len(result.pending_ops) == 1  # the op is still reported
+
+    def test_unreachable_host_is_not_preparing(self, tmp_path):
+        """An errored host is unknown, not "being prepared"."""
+        self._lock(tmp_path, "k1", ["h1"], recipe="r1")
+
+        result = self._classify(tmp_path, ["h1"], snapshot=self._status([], errors={"h1": "unreachable"}))
+
+        assert result.preparing_hosts == []
+        assert result.idle_hosts == []
+        assert result.errors == {"h1": "unreachable"}
+
+    def test_job_identity_is_recorded_on_the_lock(self, tmp_path):
+        """The launch's cluster_id / cluster name travel with the op."""
+        self._lock(tmp_path, "k1", ["h1"], recipe="r1", job_cluster_id="sparkrun_aaaa_bbbb", cluster="mylab")
+
+        result = self._classify(tmp_path, ["h1"])
+
+        (op,) = result.pending_ops
+        assert op["job_cluster_id"] == "sparkrun_aaaa_bbbb"
+        assert op["cluster"] == "mylab"
+
+    def test_to_dict_exposes_preparing_hosts(self, tmp_path):
+        """JSON consumers get the new split without losing ``idle_hosts``."""
+        self._lock(tmp_path, "k1", ["h1"], recipe="r1")
+
+        out = self._classify(tmp_path, ["h1", "h2"]).to_dict()
+
+        assert out["preparing_hosts"] == ["h1"]
+        assert out["idle_hosts"] == ["h2"]
+        assert out["pending_ops"][0]["matched_hosts"] == ["h1"]
+
+
 class TestClusterDistributionPrefs:
     """Round-trip + resolution for cluster ``distribution.model`` prefs."""
 
