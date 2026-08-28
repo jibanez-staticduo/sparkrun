@@ -16,6 +16,7 @@ from ._common import (
     _get_context,
     _is_cluster_id,
     _resolve_hosts_or_exit,
+    resolve_host_context,
     build_cluster_id_overrides,
     dry_run_option,
     host_options,
@@ -844,7 +845,8 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
     config = _get_context(ctx).config
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
+    hctx = resolve_host_context(hosts, hosts_file, cluster_name, config)
+    host_list = hctx.host_list
     ssh_kwargs = build_ssh_kwargs(config)
 
     # Resolve monitoring backend
@@ -871,7 +873,7 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
         try:
             for frame in api.live_monitor(
                 host_list,
-                cluster=cluster_name or None,
+                cluster=hctx.cluster_name,
                 ssh_kwargs=ssh_kwargs,
                 interval=interval,
                 backend=backend,
@@ -892,7 +894,7 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
             # the TUI shows local/provider workloads (not just docker).
             session = api.open_live_monitor(
                 host_list,
-                cluster=cluster_name or None,
+                cluster=hctx.cluster_name,
                 ssh_kwargs=ssh_kwargs,
                 interval=interval,
                 backend=backend,
@@ -920,7 +922,7 @@ def cluster_monitor(ctx, hosts, hosts_file, cluster_name, dry_run, interval, sim
     try:
         for frame in api.live_monitor(
             host_list,
-            cluster=cluster_name or None,
+            cluster=hctx.cluster_name,
             ssh_kwargs=ssh_kwargs,
             interval=interval,
             backend=backend,
@@ -957,7 +959,8 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
 
     sctx = _get_context(ctx)
     config = sctx.config
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
+    hctx = resolve_host_context(hosts, hosts_file, cluster_name, config, sctx=sctx)
+    host_list = hctx.host_list
 
     ssh_kwargs = build_ssh_kwargs(config)
 
@@ -971,8 +974,10 @@ def cluster_status(ctx, hosts, hosts_file, cluster_name, dry_run, output_json, c
     # (cluster-aware, so a cluster's ``executor_config`` incl. ``pid_dir`` is
     # honored), the cross-executor merge, and classification into the
     # display-oriented ``ClusterStatusResult`` (per-container role/status/image,
-    # idle hosts, pending ops).
-    result = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
+    # idle hosts, pending ops).  The *effective* cluster is forwarded (see
+    # ``HostContext``) so a default-cluster sweep keeps that cluster's
+    # executor pin and hardware instead of resolving to an anonymous one.
+    result = api.status_report(host_list, cluster=hctx.cluster_name, ssh_kwargs=ssh_kwargs, sctx=sctx)
 
     if output_json:
         out = result.to_dict()

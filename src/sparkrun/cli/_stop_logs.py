@@ -31,6 +31,7 @@ from ._common import (
     build_cluster_id_overrides,
     dry_run_option,
     host_options,
+    resolve_host_context,
     resolve_hosts_with_metadata_fallback,
 )
 
@@ -159,14 +160,17 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
     """
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-    host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, sctx=sctx)
+    hctx = resolve_host_context(hosts, hosts_file, cluster_name, config, sctx=sctx)
+    host_list = hctx.host_list
 
     ssh_kwargs = build_ssh_kwargs(config)
 
     click.echo("Discovering sparkrun containers on %d host(s)..." % len(host_list))
     # Status flows from the single source, ``api.status_report`` (cluster-aware
-    # resolution + cross-executor merge + display classification).
-    discovered = api.status_report(host_list, cluster=cluster_name or None, ssh_kwargs=ssh_kwargs, sctx=sctx)
+    # resolution + cross-executor merge + display classification).  The
+    # *effective* cluster is forwarded (see ``HostContext``): teardown reaches
+    # the right substrate only if discovery ran against the right one.
+    discovered = api.status_report(host_list, cluster=hctx.cluster_name, ssh_kwargs=ssh_kwargs, sctx=sctx)
 
     # A host that errored during discovery may still be running containers —
     # it must not silently read as "nothing to stop".
@@ -192,7 +196,7 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run, sctx=None):
     click.echo("Stopping all containers...")
     result = api.stop_all(
         host_list,
-        cluster=cluster_name or None,
+        cluster=hctx.cluster_name,
         cache_dir=str(config.cache_dir),
         ssh_kwargs=ssh_kwargs,
         dry_run=dry_run,

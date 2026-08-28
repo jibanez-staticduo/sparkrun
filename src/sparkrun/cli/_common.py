@@ -6,6 +6,7 @@ import functools
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import click
@@ -533,15 +534,41 @@ def _load_recipe(config, recipe_name, resolve=True, retry_after_update=False):
     return recipe, recipe_path, registry_mgr
 
 
-def _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, v=None, sctx: SparkrunContext | None = None):
-    """Resolve hosts from CLI args; exit if none are found.
+@dataclass(frozen=True)
+class HostContext:
+    """Resolved hosts, the cluster manager, and the cluster they came from.
 
-    Also applies the cluster's SSH user to *config* when a cluster is
-    resolved and has a user configured.  This replaces the previous
-    separate ``_apply_cluster_user()`` call.
+    :attr:`cluster_name` is the *effective* cluster: the one named with
+    ``--cluster`` or, when no hosts were supplied explicitly, the default
+    cluster (``sparkrun cluster set-default``) that
+    :func:`sparkrun.core.hosts.resolve_hosts` took the host list from.
 
-    Returns:
-        Tuple of (host_list, cluster_mgr).
+    **A command that forwards a resolved host list to an ``api.*`` entry
+    point must pass this name, not the raw ``--cluster`` option.**
+    ``api._resolve.resolve_cluster`` short-circuits to an *anonymous*
+    ``ClusterDefinition`` as soon as an explicit host list is given without a
+    cluster, so ``cluster=None`` silently drops the default cluster's
+    executor pin, ``executor_config`` (incl. ``pid_dir``), ``hosts_hardware``
+    and transport — the sweep then runs against the wrong substrate with no
+    error.
+    """
+
+    host_list: list[str]
+    cluster_mgr: Any
+    cluster: ResolvedClusterConfig
+
+    @property
+    def cluster_name(self) -> str | None:
+        """The effective cluster name, or ``None`` when hosts are unattached."""
+        return self.cluster.name or None
+
+
+def resolve_host_context(hosts, hosts_file, cluster_name, config, v=None, sctx: SparkrunContext | None = None) -> HostContext:
+    """Resolve hosts *and* the cluster they came from; exit if none are found.
+
+    The full form of :func:`_resolve_hosts_or_exit` — same resolution, but it
+    keeps the :class:`ResolvedClusterConfig` instead of discarding everything
+    but the SSH user.  See :class:`HostContext` for why that matters.
     """
     from sparkrun.core.hosts import resolve_hosts
 
@@ -556,12 +583,28 @@ def _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, v=None, sctx
     if not host_list:
         click.echo("Error: No hosts specified. Use --hosts or configure defaults.", err=True)
         sys.exit(1)
-    # Apply cluster-level SSH user (if defined) so downstream SSH calls
-    # automatically use it.
-    cluster_user = resolve_cluster_config(cluster_name, hosts, hosts_file, cluster_mgr).user
-    if cluster_user:
-        config.ssh_user = cluster_user
-    return host_list, cluster_mgr
+    # Resolve the cluster once: its name identifies what the user is looking
+    # at (including the default-cluster fallback), and its SSH user is applied
+    # to *config* so downstream SSH calls pick it up automatically.
+    cluster_cfg = resolve_cluster_config(cluster_name, hosts, hosts_file, cluster_mgr)
+    if cluster_cfg.user:
+        config.ssh_user = cluster_cfg.user
+    return HostContext(host_list=host_list, cluster_mgr=cluster_mgr, cluster=cluster_cfg)
+
+
+def _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config, v=None, sctx: SparkrunContext | None = None):
+    """Resolve hosts from CLI args; exit if none are found.
+
+    Also applies the cluster's SSH user to *config* when a cluster is
+    resolved and has a user configured.  This replaces the previous
+    separate ``_apply_cluster_user()`` call.
+
+    Returns:
+        Tuple of (host_list, cluster_mgr).  Commands that pass a cluster on
+        to the api layer want :func:`resolve_host_context` instead.
+    """
+    hctx = resolve_host_context(hosts, hosts_file, cluster_name, config, v, sctx=sctx)
+    return hctx.host_list, hctx.cluster_mgr
 
 
 def with_host_context(func):
