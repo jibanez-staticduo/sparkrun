@@ -472,6 +472,7 @@ def run(options: RunOptions, *, sctx: "SparkrunContext | None" = None, plan: Run
         effective_cache_dir=result.effective_cache_dir or "",
         runtime_info=dict(result.runtime_info or {}),
         metadata=metadata,
+        timeline=result.timeline,
         launch_result=result,
     )
     _prune_stale_job_metadata(

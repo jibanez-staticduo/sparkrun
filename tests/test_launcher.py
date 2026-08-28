@@ -523,10 +523,21 @@ class _LifecycleRecipe:
 
 
 class _LifecycleRuntime:
-    """Runtime stub recording stop() invocations."""
+    """Runtime stub recording stop() invocations.
 
-    def __init__(self):
+    ``head_suffix`` mirrors the real split between naming schemes: native
+    runtimes head a ``_node_0`` container, Ray runtimes a ``_head`` one.
+    The readiness wait asks the runtime rather than reconstructing the
+    name, because ``wait_for_port`` reads "that container isn't running"
+    as proof the workload died.
+    """
+
+    def __init__(self, head_suffix="_node_0"):
         self.stop_calls: list[dict] = []
+        self._head_suffix = head_suffix
+
+    def get_head_container_name(self, cluster_id, is_solo=False):
+        return cluster_id + ("_solo" if is_solo else self._head_suffix)
 
     def stop(self, **kwargs):
         self.stop_calls.append(dict(kwargs))
@@ -1087,3 +1098,86 @@ def test_builder_phase_aborts_on_an_unknown_builder(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="Unknown builder"):
         launch()
+
+
+# ---------------------------------------------------------------------------
+# Readiness: container naming and stage timing
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_serve_ready_asks_the_runtime_for_the_head_container(monkeypatch):
+    """Ray runtimes head a ``_head`` container, not ``_node_0``.
+
+    ``wait_for_port`` treats "that container isn't running" as proof the
+    workload died, so reconstructing the wrong name aborted the wait one
+    retry interval in — every Ray launch reached through ``proxy load`` or
+    a post-hook recipe reported a phantom startup failure.
+    """
+    import dataclasses
+
+    from sparkrun.core.launcher import wait_for_serve_ready
+
+    watched: list[str] = []
+
+    def _port(_host, _port, **kwargs):
+        watched.append(kwargs.get("container_name"))
+        return True
+
+    monkeypatch.setattr("sparkrun.orchestration.health.wait_for_port", _port)
+    monkeypatch.setattr("sparkrun.orchestration.health.wait_for_healthy", lambda *a, **k: True)
+    monkeypatch.setattr("sparkrun.utils.is_local_host", lambda host: True)
+
+    ray = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime(head_suffix="_head"))
+    ray = dataclasses.replace(ray, is_solo=False, host_list=["h1", "h2"])
+    assert wait_for_serve_ready(ray).container == "sparkrun_lifecyclecid_head"
+
+    native = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime())
+    native = dataclasses.replace(native, is_solo=False, host_list=["h1", "h2"])
+    assert wait_for_serve_ready(native).container == "sparkrun_lifecyclecid_node_0"
+
+    assert watched == ["sparkrun_lifecyclecid_head", "sparkrun_lifecyclecid_node_0"]
+
+
+def test_wait_for_serve_ready_times_both_stages_onto_the_launch_timeline(monkeypatch):
+    """Port-open and health-ok are separate spans on the launch's timeline.
+
+    They answer different questions — engine init versus weight load — and
+    summing them is the containers-running → serving figure.
+    """
+    import dataclasses
+
+    from sparkrun.core.launcher import wait_for_serve_ready
+    from sparkrun.core.timing import Timeline
+
+    _patch_serve_ready(monkeypatch)
+    timeline = Timeline()
+    result = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime())
+    result = dataclasses.replace(result, timeline=timeline)
+
+    readiness = wait_for_serve_ready(result)
+
+    names = {s["name"]: s for s in timeline.export()["spans"]}
+    assert names["serve.port_open"]["status"] == "ok"
+    assert names["serve.health_ok"]["status"] == "ok"
+    assert readiness.total_wait_s == pytest.approx(readiness.port_wait_s + readiness.health_wait_s)
+
+
+def test_wait_for_serve_ready_marks_the_stage_that_failed(monkeypatch):
+    import dataclasses
+
+    from sparkrun.core.launcher import wait_for_serve_ready
+    from sparkrun.core.timing import Timeline
+
+    _patch_serve_ready(monkeypatch, port_ready=False)
+    timeline = Timeline()
+    result = _make_launch_result(_LifecycleRecipe(), _LifecycleRuntime())
+    result = dataclasses.replace(result, timeline=timeline)
+
+    readiness = wait_for_serve_ready(result)
+
+    assert readiness.ready is False and readiness.reason == "port"
+    names = {s["name"]: s for s in timeline.export()["spans"]}
+    assert names["serve.port_open"]["status"] == "error"
+    # The health stage never ran, so it must not appear at all — a zero-duration
+    # span there would read as an instantaneous health check.
+    assert "serve.health_ok" not in names

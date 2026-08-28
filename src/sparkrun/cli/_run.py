@@ -188,6 +188,14 @@ def _summarize_platforms(
     help="Collect diagnostics to NDJSON file",
 )
 @click.option(
+    "--timings",
+    "show_timings",
+    is_flag=True,
+    default=False,
+    hidden=HIDE_ADVANCED_OPTIONS,
+    help="Print a per-stage timing breakdown of the launch when it completes",
+)
+@click.option(
     "--trust", is_flag=True, default=False, hidden=True, help="Trust post_commands from third-party registries without confirmation"
 )
 @click.option(
@@ -272,6 +280,7 @@ def run(
     restart_policy,
     transfer_mode,
     diagnostics_path,
+    show_timings,
     trust,
     runtime_cache,
     scheduler_name,
@@ -600,6 +609,15 @@ def run(
             click.echo("  Workers: %s" % ", ".join(host_list[1:]))
     click.echo()
 
+    # Own the timeline here rather than letting ``launch_inference`` create one
+    # internally: on a failed launch there is no LaunchResult to read it off,
+    # and a launch that failed is exactly when the per-stage breakdown is worth
+    # having.  ``launch_inference`` picks this up via ``sctx``.
+    if show_timings or diagnostics_path:
+        from sparkrun.core.timing import Timeline
+
+        sctx.timing = Timeline()
+
     # --- Diagnostics setup ---
     diag = None
     if diagnostics_path:
@@ -637,12 +655,20 @@ def run(
     # hosts named in the banner.
     if diag:
         diag.phase_start("launch")
+    # Spans the whole API call, not just ``launch_inference``: the difference
+    # between this and the ``launch`` span nested inside it is ``api.run``'s
+    # own preamble (transport prepare, eviction setup), which is otherwise
+    # unattributed time the reader can see in the total but not account for.
+    # Left open on the error paths below, which is what ``status="open"``
+    # means — the run did not finish.
+    _run_span = sctx.timing.begin("run") if sctx.timing is not None else None
     try:
         run_result = api.run(run_options, sctx=sctx, plan=run_plan)
     except TransferError as e:
         if diag:
             diag.phase_end("launch", error=str(e))
             diag.emit_error("launch", e)
+            diag.emit_timeline(sctx.timing)
             diag.emit_summary()
             diag.close()
         click.echo("Error: %s" % e, err=True)
@@ -651,6 +677,7 @@ def run(
         if diag:
             diag.phase_end("launch", error=str(e))
             diag.emit_error("launch", e)
+            diag.emit_timeline(sctx.timing)
             diag.emit_summary()
             diag.close()
         click.echo("Error: %s" % e, err=True)
@@ -659,6 +686,7 @@ def run(
         if diag:
             diag.phase_end("launch", error=str(e))
             diag.emit_error("launch", e)
+            diag.emit_timeline(sctx.timing)
             diag.emit_summary()
             diag.close()
         click.echo("Error: %s" % e, err=True)
@@ -667,9 +695,13 @@ def run(
         if diag:
             diag.phase_end("launch", error=str(e))
             diag.emit_error("launch", e)
+            diag.emit_timeline(sctx.timing)
             diag.emit_summary()
             diag.close()
         raise
+
+    if _run_span is not None:
+        sctx.timing.end(_run_span, rc=int(run_result.rc))
 
     # ``RunResult.launch_result`` is the raw LaunchResult — used by
     # diagnostics emission, post-launch lifecycle, and crash logs.
@@ -706,6 +738,19 @@ def run(
     else:
         if sctx.progress:
             sctx.progress.phase_skip(6)
+
+    # Printed here rather than at the very end: log following blocks until the
+    # user interrupts it, and the breakdown is worth seeing before that.  Post
+    # hooks have already run, so when the recipe defines them the readiness
+    # spans (containers-running → serving) are included.
+    if show_timings and sctx.timing is not None:
+        from sparkrun.utils.cli_formatters import format_launch_timings
+
+        _timings = format_launch_timings(sctx.timing.export())
+        if _timings:
+            click.echo()
+            click.echo(_timings)
+            click.echo()
 
     # Follow container logs after a successful detached launch
     if result.rc == 0 and not foreground and not dry_run:
@@ -749,6 +794,7 @@ def run(
                 diag.capture_container_logs(_head, _cname, _diag_ssh2(config))
             except Exception:
                 pass
+        diag.emit_timeline(sctx.timing)
         diag.emit_summary()
         diag.close()
         click.echo("Diagnostics written to: %s" % diagnostics_path)

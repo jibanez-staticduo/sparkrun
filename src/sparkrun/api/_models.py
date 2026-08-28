@@ -255,6 +255,16 @@ class RunResult:
     """Runtime-reported version strings (engine, framework, model server)."""
     metadata: dict[str, Any] = field(default_factory=dict)
     """Recipe-derived metadata (recipe qualified_name, model, image, …)."""
+    timeline: Any = None
+    """Live :class:`~sparkrun.core.timing.Timeline` of launch-stage spans.
+
+    Deliberately the collector rather than an exported snapshot: the
+    readiness wait runs *after* ``run`` returns (in ``post_launch_lifecycle``
+    or the caller's own wait) and records onto this same object, so a
+    snapshot taken here would always be missing the containers-running →
+    serving figure.  Call ``.export()`` once you are done waiting.
+
+    ``None`` only when the intent was already running (nothing launched)."""
     launch_result: Any = None
     """Opaque handle to the underlying :class:`LaunchResult` for callers
     that need the raw orchestration object (CLI ``post_launch_lifecycle``,

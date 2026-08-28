@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from sparkrun.core.config import resolve_hf_token as _get_hf_token
 from sparkrun.core.hosts import is_control_in_cluster
+from sparkrun.core.timing import timed as _timed
 from sparkrun.utils import is_local_host
 from sparkrun.utils.images import image_has_explicit_version, parse_image_ref
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from sparkrun.orchestration.infiniband import IBDetectionResult
     from sparkrun.orchestration.transfer import TransferFailure
     from sparkrun.core.recipe import Recipe
+    from sparkrun.core.timing import Timeline
 
 logger = logging.getLogger(__name__)
 
@@ -744,6 +746,7 @@ def distribute_from_config(
     skip_model: bool = False,
     skip_container: bool = False,
     after_container_sync: "Callable[[], None] | None" = None,
+    timeline: "Timeline | None" = None,
 ) -> tuple["ClusterCommEnv | None", dict[str, str], dict[str, str]]:
     """Distribute resources based on recipe ``distribution_config``.
 
@@ -772,6 +775,9 @@ def distribute_from_config(
             has not been paid for yet, so image-level preflights (see
             ``launcher._verify_image_command_passthrough``) run here rather than
             after Phase 3.  Raising from the hook aborts the launch.
+        timeline: Optional span collector.  Image and model transfers are the
+            longest and most variable part of a launch, so each entry is timed
+            separately with its mode and target count.
 
     Returns:
         Tuple of (comm_env, ib_ip_map, mgmt_ip_map, ib_iface_map).
@@ -891,19 +897,20 @@ def distribute_from_config(
             if not targets:
                 continue
             logger.log(_PROGRESS_LEVEL, "  Distributing image %s to %d host(s)", entry_name, len(targets))
-            with pending_op(_lock_id, "image_distribute", **_pop_kw):
-                img_failed = _distribute_single_image(
-                    entry_name,
-                    targets,
-                    host_list,
-                    transfer_mode,
-                    transfer_hosts,
-                    worker_transfer_hosts,
-                    ssh_kwargs,
-                    dry_run,
-                    _auto_delegated,
-                    force_pull=_force_pull,
-                )
+            with _timed(timeline, "launch.distribute.image", image=entry_name, mode=transfer_mode, targets=len(targets)):
+                with pending_op(_lock_id, "image_distribute", **_pop_kw):
+                    img_failed = _distribute_single_image(
+                        entry_name,
+                        targets,
+                        host_list,
+                        transfer_mode,
+                        transfer_hosts,
+                        worker_transfer_hosts,
+                        ssh_kwargs,
+                        dry_run,
+                        _auto_delegated,
+                        force_pull=_force_pull,
+                    )
             if img_failed:
                 raise DistributionError("Image distribution failed on: %s" % ", ".join(img_failed))
 
@@ -925,23 +932,24 @@ def distribute_from_config(
                 continue
             entry_revision = entry.revision or model_revision
             logger.log(_PROGRESS_LEVEL, "  Distributing model %s to %d host(s)", entry.name, len(targets))
-            with pending_op(_lock_id, "model_download", **_pop_kw):
-                mdl_failed = _distribute_single_model(
-                    entry.name,
-                    targets,
-                    host_list,
-                    cache_dir,
-                    effective_local_cache,
-                    transfer_mode,
-                    transfer_hosts,
-                    worker_transfer_hosts,
-                    ssh_kwargs,
-                    entry_revision,
-                    hf_token,
-                    dry_run,
-                    _auto_delegated,
-                    prefs=prefs,
-                )
+            with _timed(timeline, "launch.distribute.model", model=entry.name, mode=transfer_mode, targets=len(targets)):
+                with pending_op(_lock_id, "model_download", **_pop_kw):
+                    mdl_failed = _distribute_single_model(
+                        entry.name,
+                        targets,
+                        host_list,
+                        cache_dir,
+                        effective_local_cache,
+                        transfer_mode,
+                        transfer_hosts,
+                        worker_transfer_hosts,
+                        ssh_kwargs,
+                        entry_revision,
+                        hf_token,
+                        dry_run,
+                        _auto_delegated,
+                        prefs=prefs,
+                    )
             if mdl_failed:
                 from sparkrun.orchestration.transfer import present_and_raise_transfer_failure
 

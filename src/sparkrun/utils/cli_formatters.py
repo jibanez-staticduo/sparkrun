@@ -547,3 +547,55 @@ def _wrap(text: str, width: int, indent: str) -> list[str]:
         break_long_words=False,
         break_on_hyphens=False,
     )
+
+
+def format_launch_timings(export: dict, *, width: int = 62) -> str:
+    """Render a :meth:`~sparkrun.core.timing.Timeline.export` as a tree.
+
+    Spans nest by parent id rather than by name, because fan-out spans
+    repeat their name (one per host / per distribution entry) and a
+    name-keyed tree would collapse them into one row.
+    """
+    spans = export.get("spans") or []
+    if not spans:
+        return ""
+
+    children: dict[int | None, list[dict]] = {}
+    for span in spans:
+        children.setdefault(span.get("parent"), []).append(span)
+    for group in children.values():
+        group.sort(key=lambda s: (s.get("t_start", 0.0), s.get("id", 0)))
+
+    lines = ["Launch timings (total %.1fs):" % export.get("duration_s", 0.0)]
+
+    def walk(parent: int | None, depth: int) -> None:
+        for span in children.get(parent, ()):
+            attrs = span.get("attrs") or {}
+            label = attrs.get("label") or span.get("name", "")
+            indent = "  " * (depth + 1)
+            status = span.get("status", "ok")
+            if status == "skipped":
+                reason = attrs.get("reason")
+                timing = "skipped" + (" (%s)" % reason if reason else "")
+            elif status == "open":
+                # Never closed: the launch raised while it was running, so
+                # this is where it stopped.  Reporting the elapsed time
+                # alone would read as a completed stage.
+                timing = "%.1fs (did not finish)" % span.get("duration_s", 0.0)
+            else:
+                timing = "%.1fs" % span.get("duration_s", 0.0)
+                if status == "error":
+                    timing += " (failed)"
+            # A foreign-clock span was measured on another machine, so its
+            # duration is not additive with its neighbours' and its position
+            # carries the skew.  Naming the clock is what stops the tree
+            # reading as one arithmetic whole.
+            clock = span.get("clock")
+            if clock:
+                timing += "  [%s]" % clock
+            pad = max(1, width - len(indent) - len(label))
+            lines.append("%s%s%s%s" % (indent, label, " " * pad, timing))
+            walk(span.get("id"), depth + 1)
+
+    walk(None, 0)
+    return "\n".join(lines)

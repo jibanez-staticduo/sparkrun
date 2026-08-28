@@ -12,8 +12,11 @@ import copy
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
+
+from sparkrun.core.timing import STATUS_ERROR, Timeline
 
 if TYPE_CHECKING:
     from sparkrun.core.backend_select import BackendBundle
@@ -60,6 +63,13 @@ class LaunchResult:
     threading) — runtimes then fall back to the legacy NCCL generator
     in :func:`sparkrun.runtimes._cluster_ops.resolve_comm_env`.
     """
+    timeline: Timeline | None = None
+    """Launch-stage span timeline.
+
+    Covers up to the point containers are running; the readiness wait that
+    follows is recorded by :func:`wait_for_serve_ready` onto the same
+    timeline, so a consumer reading it after readiness sees the whole
+    launch-to-serving story."""
 
 
 def resolve_recipe_trust(recipe: Recipe, trust_cli: bool) -> bool:
@@ -791,6 +801,11 @@ def launch_inference(
     # ``None`` means "nothing was asked for" and defers to recipe / cluster /
     # config / runtime defaults.
     runtime_cache_override: dict | None = None,
+    # Span collector for launch-stage timing.  ``None`` creates one, so every
+    # caller of this function gets timings without wiring anything; pass one
+    # to widen the window beyond this call (e.g. to include planning) or to
+    # share a timeline across several launches.
+    timeline: "Timeline | None" = None,
 ) -> LaunchResult:
     """Launch an inference workload.
 
@@ -853,6 +868,21 @@ def launch_inference(
         if progress is None:
             progress = sctx.progress
     p = progress  # short alias
+
+    # Resolve the span collector and attach it to the progress tracker, whose
+    # phase/step brackets are already exactly where the timings belong.
+    if timeline is None:
+        timeline = (sctx.timing if sctx is not None else None) or (p.timeline if p is not None else None) or Timeline()
+    launch_span = timeline.begin(
+        "launch",
+        recipe=getattr(recipe, "qualified_name", None) or getattr(recipe, "name", ""),
+        runtime=runtime.runtime_name,
+        hosts=len(host_list),
+        dry_run=dry_run,
+    )
+    if p is not None:
+        p.timeline = timeline
+        p.set_root_span(launch_span)
 
     from sparkrun.orchestration.distribution import resolve_auto_transfer_mode
 
@@ -1247,6 +1277,7 @@ def launch_inference(
             skip_model=_skip_model,
             skip_container=_skip_container,
             after_container_sync=_probe_image_entrypoint,
+            timeline=timeline,
         )
         # Re-save job metadata with IP maps from IB detection
         if not dry_run and (ib_ip_map or mgmt_ip_map):
@@ -1585,6 +1616,12 @@ def launch_inference(
         except Exception:
             logger.debug("Runtime info collection failed", exc_info=True)
 
+    # A raise between here and the top leaves ``launch`` open; ``export()``
+    # reports open spans as ``status="open"`` so the failing phase is still
+    # visible.  Callers that need the timeline on the failure path must pass
+    # ``timeline=`` in — the LaunchResult below never gets built.
+    timeline.end(launch_span, status=STATUS_ERROR if rc else "ok", rc=rc, cluster_id=cluster_id)
+
     return LaunchResult(
         rc=rc,
         cluster_id=cluster_id,
@@ -1605,6 +1642,7 @@ def launch_inference(
         runtime_info=runtime_info,
         builder=builder,
         backends=backends,
+        timeline=timeline,
     )
 
 
@@ -1623,10 +1661,24 @@ class ServeReadiness:
     port: int
     container: str
     reason: str = ""
+    port_wait_s: float = 0.0
+    """Seconds from the start of the wait until the head port was listening.
+
+    Covers engine init / distributed rendezvous — an inference server
+    refuses connections outright until then."""
+    health_wait_s: float = 0.0
+    """Seconds from the port opening until ``/v1/models`` returned 200.
+
+    Covers weight load and graph capture."""
 
     @property
     def health_url(self) -> str:
         return "http://%s:%d/v1/models" % (self.head_ip, self.port)
+
+    @property
+    def total_wait_s(self) -> float:
+        """Containers-running → serving.  The time-to-first-inference figure."""
+        return self.port_wait_s + self.health_wait_s
 
 
 def wait_for_serve_ready(
@@ -1638,6 +1690,39 @@ def wait_for_serve_ready(
     port_retry_interval: int = 2,
     health_max_retries: int = 120,
     health_retry_interval: int = 5,
+    timeline: "Timeline | None" = None,
+) -> ServeReadiness:
+    """Adapter over :func:`wait_for_endpoint_ready` for a :class:`LaunchResult`."""
+    return wait_for_endpoint_ready(
+        runtime=result.runtime,
+        cluster_id=result.cluster_id,
+        host_list=result.host_list,
+        is_solo=result.is_solo,
+        port=result.serve_port,
+        ssh_kwargs=ssh_kwargs,
+        dry_run=dry_run,
+        port_max_retries=port_max_retries,
+        port_retry_interval=port_retry_interval,
+        health_max_retries=health_max_retries,
+        health_retry_interval=health_retry_interval,
+        timeline=timeline if timeline is not None else result.timeline,
+    )
+
+
+def wait_for_endpoint_ready(
+    *,
+    runtime: RuntimePlugin,
+    cluster_id: str,
+    host_list: list[str],
+    is_solo: bool,
+    port: int,
+    ssh_kwargs: dict | None = None,
+    dry_run: bool = False,
+    port_max_retries: int = 120,
+    port_retry_interval: int = 2,
+    health_max_retries: int = 120,
+    health_retry_interval: int = 5,
+    timeline: "Timeline | None" = None,
 ) -> ServeReadiness:
     """Wait for a detached launch's head endpoint to answer ``/v1/models``.
 
@@ -1654,30 +1739,42 @@ def wait_for_serve_ready(
     only then is :func:`wait_for_healthy`'s connection-refused-means-dead
     heuristic sound.
 
+    This is the field-based form, callable when there is no
+    :class:`LaunchResult` — a workload found already serving by ``--ensure``
+    still has to be waited on, and it never produced one.
+
     Args:
-        result: The :class:`LaunchResult` to wait on.
+        runtime: Runtime plugin, asked for the head container name.
+        cluster_id: Cluster id of the workload.
+        host_list: Hosts the workload runs on; the first is the head.
+        is_solo: Whether the workload launched in solo mode.
+        port: Inference HTTP port on the head.
         ssh_kwargs: SSH parameters for probing the head host.
         dry_run: Report ready without waiting.
         port_max_retries: Port-poll attempts (``port_retry_interval`` apart).
         port_retry_interval: Seconds between port polls.
         health_max_retries: Health-poll attempts (``health_retry_interval`` apart).
         health_retry_interval: Seconds between health polls.
+        timeline: Span collector for the two waits.  Pass the launch's own so
+            the readiness spans join its phases in one artifact.
 
     Returns:
-        A :class:`ServeReadiness` describing the head endpoint and
-        whether it became ready.
+        A :class:`ServeReadiness` describing the head endpoint, whether it
+        became ready, and how long each stage took.
     """
-    from sparkrun.orchestration.docker import generate_container_name, generate_node_container_name
     from sparkrun.orchestration.health import wait_for_healthy, wait_for_port
     from sparkrun.orchestration.primitives import detect_host_ip
     from sparkrun.utils import is_local_host
 
-    head_host = result.host_list[0] if result.host_list else "localhost"
+    head_host = host_list[0] if host_list else "localhost"
 
-    if result.is_solo:
-        container = generate_container_name(result.cluster_id, "solo")
-    else:
-        container = generate_node_container_name(result.cluster_id, 0)
+    # Ask the runtime, don't reconstruct.  ``wait_for_port`` treats "that
+    # container isn't running" as proof the workload died, so a name that
+    # merely doesn't match aborts the wait one interval in — and the two
+    # naming schemes differ: a Ray runtime's head is ``<id>_head`` while
+    # native ones use ``<id>_node_0``.  The runtime also routes the name
+    # through the resolved executor, which the docker generators cannot.
+    container = runtime.get_head_container_name(cluster_id, is_solo=is_solo)
 
     if is_local_host(head_host):
         head_ip = "127.0.0.1"
@@ -1687,12 +1784,19 @@ def wait_for_serve_ready(
         except RuntimeError:
             head_ip = head_host
 
-    port = result.serve_port
     base = ServeReadiness(True, head_host, head_ip, port, container)
     if dry_run:
         return base
 
-    if not wait_for_port(
+    # Recorded onto the launch's own timeline so the phases and the readiness
+    # wait land in one artifact.  ``launch_inference`` has already closed the
+    # ``launch`` span, so these are parented at the root — deliberately: this
+    # is time *after* the launch returned, not part of it.
+    tl = timeline
+
+    t0 = time.monotonic()
+    port_span = tl.begin("serve.port_open", host=head_host, port=port) if tl else None
+    port_ready = wait_for_port(
         head_host,
         port,
         max_retries=port_max_retries,
@@ -1700,18 +1804,30 @@ def wait_for_serve_ready(
         ssh_kwargs=ssh_kwargs,
         dry_run=dry_run,
         container_name=container,
-    ):
-        return ServeReadiness(False, head_host, head_ip, port, container, reason="port")
+    )
+    port_wait_s = time.monotonic() - t0
+    if tl and port_span is not None:
+        tl.end(port_span, status="ok" if port_ready else STATUS_ERROR)
+    if not port_ready:
+        return ServeReadiness(False, head_host, head_ip, port, container, reason="port", port_wait_s=port_wait_s)
 
-    if not wait_for_healthy(
+    t1 = time.monotonic()
+    health_span = tl.begin("serve.health_ok", url=base.health_url) if tl else None
+    healthy = wait_for_healthy(
         base.health_url,
         max_retries=health_max_retries,
         retry_interval=health_retry_interval,
         dry_run=dry_run,
-    ):
-        return ServeReadiness(False, head_host, head_ip, port, container, reason="health")
+    )
+    health_wait_s = time.monotonic() - t1
+    if tl and health_span is not None:
+        tl.end(health_span, status="ok" if healthy else STATUS_ERROR)
+    if not healthy:
+        return ServeReadiness(
+            False, head_host, head_ip, port, container, reason="health", port_wait_s=port_wait_s, health_wait_s=health_wait_s
+        )
 
-    return base
+    return ServeReadiness(True, head_host, head_ip, port, container, port_wait_s=port_wait_s, health_wait_s=health_wait_s)
 
 
 def post_launch_lifecycle(

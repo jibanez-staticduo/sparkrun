@@ -483,6 +483,97 @@ every `KeyboardInterrupt` state-preservation path already in the codebase runs).
 `SIGKILL` remains unreachable — it leaves the ssh client alive, the session
 healthy, and the guard correctly dormant.
 
+### Launch Timing (`core/timing.py`)
+
+Launch-stage timings are collected as a **span timeline**, not a
+`{stage: seconds}` mapping: phases nest (phase 5 → runtime steps), fan-out
+spans repeat their name (one per host / distribution entry) so names are not
+keys, and consumers want the tree — a flattened summary is derivable from it,
+not the reverse.
+
+Almost no new call sites were needed, because the elapsed times were already
+being computed and thrown away. `LaunchProgress.phase()` / `step()` timed
+every bracket only to log `done (%.1fs)`; they now also record spans when a
+`Timeline` is attached. `PHASE_SLUGS` gives the phases stable span names
+(`launch.distribute`) deliberately *not* derived from `PHASE_LABELS` —
+rewording a display string must not rename a metric already in published
+artifacts. Step spans slugify the runtime's label and keep the raw label in
+`attrs`.
+
+| Piece | Role |
+|-------|------|
+| `Timeline.begin/end` | explicit brackets, for begin/end that aren't lexically paired |
+| `Timeline.span` / `timing.timed` | context managers; `timed` tolerates `timeline=None` |
+| `LaunchResult.timeline` / `RunResult.timeline` | the live collector, not a snapshot |
+| `SparkrunContext.timing` | caller-owned timeline, widening the window past one launch |
+| `format_launch_timings` | the `run --timings` tree |
+
+`None` means "not collecting" everywhere and is byte-identical to the
+behaviour before the module existed — the convention `progress` and
+`backends` already use.
+
+Five things are load-bearing:
+
+- **Closing a span closes its open children, carrying its status.** Runtimes
+  call `step()` and never `step_done()`, so the phase boundary is what ends
+  the last step; and if the phase failed, the step that was running is *where*
+  it failed — reporting it `ok` points the reader at the wrong stage.
+- **Phases parent to an explicit root**, not to the timeline's open-span
+  stack. A phase skipped while the previous one is still open would otherwise
+  nest inside its predecessor — invisible at the call site, wrong in every
+  consumer.
+- **`skipped` is not a zero-duration success.** "Distribution found the image
+  already resident" and "distribution never ran" are different data points in
+  a benchmark artifact.
+- **`export()` reports unclosed spans as `open` without closing them.** A
+  launch that raised is when the breakdown is worth most, and the open spans
+  are exactly the path to the failure. But `LaunchResult` is never built on
+  that path, so **a caller that wants the timeline on failure must own it** —
+  set `sctx.timing` (what `run --timings` / `--collect-diagnostics` do)
+  rather than letting `launch_inference` create one internally.
+- **Clocks are never mixed in a derived figure.** A measured span is on the
+  control node's `time.monotonic()` (`CLOCK_CONTROL`), which is what makes
+  durations subtractable. Spans recovered from a remote engine's own log
+  timestamps (`remote_clock(host)`) are a *different* clock, and with NTP
+  skew "container start → weights loaded" across the two comes out negative.
+  Two things enforce the rule rather than leaving it to discipline:
+  `Timeline.add_span` — the only way in for a foreign clock — **rejects
+  `CLOCK_CONTROL`** (a control-clock span must be *measured*, never asserted,
+  or a parsed duration lands in the set that gets summed), and
+  `Timeline.total` filters by clock and defaults to the control one. A
+  foreign span's `t_start` is a placement estimate derived through our
+  origin, so it keeps its unconverted `wall_start`; `export()` adds a
+  `clocks` key **only** when mixed, so a consumer that never sees it is
+  reading a single-clock timeline and may sum freely, and
+  `format_launch_timings` annotates foreign rows `[remote:h1]` so the tree
+  does not read as one arithmetic whole. Nothing produces a foreign-clock
+  span yet — this is the seam a log probe plugs into.
+
+**Time to first inference** is `serve.port_open` + `serve.health_ok`, recorded
+by `wait_for_serve_ready` (engine init / rendezvous, then weight load and
+graph capture). `benchmark` used to reimplement that two-stage wait inline
+with its own retry budgets, which would have made the figure incomparable
+between `run` and `benchmark`; both now go through
+`launcher.wait_for_endpoint_ready` (the field-based form — the `--ensure`
+already-running path has no `LaunchResult` but still has to wait). That
+unification also fixed a live bug: the wait reconstructed the head container
+name as `<id>_node_0`, but Ray runtimes head `<id>_head`, and `wait_for_port`
+reads "that container isn't running" as proof the workload died — so every
+Ray launch reached via `proxy load` or a post-hook recipe aborted one retry
+interval in. It now asks `runtime.get_head_container_name()`, which also
+routes through the resolved executor.
+
+**Sinks**: `run --timings` (tree), `--collect-diagnostics` (`run_timeline`
+NDJSON record — additive to that collector's own phases, which bracket a
+strictly wider window including host diagnostics and `api.run`'s planning),
+and `BenchmarkResult.generate_metadata()` under `metadata["timing"]` as
+`serve_ready` + the full `launch` span list. That mapping is the Spark Arena
+submission, so the existing `start`/`end`/`duration` keys are untouched. A
+**resumed** run emits neither: its launch numbers came from a launch it did
+not perform, and reporting them beside freshly-measured throughput
+misattributes a stale launch — the same confusion `measured_at` exists to
+prevent for the benchmark numbers themselves (issue #267).
+
 ### Launch Placement (`api.plan` → `api.run`)
 
 A launch **decides once**. The launch path is split at the point where it stops
