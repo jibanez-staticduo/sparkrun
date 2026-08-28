@@ -322,6 +322,73 @@ class SparkrunConfig:
         # an unparseable value must not silently disable pruning.
         return True if parsed is None else parsed
 
+    @property
+    def missing_mount_source_policy(self) -> str:
+        """What a confirmed-missing ``executor_config.volumes`` source does.
+
+        ``"fail"`` (default) aborts the launch, ``"warn"`` logs and continues,
+        ``"ignore"`` skips the probe entirely.  Set ``mounts.missing_source``
+        in ``config.yaml``.
+
+        Failing is the default because the silent outcome is the bad one:
+        Docker materializes a missing bind source as an empty **root-owned**
+        directory rather than erroring, so a patch file or config the recipe
+        meant to shadow simply is not there and the container starts anyway,
+        serving unpatched. ``"warn"`` exists for the case the check cannot
+        distinguish — a mount the workload only needs on *some* hosts, or one
+        a ``pre_exec`` hook creates after this preflight has run.
+
+        An unrecognized value resolves to ``"fail"``: this is a safety check,
+        and a typo must not quietly disable it.
+        """
+        mounts = self._data.get("mounts", {})
+        raw = mounts.get("missing_source") if isinstance(mounts, dict) else None
+        value = str(raw).strip().lower() if raw is not None else ""
+        if value in ("fail", "warn", "ignore"):
+            return value
+        if value:
+            logger.warning(
+                "Unrecognized mounts.missing_source %r (expected fail/warn/ignore); using 'fail'",
+                raw,
+            )
+        return "fail"
+
+    @property
+    def validation_fail_on(self) -> str:
+        """Least-severe validation finding that is fatal.
+
+        ``"error"`` (default) fails only on what sparkrun cannot honor —
+        today's behaviour, unchanged.  ``"warning"`` adds the portability
+        class (a recipe that runs but runs *differently* off its author's
+        cluster); ``"suggestion"`` fails on everything; ``"none"`` never
+        fails.  Set ``validation.fail_on`` in ``config.yaml``.
+
+        Advanced.  It applies to ``sparkrun run`` as well as ``recipe
+        validate``, so raising it on a shared machine makes launches refuse
+        recipes that would previously only have warned — which is the point
+        for a locked-down site, and a surprise anywhere else.  Registry CI
+        wants ``sparkrun recipe validate --strict`` per-invocation rather than
+        this.
+
+        An unrecognized value resolves to the default: a typo must not
+        silently loosen (or tighten) the gate.
+        """
+        from sparkrun.core.validation import DEFAULT_FAIL_ON, FAIL_ON_CHOICES
+
+        validation = self._data.get("validation", {})
+        raw = validation.get("fail_on") if isinstance(validation, dict) else None
+        value = str(raw).strip().lower() if raw is not None else ""
+        if value in FAIL_ON_CHOICES:
+            return value
+        if value:
+            logger.warning(
+                "Unrecognized validation.fail_on %r (expected one of %s); using %r",
+                raw,
+                ", ".join(FAIL_ON_CHOICES),
+                DEFAULT_FAIL_ON,
+            )
+        return DEFAULT_FAIL_ON
+
     def get(self, key: str, default: Any = None) -> Any:
         """Get a config value by dot-separated key path."""
         parts = key.split(".")

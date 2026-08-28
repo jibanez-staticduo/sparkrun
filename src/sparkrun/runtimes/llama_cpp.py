@@ -108,6 +108,9 @@ class LlamaCppRuntime(RuntimePlugin):
         """
         return frozenset(_LLAMA_CPP_FLAG_MAP) | frozenset(_LLAMA_CPP_BOOL_FLAGS) | _LLAMA_CPP_SPECIAL_KEYS | {"mmproj"}
 
+    def serve_flag_map(self):
+        return {**_LLAMA_CPP_FLAG_MAP, **_LLAMA_CPP_BOOL_FLAGS}
+
     def cluster_strategy(self) -> str:
         """llama.cpp uses native RPC-based distribution, not Ray."""
         return "native"
@@ -398,13 +401,17 @@ class LlamaCppRuntime(RuntimePlugin):
         pp = defaults.get("pipeline_parallel")
         if tp and pp and int(tp) > 1 and int(pp) > 1:
             issues.append(
-                "[llama-cpp] tensor_parallel and pipeline_parallel are mutually "
-                "exclusive; use one for --split-mode row (TP) or layer (PP), not both"
+                self.recipe_error(
+                    "tensor_parallel and pipeline_parallel are mutually "
+                    "exclusive; use one for --split-mode row (TP) or layer (PP), not both"
+                )
             )
         dp = defaults.get("data_parallel")
         if dp is not None and int(dp) > 1:
             issues.append(
-                "[llama-cpp] data_parallel > 1 is not supported (got %d); llama.cpp has no native multi-replica DP coordination" % int(dp)
+                self.recipe_error(
+                    "data_parallel > 1 is not supported (got %d); llama.cpp has no native multi-replica DP coordination" % int(dp)
+                )
             )
         return issues
 

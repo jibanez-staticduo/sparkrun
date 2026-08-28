@@ -359,7 +359,7 @@ def test_vllm_distributed_validate_recipe_no_model():
 
     issues = runtime.validate_recipe(recipe)
     assert len(issues) == 1
-    assert "model is required" in issues[0]
+    assert "model is required" in str(issues[0])
 
 
 def test_vllm_distributed_container_name():

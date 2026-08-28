@@ -378,6 +378,9 @@ class AtlasRuntime(RuntimePlugin):
         """
         return frozenset(_ATLAS_FLAG_MAP) | _ATLAS_SPARKRUN_OWNED_KEYS
 
+    def serve_flag_map(self):
+        return _ATLAS_FLAG_MAP
+
     def generate_command(
         self,
         recipe: Recipe,

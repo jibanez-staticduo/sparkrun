@@ -15,6 +15,7 @@ from typing import Any
 import click
 
 import sparkrun.api as api
+from sparkrun.core.validation import FAIL_ON_CHOICES, validate_for_launch
 from sparkrun.orchestration.transfer import TransferError
 from sparkrun.runtimes.compatibility import IncompatibleHardwareError
 
@@ -229,6 +230,13 @@ def _summarize_platforms(
     hidden=HIDE_ADVANCED_OPTIONS,
     help="Arguments passed directly to the container executor (e.g. docker run)",
 )
+@click.option(
+    "--fail-on",
+    type=click.Choice(FAIL_ON_CHOICES),
+    default=None,
+    hidden=True,
+    help="Least-severe recipe-validation finding that refuses the launch (default: error)",
+)
 @click.argument("extra_args", nargs=-1, type=click.UNPROCESSED)
 @click.pass_context
 @with_host_context
@@ -271,6 +279,7 @@ def run(
     labels_override,
     options,
     executor_args,
+    fail_on,
     extra_args,
     config_path=None,
     host_list=None,
@@ -359,12 +368,6 @@ def run(
     if rebuild is not None:
         recipe.builder_config["rebuild"] = rebuild
 
-    # Validate recipe (after resolve so runtime is populated)
-    issues = recipe.validate()
-    if issues:
-        for issue in issues:
-            click.echo("Warning: %s" % issue, err=True)
-
     # Get assigned runtime
     try:
         runtime = get_runtime(recipe.runtime, v)
@@ -372,10 +375,29 @@ def run(
         click.echo("Error: %s" % e, err=True)
         sys.exit(1)
 
-    # Runtime-specific validation
-    runtime_issues = runtime.validate_recipe(recipe)
-    for issue in runtime_issues:
-        click.echo("Warning: %s" % issue, err=True)
+    # Validate recipe (after resolve so runtime is populated).  Errors abort
+    # before any side effect: they name something sparkrun cannot honor (an
+    # unresolvable builder or executor, a runtime that rejects the recipe), and
+    # launching anyway produces a deployment that isn't the one described.
+    # Warnings print and continue — each is a supported escape hatch.
+    #
+    # The unmapped-key half is left off here: ``launch_inference`` runs it
+    # after the platform default tier and with ``-o`` already split into serve
+    # vs executor keys, so running it now would both duplicate the output and
+    # report executor overrides (``-o entrypoint=''``) as having no effect.
+    issues, validation_failed = validate_for_launch(
+        recipe,
+        fail_on=fail_on,
+        runtime=runtime,
+        cluster=cluster_def,
+        config=config,
+        v=v,
+        include_unmapped_keys=False,
+    )
+    for issue in issues:
+        click.echo("%s: %s" % ("Error" if issue.is_error else "Warning", issue.message), err=True)
+    if validation_failed:
+        sys.exit(1)
 
     # Determine host source for display
     if hosts:

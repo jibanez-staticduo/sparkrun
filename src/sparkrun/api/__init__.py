@@ -81,6 +81,7 @@ from sparkrun.api._status import status, status_report
 from sparkrun.api._stop import stop
 from sparkrun.api._stop_all import stop_all
 from sparkrun.api._telemetry import LiveMonitorSession, live_monitor, open_live_monitor, open_telemetry
+from sparkrun.core.validation import RecipeIssue, validate_recipe
 
 __all__ = [
     # Subpackages
@@ -140,6 +141,8 @@ __all__ = [
     "find_running_intent",
     "search_recipes",
     "resolve_recipe_filter",
+    "validate_recipe",
+    "RecipeIssue",
     "benchmark",
     "resume_benchmark",
 ]

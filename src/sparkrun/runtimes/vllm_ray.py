@@ -36,10 +36,14 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         issues = super().validate_recipe(recipe)
         dp = recipe.defaults.get("data_parallel")
         if dp is not None and int(dp) > 1:
+            # Declared as an error: the Ray backend cannot serve this, so the
+            # launch would spend image + model distribution to fail at startup.
             issues.append(
-                "[vllm-ray] data_parallel > 1 is not yet supported with the Ray backend; "
-                "switch to the vllm-distributed runtime (unset distributed_executor_backend=ray) "
-                "or set data_parallel=1."
+                self.recipe_error(
+                    "data_parallel > 1 is not yet supported with the Ray backend; "
+                    "switch to the vllm-distributed runtime (unset distributed_executor_backend=ray) "
+                    "or set data_parallel=1."
+                )
             )
         return issues
 

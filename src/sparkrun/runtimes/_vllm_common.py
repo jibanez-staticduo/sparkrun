@@ -29,6 +29,9 @@ class VllmMixin:
         """
         return frozenset(VLLM_FLAG_MAP) | {"data_parallel_rpc_port"}
 
+    def serve_flag_map(self):
+        return VLLM_FLAG_MAP
+
     def default_executor_config(self) -> dict:
         """Allow attaching a stack sampler to a hung vLLM engine.
 

@@ -102,6 +102,9 @@ class SglangRuntime(RuntimePlugin):
         """
         return frozenset(_SGLANG_FLAG_MAP) | {"speculative_draft_model", "speculative_draft_model_path"}
 
+    def serve_flag_map(self):
+        return _SGLANG_FLAG_MAP
+
     def resolve_api_key(
         self,
         recipe: "Recipe",
@@ -350,18 +353,26 @@ class SglangRuntime(RuntimePlugin):
             cmd = recipe.command or ""
             cmd_has_tokenizer = "--tokenizer-path" in cmd or "{tokenizer_path}" in cmd
 
+            # Both are declared errors: SGLang refuses to load a GGUF model
+            # without a tokenizer path, so either shape fails at startup —
+            # after the weights have been downloaded and fanned out.
             if not tokenizer and not cmd_has_tokenizer:
                 issues.append(
-                    "[sglang] GGUF model detected but no tokenizer path configured. "
-                    "SGLang requires --tokenizer-path pointing to the base (non-GGUF) HF model. "
-                    "Set 'tokenizer_path' in defaults (e.g. tokenizer_path: Qwen/Qwen3-1.7B) "
-                    "or add --tokenizer-path to the command template."
+                    self.recipe_error(
+                        "GGUF model detected but no tokenizer path configured. "
+                        "SGLang requires --tokenizer-path pointing to the base (non-GGUF) HF model. "
+                        "Set 'tokenizer_path' in defaults (e.g. tokenizer_path: Qwen/Qwen3-1.7B) "
+                        "or add --tokenizer-path to the command template."
+                    )
                 )
             if tokenizer and cmd and not cmd_has_tokenizer:
                 issues.append(
-                    "[sglang] GGUF recipe has 'tokenizer_path' in defaults but the command "
-                    "template does not reference {tokenizer_path} or --tokenizer-path. "
-                    "Add '--tokenizer-path {tokenizer_path}' to the command template."
+                    self.recipe_error(
+                        "GGUF recipe has 'tokenizer_path' in defaults but the command "
+                        "template does not reference {tokenizer_path} or --tokenizer-path, "
+                        "so the value is dropped. "
+                        "Add '--tokenizer-path {tokenizer_path}' to the command template."
+                    )
                 )
 
         return issues

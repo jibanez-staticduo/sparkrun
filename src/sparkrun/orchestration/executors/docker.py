@@ -755,6 +755,11 @@ class DockerExecutor(Executor):
 
         return verify_host_paths(hosts, list(paths), ssh_kwargs)
 
+    def bind_mount_sources(self) -> list[str]:
+        """Docker emits every ``config.volumes`` entry as a ``-v`` bind, so each
+        source is a real claim about the host filesystem."""
+        return self._parse_bind_sources(self.config.volumes)
+
     def ensure_runtime_cache(
         self,
         mounts: "RuntimeCacheMounts",

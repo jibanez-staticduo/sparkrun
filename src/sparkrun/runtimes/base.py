@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 from abc import abstractmethod
 from logging import Logger
-from typing import Any, TYPE_CHECKING
+from typing import Any, Mapping, TYPE_CHECKING
 
 from scitrera_app_framework import Plugin, Variables, ext_parse_bool
 
+from sparkrun.core.validation import ERROR, WARNING, RecipeIssue
 from sparkrun.core.log_source import (
     MODE_FILE,
     MODE_STDOUT,
@@ -651,17 +652,51 @@ class RuntimePlugin(Plugin):
         """
         return []
 
-    def validate_recipe(self, recipe: Recipe) -> list[str]:
-        """Return list of warnings/errors for runtime-specific fields.
+    def validate_recipe(self, recipe: Recipe) -> list[str | RecipeIssue]:
+        """Return runtime-specific findings for *recipe*.
 
-        The base implementation checks that a model is specified.
-        Subclasses should call ``super().validate_recipe(recipe)`` and
-        extend the returned list with runtime-specific checks.
+        Two return forms, and the difference is severity:
+
+        * a plain ``str`` leaves severity **undeclared** and is reported as a
+          *suggestion* — the least severe level, never fatal by default and
+          not printed by ``sparkrun run`` at all.  This is the original
+          contract; a plugin written against an older base class keeps
+          behaving exactly as it did.
+        * a :class:`~sparkrun.core.validation.RecipeIssue` **declares** it.
+          :meth:`recipe_error` for a configuration this runtime genuinely
+          cannot serve (an unsupported parallelism, a missing tokenizer for a
+          GGUF model) — that aborts the launch before any side effect.
+          :meth:`recipe_warning` for one that *will* run but does something
+          different off the cluster it was written on.
+
+        The dividing question for the middle tier is in
+        :mod:`sparkrun.core.validation`: *if this runs on someone else's
+        cluster, does it break or behave differently?*  Declare anything a
+        launch would otherwise only fail on later; leave genuine advice as a
+        bare string.  Subclasses should call ``super().validate_recipe(recipe)``
+        and extend the returned list.
         """
-        issues = []
+        issues: list[str | RecipeIssue] = []
         if not recipe.model:
-            issues.append("[%s] model is required" % self.runtime_name)
+            issues.append(self.recipe_error("model is required"))
         return issues
+
+    def recipe_error(self, message: str, code: str = "runtime-field") -> RecipeIssue:
+        """Build a launch-blocking :class:`RecipeIssue` tagged with this runtime.
+
+        Sugar for :meth:`validate_recipe` implementations so declaring severity
+        costs one word rather than an import and a constructor.
+        """
+        return RecipeIssue(ERROR, code, "[%s] %s" % (self.runtime_name, message))
+
+    def recipe_warning(self, message: str, code: str = "runtime-field") -> RecipeIssue:
+        """Build a portability-class :class:`RecipeIssue` tagged with this runtime.
+
+        Not fatal by default; fatal under ``--strict`` / ``validation.fail_on:
+        warning``.  The peer of :meth:`recipe_error` for findings that run but
+        run *differently* somewhere else.
+        """
+        return RecipeIssue(WARNING, code, "[%s] %s" % (self.runtime_name, message))
 
     def known_config_keys(self) -> frozenset[str] | None:
         """Config-chain keys this runtime does something with, or ``None``.
@@ -687,6 +722,29 @@ class RuntimePlugin(Plugin):
         check for this runtime.  A wrong answer here is worse than no
         answer: it either cries wolf on a working recipe or, if a real key
         is listed by mistake, restores exactly the silence being fixed.
+        """
+        return None
+
+    def serve_flag_map(self) -> Mapping[str, str] | None:
+        """This runtime's ``{config_key: serve_flag}`` map, or ``None``.
+
+        The *spelling* peer of :meth:`known_config_keys`: that answers which
+        keys reach something, this answers what each one is called on the
+        engine's command line (``kv_cache_dtype`` → ``--kv-cache-dtype`` for
+        vLLM, ``max_model_len`` → ``--ctx-size`` for llama.cpp).
+
+        Used by :func:`sparkrun.core.validation.validate_recipe` to spot a
+        flag written *literally* into a recipe's ``command:`` template when
+        sparkrun reads the same value from the config chain — a hardcoded
+        ``--kv-cache-dtype auto`` is invisible to VRAM estimation (issue
+        #248), and a hardcoded ``--served-model-name`` is invisible to the
+        benchmark's request target (#257).  Only the small curated set in
+        :data:`~sparkrun.core.validation.SPARKRUN_READ_CONFIG_KEYS` is
+        checked, so a runtime may return its whole map without generating
+        noise about flags recipes are meant to hardcode.
+
+        ``None`` — the default — disables that check for this runtime,
+        matching the discipline on :meth:`known_config_keys`.
         """
         return None
 

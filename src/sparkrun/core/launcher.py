@@ -235,16 +235,38 @@ def _enforce_recipe_mount_trust(recipe: Recipe, trusted: bool) -> None:
         )
 
 
-def _verify_pre_placed_model(recipe, hosts, ssh_kwargs, *, runtime, cluster, config, overrides) -> None:
-    """Fail fast when pre-placed model weights are missing on the target substrate.
+def _format_missing_mounts(missing: dict, keep: set) -> str:
+    """Render ``{host: [path, ...]}`` as ``host: a, b; host2: c``, filtered to *keep*."""
+    parts = []
+    for host, paths in sorted(missing.items()):
+        relevant = [p for p in paths if p in keep]
+        if relevant:
+            parts.append("%s: %s" % (host, ", ".join(sorted(relevant))))
+    return "; ".join(parts)
 
-    An absolute-path ``model:`` or ``cluster_config.resolved_model_path`` tells
-    sparkrun the weights already exist at that path on every node, so download +
-    distribution are skipped and the path is identity-mounted.  This verifies
-    that promise *before* the skip via the launching executor's
-    :meth:`~sparkrun.orchestration.executors._base.Executor.verify_mount_sources`
-    (host substrate → SSH ``test -e``; provider executors probe their own
-    volumes).  Raises :class:`RecipeError` listing the host→path gaps.
+
+def _verify_mount_sources(recipe, hosts, ssh_kwargs, *, runtime, cluster, config, overrides) -> None:
+    """Fail fast when host paths the launch will bind are missing on the targets.
+
+    Two path sets, probed in **one** pass because they share a substrate and an
+    SSH fan-out, but reported separately because they mean different things:
+
+    * **Pre-placed model weights** — an absolute-path ``model:`` or
+      ``cluster_config.resolved_model_path`` promises the weights already exist
+      on every node, so download + distribution are *skipped*.  Verifying that
+      promise before committing to the skip is unconditional: there is no
+      configuration under which serving weights that aren't there is what the
+      user meant.
+    * **``executor_config.volumes`` sources** — extra bind mounts the recipe or
+      cluster asked for.  Governed by ``mounts.missing_source`` (default
+      ``fail``); see :attr:`SparkrunConfig.missing_mount_source_policy` for why
+      failing is the default and when ``warn`` is the honest setting.
+
+    Which volumes count is the **executor's** answer
+    (:meth:`~sparkrun.orchestration.executors._base.Executor.bind_mount_sources`),
+    not a read of ``executor_config`` here — the ``local`` executor mounts
+    nothing, so its ``volumes:`` are inert and checking them would fail a
+    working launch.
 
     Best-effort and non-fatal by design: an unresolvable executor (e.g. a
     gated-off provider) or an unreachable/unverifiable host is *skipped* rather
@@ -255,31 +277,61 @@ def _verify_pre_placed_model(recipe, hosts, ssh_kwargs, *, runtime, cluster, con
     from sparkrun.orchestration.executor import resolve_executor
     from sparkrun.orchestration.primitives import resolved_model_volume
 
-    paths = list(resolved_model_volume(recipe))  # identity-mount source path(s)
-    if not paths:
-        return
+    model_paths = list(resolved_model_volume(recipe))  # identity-mount source path(s)
 
     try:
         executor = resolve_executor(recipe=recipe, cluster=cluster, runtime=runtime, config=config, cli_overrides=overrides)
     except Exception:
         # If the executor can't be resolved here, the runtime will surface the
         # real error at launch — don't pre-empt it with a preflight failure.
-        logger.debug("pre-placed model preflight: executor unresolvable; skipping probe", exc_info=True)
+        logger.debug("mount-source preflight: executor unresolvable; skipping probe", exc_info=True)
+        return
+
+    policy = config.missing_mount_source_policy if config is not None else "fail"
+    volume_paths: list[str] = []
+    if policy != "ignore":
+        try:
+            volume_paths = [p for p in (executor.bind_mount_sources() or []) if p not in model_paths]
+        except Exception:
+            logger.debug("mount-source preflight: bind_mount_sources failed; skipping volumes", exc_info=True)
+
+    probe = model_paths + volume_paths
+    if not probe:
         return
 
     try:
-        missing = executor.verify_mount_sources(paths, hosts, ssh_kwargs=ssh_kwargs) or {}
+        missing = executor.verify_mount_sources(probe, hosts, ssh_kwargs=ssh_kwargs) or {}
     except Exception:
-        logger.debug("pre-placed model preflight: probe failed; skipping", exc_info=True)
+        logger.debug("mount-source preflight: probe failed; skipping", exc_info=True)
+        return
+    if not missing:
         return
 
-    if missing:
-        detail = "; ".join("%s: %s" % (host, ", ".join(miss)) for host, miss in sorted(missing.items()))
+    model_detail = _format_missing_mounts(missing, set(model_paths))
+    if model_detail:
         raise RecipeError(
             "Pre-placed model weights were not found on the target host(s). The model "
             "path must already exist on every node (download + distribution are skipped "
-            "for on-disk weights). Missing — %s" % detail
+            "for on-disk weights). Missing — %s" % model_detail
         )
+
+    volume_detail = _format_missing_mounts(missing, set(volume_paths))
+    if not volume_detail:
+        return
+
+    message = (
+        "Bind mount source(s) from executor_config.volumes do not exist on the target host(s). Docker "
+        "creates a missing source as an empty root-owned directory instead of failing, and sparkrun runs "
+        "the container as the SSH user by default — so the workload would start without the content it "
+        "expects, or die with a permission error from inside the container. Missing — %s. Create the "
+        "path(s) on every host, package the content as a `mods:` entry (copied into the container at "
+        "launch, so it needs no host path), bake it into the image, or set `mounts.missing_source: warn` "
+        "in config.yaml to launch anyway." % volume_detail
+    )
+    if policy == "warn":
+        logger.warning(message)
+        return
+    raise RecipeError(message)
 
 
 def _verify_image_command_passthrough(
@@ -512,6 +564,8 @@ def report_unmapped_config_keys(
     recipe: Recipe,
     runtime: RuntimePlugin,
     overrides: dict[str, Any] | None = None,
+    *,
+    log: bool = True,
 ) -> list[str]:
     """Warn about ``defaults:`` / ``-o`` keys that reach nothing.
 
@@ -534,7 +588,9 @@ def report_unmapped_config_keys(
       map,
     * internal or namespaced (see :func:`_is_internal_config_key`).
 
-    Returns the warning lines (also logged).  Empty when the runtime does
+    Returns the warning lines (logged too unless *log* is False — the
+    ``recipe validate`` path renders them itself and would otherwise emit
+    each one twice).  Empty when the runtime does
     not declare ``known_config_keys`` — silence is the safe default for a
     runtime whose consumed-key set has not been established.
 
@@ -585,8 +641,9 @@ def report_unmapped_config_keys(
             % (", ".join("-o %s" % k for k in override_keys), runtime.runtime_name, "them" if len(override_keys) > 1 else "it")
         )
 
-    for message in messages:
-        logger.warning(message)
+    if log:
+        for message in messages:
+            logger.warning(message)
     return messages
 
 
@@ -865,14 +922,17 @@ def launch_inference(
 
     ssh_kwargs = build_ssh_kwargs(config)
 
-    # Preflight: pre-placed weights (resolved_model_path / absolute-path model)
-    # skip download + distribution, so verify the path actually exists on the
-    # substrate where the workload will run before committing to that skip.
+    # Preflight: verify the host paths this launch will bind actually exist on
+    # the substrate where the workload runs — pre-placed weights (whose
+    # presence is what licenses skipping download + distribution) and the
+    # executor's own bind-mount sources from ``executor_config.volumes``.
     # Substrate-aware via the launching executor (host → SSH ``test -e``;
     # provider executors probe their own volumes). Best-effort: skipped on
     # dry-run, and an unresolvable executor / unreachable host never blocks.
-    if _resolved_model_path and not dry_run:
-        _verify_pre_placed_model(
+    # Runs unconditionally now: a recipe with no pre-placed model can still
+    # carry volumes, and that was the unchecked half.
+    if not dry_run:
+        _verify_mount_sources(
             recipe,
             host_list,
             ssh_kwargs,
@@ -961,21 +1021,18 @@ def launch_inference(
     if recipe.builder:
         if p:
             p.phase(2)
-        from sparkrun.builders.base import BuilderUnavailableError
         from sparkrun.core.bootstrap import get_builder
 
-        # Only *lookup* is tolerated failing here. A ValueError out of
-        # prepare() is a real build failure, and reporting it as "builder not
-        # found, skipping" would launch the workload without the environment
-        # it asked for. A gated builder is likewise never skipped: the user
-        # named one that exists (see BuilderUnavailableError).
-        try:
-            builder = get_builder(recipe.builder, v)
-        except BuilderUnavailableError:
-            raise
-        except ValueError:
-            builder = None
-            logger.warning("Builder '%s' not found, skipping", recipe.builder)
+        # A named builder that does not resolve is fatal, in either flavour:
+        # gated off (BuilderUnavailableError) or unknown (ValueError). This
+        # used to warn-and-skip for the unknown case, which meant the recipe's
+        # image or environment was never built and the workload launched
+        # against whatever `container:` happened to pull — a clean-looking
+        # launch running something the recipe did not describe. A builder is
+        # not a serve flag: there is no engine default to fall back to, so
+        # silence here has no safe reading. (`prepare()` raising is likewise
+        # not caught — that is a build failure, not a lookup failure.)
+        builder = get_builder(recipe.builder, v)
 
         if builder is not None:
             container_image = builder.prepare(

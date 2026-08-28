@@ -312,6 +312,7 @@ def test_launch_inference_threads_backends_to_runtime_run(monkeypatch, tmp_path)
     class _Cfg:
         hf_cache_dir = tmp_path / "hf"
         cache_dir = tmp_path / "cache"
+        missing_mount_source_policy = "fail"
 
         def get_registry_manager(self):
             return None
@@ -437,6 +438,7 @@ def test_launch_inference_logs_platform_warnings_without_raising(monkeypatch, tm
     class _Cfg:
         hf_cache_dir = tmp_path / "hf"
         cache_dir = tmp_path / "cache"
+        missing_mount_source_policy = "fail"
 
         def get_registry_manager(self):
             return None
@@ -741,6 +743,7 @@ def test_launch_inference_save_job_metadata_failure_is_best_effort(monkeypatch, 
     class _Cfg:
         hf_cache_dir = tmp_path / "hf"
         cache_dir = tmp_path / "cache"
+        missing_mount_source_policy = "fail"
 
         def get_registry_manager(self):
             return None
@@ -953,6 +956,7 @@ def _builder_phase_harness(monkeypatch, tmp_path):
     class _Cfg:
         hf_cache_dir = tmp_path / "hf"
         cache_dir = tmp_path / "cache"
+        missing_mount_source_policy = "fail"
 
         def get_registry_manager(self):
             return None
@@ -1056,16 +1060,17 @@ class _PastPhase2(Exception):
     """Sentinel: execution reached the step after the builder phase."""
 
 
-def test_builder_phase_still_skips_an_unknown_builder(monkeypatch, tmp_path, caplog):
-    """Back-compat: an unknown builder warns and the launch continues.
+def test_builder_phase_aborts_on_an_unknown_builder(monkeypatch, tmp_path):
+    """A named builder that does not resolve is fatal, not skippable.
 
-    Asserted with a sentinel raised from the first call *after* phase 2 rather
-    than by completing a launch — the point is only that phase 2 neither
-    raised nor aborted, and stubbing the whole runtime protocol to prove it
-    would test the stub.
+    This used to warn-and-continue, which meant the image or environment the
+    recipe asked for was never built and the workload launched against
+    whatever ``container:`` happened to pull — a clean-looking launch serving
+    something the recipe did not describe (observed on an ``@spark-arena``
+    recipe carrying ``builder: ursuciprian``).  Unlike an unknown serve flag
+    there is no engine default to fall through to, so silence has no safe
+    reading.  Peer of the gated case below.
     """
-    import logging
-
     from sparkrun.core import launcher
 
     launch = _builder_phase_harness(monkeypatch, tmp_path)
@@ -1077,8 +1082,8 @@ def test_builder_phase_still_skips_an_unknown_builder(monkeypatch, tmp_path, cap
         raise _PastPhase2()
 
     monkeypatch.setattr("sparkrun.core.bootstrap.get_builder", _unknown)
+    # Would fire if phase 2 fell through; reaching it at all is the failure.
     monkeypatch.setattr(launcher, "apply_platform_runtime_flag_defaults", _sentinel)
 
-    with caplog.at_level(logging.WARNING), pytest.raises(_PastPhase2):
+    with pytest.raises(ValueError, match="Unknown builder"):
         launch()
-    assert "not found, skipping" in caplog.text

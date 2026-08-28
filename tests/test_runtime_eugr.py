@@ -105,7 +105,7 @@ def test_eugr_validate_recipe():
 
     issues = runtime.validate_recipe(recipe)
     # Should pass validation
-    assert all("model is required" not in issue for issue in issues)
+    assert all("model is required" not in str(issue) for issue in issues)
 
 
 class TestEugrPrepare:

@@ -113,6 +113,47 @@ def parse_ib_detect_output(output: str) -> dict[str, str]:
     return parse_kv_output(output)
 
 
+#: Every env var :func:`generate_nccl_env` (plus its ring-topology and
+#: per-host peers) can emit for a cluster launch.
+#:
+#: These are *computed per cluster* from live IB detection — HCA names, GID
+#: index and interface names are properties of the hardware in front of us,
+#: not of the recipe.  A recipe that sets one of them wins outright
+#: (``merge_env(nccl_env, env)`` in
+#: :mod:`sparkrun.orchestration.executors._base` puts ``recipe.env`` last), so
+#: the value silently replaces whatever was detected.  That is a deliberate
+#: escape hatch and stays supported — but it pins the recipe to one machine's
+#: device naming, which is why
+#: :func:`sparkrun.core.validation.validate_recipe` warns about it.
+#:
+#: Kept next to the generators so the two move together;
+#: ``tests/test_recipe_validation.py`` asserts the generated keys stay a
+#: subset of this set.
+MANAGED_COMM_ENV_KEYS = frozenset(
+    {
+        # generate_nccl_env
+        "NCCL_IGNORE_CPU_AFFINITY",
+        "NCCL_NET",
+        "NCCL_IB_DISABLE",
+        "NCCL_CROSS_NIC",
+        "NCCL_IB_HCA",
+        "NCCL_IB_GID_INDEX",
+        "NCCL_SOCKET_IFNAME",
+        "UCX_NET_DEVICES",
+        "NODE_IP",
+        # _set_eth_interfaces
+        "MN_IF_NAME",
+        "OMPI_MCA_btl_tcp_if_include",
+        "GLOO_SOCKET_IFNAME",
+        "TP_SOCKET_IFNAME",
+        # generate_ring_nccl_overrides
+        "NCCL_NET_PLUGIN",
+        "NCCL_IB_SUBNET_AWARE_ROUTING",
+        "NCCL_IB_MERGE_NICS",
+    }
+)
+
+
 def generate_ring_nccl_overrides(ib_info: dict[str, str]) -> dict[str, str]:
     """NCCL overrides required for 3-node ring/mesh topology.
 

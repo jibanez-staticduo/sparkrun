@@ -335,7 +335,7 @@ def test_atlas_validate_recipe_no_model():
     recipe = Recipe.from_dict({"name": "test", "runtime": "atlas"})
     issues = runtime.validate_recipe(recipe)
     assert len(issues) == 1
-    assert "model is required" in issues[0]
+    assert "model is required" in str(issues[0])
 
 
 # --- Bool flag stripping (regression: bool flags were not stripped from

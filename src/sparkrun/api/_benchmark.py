@@ -499,18 +499,23 @@ def _execute_benchmark(
         **cli_overrides,
     )
 
-    issues = recipe.validate()
-    for issue in issues:
-        emitter.warning(issue)
-
     try:
         runtime = get_runtime(recipe.runtime, v)
     except ValueError as e:
         raise BenchmarkFailed("Error: %s" % e, exit_code=1) from e
 
-    runtime_issues = runtime.validate_recipe(recipe)
-    for issue in runtime_issues:
-        emitter.warning(issue)
+    # Same contract as ``sparkrun run`` — shared helper so the two cannot
+    # drift on what they print or what they refuse.  A benchmark that launches
+    # its own workload has the same stake in the recipe being honorable.
+    from sparkrun.core.validation import validate_for_launch
+
+    issues, validation_failed = validate_for_launch(recipe, runtime=runtime, config=config, v=v, include_unmapped_keys=False)
+    for issue in issues:
+        emitter.warning(issue.message)
+    if validation_failed:
+        blocking = next((i for i in issues if i.is_error), None)
+        detail = blocking.message if blocking else "validation threshold not met"
+        raise BenchmarkFailed("Recipe '%s' cannot be launched: %s" % (recipe.name, detail), exit_code=1)
 
     # Resolve hosts — resolve_host_list expects a comma-separated string
     # (the raw CLI token), not a list; join any pre-resolved hosts back to string.

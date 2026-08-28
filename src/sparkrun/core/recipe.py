@@ -1203,7 +1203,22 @@ class Recipe:
         return rendered
 
     def validate(self) -> list[str]:
-        """Validate the recipe and return a list of warnings/errors."""
+        """Validate the recipe and return a list of warnings/errors.
+
+        The flat string form kept for back-compat.  Callers that need to tell
+        a launch-blocking problem from a cosmetic one use
+        :func:`sparkrun.core.validation.validate_recipe`, which calls the two
+        halves below directly.
+        """
+        return self.validate_structure() + self.validate_metadata()
+
+    def validate_structure(self) -> list[str]:
+        """Problems that make the recipe unlaunchable.
+
+        A missing model or an out-of-range node range is not something any
+        later stage can work around, which is why these are the half
+        :func:`sparkrun.core.validation.validate_recipe` reports as errors.
+        """
         issues = []
         if not self.name:
             issues.append("Recipe missing 'name' field")
@@ -1217,8 +1232,21 @@ class Recipe:
             issues.append("min_nodes must be >= 1, got %d" % self.min_nodes)
         if self.max_nodes is not None and self.max_nodes < self.min_nodes:
             issues.append("max_nodes (%s) < min_nodes (%s)" % (self.max_nodes, self.min_nodes))
+        return issues
 
-        # Validate metadata if present
+    def validate_metadata(self) -> list[str]:
+        """Problems in ``metadata:`` that degrade a *estimate*, not the launch.
+
+        Every field here feeds VRAM estimation or display.  A bad value costs
+        an estimate — the estimator skips the claim and placement falls back to
+        capacity-only — so these are reported as warnings, never as a reason to
+        refuse to launch.  Real published recipes carry prose in
+        ``metadata.quantization`` ("NVFP4 (compressed-tensors, mixed
+        precision)"); aborting on that would strand a working recipe over a
+        label.
+        """
+        issues: list[str] = []
+
         if self.metadata:
             from sparkrun.models.kv import arch_fields, is_valid_kv_dtype
             from sparkrun.models.vram import parse_param_count, bytes_per_element

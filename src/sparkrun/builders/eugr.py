@@ -585,7 +585,12 @@ class EugrBuilder(BuilderPlugin):
         return image
 
     def validate_recipe(self, recipe: Recipe) -> list[str]:
-        """Validate eugr-specific recipe fields."""
+        """Validate eugr-specific recipe fields.
+
+        Left as a bare string (→ warning): eugr builds a command from
+        ``build_args`` / ``mods`` when the template is absent, so this is
+        advice, not a blocker.
+        """
         issues = []
         if not recipe.command:
             issues.append("[eugr] command template is recommended for eugr recipes")

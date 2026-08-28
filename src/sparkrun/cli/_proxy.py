@@ -554,9 +554,6 @@ def load_cmd(
         recipe=recipe,
     )
 
-    issues = recipe.validate()
-    for issue in issues:
-        click.echo("Warning: %s" % issue, err=True)
     if port is not None:
         overrides["port"] = port
 
@@ -565,6 +562,16 @@ def load_cmd(
         runtime = get_runtime(recipe.runtime, v)
     except ValueError as e:
         click.echo("Error: %s" % e, err=True)
+        sys.exit(1)
+
+    # Same contract as ``sparkrun run`` — shared helper, so the two agree on
+    # what they print and what they refuse.
+    from sparkrun.core.validation import validate_for_launch
+
+    issues, validation_failed = validate_for_launch(recipe, runtime=runtime, config=config, v=v, include_unmapped_keys=False)
+    for issue in issues:
+        click.echo("%s: %s" % ("Error" if issue.is_error else "Warning", issue.message), err=True)
+    if validation_failed:
         sys.exit(1)
 
     # Node count validation, max_nodes enforcement, and solo mode determination

@@ -13,6 +13,7 @@ from sparkrun.utils.shell import quote
 if TYPE_CHECKING:
     from sparkrun.core.config import SparkrunConfig
     from sparkrun.core.recipe import Recipe
+    from sparkrun.core.validation import RecipeIssue
 
 EXT_BUILDER = "sparkrun.builder"
 
@@ -264,9 +265,32 @@ class BuilderPlugin(Plugin):
         """
         return container_image, False
 
-    def validate_recipe(self, recipe: Recipe) -> list[str]:
-        """Validate builder-specific recipe fields."""
+    def validate_recipe(self, recipe: Recipe) -> list["str | RecipeIssue"]:
+        """Return builder-specific findings for *recipe*.
+
+        Same two return forms as
+        :meth:`~sparkrun.runtimes.base.RuntimePlugin.validate_recipe`: a plain
+        ``str`` leaves severity undeclared and is reported as a *suggestion*
+        (never fatal by default, not shown at launch), a
+        :class:`~sparkrun.core.validation.RecipeIssue` declares it.  Use
+        :meth:`recipe_error` for a recipe this builder cannot build — that
+        aborts the launch rather than letting ``prepare()`` fail after image
+        and model distribution have already run — and :meth:`recipe_warning`
+        for one that builds but not reproducibly elsewhere.
+        """
         return []
+
+    def recipe_error(self, message: str, code: str = "builder-field") -> "RecipeIssue":
+        """Build a launch-blocking :class:`RecipeIssue` tagged with this builder."""
+        from sparkrun.core.validation import ERROR, RecipeIssue
+
+        return RecipeIssue(ERROR, code, "[%s] %s" % (self.builder_name, message))
+
+    def recipe_warning(self, message: str, code: str = "builder-field") -> "RecipeIssue":
+        """Build a portability-class :class:`RecipeIssue` tagged with this builder."""
+        from sparkrun.core.validation import WARNING, RecipeIssue
+
+        return RecipeIssue(WARNING, code, "[%s] %s" % (self.builder_name, message))
 
     def __repr__(self) -> str:
         return "%s(builder_name=%r)" % (self.__class__.__name__, self.builder_name)

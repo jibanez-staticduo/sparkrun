@@ -470,3 +470,75 @@ def format_activity_table(frame, hosts: list[str]) -> str:
         lines.append(f"{host_label:<{host_w}}{jobs:>6}{cpu_pct:>8}{ram_pct:>8}{gpu_util:>8}{cpu_temp:>10}{gpu_temp:>10}{gpu_power:>11}")
 
     return "\n".join(lines)
+
+
+def format_validation_report(qualified_name: str, issues: list) -> str:
+    """Render ``sparkrun recipe validate`` findings for a terminal.
+
+    Validation messages are paragraphs, not labels — each one names the
+    defect, the consequence *and* the fix, so run together at full width they
+    read as a wall.  Three things break that up:
+
+    * a scannable header line per finding (severity + check name), and a blank
+      line between findings, so the number of distinct problems is visible at a
+      glance rather than parsed out of the prose;
+    * the diagnosis wrapped and indented beneath it;
+    * :attr:`~sparkrun.core.validation.RecipeIssue.fix` as its own further-
+      indented block, because it is read at a different moment than the
+      diagnosis — only once you've decided you care.
+
+    Wrapping is capped at 100 columns even on a wide terminal: a 200-column
+    paragraph is no easier to read than an unwrapped one.  Colour goes through
+    ``click.style``, which is a no-op when stdout isn't a TTY, so piping to a
+    file or a grep yields plain text.
+    """
+    import shutil
+
+    width = max(40, min(shutil.get_terminal_size(fallback=(80, 24)).columns, 100))
+    indent = "    "
+
+    from sparkrun.core.validation import ERROR, SEVERITIES, SUGGESTION, WARNING
+
+    # Label, colour and bold per severity.  ERROR shouts (uppercase + bold)
+    # because it is the only one that always stops something; suggestion is
+    # dimmed so a long report reads as a hierarchy rather than a list.
+    styling = {
+        ERROR: ("ERROR", "red", True, False),
+        WARNING: ("warning", "yellow", False, False),
+        SUGGESTION: ("suggestion", "cyan", False, True),
+    }
+    counts = []
+    for level in SEVERITIES:
+        n = sum(1 for i in issues if i.severity == level)
+        if n:
+            counts.append("%d %s%s" % (n, level, "" if n == 1 else "s"))
+
+    lines = ["Recipe '%s': %s" % (qualified_name, ", ".join(counts))]
+    for issue in issues:
+        lines.append("")
+        label, colour, bold, dim = styling.get(issue.severity, (issue.severity, None, False, False))
+        lines.append(
+            "%s  %s"
+            % (
+                click.style(label, fg=colour, bold=bold, dim=dim),
+                click.style(issue.code, bold=not dim, dim=dim),
+            )
+        )
+        lines.extend(_wrap(issue.summary, width, indent))
+        if issue.fix:
+            lines.append("")
+            lines.extend(_wrap(issue.fix, width, indent + "  "))
+    return "\n".join(lines)
+
+
+def _wrap(text: str, width: int, indent: str) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(
+        text,
+        width=width,
+        initial_indent=indent,
+        subsequent_indent=indent,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
