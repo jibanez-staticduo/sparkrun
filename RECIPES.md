@@ -385,6 +385,51 @@ Explicit `runtime` always wins. Command-hint detection only fires when `runtime`
 Any key can appear in `defaults` — there is no fixed schema. Runtime-specific keys (e.g. `tool_call_parser`, `ctx_size`,
 `n_gpu_layers`, `reasoning_parser`) are passed through to command template substitution.
 
+#### Keys the runtime doesn't recognise
+
+A recipe with no `command:` template has its serve command built by iterating the runtime's flag map, so a `defaults`
+key that map doesn't list reaches nothing — it is **dropped**, and the engine uses its own default instead. The same
+is true of a `-o key=value` override. Nothing about the resulting deployment looks wrong, which is how an `@atlas`
+recipe's `lm_head_dtype: bf16` correctness pin served weeks of traffic at NVFP4 ([#276]).
+
+sparkrun now reports these at launch (including under `--dry-run`):
+
+```
+Recipe 'my-recipe' sets defaults the 'atlas' runtime does not understand, so they are dropped from the serve
+command and the engine will use its own default instead: lm_head_dytpe. ...
+Override(s) -o max_num_seqz have no effect: the 'atlas' runtime does not understand it, ...
+```
+
+A key is *not* reported when it is referenced as a `{placeholder}` in the recipe's `command:` template or in another
+default's value — that is the documented pass-through above, and it doubles as the workaround if your sparkrun build
+predates an engine flag you need:
+
+```yaml
+command: spark serve {model} --port {port} --brand-new-flag {brand_new_knob}
+defaults:
+  brand_new_knob: 7
+```
+
+It is a warning rather than an error on purpose: recipes come from registries that version independently of sparkrun,
+so a key this build doesn't know is routinely a *newer* recipe rather than a broken one. Runtimes that haven't
+declared their key set (`eugr-vllm`) report nothing at all.
+
+[#276]: https://github.com/spark-arena/sparkrun/issues/276
+
+#### Atlas booleans come in two shapes
+
+Atlas spells boolean options two ways and they are not interchangeable:
+
+- **presence-only** (`enable_prefix_caching`, `disable_thinking`, `video_allow_ffmpeg`, …) — the bare flag when
+  truthy, nothing when falsy.
+- **value-taking** (`disable_tool_grammar`, `ssm_tail_midchunk`, `gdn_fused_norm`, `prefill_varlen_batch`,
+  `ssm_batched_recurrent`, `exact_verify`, `content_loop_watchdog`, `high_speed_swap_graph`) — parsed as
+  `Option<bool>`, so *absent* defers to MODEL.toml / the engine default while an explicit `false` **overrides** it.
+  Writing `ssm_tail_midchunk: false` emits `--ssm-tail-midchunk false`, not nothing.
+
+Write them as ordinary YAML booleans either way; sparkrun renders the lowercase `true`/`false` Atlas's parser
+requires.
+
 #### Atlas high-speed swap
 
 Atlas's block-level KV streaming (`--high-speed-swap`) is enabled with the boolean `high_speed_swap` key, but it

@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -471,6 +472,124 @@ def apply_platform_runtime_flag_defaults(recipe: Recipe, runtime_name: str, host
     return applied
 
 
+#: A ``{placeholder}`` in a recipe ``command:`` template or in another
+#: default's value.  Matches the name only; the surrounding-brace rules live
+#: in :func:`sparkrun.utils.text.mask_non_placeholder_braces`.
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _is_internal_config_key(key: str) -> bool:
+    """True for keys excluded from the unmapped-key report regardless of runtime.
+
+    A leading underscore marks a value sparkrun injects into the config chain
+    mid-launch (``_gguf_model_path``, ``_mmproj_path``); a dot marks a
+    namespaced override (``-o env.KEY=VALUE``) routed by prefix rather than
+    looked up as a whole key.
+    """
+    return key.startswith("_") or "." in key
+
+
+def _referenced_placeholders(recipe: Recipe) -> set[str]:
+    """Names a recipe resolves through ``{placeholder}`` substitution.
+
+    Covers the ``command:`` template and the *values* of ``defaults`` and
+    ``env`` — ``render_template`` iterates, so one default may legitimately
+    exist only to be interpolated into another (``base_url:
+    "http://localhost:{port}"``), which is a use even though no flag map
+    lists it.
+    """
+    found: set[str] = set()
+    sources = [recipe.command or ""]
+    sources.extend(str(val) for val in recipe.defaults.values() if isinstance(val, str))
+    sources.extend(str(val) for val in (recipe.env or {}).values() if isinstance(val, str))
+    for text in sources:
+        if "{" in text:
+            found.update(_TEMPLATE_PLACEHOLDER_RE.findall(text))
+    return found
+
+
+def report_unmapped_config_keys(
+    recipe: Recipe,
+    runtime: RuntimePlugin,
+    overrides: dict[str, Any] | None = None,
+) -> list[str]:
+    """Warn about ``defaults:`` / ``-o`` keys that reach nothing.
+
+    A structured runtime renders its serve command by iterating a flag map,
+    so a key the map doesn't list is not passed through — it is *dropped*,
+    with no error, no warning, and no trace in the rendered command.  The
+    engine then falls back to its own default, which is exactly what a
+    recipe pinning ``lm_head_dtype: bf16`` for correctness was trying to
+    prevent (issue #276; ``--disable-tool-grammar`` in #221 was the same
+    gap).  Nothing about the resulting deployment looks wrong.
+
+    A key counts as reaching something when it is any of:
+
+    * listed in :meth:`~sparkrun.runtimes.base.RuntimePlugin.known_config_keys`
+      (the runtime's flag map plus whatever it consumes outside it),
+    * in :data:`~sparkrun.runtimes.base.BASE_CONSUMED_CONFIG_KEYS`,
+    * referenced as a ``{placeholder}`` in the recipe's ``command:``
+      template — the documented escape hatch for runtime-specific keys
+      (RECIPES.md), and the reason this cannot just diff against the flag
+      map,
+    * internal or namespaced (see :func:`_is_internal_config_key`).
+
+    Returns the warning lines (also logged).  Empty when the runtime does
+    not declare ``known_config_keys`` — silence is the safe default for a
+    runtime whose consumed-key set has not been established.
+
+    Warns rather than raises deliberately: recipes are fetched from
+    registries that version independently of sparkrun, so a key this build
+    doesn't know is routinely a *newer* recipe rather than a broken one,
+    and hard-failing would strand a user between two published artifacts.
+    The report names the launch's runtime because the same recipe key can
+    be live under one runtime and dead under another.
+    """
+    from sparkrun.runtimes.base import BASE_CONSUMED_CONFIG_KEYS
+
+    # Resolved defensively: this is a diagnostic, and an out-of-tree runtime
+    # built against an older base class (or one whose hook raises) must cost
+    # the launch nothing more than the report it would have produced.
+    hook = getattr(runtime, "known_config_keys", None)
+    try:
+        known = hook() if callable(hook) else None
+    except Exception:
+        logger.debug("Runtime %r known_config_keys raised", getattr(runtime, "runtime_name", "?"), exc_info=True)
+        return []
+    if known is None:
+        return []
+
+    consumed = set(known) | BASE_CONSUMED_CONFIG_KEYS | _referenced_placeholders(recipe)
+
+    def _unmapped(keys) -> list[str]:
+        return sorted(k for k in keys if not _is_internal_config_key(k) and k not in consumed)
+
+    # An override is reported separately from a recipe default: it was typed
+    # at this invocation, so "did nothing" is a failed instruction rather
+    # than an inherited defect, and the fix is the user's to make.
+    override_keys = _unmapped(overrides or {})
+    default_keys = _unmapped(k for k in recipe.defaults if k not in (overrides or {}))
+
+    messages: list[str] = []
+    if default_keys:
+        messages.append(
+            "Recipe '%s' sets defaults the '%s' runtime does not understand, so they are dropped from the serve "
+            "command and the engine will use its own default instead: %s. Remove them, or reference them from the "
+            "recipe's 'command:' template if this build of sparkrun predates the engine flag."
+            % (recipe.name, runtime.runtime_name, ", ".join(default_keys))
+        )
+    if override_keys:
+        messages.append(
+            "Override(s) %s have no effect: the '%s' runtime does not understand %s, so nothing is added to the "
+            "serve command."
+            % (", ".join("-o %s" % k for k in override_keys), runtime.runtime_name, "them" if len(override_keys) > 1 else "it")
+        )
+
+    for message in messages:
+        logger.warning(message)
+    return messages
+
+
 def resolve_platform_env_defaults(runtime: RuntimePlugin, host_hardware) -> dict[str, str]:
     """Return the platform's container-env defaults for *runtime*.
 
@@ -928,6 +1047,11 @@ def launch_inference(
     _applied_flags = apply_platform_runtime_flag_defaults(recipe, runtime.runtime_name, _head_hw)
     if _applied_flags:
         logger.debug("Applied platform runtime-flag defaults: %s", _applied_flags)
+
+    # Report recipe defaults / -o overrides this runtime will silently drop.
+    # Runs after the platform tier so a platform contributing an unmapped flag
+    # is caught too, and before any container starts so --dry-run reports it.
+    report_unmapped_config_keys(recipe, runtime, overrides)
 
     # Save job metadata
     if not dry_run:

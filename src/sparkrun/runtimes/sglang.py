@@ -93,6 +93,15 @@ class SglangRuntime(RuntimePlugin):
         """SGLang uses native multi-node distribution, not Ray."""
         return "native"
 
+    def known_config_keys(self) -> frozenset[str]:
+        """Flag-map keys plus the SGLang keys read outside it.
+
+        The speculative draft-model keys are consumed by ``prepare()`` /
+        distribution rather than emitted from the map.  See
+        :func:`sparkrun.core.launcher.report_unmapped_config_keys`.
+        """
+        return frozenset(_SGLANG_FLAG_MAP) | {"speculative_draft_model", "speculative_draft_model_path"}
+
     def resolve_api_key(
         self,
         recipe: "Recipe",

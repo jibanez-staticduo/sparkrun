@@ -20,6 +20,15 @@ class VllmMixin:
     def get_common_env(self):
         return default_env_hf_offline()
 
+    def known_config_keys(self) -> frozenset[str]:
+        """Flag-map keys plus the vLLM keys read outside it.
+
+        ``data_parallel_rpc_port`` is consumed by the vllm-distributed rank
+        wiring rather than emitted from the map.  See
+        :func:`sparkrun.core.launcher.report_unmapped_config_keys`.
+        """
+        return frozenset(VLLM_FLAG_MAP) | {"data_parallel_rpc_port"}
+
     def default_executor_config(self) -> dict:
         """Allow attaching a stack sampler to a hung vLLM engine.
 

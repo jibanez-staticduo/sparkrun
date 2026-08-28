@@ -68,6 +68,13 @@ class ModularMaxRuntime(RuntimePlugin):
     runtime_name = "modular-max"
     default_image_prefix = "modular/max-nvidia-full"
 
+    def known_config_keys(self) -> frozenset[str]:
+        """Flag-map keys plus ``devices`` (the local-GPU list MAX takes for TP).
+
+        See :func:`sparkrun.core.launcher.report_unmapped_config_keys`.
+        """
+        return frozenset(_MAX_FLAG_MAP) | {"devices"}
+
     # --- placement: single node, always ---
 
     # noinspection PyUnusedLocal

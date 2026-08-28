@@ -80,6 +80,24 @@ class TrtllmRuntime(RuntimePlugin):
         """TRT-LLM uses native clustering with MPI orchestration."""
         return "native"
 
+    def known_config_keys(self) -> frozenset[str]:
+        """Flag-map keys plus the keys that land in the extra-config YAML.
+
+        TRT-LLM takes much of its tuning through
+        ``--extra_llm_api_options`` rather than CLI flags, so those keys are
+        consumed by ``_build_extra_config`` and are not in the flag map.  See
+        :func:`sparkrun.core.launcher.report_unmapped_config_keys`.
+        """
+        return frozenset(_TRTLLM_FLAG_MAP) | {
+            "backend",
+            "cuda_graph_max_batch_size",
+            "cuda_graph_padding",
+            "free_gpu_memory_fraction",
+            "kv_cache_enable_block_reuse",
+            "moe_backend",
+            "print_iter_log",
+        }
+
     def _augment_extra_config_flag(self, command: str, recipe: Recipe, overrides: dict[str, Any] | None = None) -> str:
         """Append ``--extra_llm_api_options`` if extra config keys are present.
 

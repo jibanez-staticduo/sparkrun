@@ -275,6 +275,43 @@ recipe → `runtime.default_executor()` → per-executor adjustments →
 previously-hardcoded `_KNOWN_EXECUTORS` set has been retired; selector
 validation queries SAF via `get_extensions(EXT_EXECUTOR)`.
 
+**Unmapped-key reporting** (`RuntimePlugin.known_config_keys` +
+`launcher.py:report_unmapped_config_keys`): a structured runtime builds its
+serve command by iterating a flag map, so a `defaults:` key — or a
+`-o key=value` — the map doesn't list is **dropped**: no error, no warning,
+nothing in the rendered command, and the engine quietly uses its own default.
+That is how an `@atlas` recipe's `lm_head_dtype: bf16` correctness pin served
+weeks of traffic at NVFP4 (#276), and the same gap as `--disable-tool-grammar`
+in #221.
+
+A runtime declares the keys it understands — its flag map **plus what it
+consumes outside it** (`prepare()`, parallelism, builder, executor); a key
+handled elsewhere reported as dropped is noise that trains people to ignore
+the report. `BASE_CONSUMED_CONFIG_KEYS` (`runtimes/base.py`) covers what the
+shared layers read for every runtime. `None` — the base default — means "not
+declared" and disables the check, which is what `eugr-vllm` returns: it
+inherits vLLM's map but routes v1 `defaults` through eugr's `build_args` /
+`mods`, so the inherited answer would be wrong.
+
+Three things are deliberately *not* reported, and each was load-bearing in
+getting the false-positive rate to zero across all 292 cached registry
+recipes: keys referenced as a `{placeholder}` in `command:` **or in another
+default's value** (`render_template` iterates, so one default may exist only
+to feed another), `_`-prefixed keys sparkrun injects mid-launch, and dotted
+keys routed by prefix (`-o env.KEY=VALUE`). It warns rather than raises
+because registries version independently of sparkrun — an unknown key is
+routinely a *newer* recipe, and hard-failing would strand a user between two
+published artifacts. It runs from `launch_inference` after the platform
+default tier (so a platform contributing an unmapped flag is caught too) and
+before anything starts, so `--dry-run` reports it.
+
+The atlas flag map is now exhaustive against Atlas's own machine-readable
+`vendor/serve-options.v1.json`, which also distinguishes the two boolean
+shapes: presence-only (`_ATLAS_BOOL_FLAGS`, bare flag) versus `Option<bool>`
+(`_ATLAS_VALUE_BOOL_FLAGS`, explicit lowercase `true`/`false`, where *absent*
+defers to MODEL.toml but `false` overrides it — so dropping the flag for a
+falsy value hands the decision back to the engine).
+
 **Trust gating** (`launcher.py:resolve_recipe_trust`): each launch resolves a
 single trust verdict shared by `pre_exec` (inside `runtime.run()`) and
 `post_exec` / `post_commands` (inside `post_launch_lifecycle`). Local recipes

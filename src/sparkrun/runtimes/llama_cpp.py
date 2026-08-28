@@ -98,6 +98,16 @@ class LlamaCppRuntime(RuntimePlugin):
     runtime_name = "llama-cpp"
     default_image_prefix = "scitrera/dgx-spark-llama-cpp"
 
+    def known_config_keys(self) -> frozenset[str]:
+        """Flag-map keys, bool toggles, and the bespoke-emission keys.
+
+        ``_LLAMA_CPP_SPECIAL_KEYS`` (``flash_attn`` / ``webui`` / ``mmap``)
+        are emitted by ``_special_flags`` rather than the generic map pass,
+        and ``mmproj`` is resolved into a container path by the launcher.
+        See :func:`sparkrun.core.launcher.report_unmapped_config_keys`.
+        """
+        return frozenset(_LLAMA_CPP_FLAG_MAP) | frozenset(_LLAMA_CPP_BOOL_FLAGS) | _LLAMA_CPP_SPECIAL_KEYS | {"mmproj"}
+
     def cluster_strategy(self) -> str:
         """llama.cpp uses native RPC-based distribution, not Ray."""
         return "native"

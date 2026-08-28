@@ -32,6 +32,53 @@ logger = logging.getLogger(__name__)
 
 EXT_RUNTIME = "sparkrun.runtime"
 
+#: Config-chain keys the *shared* machinery consumes for every runtime, so a
+#: runtime declaring :meth:`RuntimePlugin.known_config_keys` need not repeat
+#: them.  None of these is a serve flag; each is read by sparkrun itself, and
+#: listing them here is what keeps the unmapped-key report free of noise it
+#: would train people to ignore.
+BASE_CONSUMED_CONFIG_KEYS = frozenset(
+    {
+        # Injected into every config chain by Recipe.build_config_chain for
+        # `{model}` / `{resolved_model_path}` template substitution.
+        "model",
+        "resolved_model_path",
+        # Parallelism dims — resolved into ParallelismConfig and folded into
+        # world size / placement whether or not a given runtime emits a flag
+        # for them.  A runtime that ignores one still *consumed* it.
+        "tensor_parallel",
+        "pipeline_parallel",
+        "data_parallel",
+        "expert_parallel",
+        "ep_size",
+        # Distributed bootstrap port; sparkrun emits the coordination flags.
+        "init_port",
+        # Portable keys the shared layers read off the recipe regardless of
+        # which runtime (and regardless of whether that runtime emits a flag
+        # for them): the VRAM estimator (max_model_len, kv_cache_dtype,
+        # gpu_memory_utilization), served-name resolution, api-key
+        # resolution, and port/host handling.
+        "max_model_len",
+        "gpu_memory_utilization",
+        "kv_cache_dtype",
+        "served_model_name",
+        "api_key",
+        "port",
+        "host",
+        # Executor / builder selectors read off recipe defaults.
+        "executor",
+        "image_prefix",
+        "launcher_image",
+        "use_sentinel_image",
+        "save_build_logs",
+        "transformers",
+        "kubectl",
+        # Benchmark-path keys (api/_benchmark.py reads these off the recipe).
+        "benchmark_framework",
+        "benchmark_output_dir",
+    }
+)
+
 
 class RuntimePlugin(Plugin):
     """Abstract base class for sparkrun inference runtimes.
@@ -615,6 +662,33 @@ class RuntimePlugin(Plugin):
         if not recipe.model:
             issues.append("[%s] model is required" % self.runtime_name)
         return issues
+
+    def known_config_keys(self) -> frozenset[str] | None:
+        """Config-chain keys this runtime does something with, or ``None``.
+
+        A structured runtime builds its serve command by iterating a flag
+        map, so a ``defaults:`` key (or a ``-o key=value``) the map doesn't
+        list reaches nothing at all and is dropped without a trace.  That
+        is how an ``@atlas`` recipe's ``lm_head_dtype: bf16`` correctness
+        pin served weeks of traffic at NVFP4 (issue #276), and the same
+        shape as the ``--disable-tool-grammar`` gap in #221.
+
+        Declaring the answer here lets
+        :func:`sparkrun.core.launcher.report_unmapped_config_keys` say so
+        at launch.  The set is *everything the runtime understands*, not
+        just its flag map: keys consumed by ``prepare()``, parallelism
+        resolution, the builder or the executor belong here too, or they
+        would be reported as dropped when they are merely handled
+        elsewhere.  :data:`BASE_CONSUMED_CONFIG_KEYS` covers the ones the
+        shared machinery reads for every runtime, so subclasses typically
+        return ``frozenset(_MY_FLAG_MAP) | {…runtime extras…}``.
+
+        ``None`` — the default — means "not declared" and disables the
+        check for this runtime.  A wrong answer here is worse than no
+        answer: it either cries wolf on a working recipe or, if a real key
+        is listed by mistake, restores exactly the silence being fixed.
+        """
+        return None
 
     # noinspection PyUnusedLocal
     def world_size(
