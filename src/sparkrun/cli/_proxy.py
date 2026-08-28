@@ -16,6 +16,7 @@ from ._common import (
     json_option,
     print_json,
     recipe_override_options,
+    report_launch_validation,
     resolve_cluster_config,
     resolve_effective_hosts_for_recipe,
     with_host_context,
@@ -569,8 +570,7 @@ def load_cmd(
     from sparkrun.core.validation import validate_for_launch
 
     issues, validation_failed = validate_for_launch(recipe, runtime=runtime, config=config, v=v, include_unmapped_keys=False)
-    for issue in issues:
-        click.echo("%s: %s" % ("Error" if issue.is_error else "Warning", issue.message), err=True)
+    report_launch_validation(recipe.qualified_name, issues, validation_failed)
     if validation_failed:
         sys.exit(1)
 

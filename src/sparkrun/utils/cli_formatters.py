@@ -472,8 +472,13 @@ def format_activity_table(frame, hosts: list[str]) -> str:
     return "\n".join(lines)
 
 
-def format_validation_report(qualified_name: str, issues: list) -> str:
-    """Render ``sparkrun recipe validate`` findings for a terminal.
+def format_validation_report(qualified_name: str, issues: list, *, title: str | None = None) -> str:
+    """Render recipe-validation findings for a terminal.
+
+    Shared by ``recipe validate`` and the launch paths, which differ only in
+    *title*: under ``recipe validate`` the context is obvious, whereas amid a
+    launch the reader needs telling that these came from validating the recipe
+    rather than from anything that has started.
 
     Validation messages are paragraphs, not labels — each one names the
     defect, the consequence *and* the fix, so run together at full width they
@@ -513,7 +518,7 @@ def format_validation_report(qualified_name: str, issues: list) -> str:
         if n:
             counts.append("%d %s%s" % (n, level, "" if n == 1 else "s"))
 
-    lines = ["Recipe '%s': %s" % (qualified_name, ", ".join(counts))]
+    lines = ["%s: %s" % (title or "Recipe '%s'" % qualified_name, ", ".join(counts))]
     for issue in issues:
         lines.append("")
         label, colour, bold, dim = styling.get(issue.severity, (issue.severity, None, False, False))

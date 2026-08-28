@@ -32,6 +32,7 @@ from ._common import (
     host_options,
     _render_capacity_diagnostics,
     recipe_override_options,
+    report_launch_validation,
     resolve_cluster_config,
     with_host_context,
     HIDE_ADVANCED_OPTIONS,
@@ -394,8 +395,9 @@ def run(
         v=v,
         include_unmapped_keys=False,
     )
-    for issue in issues:
-        click.echo("%s: %s" % ("Error" if issue.is_error else "Warning", issue.message), err=True)
+    # Echo back the reference the user typed: it is what the `recipe validate`
+    # hint has to be re-typable as, and for a URL recipe it beats the raw URL.
+    report_launch_validation(recipe_name, issues, validation_failed)
     if validation_failed:
         sys.exit(1)
 

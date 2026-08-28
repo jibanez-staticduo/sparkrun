@@ -727,3 +727,66 @@ def test_builder_severity_sugar(v):
     assert b.recipe_error("boom").severity == ERROR
     assert b.recipe_warning("hmm").severity == WARNING
     assert b.recipe_warning("hmm").message.startswith("[docker-pull]")
+
+
+# --------------------------------------------------------------------------
+# Launch-path presentation
+# --------------------------------------------------------------------------
+
+
+def _launch_report(issues, failed, ref="my-recipe"):
+    """Capture what a launch prints. Findings go to stderr (stdout stays free
+    for the launch's own output), so read that stream specifically."""
+    import click
+    from click.testing import CliRunner
+
+    from sparkrun.cli._common import report_launch_validation
+
+    @click.command()
+    def _cmd():
+        report_launch_validation(ref, issues, failed)
+
+    return click.unstyle(CliRunner().invoke(_cmd).stderr)
+
+
+def test_launch_report_names_validation_as_the_source():
+    """Amid a launch, unlabelled findings read as failures of whatever ran last."""
+    text = _launch_report([RecipeIssue(WARNING, "managed-comm-env", "pinned devices")], False)
+    assert text.startswith("Recipe validation for 'my-recipe': 1 warning")
+
+
+def test_launch_report_states_the_verdict_when_fatal():
+    text = _launch_report([RecipeIssue(ERROR, "builder-unknown", "no such builder")], True)
+    assert "Cannot launch" in text
+    # Points at the one place the withheld suggestions can be seen.
+    assert "sparkrun recipe validate my-recipe" in text
+
+
+def test_launch_report_states_the_verdict_when_advisory():
+    """ "Did this stop my launch?" is the reader's only real question."""
+    text = _launch_report([RecipeIssue(WARNING, "managed-comm-env", "pinned devices")], False)
+    assert "Nothing above blocks the launch" in text
+    assert "Cannot launch" not in text
+
+
+def test_launch_report_is_silent_with_no_findings():
+    assert _launch_report([], False) == ""
+
+
+def test_launch_report_uses_the_block_layout():
+    """Same renderer as `recipe validate` — the two must not drift."""
+    text = _launch_report([RecipeIssue(WARNING, "non-portable-mount", "binds a path", "Use a mod.")], False)
+    assert "warning  non-portable-mount" in text
+    lines = text.splitlines()
+    summary = next(ln for ln in lines if "binds a path" in ln)
+    fix = next(ln for ln in lines if "Use a mod." in ln)
+    assert len(fix) - len(fix.lstrip()) > len(summary) - len(summary.lstrip())
+
+
+def test_report_title_override():
+    from sparkrun.utils.cli_formatters import format_validation_report
+
+    import click
+
+    text = click.unstyle(format_validation_report("r", [RecipeIssue(ERROR, "c", "m")], title="Custom heading"))
+    assert text.splitlines()[0] == "Custom heading: 1 error"

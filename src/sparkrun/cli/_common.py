@@ -646,6 +646,39 @@ def _display_recipe_detail(recipe, show_vram=True, registry_name=None, cli_overr
     display_recipe_detail(recipe, show_vram=show_vram, registry_name=registry_name, cli_overrides=cli_overrides, cache_dir=cache_dir)
 
 
+def report_launch_validation(recipe_ref: str, issues, failed: bool) -> None:
+    """Print launch-path validation findings, and say what they mean.
+
+    The launch peer of ``recipe validate``'s output, sharing its renderer so
+    the two cannot drift.  Two things it adds that a bare list of messages
+    could not:
+
+    * a **heading naming validation as the source**.  Amid a launch there is
+      no other clue — the findings arrive before anything has started, so
+      unlabelled they read as failures of whatever ran last.
+    * a **verdict**.  The same three findings can be fatal or advisory
+      depending on the threshold (see
+      :func:`sparkrun.core.validation.validate_for_launch`), and "did this
+      stop my launch?" is the one question the reader actually has.
+
+    On failure it points at ``recipe validate``, which is the only place the
+    withheld suggestions can be seen.  Everything goes to stderr, keeping
+    stdout free for the launch's own output.
+    """
+    from sparkrun.utils.cli_formatters import format_validation_report
+
+    if not issues:
+        return
+    click.echo(
+        format_validation_report(recipe_ref, issues, title="Recipe validation for '%s'" % recipe_ref),
+        err=True,
+    )
+    if failed:
+        click.echo("\nCannot launch: fix the above, or see `sparkrun recipe validate %s` for the full report." % recipe_ref, err=True)
+    else:
+        click.echo("\nNothing above blocks the launch. Continuing.", err=True)
+
+
 def _display_vram_estimate(
     recipe,
     cli_overrides=None,
