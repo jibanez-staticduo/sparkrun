@@ -57,9 +57,9 @@ class VllmRayRuntime(VllmMixin, RuntimePlugin):
         overrides: dict[str, Any] | None = None,
     ) -> None:
         """Detect and add a draft model to distribution config if needed"""
-        draft_model = self.detect_spec_config_draft_model(recipe)
+        draft_model, draft_revision = self.detect_spec_config_draft(recipe)
         if draft_model:
-            recipe.distribution_config.add_model(draft_model)
+            recipe.distribution_config.add_model(draft_model, revision=draft_revision)
 
     def generate_command(
         self,

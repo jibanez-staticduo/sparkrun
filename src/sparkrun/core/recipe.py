@@ -88,7 +88,22 @@ _KNOWN_KEYS = {
 
 @dataclass
 class DistributionModelEntry:
-    """A single model to distribute during the distribution phase."""
+    """A single model to distribute during the distribution phase.
+
+    ``revision`` is **per-entry and authoritative** — there is no fallback to
+    the recipe's ``model_revision``.  A launch distributes several unrelated
+    repos (the served model plus any speculative draft model a runtime adds in
+    ``prepare()``), and a commit SHA is only meaningful in the repo it came
+    from: pinning the draft model to the served model's SHA asks the Hub for a
+    revision that repo has never had, and the download dies with
+    ``Revision Not Found`` after the served model has already synced.
+
+    The recipe-level pin reaches the served model by being stamped onto the
+    auto-generated entry at construction (see
+    :func:`_default_distribution_config`), so a recipe that hand-writes its
+    ``distribution_config`` entries states every revision it wants — an entry
+    with no ``revision`` is authoritatively unpinned.
+    """
 
     name: str
     target: list[int] = field(default_factory=list)
@@ -177,13 +192,19 @@ class DistributionConfig:
             externally_provided=data.get("externally_provided", True),
         )
 
-    def add_model(self, model: str):
-        """Add a model distribution config to the distribution config."""
+    def add_model(self, model: str, revision: str | None = None):
+        """Add a model distribution config to the distribution config.
+
+        ``revision`` pins *this* model only.  Runtimes call this from
+        ``prepare()`` to add a speculative draft model, which is a different
+        repo from the served model and must never inherit its pin — see
+        :class:`DistributionModelEntry`.
+        """
         # scan through existing models and make sure that we don't add a duplicate
         for existing_model in self.models.entries:
             if existing_model.name == model:
                 return
-        self.models.entries.append(DistributionModelEntry(name=model))
+        self.models.entries.append(DistributionModelEntry(name=model, revision=revision))
 
     def add_container(self, model_container_config: DistributionContainerEntry):
         self.containers.entries.append(model_container_config)
@@ -218,12 +239,23 @@ class DistributionConfig:
         return self
 
 
-def _default_distribution_config(model: str = "{model}", container: str = "{container}") -> DistributionConfig:
-    """Create the default distribution config for a recipe."""
+def _default_distribution_config(
+    model: str = "{model}",
+    container: str = "{container}",
+    model_revision: str | None = None,
+) -> DistributionConfig:
+    """Create the default distribution config for a recipe.
+
+    ``model_revision`` is the recipe's top-level pin.  Stamping it onto the
+    auto-generated entry here — rather than applying it at distribution time to
+    whatever entries happen to be present — is what keeps it attached to the
+    model it actually describes once a runtime has added a draft model
+    alongside it.
+    """
     return DistributionConfig(
         models=DistributionResourceConfig(
             enabled=True,
-            entries=[DistributionModelEntry(name=model)],
+            entries=[DistributionModelEntry(name=model, revision=model_revision)],
         ),
         containers=DistributionResourceConfig(
             enabled=True,
@@ -242,13 +274,18 @@ def _parse_distribution_config(data: dict[str, Any]) -> DistributionConfig:
     container it never customized.  A subkey that IS present is honored
     literally — an explicit ``entries: []`` or ``enabled: false`` still means
     "distribute nothing", not "use the default".
+
+    The recipe's top-level ``model_revision`` is stamped onto the auto-generated
+    model entry (and onto the one inherited when ``models`` is omitted), so a
+    recipe that lists its own entries owns their revisions outright.
     """
     raw = data.get("distribution_config")
+    model_revision = data.get("model_revision")
     # fallback if not provided (expected to be the default case)
     if not raw or not isinstance(raw, dict):
-        return _default_distribution_config()
+        return _default_distribution_config(model_revision=model_revision)
 
-    default = _default_distribution_config()
+    default = _default_distribution_config(model_revision=model_revision)
 
     def _parse_models(models_raw: Any) -> DistributionResourceConfig:
         if not isinstance(models_raw, dict):

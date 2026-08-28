@@ -1265,7 +1265,6 @@ def launch_inference(
             effective_cache_dir,
             config,
             dry_run,
-            model_revision=recipe.model_revision,
             recipe_name=recipe.name,
             transfer_mode=effective_transfer_mode,
             transfer_interface=transfer_interface,

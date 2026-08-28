@@ -364,6 +364,38 @@ def test_sglang_prepare_no_speculative_is_noop():
     assert _model_names(recipe) == before
 
 
+def _draft_entry(recipe, name):
+    return next(e for e in recipe.distribution_config.models.entries if e.name == name)
+
+
+def test_sglang_prepare_draft_model_is_unpinned_by_default():
+    """The draft repo must not inherit the served model's revision pin."""
+    runtime = SglangRuntime()
+    recipe = _sglang_recipe(model_revision="deadbeef", defaults={"speculative_draft_model_path": "draft/repo"})
+    runtime.prepare(recipe, hosts=["10.0.0.1"])
+    assert _draft_entry(recipe, "draft/repo").revision is None
+
+
+def test_sglang_prepare_pins_draft_model_revision_when_declared():
+    """speculative_draft_model_revision pins the draft repo, not the served one."""
+    runtime = SglangRuntime()
+    recipe = _sglang_recipe(
+        model_revision="deadbeef",
+        defaults={
+            "speculative_draft_model_path": "draft/repo",
+            "speculative_draft_model_revision": "cafe1234",
+        },
+    )
+    runtime.prepare(recipe, hosts=["10.0.0.1"])
+    assert _draft_entry(recipe, "draft/repo").revision == "cafe1234"
+    assert _draft_entry(recipe, "{model}").revision == "deadbeef"
+
+
+def test_sglang_draft_revision_key_is_declared_known():
+    """Otherwise report_unmapped_config_keys warns the key was dropped."""
+    assert "speculative_draft_model_revision" in SglangRuntime().known_config_keys()
+
+
 def test_sglang_speculative_canonical_emits_flag():
     """Generated command includes --speculative-draft-model-path."""
     runtime = SglangRuntime()

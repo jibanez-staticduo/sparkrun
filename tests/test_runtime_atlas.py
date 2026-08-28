@@ -428,6 +428,34 @@ def test_atlas_prepare_dedupes_when_draft_equals_main_model():
     assert names.count("Sehyo/Qwen3.5-35B-A3B-NVFP4") == 1
 
 
+def _atlas_entry(recipe, name):
+    return next(e for e in recipe.distribution_config.models.entries if e.name == name)
+
+
+def test_atlas_prepare_draft_model_is_unpinned_by_default():
+    """The draft repo must not inherit the served model's revision pin."""
+    runtime = AtlasRuntime()
+    recipe = _recipe(model_revision="deadbeef", defaults={"draft_model": "Sehyo/Qwen3.5-35B-Draft"})
+    runtime.prepare(recipe, hosts=["10.0.0.1"])
+    assert _atlas_entry(recipe, "Sehyo/Qwen3.5-35B-Draft").revision is None
+
+
+def test_atlas_prepare_pins_draft_model_revision_when_declared():
+    runtime = AtlasRuntime()
+    recipe = _recipe(
+        model_revision="deadbeef",
+        defaults={"draft_model": "Sehyo/Qwen3.5-35B-Draft", "draft_model_revision": "cafe1234"},
+    )
+    runtime.prepare(recipe, hosts=["10.0.0.1"])
+    assert _atlas_entry(recipe, "Sehyo/Qwen3.5-35B-Draft").revision == "cafe1234"
+    assert _atlas_entry(recipe, "{model}").revision == "deadbeef"
+
+
+def test_atlas_draft_revision_key_is_declared_known():
+    """Otherwise report_unmapped_config_keys warns the key was dropped."""
+    assert "draft_model_revision" in AtlasRuntime().known_config_keys()
+
+
 def test_atlas_prepare_with_cli_override():
     """prepare() respects CLI overrides via _effective_default."""
     runtime = AtlasRuntime()

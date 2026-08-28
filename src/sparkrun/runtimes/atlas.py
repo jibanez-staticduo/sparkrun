@@ -254,6 +254,10 @@ _ATLAS_SPARKRUN_OWNED_KEYS = frozenset(
         "world_size",
         "master_addr",
         "master_port",
+        # Distribution-only: pins the repo `--draft-model` names.  Atlas has no
+        # serve flag for it, and it is not the recipe's `model_revision` — that
+        # SHA belongs to the served model's repo.
+        "draft_model_revision",
     }
 )
 
@@ -335,7 +339,9 @@ class AtlasRuntime(RuntimePlugin):
         # noinspection PyProtectedMember
         draft_model = recipe._effective_default("draft_model")
         if draft_model:
-            recipe.distribution_config.add_model(str(draft_model))
+            # noinspection PyProtectedMember
+            draft_revision = recipe._effective_default("draft_model_revision")
+            recipe.distribution_config.add_model(str(draft_model), revision=str(draft_revision) if draft_revision else None)
 
     # --- Command generation ---
 

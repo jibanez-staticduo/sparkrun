@@ -242,16 +242,24 @@ class VllmMixin:
 
         return base
 
-    def detect_spec_config_draft_model(self, recipe: "Recipe") -> str | None:
+    def detect_spec_config_draft(self, recipe: "Recipe") -> tuple[str | None, str | None]:
+        """Return ``(draft_model, draft_revision)`` from ``speculative_config``.
+
+        The revision is read from the same JSON object as the model — it is
+        vLLM's own ``revision`` field, and it pins the *draft* repo.  It is
+        deliberately not defaulted to the recipe's ``model_revision``: that SHA
+        belongs to the served model's repo and does not exist in the draft's,
+        so inheriting it fails the download with ``Revision Not Found``.
+        """
         try:
             # TODO: support various ways that speculative config can be specified
             # noinspection PyProtectedMember
             spec_cfg = recipe._effective_default("speculative_config")
             spec_cfg_dict = json.loads(spec_cfg) or {}
             # intended primarily for dflash, but we allow any "model" field for future extensibility
-            return spec_cfg_dict.get("model", None)
+            return spec_cfg_dict.get("model", None), spec_cfg_dict.get("revision", None)
         except Exception:
-            return None
+            return None, None
 
 
 # Standard vLLM CLI flags and their recipe default keys

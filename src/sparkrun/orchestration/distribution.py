@@ -734,7 +734,6 @@ def distribute_from_config(
     cache_dir: str,
     config: SparkrunConfig,
     dry_run: bool,
-    model_revision: str | None = None,
     recipe_name: str = "",
     transfer_mode: str = "auto",
     transfer_interface: str | None = None,
@@ -764,7 +763,6 @@ def distribute_from_config(
         cache_dir: HuggingFace cache directory.
         config: SparkrunConfig instance.
         dry_run: Show what would be done without executing.
-        model_revision: Optional HuggingFace model revision to pin.
         recipe_name: Recipe name for pending-op lock display.
         transfer_mode: Distribution strategy.
         transfer_interface: Network interface for transfers.
@@ -814,7 +812,8 @@ def distribute_from_config(
     hf_token = _get_hf_token()
     if len(host_list) <= 1 and is_local_host(host_list[0]) and not _is_cross_user(ssh_kwargs):
         _do_local_ensure = dist_cfg.containers.enabled and not skip_container
-        _model_names = [e.name for e in dist_cfg.models.entries] if (dist_cfg.models.enabled and not skip_model) else []
+        _model_entries = list(dist_cfg.models.entries) if (dist_cfg.models.enabled and not skip_model) else []
+        _model_names = [e.name for e in _model_entries]
         lock_parts = [image] + _model_names
         _lock_key = hashlib.sha256("|".join(lock_parts).encode()).hexdigest()[:12]
         _lock_id = f"sparkrun_{_lock_key}"
@@ -835,12 +834,15 @@ def distribute_from_config(
                     raise DistributionError(f"Failed to pull or locate image: {image}")
         if after_container_sync is not None:
             after_container_sync()
-        if _model_names:
+        if _model_entries:
             with pending_op(_lock_id, "model_download", **_pop_kw):
-                for mn in _model_names:
+                for entry in _model_entries:
+                    mn = entry.name
                     logger.info("Ensuring model %s is available locally...", mn)
+                    # Per-entry revision, as on the cluster path below.
+                    entry_revision = getattr(entry, "revision", None)
                     if (
-                        download_model(mn, cache_dir=local_cache_dir or cache_dir, token=hf_token, revision=model_revision, dry_run=dry_run)
+                        download_model(mn, cache_dir=local_cache_dir or cache_dir, token=hf_token, revision=entry_revision, dry_run=dry_run)
                         != 0
                     ):
                         raise DistributionError(f"Failed to download model: {mn}")
@@ -950,7 +952,11 @@ def distribute_from_config(
             targets = _resolve_targets(entry.target if entry.target else [-1], host_list)
             if not targets:
                 continue
-            entry_revision = entry.revision or model_revision
+            # Per-entry and authoritative: the recipe's top-level model_revision
+            # is already stamped on the served model's entry, and a draft model
+            # added by runtime.prepare() is a different repo whose SHAs are its
+            # own (see DistributionModelEntry).
+            entry_revision = entry.revision
             logger.log(_PROGRESS_LEVEL, "  Distributing model %s to %d host(s)", entry.name, len(targets))
             with _timed(timeline, "launch.distribute.model", model=entry.name, mode=transfer_mode, targets=len(targets)):
                 with pending_op(_lock_id, "model_download", **_pop_kw):

@@ -100,7 +100,11 @@ class SglangRuntime(RuntimePlugin):
         distribution rather than emitted from the map.  See
         :func:`sparkrun.core.launcher.report_unmapped_config_keys`.
         """
-        return frozenset(_SGLANG_FLAG_MAP) | {"speculative_draft_model", "speculative_draft_model_path"}
+        return frozenset(_SGLANG_FLAG_MAP) | {
+            "speculative_draft_model",
+            "speculative_draft_model_path",
+            "speculative_draft_model_revision",
+        }
 
     def serve_flag_map(self):
         return _SGLANG_FLAG_MAP
@@ -129,7 +133,7 @@ class SglangRuntime(RuntimePlugin):
         """Pre-sync the speculative draft model when configured."""
         draft_model = self._detect_speculative_draft_model(recipe)
         if draft_model:
-            recipe.distribution_config.add_model(draft_model)
+            recipe.distribution_config.add_model(draft_model, revision=self._detect_speculative_draft_revision(recipe))
 
     @staticmethod
     def _detect_speculative_draft_model(recipe: "Recipe") -> str | None:
@@ -145,6 +149,19 @@ class SglangRuntime(RuntimePlugin):
             if val:
                 return str(val)
         return None
+
+    @staticmethod
+    def _detect_speculative_draft_revision(recipe: "Recipe") -> str | None:
+        """Resolve the pin for the draft model's *own* repo, if declared.
+
+        Distribution-only, like the draft model path itself — SGLang has no
+        serve flag for it.  Absent a declaration the draft model is fetched
+        unpinned; the recipe's ``model_revision`` is emphatically not a
+        substitute, since that SHA exists only in the served model's repo.
+        """
+        # noinspection PyProtectedMember
+        val = recipe._effective_default("speculative_draft_model_revision")
+        return str(val) if val else None
 
     def generate_command(
         self,

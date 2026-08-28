@@ -56,6 +56,19 @@ unverifiable node never blocks the launch.
 `model_revision` affects download, cache checking, VRAM auto-detection, and model sync. Pin to a commit hash for
 reproducible deployments.
 
+It pins **`model` only**. A launch may distribute several repos — notably a speculative draft model, which the runtime
+adds automatically — and a commit hash is only valid in the repo it came from, so nothing else inherits it. Pin a draft
+model with its own key:
+
+| Runtime                          | Draft model key                  | Revision key                          |
+|----------------------------------|----------------------------------|---------------------------------------|
+| `sglang`                         | `speculative_draft_model_path`   | `speculative_draft_model_revision`    |
+| `vllm-ray`, `vllm-distributed`   | `speculative_config` → `model`   | `speculative_config` → `revision`     |
+| `atlas`                          | `draft_model`                    | `draft_model_revision`                |
+
+The same rule applies to a hand-written `distribution_config`: each entry's `revision` is authoritative, and an entry
+without one is fetched unpinned.
+
 ### Topology
 
 | Field          | Type                                | Default  | Description                                               |
