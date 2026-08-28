@@ -56,7 +56,15 @@ def distribute_tuning_to_hosts(
         logger.debug("No remote hosts for tuning distribution")
         return []
 
-    from sparkrun.orchestration.ssh import run_rsync_parallel, build_ssh_opts_string, run_remote_script
+    from sparkrun.orchestration.ssh import NFS_SAFE_ATTR_OPTS, run_rsync_parallel, build_ssh_opts_string, run_remote_script
+    from sparkrun.orchestration.transfer import map_transfer_failures
+
+    # Tuning configs land in the SSH user's own cache dir, which on a shared
+    # /home is routinely owned by a different uid than the one we connect as.
+    # Without the NFS-safe relaxation rsync transfers every config and then
+    # exits 23 setting times on the destination root.  --mkpath because the
+    # per-runtime subdirectory may not exist on a host that has never tuned.
+    tuning_rsync_options = ["-az", "--delete", "--mkpath", "--partial", *NFS_SAFE_ATTR_OPTS]
 
     source = str(tuning_dir)
     remote_dest = _get_remote_tuning_dir(runtime, ssh_user=ssh_user)
@@ -82,10 +90,10 @@ def distribute_tuning_to_hosts(
             ssh_user=ssh_user,
             ssh_key=ssh_key,
             ssh_options=ssh_options,
-            rsync_options=["-az", "--delete", "--partial"],
+            rsync_options=tuning_rsync_options,
             dry_run=dry_run,
         )
-        head_failed = [r.host for r in head_results if not r.success]
+        head_failed = map_transfer_failures(head_results, [head], [head])
         if head_failed:
             logger.warning("Tuning config push to head failed: %s", head)
             return list(remote_hosts)
@@ -102,12 +110,13 @@ def distribute_tuning_to_hosts(
             "set -euo pipefail\n"
             'SOURCE="{source}"\n'
             "for TARGET in {targets}; do\n"
-            '  rsync -az --delete --partial -e "ssh {ssh_opts}" '
+            '  rsync {attr_flags} -e "ssh {ssh_opts}" '
             '"$SOURCE/" {user_prefix}$TARGET:"$SOURCE/"\n'
             "done\n"
         ).format(
             source=remote_dest,
             targets=targets_str,
+            attr_flags=" ".join(tuning_rsync_options),
             ssh_opts=ssh_opts,
             user_prefix=user_prefix,
         )
@@ -142,11 +151,11 @@ def distribute_tuning_to_hosts(
         ssh_user=ssh_user,
         ssh_key=ssh_key,
         ssh_options=ssh_options,
-        rsync_options=["-az", "--delete", "--partial"],
+        rsync_options=tuning_rsync_options,
         dry_run=dry_run,
     )
 
-    failed = [r.host for r in results if not r.success]
+    failed = map_transfer_failures(results, remote_hosts, remote_hosts)
     if failed:
         logger.warning("Tuning config distribution failed on hosts: %s", failed)
     else:

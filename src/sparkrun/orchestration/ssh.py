@@ -24,7 +24,29 @@ from sparkrun.utils.shell import quote, quote_list, args_list_to_shell_str, stdi
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_RSYNC_OPTIONS = ["-az", "--mkpath", "--partial", "--links"]
+# The three attribute classes rsync cannot apply to a *destination directory it
+# does not own* — the common case for a cache on NFS (root_squash, a differing
+# uid mapping, or a directory a container created as root).  rsync transfers the
+# data fine, then the generator EPERMs applying attributes to the destination
+# root and exits 23, so a complete transfer is reported as a failure:
+#
+#     rsync: [generator] chgrp "/cache/." failed: Operation not permitted (1)
+#     rsync error: some files/attrs were not transferred (code 23)
+#
+# ``-a`` implies ``-rlptgoD``; of those only ``-p``, ``-g`` and directory times
+# can fail this way (``-o`` is already a no-op for a non-root user).  Dropping
+# them costs nothing we rely on: rsync still creates *new* files with the
+# source's mode masked by the receiving umask, so executability survives (which
+# matters for the hook/mod paths that stage scripts) — ``--no-perms`` only
+# declines to chmod files that already exist.  File times (``-t``) are kept,
+# since rsync writes via temp-file+rename and therefore owns what it creates.
+#
+# This is the *default* relaxation, applied everywhere.  ``preserve_perms:
+# false`` remains the harder one (it also drops ``-t``) but is no longer needed
+# for the ordinary shared-cache case.
+NFS_SAFE_ATTR_OPTS = ["--no-perms", "--no-group", "--omit-dir-times"]
+
+_DEFAULT_RSYNC_OPTIONS = ["-az", "--mkpath", "--partial", "--links", *NFS_SAFE_ATTR_OPTS]
 
 # Default cap on concurrent SSH/rsync fan-out workers.  At 32+ hosts an
 # uncapped ``max_workers=len(hosts)`` spawns one SSH (or ``docker save|ssh
@@ -219,8 +241,18 @@ def _decode(raw: bytes | str | None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _failure_detail(result: "RemoteResult", limit: int = 200) -> str:
-    """Best available one-line explanation for a failed remote script.
+# Truncation budget for a failed command's captured output.  The default suits
+# a probe that fails on one line.  rsync does not: it reports one line *per
+# problem file* and its most diagnostic line is rarely the first, so 200 chars
+# routinely cut a message mid-path — leaving ``mkdir ".../sglang/c`` with the
+# reason it failed truncated away, which is precisely the byte that decides
+# whether a transfer completed.
+_DEFAULT_FAILURE_DETAIL_LIMIT = 200
+RSYNC_FAILURE_DETAIL_LIMIT = 2000
+
+
+def _failure_detail(result: "RemoteResult", limit: int = _DEFAULT_FAILURE_DETAIL_LIMIT) -> str:
+    """Best available explanation for a failed remote script.
 
     Falls back from stderr to stdout, then to an explicit ``(no output)``.
     Logging stderr alone produced a bare ``FAILED rc=1 (0.3s):`` with nothing
@@ -229,11 +261,16 @@ def _failure_detail(result: "RemoteResult", limit: int = 200) -> str:
     diagnostics. An empty reason reads as a tool malfunction rather than as a
     remote command that failed for a stated reason.  Mirrors the fallback
     :func:`sparkrun.orchestration.hooks._run_exec_command` already applies.
+
+    Truncation is marked when it happens, so a reader can tell a complete
+    message from a clipped one rather than guessing at the tail.
     """
     for stream in (result.stderr, result.stdout):
         text = (stream or "").strip()
         if text:
-            return text[:limit]
+            if len(text) > limit:
+                return text[:limit] + "… (truncated)"
+            return text
     return "(no output)"
 
 
@@ -245,6 +282,7 @@ def _run_subprocess(
     input_data: str | None = None,
     shell: bool = False,
     quiet: bool = False,
+    detail_limit: int = _DEFAULT_FAILURE_DETAIL_LIMIT,
 ) -> RemoteResult:
     """Run a subprocess and return a RemoteResult with standard error handling.
 
@@ -260,6 +298,9 @@ def _run_subprocess(
         shell: Whether to use shell=True.
         quiet: If True, downgrade failure logging from WARNING to DEBUG.
             Used for expected-failure probes (e.g. NOPASSWD sudo checks).
+        detail_limit: Truncation budget for the logged failure output.
+            Commands whose diagnostics run to many lines (rsync) pass a
+            larger budget — see :data:`RSYNC_FAILURE_DETAIL_LIMIT`.
 
     Returns:
         RemoteResult with returncode, stdout, stderr.
@@ -294,7 +335,7 @@ def _run_subprocess(
                 host,
                 proc.returncode,
                 elapsed,
-                _failure_detail(result),
+                _failure_detail(result, limit=detail_limit),
             )
         return result
     except subprocess.TimeoutExpired:
@@ -1116,7 +1157,7 @@ def _run_rsync_impl(
     logger.info("  Rsync %s %s%s", direction, host, f" [timeout={timeout}s]" if timeout else "")
     logger.debug("Rsync command: %s", " ".join(cmd))
 
-    result = _run_subprocess(cmd, host, "Rsync", timeout=timeout)
+    result = _run_subprocess(cmd, host, "Rsync", timeout=timeout, detail_limit=RSYNC_FAILURE_DETAIL_LIMIT)
     if result.success:
         logger.info("  Rsync %s %s OK", direction, host)
     return result

@@ -17,6 +17,7 @@ from sparkrun.orchestration.transfer import (
 )
 from sparkrun.orchestration.ssh import (
     HEAD_DISTRIBUTE_MAX_PARALLEL,
+    NFS_SAFE_ATTR_OPTS,
     build_ssh_opts_string,
     run_remote_scripts_parallel,
     run_rsync_parallel,
@@ -46,13 +47,13 @@ def _model_rsync_options(preserve_perms: bool) -> list[str]:
     The HF cache is content-addressed (``blobs/<sha256>``), so transfers only
     need contents + symlinks; ``--size-only`` skips already-synced shards
     instantly.  When *preserve_perms* is ``True`` we keep ``-a`` (archive,
-    historical default).  When ``False`` we use ``-r --links`` and omit the
-    owner/group/perm/time preservation that ``-a`` implies — these trigger
-    ``chgrp``/``chown`` operations that fail with ``Operation not permitted``
-    on shared/NFS caches under root_squash (rsync exits 23).
+    historical default) minus :data:`~sparkrun.orchestration.ssh.NFS_SAFE_ATTR_OPTS`,
+    which is what makes the default work on a shared/NFS cache without
+    configuration.  When ``False`` we use ``-r --links``, additionally dropping
+    file times — the harder relaxation, for destinations where even that EPERMs.
     """
     if preserve_perms:
-        return ["-a", "--size-only", "--mkpath", "--partial", "--links"]
+        return ["-a", "--size-only", "--mkpath", "--partial", "--links", *NFS_SAFE_ATTR_OPTS]
     return ["-r", "--links", "--size-only", "--mkpath", "--partial"]
 
 
@@ -376,9 +377,10 @@ def distribute_model_from_head(
         )
         return [TransferFailure(host=h, reason="model download on head failed (see log above)") for h in failed_hosts]
 
-    # Build distribute script (rsync from head to workers).  When perms are not
-    # preserved we use ``-r --links`` instead of ``-a`` so the unprivileged SSH
-    # user doesn't trip chgrp/chown on a shared/NFS destination (rsync rc=23).
+    # Build distribute script (rsync from head to workers).  The head→worker hop
+    # lands on the same kind of destination as the control→host one, so it takes
+    # the same NFS-safe attribute relaxation; when perms are not preserved we use
+    # ``-r --links`` instead of ``-a``, additionally dropping file times.
     targets = worker_transfer_hosts or hosts[1:]
     model_path = model_cache_path(model_id, cache)
     ssh_opts = build_ssh_opts_string(
@@ -386,7 +388,7 @@ def distribute_model_from_head(
         ssh_key=ssh_key,
         ssh_options=ssh_options,
     )
-    rsync_attr_flags = "-a" if preserve_perms else "-r --links"
+    rsync_attr_flags = " ".join(["-a", *NFS_SAFE_ATTR_OPTS]) if preserve_perms else "-r --links"
     dist_script = read_script("model_distribute.sh").format(
         model_path=model_path,
         targets=" ".join(targets),
