@@ -455,6 +455,43 @@ the injected value. `ClusterDefinition.mgmt_interface` is the persistent
 override, threaded through `detect_ib_for_hosts` / `distribute_from_config` /
 solo `_run_solo`.
 
+**Address-persistence attribution** (`scripts/_net_persist.sh`): "will this CX7
+address survive a reboot?" was answered by testing for
+`/etc/netplan/40-cx7.yaml`, which actually answers "did *sparkrun* write it?".
+Those are different questions, and `setup check` reported every host
+configured another way as a defect — pointing at a `sparkrun setup cx7` that
+then correctly did nothing, because `plan_cluster_cx7` already reads the live
+IPs and returns `"already configured"`. On Ubuntu 24.04 / DGX OS 7 the false
+positive is the *common* case: netplan renders through NetworkManager, and
+`nmcli con add` writes its own `90-NM-<uuid>.yaml`.
+
+The helper attributes the live address to whatever owns it, first hit wins:
+`netplan status --format=json` (an interface netplan owns carries an `id`;
+this is netplan's *merged* view, so any filename counts) → the active
+NetworkManager profile (`autoconnect` + `ipv4.method` + a matching
+`ipv4.addresses`) → `networkctl`'s `Network File:` → `/etc/network/interfaces`.
+Every probe is read-only and works unprivileged — deliberately, since `netplan
+get` does not (the files are mode 600) and detection runs as the SSH user.
+
+`CX7Persistence` is tri-state and that is the load-bearing part: **`UNKNOWN`
+(no probe available) must never render as "won't survive reboot"** — the rule
+`TerminationInfo.exists=None` follows. A failing `nmcli` counts as *unprobed*
+rather than as "NM says no", so a half-interrogated host degrades to `UNKNOWN`
+rather than to `EPHEMERAL`. `EPHEMERAL` is only claimed when a probe actually
+answered and nothing owned the address. `CX7HostDetection.netplan_exists`
+survives, but now means only "sparkrun's own file is present", which is what
+the *uninstall* path needs.
+
+Two consequences beyond the check. `plan_cluster_cx7` / `plan_ring_cx7` warn
+(never refuse) when they would reconfigure a device a non-netplan source
+persists — writing `CX7_NETPLAN_FILE` there leaves two owners, and which wins
+is a property of the host's renderer. And `cx7_unconfigure.sh` reports
+`FOREIGN:` for interfaces it cannot release instead of printing `SKIPPED` and
+letting `setup uninstall` claim a teardown it did not perform; `_teardown_cx7`
+renders those as `[WARN]`. `CX7_NETPLAN_FILE` is the one Python spelling of
+the path, drift-guarded against the two bash scripts by a test (they include
+brace-using helpers, so they cannot take it as a `.format()` placeholder).
+
 **Session guard** (`ssh.py:wrap_with_session_guard` + `scripts/session_guard.sh`):
 remote payloads run via `ssh <host> bash -s`, i.e. **without a PTY**, so on
 disconnect sshd's session process exits without signalling its child (the

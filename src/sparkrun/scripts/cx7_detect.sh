@@ -6,6 +6,7 @@
 set -uo pipefail
 
 # sparkrun:include _mgmt_iface.sh
+# sparkrun:include _net_persist.sh
 
 echo "Running CX7 interface detection..." >&2
 
@@ -37,6 +38,10 @@ declare -a IFACE_MTUS=()
 declare -a IFACE_STATES=()
 declare -a IFACE_HCAS=()
 declare -a IFACE_MACS=()
+declare -a IFACE_PERSIST=()
+declare -a IFACE_PERSIST_SOURCE=()
+declare -a IFACE_PERSIST_DETAIL=()
+declare -a IFACE_DHCP=()
 
 for ib_path in /sys/class/infiniband/*; do
     [ -e "$ib_path" ] || continue
@@ -82,7 +87,15 @@ for ib_path in /sys/class/infiniband/*; do
         subnet=""
     fi
 
-    echo "Device $hca_name: Active, interface=$net_if, ip=$ip_addr/$prefix, mtu=$mtu, state=$operstate" >&2
+    # Ask which config source (if any) persists this address, rather than
+    # looking for a specific netplan filename -- see _net_persist.sh.
+    persist_raw=$(sparkrun_net_persistence "$net_if" "$ip_addr")
+    persist_state=$(printf '%s' "$persist_raw" | cut -d'|' -f1)
+    persist_source=$(printf '%s' "$persist_raw" | cut -d'|' -f2)
+    persist_detail=$(printf '%s' "$persist_raw" | cut -d'|' -f3-)
+    is_dhcp=$(sparkrun_net_is_dhcp "$net_if")
+
+    echo "Device $hca_name: Active, interface=$net_if, ip=$ip_addr/$prefix, mtu=$mtu, state=$operstate, persistence=$persist_state${persist_source:+ ($persist_source)}" >&2
 
     IFACE_NAMES+=("$net_if")
     IFACE_IPS+=("$ip_addr")
@@ -91,6 +104,10 @@ for ib_path in /sys/class/infiniband/*; do
     IFACE_MTUS+=("$mtu")
     IFACE_STATES+=("$operstate")
     IFACE_HCAS+=("$hca_name")
+    IFACE_PERSIST+=("$persist_state")
+    IFACE_PERSIST_SOURCE+=("$persist_source")
+    IFACE_PERSIST_DETAIL+=("$persist_detail")
+    IFACE_DHCP+=("$is_dhcp")
 
     # MAC address
     mac_addr=$(cat "/sys/class/net/$net_if/address" 2>/dev/null || echo "")
@@ -105,7 +122,11 @@ if [ "$IFACE_COUNT" -eq 0 ]; then
     exit 0
 fi
 
-# --- Check for existing netplan config ---
+# --- Check for sparkrun's own netplan config ---
+# This says "did sparkrun write this host's config", NOT "is the address
+# persistent" -- that question is answered per-interface above, because a
+# working config may equally live in another netplan file, a NetworkManager
+# profile, a .network unit or /etc/network/interfaces.
 NETPLAN_EXISTS=0
 if [ -f /etc/netplan/40-cx7.yaml ]; then
     NETPLAN_EXISTS=1
@@ -168,6 +189,10 @@ for i in $(seq 0 $((IFACE_COUNT - 1))); do
     echo "CX7_IFACE_${i}_STATE=${IFACE_STATES[$i]}"
     echo "CX7_IFACE_${i}_HCA=${IFACE_HCAS[$i]}"
     echo "CX7_IFACE_${i}_MAC=${IFACE_MACS[$i]}"
+    echo "CX7_IFACE_${i}_PERSIST=${IFACE_PERSIST[$i]}"
+    echo "CX7_IFACE_${i}_PERSIST_SOURCE=${IFACE_PERSIST_SOURCE[$i]}"
+    echo "CX7_IFACE_${i}_PERSIST_DETAIL=${IFACE_PERSIST_DETAIL[$i]}"
+    echo "CX7_IFACE_${i}_DHCP=${IFACE_DHCP[$i]}"
 done
 
 echo "CX7_USED_SUBNETS=$USED_SUBNETS"
