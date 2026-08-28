@@ -288,12 +288,17 @@ def detect_infiniband(
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
     topology: str | None = None,
+    mgmt_interface: str | None = None,
 ) -> ClusterCommEnv:
     """Run InfiniBand detection on *hosts* and return a :class:`ClusterCommEnv`.
 
     Probes IB on all hosts in parallel and builds a comm env with
     shared keys factored out and per-host interface overrides kept
     separate.
+
+    *mgmt_interface* pins the management interface on every host, overriding
+    detection (see
+    :attr:`~sparkrun.core.cluster_manager.ClusterDefinition.mgmt_interface`).
     """
     if not hosts:
         return ClusterCommEnv.empty()
@@ -305,6 +310,7 @@ def detect_infiniband(
         ssh_kwargs=ssh_kwargs,
         dry_run=dry_run,
         topology=topology,
+        mgmt_interface=mgmt_interface,
     )
     # ``head_host`` is accepted for backward-compat with older callers
     # but the per-host map is now the source of truth — logging is
@@ -315,9 +321,10 @@ def detect_infiniband(
 
 def detect_infiniband_local(
     dry_run: bool = False,
+    mgmt_interface: str | None = None,
 ) -> ClusterCommEnv:
     """Run InfiniBand detection locally and return a :class:`ClusterCommEnv`."""
-    ib_script = generate_ib_detect_script()
+    ib_script = generate_ib_detect_script(mgmt_interface)
     result = run_local_script(ib_script, dry_run=dry_run)
     if result.success:
         ib_info = parse_ib_detect_output(result.stdout)

@@ -356,6 +356,12 @@ cluster_import.add_command(cluster_import_svd, "eugr")
     help="CX7 topology (none=remove, direct/switch=switched fabric, ring=3-node mesh/ring)",
 )
 @click.option(
+    "--mgmt-interface",
+    default=None,
+    help="Pin the management/control interface name on every host (e.g. enP7s7), overriding detection. "
+    "Needed only where detection can't decide — e.g. a bonded or VLAN management link. Pass empty string to clear.",
+)
+@click.option(
     "--infer-hardware",
     is_flag=True,
     help="SSH into each cluster host, detect accelerators (NVIDIA/AMD/Intel/Apple) + IB, and persist per-host hardware metadata",
@@ -407,6 +413,7 @@ def cluster_update(
     transfer_mode,
     transfer_interface,
     topology,
+    mgmt_interface,
     infer_hardware,
     executor_name,
     executor_opts,
@@ -449,6 +456,7 @@ def cluster_update(
     transfer_mode_provided = ctx.get_parameter_source("transfer_mode") == ParameterSource.COMMANDLINE
     transfer_interface_provided = ctx.get_parameter_source("transfer_interface") == ParameterSource.COMMANDLINE
     topology_provided = ctx.get_parameter_source("topology") == ParameterSource.COMMANDLINE
+    mgmt_interface_provided = ctx.get_parameter_source("mgmt_interface") == ParameterSource.COMMANDLINE
     executor_provided = ctx.get_parameter_source("executor_name") == ParameterSource.COMMANDLINE
     executor_opts_provided = bool(executor_opts) or clear_executor_config
     scheduler_provided = ctx.get_parameter_source("scheduler_name") == ParameterSource.COMMANDLINE
@@ -463,6 +471,7 @@ def cluster_update(
         and not transfer_mode_provided
         and not transfer_interface_provided
         and not topology_provided
+        and not mgmt_interface_provided
         and not infer_hardware
         and not executor_provided
         and not executor_opts_provided
@@ -472,7 +481,7 @@ def cluster_update(
         click.echo(
             "Error: Nothing to update. Provide --hosts, --hosts-file, --add-host, "
             "--remove-host, -d, --user, --cache-dir, --transfer-mode, "
-            "--transfer-interface, --topology, --infer-hardware, --executor, "
+            "--transfer-interface, --topology, --mgmt-interface, --infer-hardware, --executor, "
             "--executor-opt, --clear-executor-config, --scheduler, or --max-gpu-mem-util.",
             err=True,
         )
@@ -536,6 +545,9 @@ def cluster_update(
             update_kwargs["topology"] = "switch"
         else:
             update_kwargs["topology"] = topology
+    if mgmt_interface_provided:
+        # Empty string clears the pin and restores per-host detection
+        update_kwargs["mgmt_interface"] = mgmt_interface.strip() if mgmt_interface and mgmt_interface.strip() else None
     if executor_provided:
         # Empty string clears the executor selector
         update_kwargs["executor"] = executor_name if executor_name else None
@@ -686,6 +698,8 @@ def cluster_show(ctx, name, output_json):
         click.echo(f"Xfer iface:  {c.transfer_interface}")
     if c.topology:
         click.echo(f"Topology:    {c.topology}")
+    if c.mgmt_interface:
+        click.echo(f"Mgmt iface:  {c.mgmt_interface}")
     if c.executor:
         click.echo(f"Executor:    {c.executor}")
     if c.executor_config:
@@ -1232,7 +1246,14 @@ def cluster_inspect(ctx, name, hosts, hosts_file, cluster_name, dry_run, output_
     # Resolve auto transfer mode to a concrete value
     from sparkrun.orchestration.distribution import resolve_auto_transfer_mode
 
-    xfer_result = resolve_auto_transfer_mode(xfer_mode, host_list, ssh_kwargs=ssh_kwargs, dry_run=dry_run, topology=cluster_cfg.topology)
+    xfer_result = resolve_auto_transfer_mode(
+        xfer_mode,
+        host_list,
+        ssh_kwargs=ssh_kwargs,
+        dry_run=dry_run,
+        topology=cluster_cfg.topology,
+        mgmt_interface=cluster_cfg.mgmt_interface,
+    )
     resolved_mode = xfer_result.mode
 
     # Detect IB / NCCL env — reuse from transfer mode resolution if available,
@@ -1241,7 +1262,9 @@ def cluster_inspect(ctx, name, hosts, hosts_file, cluster_name, dry_run, output_
     if ib_result is None and not dry_run:
         from sparkrun.orchestration.infiniband import detect_ib_for_hosts
 
-        ib_result = detect_ib_for_hosts(host_list, ssh_kwargs=ssh_kwargs, topology=cluster_cfg.topology)
+        ib_result = detect_ib_for_hosts(
+            host_list, ssh_kwargs=ssh_kwargs, topology=cluster_cfg.topology, mgmt_interface=cluster_cfg.mgmt_interface
+        )
 
     nccl_env = ib_result.comm_env.get_env(host_list[0]) if ib_result else {}
 
@@ -1307,6 +1330,7 @@ def cluster_inspect(ctx, name, hosts, hosts_file, cluster_name, dry_run, output_
         "transfer_interface": xfer_iface or "auto",
         "transfer_interface_resolved": resolved_iface,
         "topology": cluster_cfg.topology,
+        "mgmt_interface": cluster_cfg.mgmt_interface,
         "hf_cache_local": local_hf,
         "hf_cache_remote": remote_hf,
         "sparkrun_cache": local_sparkrun,
@@ -1363,6 +1387,7 @@ def cluster_inspect(ctx, name, hosts, hosts_file, cluster_name, dry_run, output_
     cfg_iface = xfer_iface or "auto"
     click.echo("  transfer_interface: %s" % _fmt_resolved(cfg_iface, resolved_iface))
     click.echo("  topology:           %s" % (cluster_cfg.topology or "(none)"))
+    click.echo("  mgmt_interface:     %s" % (cluster_cfg.mgmt_interface or "(auto-detect)"))
     if scheduler_defaulted:
         click.echo("  scheduler:          %s (default — not set on this cluster)" % effective_scheduler)
     else:

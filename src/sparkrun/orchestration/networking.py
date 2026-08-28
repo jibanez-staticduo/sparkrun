@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from sparkrun.orchestration.infiniband import parse_kv_output
-from sparkrun.scripts import read_script
+from sparkrun.scripts import inject_shell_vars, read_script
 from sparkrun.utils.shell import quote
 
 logger = logging.getLogger(__name__)
@@ -118,9 +118,16 @@ class CX7ClusterPlan:
 # ---------------------------------------------------------------------------
 
 
-def generate_cx7_detect_script() -> str:
-    """Load the CX7 detection bash script."""
-    return read_script("cx7_detect.sh")
+def generate_cx7_detect_script(mgmt_interface: str | None = None) -> str:
+    """Load the CX7 detection bash script.
+
+    Args:
+        mgmt_interface: Optional management interface to pin, overriding
+            detection on the host.  The script uses it only to exclude the
+            management NIC from the CX7 interface list (see
+            :attr:`~sparkrun.core.cluster_manager.ClusterDefinition.mgmt_interface`).
+    """
+    return inject_shell_vars(read_script("cx7_detect.sh"), SPARKRUN_MGMT_IFACE=mgmt_interface)
 
 
 def parse_cx7_detect_output(output: str) -> dict[str, str]:

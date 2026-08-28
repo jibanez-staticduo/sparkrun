@@ -72,6 +72,16 @@ class ClusterContext:
     through; runtimes that consume it must fall back to ``enumerate(hosts)``.
     """
 
+    @property
+    def mgmt_interface(self) -> str | None:
+        """Management interface pinned by the cluster, if any.
+
+        Read from :attr:`cluster` rather than stored separately so it cannot
+        drift from the definition — see
+        :attr:`~sparkrun.core.cluster_manager.ClusterDefinition.mgmt_interface`.
+        """
+        return self.cluster.mgmt_interface if self.cluster is not None else None
+
     def hardware_for(self, host: str):
         """Return per-host :class:`HostHardware` (DGX Spark default when unknown)."""
         from sparkrun.core.hardware import default_dgx_spark_hardware
@@ -490,6 +500,7 @@ def resolve_comm_env(
         dry_run=ctx.dry_run,
         topology=ctx.topology,
         backends=backends,
+        mgmt_interface=ctx.mgmt_interface,
     )
     if ib_result.comm_env.is_empty():
         logger.info("  No InfiniBand detected, using default networking")
@@ -542,6 +553,7 @@ def detect_ib_with_ips(
         dry_run=ctx.dry_run,
         topology=ctx.topology,
         backends=backends,
+        mgmt_interface=ctx.mgmt_interface,
     )
     return ib_result.comm_env, ib_result.ib_ip_map, ib_result.ib_iface_map
 

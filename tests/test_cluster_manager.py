@@ -90,6 +90,52 @@ def test_update_max_gpu_memory_utilization(tmp_path: Path):
     assert manager.get("c").max_gpu_memory_utilization is None
 
 
+def test_mgmt_interface_round_trips(tmp_path: Path):
+    """mgmt_interface (issue #275) survives create/update/load; unset is omitted."""
+    manager = ClusterManager(tmp_path)
+
+    manager.create("plain", ["host1"])
+    plain = manager.get("plain")
+    assert plain.mgmt_interface is None
+    assert "mgmt_interface" not in plain.to_dict()
+
+    manager.create("pinned", ["a", "b"], mgmt_interface="enP7s7")
+    assert manager.get("pinned").mgmt_interface == "enP7s7"
+    assert manager.get("pinned").to_dict()["mgmt_interface"] == "enP7s7"
+
+    # An unrelated update leaves the pin intact (_UNSET sentinel).
+    manager.update("pinned", topology="switch")
+    assert manager.get("pinned").mgmt_interface == "enP7s7"
+
+    manager.update("pinned", mgmt_interface="enP7s8")
+    assert manager.get("pinned").mgmt_interface == "enP7s8"
+
+    # Explicit clear restores per-host detection.
+    manager.update("pinned", mgmt_interface=None)
+    assert manager.get("pinned").mgmt_interface is None
+    assert "mgmt_interface" not in manager.get("pinned").to_dict()
+
+
+def test_mgmt_interface_reaches_resolved_config(tmp_path: Path):
+    """It applies whenever the cluster is named — even with explicit --hosts.
+
+    The pinned NIC is a property of the machines, not of how their addresses
+    were supplied, so it must not be gated like transfer_mode/topology are.
+    """
+    from sparkrun.core.cluster_manager import resolve_cluster_config
+
+    manager = ClusterManager(tmp_path)
+    manager.create("c", ["a", "b"], mgmt_interface="enP7s7", topology="switch")
+
+    from_cluster = resolve_cluster_config("c", None, None, manager)
+    assert from_cluster.mgmt_interface == "enP7s7"
+    assert from_cluster.topology == "switch"
+
+    explicit_hosts = resolve_cluster_config("c", "a,b", None, manager)
+    assert explicit_hosts.mgmt_interface == "enP7s7"
+    assert explicit_hosts.topology is None  # host-list-gated, unlike mgmt_interface
+
+
 def test_fabric_interfaces_round_trips(tmp_path: Path):
     """fabric_interfaces (issue #203) survives create/update/load; empty is omitted."""
     manager = ClusterManager(tmp_path)

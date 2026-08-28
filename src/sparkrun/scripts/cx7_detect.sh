@@ -5,6 +5,8 @@
 
 set -uo pipefail
 
+# sparkrun:include _mgmt_iface.sh
+
 echo "Running CX7 interface detection..." >&2
 
 if ! [ -d /sys/class/infiniband ]; then
@@ -13,8 +15,16 @@ if ! [ -d /sys/class/infiniband ]; then
 fi
 
 # --- Detect management interface and IP ---
-MGMT_IFACE=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
-MGMT_IP=$(ip -4 addr show "$MGMT_IFACE" 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)
+# No exclude list here: MGMT_IFACE is needed to skip the management NIC during
+# the scan below, so it must be resolved before the CX7 interfaces are known.
+# The helper declines to select an RDMA-backed NIC on its own, which is what
+# keeps a CX7 port from being mistaken for the management interface.  An empty
+# answer is harmless -- it simply matches no interface in the skip test.
+MGMT_IFACE=$(sparkrun_mgmt_iface "")
+MGMT_IP=""
+if [ -n "$MGMT_IFACE" ]; then
+    MGMT_IP=$(ip -4 addr show "$MGMT_IFACE" 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)
+fi
 echo "Management interface: $MGMT_IFACE ($MGMT_IP)" >&2
 
 # --- Find active CX7/RoCE interfaces ---

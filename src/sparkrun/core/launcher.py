@@ -950,12 +950,18 @@ def launch_inference(
         config,
         dry_run=dry_run,
     )
+    # Management interface pinned by the cluster, threaded into every host
+    # probe this launch performs (see ClusterDefinition.mgmt_interface).
+    # ``None`` for host-list-only launches, which detect per host.
+    mgmt_interface = cluster.mgmt_interface if cluster is not None else None
+
     transfer_result = resolve_auto_transfer_mode(
         transfer_mode or "auto",
         host_list,
         ssh_kwargs=ssh_kwargs,
         dry_run=dry_run,
         topology=topology,
+        mgmt_interface=mgmt_interface,
     )
     effective_transfer_mode = transfer_result.mode
 
@@ -1236,6 +1242,7 @@ def launch_inference(
             local_cache_dir=effective_local_cache,
             pre_ib=transfer_result,
             topology=topology,
+            mgmt_interface=mgmt_interface,
             prefs=_model_prefs,
             skip_model=_skip_model,
             skip_container=_skip_container,

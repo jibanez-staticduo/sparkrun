@@ -73,6 +73,7 @@ def resolve_auto_transfer_mode(
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
     topology: str | None = None,
+    mgmt_interface: str | None = None,
 ) -> TransferModeResult:
     """Resolve ``"auto"`` transfer mode to a concrete strategy.
 
@@ -119,7 +120,7 @@ def resolve_auto_transfer_mode(
     # resolve definitively and cache results for distribute_resources().
     from sparkrun.orchestration.infiniband import detect_ib_for_hosts, validate_ib_connectivity
 
-    ib_result = detect_ib_for_hosts(host_list, ssh_kwargs=ssh_kwargs, dry_run=dry_run, topology=topology)
+    ib_result = detect_ib_for_hosts(host_list, ssh_kwargs=ssh_kwargs, dry_run=dry_run, topology=topology, mgmt_interface=mgmt_interface)
     ib_validated = validate_ib_connectivity(ib_result.ib_candidates, ssh_kwargs=ssh_kwargs, dry_run=dry_run)
 
     if ib_validated:
@@ -738,6 +739,7 @@ def distribute_from_config(
     local_cache_dir: str | None = None,
     pre_ib: TransferModeResult | None = None,
     topology: str | None = None,
+    mgmt_interface: str | None = None,
     prefs: ModelDistributionPrefs | None = None,
     skip_model: bool = False,
     skip_container: bool = False,
@@ -832,7 +834,7 @@ def distribute_from_config(
         _ib_validated = pre_ib.ib_validated
         _auto_delegated = pre_ib.auto_delegated
     else:
-        ib_result = detect_ib_for_hosts(host_list, ssh_kwargs=ssh_kwargs, dry_run=dry_run, topology=topology)
+        ib_result = detect_ib_for_hosts(host_list, ssh_kwargs=ssh_kwargs, dry_run=dry_run, topology=topology, mgmt_interface=mgmt_interface)
         _ib_validated = None
         if transfer_mode in ("auto", "local"):
             _ib_validated = validate_ib_connectivity(ib_result.ib_candidates, ssh_kwargs=ssh_kwargs, dry_run=dry_run)

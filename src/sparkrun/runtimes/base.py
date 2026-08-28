@@ -1214,9 +1214,13 @@ class RuntimePlugin(Plugin):
 
         if len(hosts) <= 1:
             # Pop cluster-aware kwargs that solo path doesn't need yet
-            # (placement is meaningless for single-host workloads).
-            kwargs.pop("cluster", None)
+            # (placement is meaningless for single-host workloads).  The
+            # cluster's pinned management interface *is* needed though: solo
+            # still runs IB detection, so a bad interface name reaches
+            # GLOO_SOCKET_IFNAME and kills the launch (issue #275).
+            solo_cluster = kwargs.pop("cluster", None)
             return self._run_solo(
+                mgmt_interface=solo_cluster.mgmt_interface if solo_cluster is not None else None,
                 host=hosts[0] if hosts else "localhost",
                 image=image,
                 serve_command=serve_command,
@@ -1343,6 +1347,7 @@ class RuntimePlugin(Plugin):
         backends: "dict[str, BackendBundle] | None" = None,
         trust: bool = False,
         runtime_cache: "RuntimeCacheMounts | None" = None,
+        mgmt_interface: str | None = None,
     ) -> int:
         """Launch a single-node inference workload.
 
@@ -1412,12 +1417,13 @@ class RuntimePlugin(Plugin):
             else:
                 logger.info("Step 1/3: Detecting InfiniBand on %s...", host)
             if is_local:
-                comm_env = detect_infiniband_local(dry_run=dry_run)
+                comm_env = detect_infiniband_local(dry_run=dry_run, mgmt_interface=mgmt_interface)
             else:
                 comm_env = detect_infiniband(
                     [host],
                     ssh_kwargs=ssh_kwargs,
                     dry_run=dry_run,
+                    mgmt_interface=mgmt_interface,
                 )
             logger.info("Step 1/3: IB detection done (%.1fs)", time.monotonic() - t0)
 

@@ -418,6 +418,43 @@ All remote operations use **SSH stdin piping** — scripts are generated as Pyth
 - **`collectives/`** — `CollectiveBackend` ABC + implementations: `nccl.py` (default; wraps `infiniband.py`), `rccl.py` (AMD scaffold), `hccl.py` (Intel Gaudi scaffold). `get_backend(vendor)` is the lookup.
 - **`hooks.py`** — `pre_exec` / `post_exec` / `post_commands` runners. Trust gating via `_confirm_hook_execution(trust=...)`.
 
+**Management-interface detection** (`scripts/_mgmt_iface.sh`): every host probe
+needs to know which NIC is the *management* interface — it becomes
+`DETECTED_SOCKET_IFNAME` and from there `GLOO_SOCKET_IFNAME` /
+`TP_SOCKET_IFNAME` / `MN_IF_NAME`, the head of `NCCL_SOCKET_IFNAME`, and
+`NODE_IP`. Seven probes each answered it with `ip route get 8.8.8.8 || echo
+"eth0"`, which on an air-gapped Spark (no default route, by design in `push`
+mode) emitted an interface that does not exist on the hardware and killed the
+launch at gloo init (issue #275).
+
+They now share one helper with a four-step chain — operator pin
+(`SPARKRUN_MGMT_IFACE`) → default route → the interface holding the local end
+of our own `SSH_CONNECTION` → first physical NIC that is up with a global IPv4
+— and **print nothing when none of them resolves**. Empty is the load-bearing
+part: `generate_nccl_env` already falls back to `DETECTED_NET_LIST` (the
+fabric adapters, which exist), whereas a guessed name is unrecoverable. Every
+candidate is checked against sysfs first, so a pin naming an absent device
+warns and falls through rather than being passed along.
+
+Two details are easy to break. The `<sysfs>/<if>/device` test is what
+separates real NICs from `docker0` / `br-*` / `veth*` / `tailscale0` (several
+hold a global IPv4 and sort *ahead* of the mgmt NIC), and `device/infiniband`
+is what stops the scan claiming a CX7 port as "management" — pinning the
+fabric is a deliberate act (`pin_comm_env_to_ib`), never a fallback. The
+helper is also written **brace-free, including its comments**: `ray_head.sh` /
+`ray_worker.sh` / the combined probe run it through `str.format()`, so one
+brace raises `KeyError` inside a Ray launch. `tests/test_mgmt_iface.py` runs
+the helper under real bash against a fixture sysfs tree and guards both.
+
+Scripts compose via a `# sparkrun:include <file>` directive resolved in
+`scripts/read_script` (`load_script_resource` is the *raw* loader and does not
+expand it); `scripts.inject_shell_vars` passes config into a script piped to
+`bash -s`, which takes no arguments. An included helper must not default a
+var `inject_shell_vars` sets — it is included partway down and would clobber
+the injected value. `ClusterDefinition.mgmt_interface` is the persistent
+override, threaded through `detect_ib_for_hosts` / `distribute_from_config` /
+solo `_run_solo`.
+
 **Session guard** (`ssh.py:wrap_with_session_guard` + `scripts/session_guard.sh`):
 remote payloads run via `ssh <host> bash -s`, i.e. **without a PTY**, so on
 disconnect sshd's session process exits without signalling its child (the

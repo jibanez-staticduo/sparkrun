@@ -165,6 +165,24 @@ class ClusterDefinition:
     high-speed-fabric abstraction; distinct from
     :attr:`transfer_interface`, which selects the data-transfer NIC.
     """
+    mgmt_interface: str | None = None
+    """Optional management/control interface name to pin for this cluster.
+
+    Injected into every host probe as ``SPARKRUN_MGMT_IFACE`` and consumed by
+    ``scripts/_mgmt_iface.sh``, where it outranks the whole detection chain.
+    It becomes ``DETECTED_SOCKET_IFNAME`` and from there the control-socket
+    env (``GLOO_SOCKET_IFNAME``, ``TP_SOCKET_IFNAME``, ``MN_IF_NAME``, the head
+    of ``NCCL_SOCKET_IFNAME``) plus ``NODE_IP``.
+
+    The escape hatch for hosts where detection cannot decide — most of the
+    fabric/management split is unambiguous, but a bonded or VLAN management
+    link has no ``device`` entry in sysfs and so is invisible to the heuristic
+    scan.  Unlike :attr:`fabric_interfaces` this is a single exact name, not a
+    glob: it is one interface per host and it must exist, or the probe warns
+    and falls back to detection rather than emitting a name that isn't there
+    (issue #275).  Distinct from :attr:`transfer_interface` (data-transfer NIC
+    selection) and :attr:`fabric_interfaces` (which CX7 ports to configure).
+    """
     distribution: ClusterDistributionConfig = field(default_factory=ClusterDistributionConfig)
     """Cluster-level model/resource distribution preferences (see
     :class:`ClusterDistributionConfig`).  Defaults reproduce historical
@@ -327,6 +345,8 @@ class ClusterDefinition:
             d["topology"] = self.topology
         if self.fabric_interfaces:
             d["fabric_interfaces"] = list(self.fabric_interfaces)
+        if self.mgmt_interface:
+            d["mgmt_interface"] = self.mgmt_interface
         if self.env:
             d["env"] = dict(self.env)
         if self.env_file:
@@ -470,6 +490,7 @@ class ClusterManager:
         transfer_interface: str | None = None,
         topology: str | None = None,
         fabric_interfaces: list[str] | None = None,
+        mgmt_interface: str | None = None,
         env: dict[str, str] | None = None,
         env_file: str | None = None,
         sync_source: str | None = None,
@@ -495,6 +516,9 @@ class ClusterManager:
             topology: Optional CX7 topology (direct, switch, ring)
             fabric_interfaces: Optional high-speed-fabric interface globs/names
                 (e.g. ``["*np1"]``) pinning a specific CX7 port pair.
+            mgmt_interface: Optional management interface name to pin,
+                overriding per-host detection (see
+                :attr:`ClusterDefinition.mgmt_interface`).
             env: Optional cluster-level container env (values may use
                 ``${VAR}`` resolved from ``env_file``).
             env_file: Optional path backing ``${VAR}`` references in ``env``.
@@ -529,6 +553,7 @@ class ClusterManager:
             transfer_interface=transfer_interface,
             topology=topology,
             fabric_interfaces=list(fabric_interfaces) if fabric_interfaces else [],
+            mgmt_interface=mgmt_interface,
             env=dict(env) if env else {},
             env_file=env_file,
             sync_source=sync_source,
@@ -573,6 +598,7 @@ class ClusterManager:
         transfer_interface: str | None = _UNSET,
         topology: str | None = _UNSET,
         fabric_interfaces: list[str] | None = _UNSET,
+        mgmt_interface: str | None = _UNSET,
         env: dict[str, str] | None = _UNSET,
         env_file: str | None = _UNSET,
         sync_source: str | None = _UNSET,
@@ -595,6 +621,7 @@ class ClusterManager:
             transfer_interface: Transfer interface (if provided; pass ``None`` explicitly to clear)
             topology: CX7 topology (if provided; pass ``None`` explicitly to clear)
             fabric_interfaces: Fabric interface globs/names (if provided; pass empty list to clear)
+            mgmt_interface: Pinned management interface (if provided; pass ``None`` explicitly to clear)
             env: Cluster-level container env (if provided; pass empty dict to clear)
             env_file: Env file path backing ``${VAR}`` refs (if provided; pass ``None`` to clear)
             sync_source: Import provenance / re-sync identity (if provided; pass ``None`` to clear)
@@ -644,6 +671,10 @@ class ClusterManager:
         if fabric_interfaces is not _UNSET:
             cluster_def.fabric_interfaces = list(fabric_interfaces) if fabric_interfaces else []
             logger.debug("Updated fabric_interfaces for cluster '%s'", name)
+
+        if mgmt_interface is not _UNSET:
+            cluster_def.mgmt_interface = mgmt_interface or None
+            logger.debug("Updated mgmt_interface for cluster '%s'", name)
 
         if env is not _UNSET:
             cluster_def.env = dict(env) if env else {}
@@ -797,6 +828,8 @@ class ClusterManager:
             data["topology"] = cluster_def.topology
         if cluster_def.fabric_interfaces:
             data["fabric_interfaces"] = list(cluster_def.fabric_interfaces)
+        if cluster_def.mgmt_interface:
+            data["mgmt_interface"] = cluster_def.mgmt_interface
         if cluster_def.env:
             data["env"] = dict(cluster_def.env)
         if cluster_def.env_file:
@@ -859,6 +892,9 @@ class ClusterManager:
         raw_fabric_ifaces = data.get("fabric_interfaces") or []
         fabric_interfaces: list[str] = [str(x) for x in raw_fabric_ifaces] if isinstance(raw_fabric_ifaces, list) else []
 
+        raw_mgmt_iface = data.get("mgmt_interface")
+        mgmt_interface = str(raw_mgmt_iface).strip() or None if raw_mgmt_iface else None
+
         raw_env = data.get("env") or {}
         cluster_env: dict[str, str] = {str(k): str(v) for k, v in raw_env.items()} if isinstance(raw_env, dict) else {}
 
@@ -881,6 +917,7 @@ class ClusterManager:
             transfer_interface=data.get("transfer_interface"),
             topology=data.get("topology"),
             fabric_interfaces=fabric_interfaces,
+            mgmt_interface=mgmt_interface,
             env=cluster_env,
             env_file=data.get("env_file"),
             sync_source=data.get("sync_source"),
@@ -1006,6 +1043,9 @@ class ResolvedClusterConfig:
     transfer_mode: str | None = None
     transfer_interface: str | None = None
     topology: str | None = None
+    mgmt_interface: str | None = None
+    """Pinned management interface for host probes.  Mirrors
+    :attr:`ClusterDefinition.mgmt_interface`."""
     transport: str = "ssh"
     """Cluster connectivity transport selector (see :mod:`sparkrun.transports`).
     Mirrors :attr:`ClusterDefinition.transport`; ``"ssh"`` for plain clusters."""
@@ -1118,6 +1158,12 @@ def resolve_cluster_config(
     cfg.executor = cluster_def.executor
     cfg.executor_config = dict(cluster_def.executor_config) if cluster_def.executor_config else None
     cfg.scheduler = cluster_def.scheduler
+
+    # Management interface is a property of the *machines*, not of how their
+    # addresses were supplied — the same NIC names apply whether the host list
+    # came from the cluster or from --hosts.  So it applies whenever the
+    # cluster is named, like executor/transport above and unlike transfer_mode.
+    cfg.mgmt_interface = cluster_def.mgmt_interface
 
     # Transport is a cluster-deployment property (like executor): it governs
     # how the cluster's hosts are reached, so it applies whenever the cluster
