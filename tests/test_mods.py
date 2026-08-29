@@ -216,8 +216,7 @@ def test_resolve_order_priority_adjacent_beats_registry(tmp_path: Path):
 
     # Adjacent path wins over registry path
     copy_path = recipe.pre_exec[0]["copy"]
-    assert "mods/foo" in copy_path
-    assert "home" not in copy_path  # registry cache name not in path
+    assert Path(copy_path) == adjacent_dir / "foo"
 
 
 def test_resolve_order_priority_scoped_beats_adjacent(tmp_path: Path):
