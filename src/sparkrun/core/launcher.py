@@ -12,11 +12,12 @@ import copy
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
-from sparkrun.core.timing import STATUS_ERROR, Timeline
+from sparkrun.core.timing import ROOT as TIMELINE_ROOT, STATUS_ERROR, Timeline
 
 if TYPE_CHECKING:
     from sparkrun.core.backend_select import BackendBundle
@@ -1666,8 +1667,13 @@ class ServeReadiness:
     """Outcome of waiting for a launched workload's head endpoint.
 
     ``reason`` is empty when ready, else ``"port"`` (never started
-    listening / container exited) or ``"health"`` (listening but never
-    returned HTTP 200).
+    listening / container exited), ``"health"`` (listening but never
+    returned HTTP 200), or ``"cancelled"`` (the caller abandoned the wait).
+
+    ``"cancelled"`` is deliberately not folded into the other two: they
+    say the workload is broken, this one says only that we stopped
+    looking.  Rendering "the server never came up" because the user
+    pressed Ctrl-C would be a lie about the cluster.
     """
 
     ready: bool
@@ -1706,6 +1712,8 @@ def wait_for_serve_ready(
     health_max_retries: int = 120,
     health_retry_interval: int = 5,
     timeline: "Timeline | None" = None,
+    cancel: "threading.Event | None" = None,
+    parent: int | None = None,
 ) -> ServeReadiness:
     """Adapter over :func:`wait_for_endpoint_ready` for a :class:`LaunchResult`."""
     return wait_for_endpoint_ready(
@@ -1721,6 +1729,8 @@ def wait_for_serve_ready(
         health_max_retries=health_max_retries,
         health_retry_interval=health_retry_interval,
         timeline=timeline if timeline is not None else result.timeline,
+        cancel=cancel,
+        parent=parent,
     )
 
 
@@ -1738,6 +1748,8 @@ def wait_for_endpoint_ready(
     health_max_retries: int = 120,
     health_retry_interval: int = 5,
     timeline: "Timeline | None" = None,
+    cancel: "threading.Event | None" = None,
+    parent: int | None = None,
 ) -> ServeReadiness:
     """Wait for a detached launch's head endpoint to answer ``/v1/models``.
 
@@ -1772,6 +1784,14 @@ def wait_for_endpoint_ready(
         health_retry_interval: Seconds between health polls.
         timeline: Span collector for the two waits.  Pass the launch's own so
             the readiness spans join its phases in one artifact.
+        cancel: Set to abandon the wait.  Yields ``reason="cancelled"`` and
+            leaves the in-flight span *open*, so a rendered timeline shows
+            "did not finish" rather than claiming a stage failed.
+        parent: Span to record the two stages under.  ``None`` inherits from
+            the timeline's open-span stack, which is what nests them inside
+            phase 6 when ``post_launch_lifecycle`` is the caller.  A caller
+            running this **off the main thread** must not inherit — pass a
+            span id or :data:`~sparkrun.core.timing.ROOT`.
 
     Returns:
         A :class:`ServeReadiness` describing the head endpoint, whether it
@@ -1804,13 +1824,17 @@ def wait_for_endpoint_ready(
         return base
 
     # Recorded onto the launch's own timeline so the phases and the readiness
-    # wait land in one artifact.  ``launch_inference`` has already closed the
-    # ``launch`` span, so these are parented at the root — deliberately: this
-    # is time *after* the launch returned, not part of it.
+    # wait land in one artifact.  Parenting is the caller's to state: from
+    # ``post_launch_lifecycle`` these nest inside phase 6, and from the
+    # background ``ReadinessWatcher`` they must be explicitly rooted rather
+    # than inheriting whatever the main thread has open.
     tl = timeline
 
+    def cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
+
     t0 = time.monotonic()
-    port_span = tl.begin("serve.port_open", host=head_host, port=port) if tl else None
+    port_span = tl.begin("serve.port_open", parent=parent, host=head_host, port=port) if tl else None
     port_ready = wait_for_port(
         head_host,
         port,
@@ -1819,22 +1843,34 @@ def wait_for_endpoint_ready(
         ssh_kwargs=ssh_kwargs,
         dry_run=dry_run,
         container_name=container,
+        cancel=cancel,
     )
     port_wait_s = time.monotonic() - t0
+    # Checked before the span is closed: the waiters report cancellation and
+    # genuine failure with the same ``False``, and closing this ``error``
+    # would put "the port never opened" in the artifact for a workload that
+    # was merely still starting when we stopped watching.
+    if not port_ready and cancelled():
+        return ServeReadiness(False, head_host, head_ip, port, container, reason="cancelled", port_wait_s=port_wait_s)
     if tl and port_span is not None:
         tl.end(port_span, status="ok" if port_ready else STATUS_ERROR)
     if not port_ready:
         return ServeReadiness(False, head_host, head_ip, port, container, reason="port", port_wait_s=port_wait_s)
 
     t1 = time.monotonic()
-    health_span = tl.begin("serve.health_ok", url=base.health_url) if tl else None
+    health_span = tl.begin("serve.health_ok", parent=parent, url=base.health_url) if tl else None
     healthy = wait_for_healthy(
         base.health_url,
         max_retries=health_max_retries,
         retry_interval=health_retry_interval,
         dry_run=dry_run,
+        cancel=cancel,
     )
     health_wait_s = time.monotonic() - t1
+    if not healthy and cancelled():
+        return ServeReadiness(
+            False, head_host, head_ip, port, container, reason="cancelled", port_wait_s=port_wait_s, health_wait_s=health_wait_s
+        )
     if tl and health_span is not None:
         tl.end(health_span, status="ok" if healthy else STATUS_ERROR)
     if not healthy:
@@ -1843,6 +1879,108 @@ def wait_for_endpoint_ready(
         )
 
     return ServeReadiness(True, head_host, head_ip, port, container, port_wait_s=port_wait_s, health_wait_s=health_wait_s)
+
+
+class ReadinessWatcher:
+    """Run :func:`wait_for_endpoint_ready` on a background thread.
+
+    Exists for the one case where the readiness wait cannot own the
+    terminal: ``sparkrun run`` attaches to the container logs immediately
+    after launching, and the minutes of weight load and graph capture that
+    the wait measures are exactly the minutes the user is watching scroll
+    past.  Waiting first would hide the boot log; not waiting at all left
+    the whole expensive half of the launch unmeasured.
+
+    So the poll runs alongside the log stream and reports through
+    *on_ready*, which is called **on the watcher thread** while another
+    process is writing to the same terminal.  A callback must therefore
+    emit a single short line in one write; anything multi-line belongs in
+    the caller's finalize step, after the stream has stopped.
+
+    Console-free by construction — the callback supplies all presentation.
+
+    Not reusable: one watcher per launch, started once.
+    """
+
+    def __init__(
+        self,
+        result: LaunchResult,
+        *,
+        ssh_kwargs: dict | None = None,
+        on_ready: "Callable[[ServeReadiness], None] | None" = None,
+        timeline: "Timeline | None" = None,
+        dry_run: bool = False,
+    ) -> None:
+        self._result = result
+        self._ssh_kwargs = ssh_kwargs
+        self._on_ready = on_ready
+        self._timeline = timeline
+        self._dry_run = dry_run
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.readiness: ServeReadiness | None = None
+        """Outcome, once the wait has finished.  ``None`` while still polling."""
+
+    def start(self) -> "ReadinessWatcher":
+        # ``daemon=True`` is a backstop, not the plan: ``stop()`` cancels and
+        # joins.  It only matters if the process exits by a path that never
+        # reaches the finalize step.
+        self._thread = threading.Thread(target=self._run, name="sparkrun-readiness", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            readiness = wait_for_serve_ready(
+                self._result,
+                ssh_kwargs=self._ssh_kwargs,
+                timeline=self._timeline,
+                cancel=self._cancel,
+                dry_run=self._dry_run,
+                # Explicit, not inherited: this runs off the main thread, and
+                # a span taken from the shared open-span stack would be closed
+                # (with the wrong status) by the next main-thread ``end()``.
+                parent=TIMELINE_ROOT,
+            )
+        except Exception:
+            # Observational only — this thread must never be why a launch
+            # that already succeeded reports a problem.
+            logger.debug("Readiness watch failed", exc_info=True)
+            return
+        self.readiness = readiness
+        if readiness.ready and self._on_ready is not None:
+            try:
+                self._on_ready(readiness)
+            except Exception:
+                logger.debug("Readiness callback failed", exc_info=True)
+
+    def stop(self, timeout: float = 12.0) -> ServeReadiness | None:
+        """Cancel the wait and join, returning whatever was observed.
+
+        The cancel event only shortens the *gaps between* probes; it cannot
+        interrupt one in flight, and those are bounded at 5s (port probe) to
+        10s (container liveness, with ``ConnectTimeout=10`` under it).  A
+        join shorter than that abandons the thread — with a live ``ssh``
+        child — in precisely the case worth waiting for: a log stream that
+        ended on its own means the container exited, and the probe about to
+        return is what would say so.
+
+        A longer join costs nothing on Ctrl-C.  The probe runs in this
+        process group, so SIGINT reaches the ``ssh`` child too and the
+        in-flight probe dies with it; the loop then sees the cancel at the
+        top of its next iteration.
+
+        Still bounded, and ``daemon=True`` remains the backstop: a watcher
+        that somehow misses both must not hold up the exit.
+        """
+        self._cancel.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                # Deliberate, but worth a breadcrumb: the readiness outcome
+                # reported to the user is "unknown" rather than observed.
+                logger.debug("Readiness watch did not stop within %.1fs; abandoning it", timeout)
+        return self.readiness
 
 
 def post_launch_lifecycle(

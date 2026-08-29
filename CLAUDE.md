@@ -543,7 +543,8 @@ artifacts. Step spans slugify the runtime's label and keep the raw label in
 | `Timeline.span` / `timing.timed` | context managers; `timed` tolerates `timeline=None` |
 | `LaunchResult.timeline` / `RunResult.timeline` | the live collector, not a snapshot |
 | `SparkrunContext.timing` | caller-owned timeline, widening the window past one launch |
-| `format_launch_timings` | the `run --timings` tree |
+| `format_launch_timings` | the `run` timing tree (on by default; `--no-timings`) |
+| `launcher.ReadinessWatcher` | the readiness poll, run alongside `run`'s log stream |
 
 `None` means "not collecting" everywhere and is byte-identical to the
 behaviour before the module existed — the convention `progress` and
@@ -566,8 +567,8 @@ Five things are load-bearing:
   launch that raised is when the breakdown is worth most, and the open spans
   are exactly the path to the failure. But `LaunchResult` is never built on
   that path, so **a caller that wants the timeline on failure must own it** —
-  set `sctx.timing` (what `run --timings` / `--collect-diagnostics` do)
-  rather than letting `launch_inference` create one internally.
+  set `sctx.timing` (what `run` / `--collect-diagnostics` do) rather than
+  letting `launch_inference` create one internally.
 - **Clocks are never mixed in a derived figure.** A measured span is on the
   control node's `time.monotonic()` (`CLOCK_CONTROL`), which is what makes
   durations subtractable. Spans recovered from a remote engine's own log
@@ -600,7 +601,60 @@ Ray launch reached via `proxy load` or a post-hook recipe aborted one retry
 interval in. It now asks `runtime.get_head_container_name()`, which also
 routes through the resolved executor.
 
-**Sinks**: `run --timings` (tree), `--collect-diagnostics` (`run_timeline`
+**On `run`, that wait is concurrent with the log stream** (`ReadinessWatcher`).
+`sparkrun run` attaches to the container logs immediately after launching, so
+the two obvious placements are both wrong: waiting *before* attaching blanks
+the screen for the most informative minutes of the launch, and not waiting at
+all is what the original `--timings` did — `wait_for_serve_ready` was reachable
+only from `post_launch_lifecycle`, so for any recipe **without** post hooks the
+tree reported distribution and container start while weight load and graph
+capture scrolled past unrecorded. The watcher polls on a background thread and
+reports through an `on_ready` callback; the CLI skips it when the recipe *has*
+post hooks (that path already waited synchronously and would double-record
+`serve.*`).
+
+Four properties are load-bearing:
+
+- **The live half is one line, the tree is not.** The callback fires on the
+  watcher thread while `docker logs -f` writes to the same terminal, so it
+  emits a single short line in one write. The multi-line table is printed by
+  the CLI's finalize step, after the stream has stopped — which is also the
+  fix for the original cosmetic bug, where the tree was printed and then
+  immediately buried under `--tail 100` plus a live stream.
+- **Cancelled is not failed.** `wait_for_port` / `wait_for_healthy` report
+  cancellation and genuine failure with the same `False`, so
+  `wait_for_endpoint_ready` checks the event before closing the span and
+  returns `reason="cancelled"` with the span left **open** — rendered "did not
+  finish" rather than an `error` claiming the endpoint never came up. Ctrl-C
+  must not write a verdict about the cluster into a benchmark artifact.
+- **A worker-thread span states its parent.** `parent=None` means "inherit
+  from the open-span stack", which is a sequential-control-flow convenience
+  and the wrong default off-thread: `Timeline.end` closes everything open
+  *above* its target, so a main-thread `end()` would close the watcher's span
+  too, stamp it with the main thread's status, and turn the watcher's own
+  `end()` into a silent no-op — defeating the open-span property above *and*
+  the ok/error verdict. `timing.ROOT` is the sentinel that lets a worker say
+  "root" rather than depend on the stack happening to be empty. The same
+  function nests under phase 6 when `post_launch_lifecycle` is the caller,
+  which is why the parent is the caller's to state rather than a constant.
+- **Cancellation reaches into the sleep.** Both waiters take a
+  `cancel: threading.Event` and wait *on it* between polls
+  (`health._interruptible_sleep`). At the readiness defaults the health stage
+  sleeps 5s at a time up to 120 times, so a plain `time.sleep` would leave a
+  cancelled watch polling over SSH for minutes after its caller exited — the
+  same orphaned-work failure the session guard exists to prevent.
+- **The watch is observational.** It runs on every launch now, so it never
+  touches the exit code: a model that outlasts the poll budget would otherwise
+  start failing everything scripted around `sparkrun run`. It warns instead,
+  and stays silent for `cancelled`.
+
+**Timings are on by default.** `--no-timings` (hidden) suppresses the *table
+only* — the readiness watch and its "endpoint ready" line still run, because
+"the endpoint is up now" is worth having while logs scroll whether or not you
+want a breakdown afterwards. `--collect-diagnostics` keeps the timeline for its
+own record regardless.
+
+**Sinks**: `run` (tree, on by default), `--collect-diagnostics` (`run_timeline`
 NDJSON record — additive to that collector's own phases, which bracket a
 strictly wider window including host diagnostics and `api.run`'s planning),
 and `BenchmarkResult.generate_metadata()` under `metadata["timing"]` as

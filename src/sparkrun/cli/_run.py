@@ -69,6 +69,57 @@ _EXECUTOR_OVERRIDE_KEYS = frozenset(
 )
 
 
+def _echo_endpoint_ready(readiness) -> None:
+    """Announce a now-serving endpoint from the readiness watcher thread.
+
+    Called while ``docker logs -f`` is writing to the same terminal, so it
+    must be **one short line in one write**: a multi-line block would be
+    interleaved with log output mid-render.  The full breakdown waits for
+    the finalize step, once the stream has stopped.
+
+    Goes to stderr so a caller piping the log stream keeps it uncontaminated.
+    """
+    from sparkrun.utils.text import format_duration
+
+    click.secho(
+        "\n[sparkrun] Endpoint ready at http://%s:%d/v1 after %s (engine init %s, model load %s)\n"
+        % (
+            readiness.head_ip,
+            readiness.port,
+            format_duration(readiness.total_wait_s),
+            format_duration(readiness.port_wait_s),
+            format_duration(readiness.health_wait_s),
+        ),
+        fg="green",
+        err=True,
+    )
+
+
+def _report_readiness_outcome(readiness) -> None:
+    """Report a readiness watch that ended without the endpoint serving.
+
+    Deliberately does **not** touch the exit code.  The watch is
+    observational: it runs on every launch now, and a slow-loading model
+    that outlasts the poll budget must not turn a successful launch into a
+    failure for everything scripted around ``sparkrun run``.
+
+    Silent for ``None`` (still polling when we exited) and for
+    ``"cancelled"`` (the user stopped the stream) — neither says anything
+    about the workload.
+    """
+    if readiness is None or readiness.ready or readiness.reason == "cancelled":
+        return
+    if readiness.reason == "port":
+        detail = "the head container stopped or port %d never opened" % readiness.port
+    else:
+        detail = "%s never returned HTTP 200" % readiness.health_url
+    click.secho(
+        "[sparkrun] WARNING: endpoint did not become ready — %s." % detail,
+        fg="yellow",
+        err=True,
+    )
+
+
 def _summarize_platforms(
     host_list: list[str],
     cluster=None,
@@ -188,12 +239,11 @@ def _summarize_platforms(
     help="Collect diagnostics to NDJSON file",
 )
 @click.option(
-    "--timings",
+    "--timings/--no-timings",
     "show_timings",
-    is_flag=True,
-    default=False,
+    default=True,
     hidden=HIDE_ADVANCED_OPTIONS,
-    help="Print a per-stage timing breakdown of the launch when it completes",
+    help="Print a per-stage timing breakdown when the run finishes (on by default; --no-timings suppresses it)",
 )
 @click.option(
     "--trust", is_flag=True, default=False, hidden=True, help="Trust post_commands from third-party registries without confirmation"
@@ -613,6 +663,11 @@ def run(
     # internally: on a failed launch there is no LaunchResult to read it off,
     # and a launch that failed is exactly when the per-stage breakdown is worth
     # having.  ``launch_inference`` picks this up via ``sctx``.
+    #
+    # ``--no-timings`` suppresses the *table*, not the readiness watch below —
+    # "the endpoint is up now" is worth having while logs scroll whether or
+    # not you want a breakdown afterwards.  Diagnostics needs the timeline for
+    # its own record regardless.
     if show_timings or diagnostics_path:
         from sparkrun.core.timing import Timeline
 
@@ -739,28 +794,50 @@ def run(
         if sctx.progress:
             sctx.progress.phase_skip(6)
 
-    # Printed here rather than at the very end: log following blocks until the
-    # user interrupts it, and the breakdown is worth seeing before that.  Post
-    # hooks have already run, so when the recipe defines them the readiness
-    # spans (containers-running → serving) are included.
-    if show_timings and sctx.timing is not None:
-        from sparkrun.utils.cli_formatters import format_launch_timings
-
-        _timings = format_launch_timings(sctx.timing.export())
-        if _timings:
-            click.echo()
-            click.echo(_timings)
-            click.echo()
-
     # Follow container logs after a successful detached launch
+    watcher = None
     if result.rc == 0 and not foreground and not dry_run:
         if not no_follow:
-            runtime.follow_logs(
-                hosts=host_list,
-                cluster_id=result.cluster_id,
-                config=config,
-                dry_run=dry_run,
-            )
+            # The readiness poll runs *alongside* the log stream rather than
+            # before it.  ``launch_inference`` returns once the containers are
+            # up, which for a large model is minutes before the server accepts
+            # a request — and those minutes are precisely what the user is
+            # watching scroll past.  Waiting first would blank the screen for
+            # the most informative part of the launch; not waiting at all is
+            # what left `serve.port_open` / `serve.health_ok` unrecorded on
+            # every run of a recipe without post hooks.
+            #
+            # Skipped when the recipe *has* post hooks: `post_launch_lifecycle`
+            # above already waited synchronously and recorded those spans, so a
+            # watcher here would duplicate them and re-poll a live endpoint.
+            if not has_post_hooks:
+                from sparkrun.core.launcher import ReadinessWatcher
+                from sparkrun.orchestration.primitives import build_ssh_kwargs as _watch_ssh
+
+                watcher = ReadinessWatcher(
+                    result,
+                    ssh_kwargs=_watch_ssh(config),
+                    on_ready=_echo_endpoint_ready,
+                    timeline=sctx.timing,
+                ).start()
+
+            # `finally`, not a plain follow-up statement: the watcher holds a
+            # thread that polls over SSH, and it must be cancelled even if the
+            # stream ends by an exception rather than by the user.
+            try:
+                runtime.follow_logs(
+                    hosts=host_list,
+                    cluster_id=result.cluster_id,
+                    config=config,
+                    dry_run=dry_run,
+                )
+            finally:
+                readiness = watcher.stop() if watcher is not None else None
+
+            # Reached when the user interrupts the stream (Ctrl-C is caught
+            # inside the log printer) or the container exits and `docker logs
+            # -f` ends.  Either way nothing else owns the terminal from here.
+            _report_readiness_outcome(readiness)
         else:
             # Perform a 5s boot liveness check for detached containers to catch crashes
             import time
@@ -780,6 +857,24 @@ def run(
             if not status.running:
                 click.secho("\n[sparkrun] CRITICAL: Container died unexpectedly after detached launch.", fg="red", err=True, bold=True)
                 result.rc = 1
+
+    # Printed last, and only here.  The table is multi-line, so it cannot be
+    # emitted while `docker logs -f` is writing to the same terminal without
+    # being shredded mid-render — the live half of the report is the single
+    # line `_echo_endpoint_ready` injects.  By this point the stream has
+    # stopped and nothing else is writing.
+    #
+    # A watcher still polling when the user interrupts leaves `serve.*` open,
+    # which `format_launch_timings` renders "did not finish" — the honest
+    # reading of "we stopped watching", not a claim that the stage failed.
+    if show_timings and sctx.timing is not None:
+        from sparkrun.utils.cli_formatters import format_launch_timings
+
+        _timings = format_launch_timings(sctx.timing.export())
+        if _timings:
+            click.echo()
+            click.echo(_timings)
+            click.echo()
 
     # --- Diagnostics finalize ---
     if diag:

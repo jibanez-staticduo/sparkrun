@@ -54,7 +54,12 @@ Threading
 Span *creation* is lock-protected, so a fan-out worker may record spans.
 The open-span stack, however, is a convenience for sequential control flow
 on one thread: a span created off the main thread must pass ``parent=``
-explicitly rather than relying on the stack.
+explicitly rather than relying on the stack — a span id to nest under one,
+or :data:`ROOT` to sit at the root.  Inheriting from the stack across
+threads is not merely imprecise: :meth:`Timeline.end` closes everything
+open *above* its target, so a main-thread ``end()`` would close the
+worker's span too, stamping it with the main thread's status and turning
+the worker's own ``end()`` into a silent no-op.
 """
 
 from __future__ import annotations
@@ -71,6 +76,7 @@ __all__ = [
     "timed",
     "remote_clock",
     "CLOCK_CONTROL",
+    "ROOT",
     "STATUS_OK",
     "STATUS_ERROR",
     "STATUS_SKIPPED",
@@ -80,6 +86,17 @@ __all__ = [
 #: The control node's ``time.monotonic()``.  Spans on this clock are the
 #: only ones whose durations may be combined arithmetically.
 CLOCK_CONTROL = "control"
+
+#: ``parent=ROOT`` — parent this span to the timeline root, explicitly.
+#:
+#: ``parent=None`` means "inherit from the open-span stack", which is a
+#: *sequential-control-flow* convenience and the wrong default for a span
+#: opened off the main thread: whatever that thread happens to find on the
+#: stack becomes the parent, and a main-thread ``end()`` above it will slice
+#: the worker's span out and stamp it with the main thread's status.  A
+#: worker that wants the root must be able to say so rather than depend on
+#: the stack being empty at that instant.
+ROOT = -1
 
 
 def remote_clock(host: str) -> str:
@@ -163,6 +180,19 @@ class _Open:
     attrs: dict[str, Any]
 
 
+def _resolve_parent(parent: int | None, stack: list[_Open]) -> int | None:
+    """Resolve a ``parent=`` argument against the open-span stack.
+
+    Three inputs, three meanings: a span id parents explicitly, :data:`ROOT`
+    parents to the root, and ``None`` inherits from the stack.
+    """
+    if parent == ROOT:
+        return None
+    if parent is not None:
+        return parent
+    return stack[-1].id if stack else None
+
+
 class Timeline:
     """Collects :class:`Span` records for one launch.
 
@@ -210,12 +240,13 @@ class Timeline:
         """Open a span and return its id.
 
         ``parent`` defaults to the innermost span open *on this thread's
-        behalf* (the stack).  Pass it explicitly from a worker thread.
+        behalf* (the stack).  From a worker thread pass it explicitly — a
+        span id, or :data:`ROOT` for the root.
         """
         with self._lock:
             span_id = self._next_id
             self._next_id += 1
-            resolved_parent = parent if parent is not None else (self._stack[-1].id if self._stack else None)
+            resolved_parent = _resolve_parent(parent, self._stack)
             self._stack.append(
                 _Open(
                     id=span_id,
@@ -319,7 +350,7 @@ class Timeline:
         with self._lock:
             span_id = self._next_id
             self._next_id += 1
-            resolved_parent = parent if parent is not None else (self._stack[-1].id if self._stack else None)
+            resolved_parent = _resolve_parent(parent, self._stack)
             self._spans.append(
                 Span(
                     id=span_id,
@@ -390,7 +421,10 @@ class Timeline:
         skew independently.  Pass ``clock=`` to total a single foreign
         clock's spans, which *are* comparable with each other.
         """
-        return sum(s.duration_s for s in self._spans if s.name == name and s.clock == clock)
+        # Locked like every other reader: spans are appended off the main
+        # thread now that the readiness watch records onto a live timeline.
+        with self._lock:
+            return sum(s.duration_s for s in self._spans if s.name == name and s.clock == clock)
 
     def find(self, name: str) -> Span | None:
         """First closed span named ``name``, in start order."""

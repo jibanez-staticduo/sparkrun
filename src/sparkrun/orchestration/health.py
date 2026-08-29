@@ -6,6 +6,7 @@ Extracted from orchestration/primitives.py to reduce scope creep in that module.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,7 @@ def wait_for_port(
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
     container_name: str | None = None,
+    cancel: "threading.Event | None" = None,
 ) -> bool:
     """Poll until a TCP port is listening on a host.
 
@@ -137,10 +139,14 @@ def wait_for_port(
         container_name: If provided, verify the container is still
             running on each iteration.  Aborts early if the container
             has exited (e.g. crashed on startup).
+        cancel: Set to abandon the wait.  Checked before every probe and
+            slept on between them, so a caller running this off the main
+            thread can stop it within one probe rather than one interval.
 
     Returns:
-        True if port became reachable, False if timed out or the
-        container exited.
+        True if port became reachable, False if timed out, the container
+        exited, or the wait was cancelled.  Callers that must tell
+        cancellation from failure check the event themselves.
     """
     if dry_run:
         return True
@@ -151,6 +157,9 @@ def wait_for_port(
     # `listen_probe_cmd` for why a connecting probe breaks NCCL bootstrap.
     check_cmd = listen_probe_cmd(port)
     for attempt in range(1, max_retries + 1):
+        if cancel is not None and cancel.is_set():
+            return False
+
         # Check container liveness before polling the port
         if container_name and attempt > 1:
             if not is_container_running(host, container_name, ssh_kwargs=ssh_kwargs):
@@ -171,9 +180,24 @@ def wait_for_port(
                 port,
                 attempt * retry_interval,
             )
-        time.sleep(retry_interval)
+        if _interruptible_sleep(retry_interval, cancel):
+            return False
 
     return False
+
+
+def _interruptible_sleep(seconds: float, cancel: "threading.Event | None") -> bool:
+    """Sleep *seconds*, returning ``True`` if *cancel* fired instead.
+
+    A plain :func:`time.sleep` between polls is what makes a cancelled wait
+    outlive its caller: at the readiness defaults the health poll sleeps 5s
+    at a time up to 120 times, so a Ctrl-C would be noticed minutes later,
+    with an SSH probe spawned on every interval in between.
+    """
+    if cancel is None:
+        time.sleep(seconds)
+        return False
+    return cancel.wait(seconds)
 
 
 def wait_for_healthy(
@@ -182,6 +206,7 @@ def wait_for_healthy(
     retry_interval: int = 5,
     dry_run: bool = False,
     max_consecutive_refused=2,
+    cancel: "threading.Event | None" = None,
 ) -> bool:
     """Poll an HTTP endpoint until it returns 200.
 
@@ -196,9 +221,11 @@ def wait_for_healthy(
         retry_interval: Seconds between retries.
         dry_run: Skip waiting in dry-run mode.
         max_consecutive_refused: Maximum number of consecutive refused connections before giving up.
+        cancel: Set to abandon the wait; see :func:`wait_for_port`.
 
     Returns:
-        True if the endpoint returned 200, False if timed out.
+        True if the endpoint returned 200, False if timed out, the server
+        died, or the wait was cancelled.
     """
     if dry_run:
         return True
@@ -208,6 +235,8 @@ def wait_for_healthy(
 
     consecutive_refused = 0
     for attempt in range(1, max_retries + 1):
+        if cancel is not None and cancel.is_set():
+            return False
         try:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -237,6 +266,7 @@ def wait_for_healthy(
                 "  Still waiting for server to be ready (%ds elapsed)...",
                 attempt * retry_interval,
             )
-        time.sleep(retry_interval)
+        if _interruptible_sleep(retry_interval, cancel):
+            return False
 
     return False
