@@ -667,6 +667,17 @@ Four properties are load-bearing:
   sleeps 5s at a time up to 120 times, so a plain `time.sleep` would leave a
   cancelled watch polling over SSH for minutes after its caller exited — the
   same orphaned-work failure the session guard exists to prevent.
+- **`serve.serving` closes the accounting.** A root-level sibling of `run`
+  and the two readiness stages, opened when the endpoint answers and closed
+  when the watch stops. Without it the tree stopped accounting at readiness
+  while the total kept running — a launch watched for two hours rendered
+  ~775s of rows under a 7695s total. It is **measured** (endpoint answered →
+  we stopped watching), not the arithmetic gap between the rows and the
+  total: a derived row would be invisible to `export()`, so the diagnostics
+  record and the tree would disagree, and it would put an unmeasured number
+  in the tree that `Timeline.add_span`'s refusal of `CLOCK_CONTROL` exists to
+  keep out. The post-hook path opens its own (it waited synchronously and has
+  no watcher), so both follow paths account the same.
 - **The watch is observational.** It runs on every launch now, so it never
   touches the exit code: a model that outlasts the poll budget would otherwise
   start failing everything scripted around `sparkrun run`. It warns instead,

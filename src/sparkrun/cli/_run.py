@@ -796,6 +796,7 @@ def run(
 
     # Follow container logs after a successful detached launch
     watcher = None
+    serving_span = None
     if result.rc == 0 and not foreground and not dry_run:
         if not no_follow:
             # The readiness poll runs *alongside* the log stream rather than
@@ -820,6 +821,15 @@ def run(
                     on_ready=_echo_endpoint_ready,
                     timeline=sctx.timing,
                 ).start()
+            elif sctx.timing is not None:
+                # The post-hook path waited synchronously above, so the
+                # endpoint is already serving and there is no watcher to own
+                # the interval — but the log stream below still runs for as
+                # long as the user watches, and that time is just as
+                # unaccounted here as it would be there.
+                from sparkrun.core.timing import ROOT as _TIMELINE_ROOT
+
+                serving_span = sctx.timing.begin("serve.serving", parent=_TIMELINE_ROOT, label="serving")
 
             # `finally`, not a plain follow-up statement: the watcher holds a
             # thread that polls over SSH, and it must be cancelled even if the
@@ -832,7 +842,11 @@ def run(
                     dry_run=dry_run,
                 )
             finally:
+                # ``watcher.stop()`` closes its own serving span; this one is
+                # the post-hook path's, which has no watcher.
                 readiness = watcher.stop() if watcher is not None else None
+                if serving_span is not None and sctx.timing is not None:
+                    sctx.timing.end(serving_span)
 
             # Reached when the user interrupts the stream (Ctrl-C is caught
             # inside the log printer) or the container exits and `docker logs

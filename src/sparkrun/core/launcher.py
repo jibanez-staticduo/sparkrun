@@ -1947,6 +1947,14 @@ class ReadinessWatcher:
 
     Console-free by construction — the callback supplies all presentation.
 
+    On success it also opens a ``serve.serving`` span, closed by
+    :meth:`stop`.  Without it the tree stops accounting at the moment the
+    endpoint answered while the total kept running, so a launch watched for
+    two hours showed ~775s of rows under a 7695s total.  It is *measured*
+    (endpoint answered → we stopped watching) rather than derived from that
+    gap, which is what lets it reach the diagnostics record and keeps the
+    formatter free of a synthesized row that no artifact contains.
+
     Not reusable: one watcher per launch, started once.
     """
 
@@ -1966,6 +1974,7 @@ class ReadinessWatcher:
         self._dry_run = dry_run
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
+        self._serving_span: int | None = None
         self.readiness: ServeReadiness | None = None
         """Outcome, once the wait has finished.  ``None`` while still polling."""
 
@@ -2004,7 +2013,13 @@ class ReadinessWatcher:
             logger.debug("Readiness watch failed", exc_info=True)
             return
         self.readiness = readiness
-        if readiness.ready and self._on_ready is not None:
+        if not readiness.ready:
+            return
+        # Opened before the callback renders, so the span starts when the
+        # endpoint answered rather than when we finished saying so.
+        if self._timeline is not None:
+            self._serving_span = self._timeline.begin("serve.serving", parent=TIMELINE_ROOT, label="serving")
+        if self._on_ready is not None:
             try:
                 self._on_ready(readiness)
             except Exception:
@@ -2028,6 +2043,9 @@ class ReadinessWatcher:
 
         Still bounded, and ``daemon=True`` remains the backstop: a watcher
         that somehow misses both must not hold up the exit.
+
+        Also closes the ``serve.serving`` span, since "we stopped watching"
+        is exactly where the observed serving interval ends.
         """
         self._cancel.set()
         if self._thread is not None:
@@ -2036,6 +2054,12 @@ class ReadinessWatcher:
                 # Deliberate, but worth a breadcrumb: the readiness outcome
                 # reported to the user is "unknown" rather than observed.
                 logger.debug("Readiness watch did not stop within %.1fs; abandoning it", timeout)
+        # After the join, so a span the thread opened as we cancelled is
+        # still closed.  An abandoned thread that opens one later leaves it
+        # ``open`` — reported as "did not finish", which is accurate.
+        if self._serving_span is not None and self._timeline is not None:
+            self._timeline.end(self._serving_span)
+            self._serving_span = None
         return self.readiness
 
 

@@ -368,6 +368,48 @@ def test_watcher_spans_are_rooted_explicitly_not_taken_from_the_stack():
     assert spans["serve.port_open"]["parent"] is None, "watcher span inherited the main thread's open span"
 
 
+def test_serving_span_accounts_for_the_time_after_readiness():
+    """Measured, not derived from the gap between the rows and the total.
+
+    Without it the tree stopped accounting the moment the endpoint
+    answered while the total kept running — a launch watched for two hours
+    showed ~775s of rows under a 7695s total.
+    """
+    tl = Timeline()
+
+    with mock.patch("sparkrun.core.launcher.wait_for_serve_ready", return_value=_ready()):
+        watcher = ReadinessWatcher(mock.Mock(), timeline=tl).start()
+        watcher.stop(timeout=5.0)
+
+    spans = {s["name"]: s for s in tl.export()["spans"]}
+    serving = spans["serve.serving"]
+    assert serving["status"] == "ok"
+    assert serving["parent"] is None, "serving must sit beside run, not inside it"
+    assert serving["attrs"]["label"] == "serving"
+
+
+def test_no_serving_span_when_the_endpoint_never_served():
+    """A row claiming "serving" for a launch that never served is a lie."""
+    tl = Timeline()
+
+    with mock.patch("sparkrun.core.launcher.wait_for_serve_ready", return_value=_ready(ready=False, reason="port")):
+        ReadinessWatcher(mock.Mock(), timeline=tl).start().stop(timeout=5.0)
+
+    assert "serve.serving" not in {s["name"] for s in tl.export()["spans"]}
+
+
+def test_serving_span_is_left_open_if_never_stopped():
+    """An unclosed span renders "did not finish" rather than a duration."""
+    tl = Timeline()
+
+    with mock.patch("sparkrun.core.launcher.wait_for_serve_ready", return_value=_ready()):
+        watcher = ReadinessWatcher(mock.Mock(), timeline=tl).start()
+        watcher._thread.join(timeout=5.0)  # let it open the span, but never stop()
+
+    spans = {s["name"]: s for s in tl.export()["spans"]}
+    assert spans["serve.serving"]["status"] == "open"
+
+
 def test_watcher_swallows_a_failing_wait():
     """Observational only: the watch must never break a successful launch."""
     with mock.patch("sparkrun.core.launcher.wait_for_serve_ready", side_effect=RuntimeError("ssh exploded")):
@@ -493,6 +535,16 @@ def _invoke(runner, *extra):
     return runner.invoke(main, ["run", _RECIPE_NAME, "--cluster", "wopr", "--solo", *extra])
 
 
+def _table_len(after_header: list[str]) -> int:
+    """Number of indented rows following the timings header."""
+    n = 0
+    for line in after_header:
+        if not line.startswith("  "):
+            break
+        n += 1
+    return n
+
+
 def _all_output(result) -> str:
     """Click's ``output`` already interleaves stderr, which is where the
     readiness line goes."""
@@ -537,6 +589,51 @@ def test_readiness_spans_reach_the_printed_table(run_env, launched, follow_marke
 
     assert "serve.port_open" in out
     assert "serve.health_ok" in out
+
+
+def test_the_table_accounts_for_the_whole_total(run_env, launched, follow_marker, monkeypatch):
+    """Every root-level row summed reaches the reported total.
+
+    The serving row is what closes the gap; before it, the rows stopped at
+    readiness while the total ran to whenever the user pressed Ctrl-C.
+    """
+    monkeypatch.setattr("sparkrun.core.launcher.wait_for_serve_ready", lambda *a, **k: _ready())
+
+    out = _all_output(_invoke(CliRunner()))
+
+    assert "serving" in out
+
+    # Scoped to the table: the pre-launch banner is also two-space indented.
+    lines = out.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("Launch timings"))
+    table = lines[start : start + 1 + _table_len(lines[start + 1 :])]
+    total = float(table[0].split("total ")[1].rstrip("s):"))
+
+    # Root-level rows are indented exactly two spaces.
+    rows = [ln for ln in table[1:] if ln.startswith("  ") and not ln.startswith("    ")]
+    assert rows, "no root-level rows parsed"
+    summed = sum(float(ln.rsplit(" ", 1)[-1].rstrip("s")) for ln in rows)
+    assert summed == pytest.approx(total, abs=0.5), "root rows do not account for the total"
+
+
+def test_post_hook_recipes_also_account_for_their_serving_time(run_env, launched, follow_marker, monkeypatch):
+    """That path has no watcher, but the log stream still runs."""
+    import sparkrun.core.recipe
+
+    hooked = dict(_RECIPE_DATA, post_commands=["echo hi"])
+    recipe_file = run_env.parent / ("%s.yaml" % _RECIPE_NAME)
+    recipe_file.write_text(yaml.safe_dump(hooked))
+    original = sparkrun.core.recipe.discover_cwd_recipes
+    monkeypatch.setattr(
+        sparkrun.core.recipe,
+        "discover_cwd_recipes",
+        lambda directory=None: [recipe_file] + original(directory),
+    )
+    monkeypatch.setattr("sparkrun.core.launcher.post_launch_lifecycle", lambda *a, **k: None)
+
+    out = _all_output(_invoke(CliRunner()))
+
+    assert "serving" in out
 
 
 def test_no_timings_suppresses_the_table_but_keeps_the_readiness_line(run_env, launched, follow_marker, monkeypatch):
