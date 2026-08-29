@@ -158,15 +158,15 @@ def test_llama_benchy_pinned_version_threads_into_package_spec():
     assert "llama-benchy@0.5.7" in cmd
 
 
-def test_llama_benchy_no_pinned_version_uses_floating_package_spec():
-    """Without the sentinel, the package spec is plain ``llama-benchy``."""
+def test_llama_benchy_no_pinned_version_uses_minimum_compatible_package_spec():
+    """Without the sentinel, resolution keeps the minimum extra-body capability."""
     fw = LlamaBenchyFramework()
     cmd = fw.build_benchmark_command(
         target_url="http://localhost:8000/v1",
         model="org/model",
         args={},
     )
-    assert "llama-benchy" in cmd
+    assert "'llama-benchy>=0.3.8'" in cmd
     # No version-pinned variant should appear
     assert not any(token.startswith("llama-benchy@") for token in cmd)
 

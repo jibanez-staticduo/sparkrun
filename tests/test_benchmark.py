@@ -320,7 +320,7 @@ def test_llama_benchy_build_command():
     )
 
     assert cmd[0] == "uvx"
-    assert cmd[1] == "llama-benchy"
+    assert cmd[1] == "'llama-benchy>=0.3.8'"
     assert "--base-url" in cmd
     assert "http://localhost:8000/v1" in cmd
     assert "--model" in cmd

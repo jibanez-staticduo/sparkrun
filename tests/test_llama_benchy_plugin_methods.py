@@ -6,6 +6,8 @@ generic aggregator / progress_ui modules.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from sparkrun.benchmarking.llama_benchy import LlamaBenchyFramework
 from sparkrun.benchmarking.scheduler import BenchTask
 
@@ -17,6 +19,29 @@ def _task(depth: int | None, conc: int | None) -> BenchTask:
     if conc is not None:
         run_args["concurrency"] = [conc]
     return BenchTask(index=0, label="t", run_args=run_args, schedule_entry={})
+
+
+def test_detect_version_resolves_minimum_extra_body_capability():
+    fw = LlamaBenchyFramework()
+
+    with patch("subprocess.run") as run:
+        run.return_value.returncode = 0
+        run.return_value.stdout = "llama-benchy 0.4.0\n"
+        run.return_value.stderr = ""
+
+        assert fw.detect_version() == "0.4.0"
+
+    assert run.call_args.args[0] == ["uvx", "llama-benchy>=0.3.8", "--version"]
+
+
+def test_unpinned_command_uses_minimum_extra_body_capability():
+    cmd = LlamaBenchyFramework().build_benchmark_command(
+        "http://h:8000/v1",
+        "org/model",
+        {"extra_body": "return_token_ids=false"},
+    )
+
+    assert cmd[:2] == ["uvx", "'llama-benchy>=0.3.8'"]
 
 
 # ---------------------------------------------------------------------------

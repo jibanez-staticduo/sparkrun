@@ -51,6 +51,10 @@ _PASSTHROUGH_ARGS = {
     "tokenizer",  # tokenizer value configured in a recipe can pass-thru to benchmark profile definitions
 }
 
+# SGLang compatibility below relies on --extra-body, added in llama-benchy
+# 0.3.8. Keep this as a minimum so normal uvx resolution can adopt newer fixes.
+_LLAMA_BENCHY_PACKAGE_SPEC = "llama-benchy>=0.3.8"
+
 # Runtime families whose OpenAI server rejects ``return_token_ids`` on a
 # *streaming* request, which llama-benchy sends unconditionally on every
 # measurement (``client.py:_build_generation_payload`` sets ``stream`` and
@@ -269,7 +273,7 @@ class LlamaBenchyFramework(BenchmarkingPlugin):
     def detect_version(self) -> str | None:
         """Resolve the llama-benchy version uvx will use for execution.
 
-        Runs ``uvx llama-benchy --version`` once and parses the version
+        Runs the minimum-compatible llama-benchy spec once and parses the version
         token out of stdout.  Returns ``None`` on any failure — callers
         should treat ``None`` as "leave version floating".
         """
@@ -278,7 +282,7 @@ class LlamaBenchyFramework(BenchmarkingPlugin):
 
         try:
             result = subprocess.run(
-                ["uvx", "llama-benchy", "--version"],
+                ["uvx", _LLAMA_BENCHY_PACKAGE_SPEC, "--version"],
                 capture_output=True,
                 text=True,
                 timeout=300,
@@ -288,7 +292,7 @@ class LlamaBenchyFramework(BenchmarkingPlugin):
             return None
 
         if result.returncode != 0:
-            logger.warning("`uvx llama-benchy --version` exited %d: %s", result.returncode, result.stderr.strip())
+            logger.warning("`uvx %s --version` exited %d: %s", _LLAMA_BENCHY_PACKAGE_SPEC, result.returncode, result.stderr.strip())
             return None
 
         text = (result.stdout or "") + "\n" + (result.stderr or "")
@@ -321,7 +325,7 @@ class LlamaBenchyFramework(BenchmarkingPlugin):
         model_id, _ = parse_gguf_model_spec(model)
 
         pinned_version = args.get("framework_pinned_version") if isinstance(args, dict) else None
-        package_spec = "llama-benchy@%s" % pinned_version if pinned_version else "llama-benchy"
+        package_spec = "llama-benchy@%s" % pinned_version if pinned_version else _LLAMA_BENCHY_PACKAGE_SPEC
 
         cmd = [
             "uvx",
