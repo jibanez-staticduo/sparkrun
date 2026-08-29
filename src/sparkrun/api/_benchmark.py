@@ -969,7 +969,8 @@ def _execute_benchmark(
             # container-start → serving figure, and a second copy of it with
             # its own retry budgets would make that number incomparable
             # between `run` and `benchmark`.  The budgets stay this path's
-            # own (a benchmark waits far longer than an interactive launch).
+            # own (a benchmark is unattended, so it can afford to wait past
+            # the interactive default before calling a launch dead).
             readiness = wait_for_endpoint_ready(
                 runtime=runtime,
                 cluster_id=cluster_id,
@@ -978,9 +979,9 @@ def _execute_benchmark(
                 port=serve_port,
                 ssh_kwargs=ssh_kwargs,
                 dry_run=dry_run,
-                port_max_retries=180,
+                port_timeout_s=3600.0,
                 port_retry_interval=5,
-                health_max_retries=360,
+                health_timeout_s=1800.0,
                 health_retry_interval=5,
                 timeline=launch_result.timeline if launch_result is not None else None,
             )

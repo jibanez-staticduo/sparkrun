@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import re
 import threading
@@ -1662,6 +1663,28 @@ def launch_inference(
     )
 
 
+#: Wall-clock budget for "the head port is listening".
+#:
+#: Sized for the stage the *engine* spends its time in, which is not the one
+#: the two-stage split originally assumed.  sglang and vLLM V1 start their
+#: HTTP server **after** engine init, weight load and CUDA-graph capture are
+#: all finished, so nearly the whole startup lands here and the health stage
+#: that follows is seconds.  A 30B NVFP4 spec-decode model on 2 Sparks was
+#: measured at 775s to bind (570s of it capturing target-verify graphs)
+#: against a budget that expired at 321s — reported, wrongly, as an endpoint
+#: that never came up.
+#:
+#: Generous is safe: `wait_for_port` re-checks container liveness on every
+#: attempt, so a workload that actually died is caught within one interval
+#: regardless of the budget.  The budget's only job is to bound a *hang*.
+DEFAULT_PORT_READY_TIMEOUT_S = 1800.0
+
+#: Wall-clock budget for ``/v1/models`` answering once the port is open.
+#: Short by comparison on purpose — by this point the engine is up, and a
+#: server that dies is caught by the consecutive-refusal check, not here.
+DEFAULT_HEALTH_READY_TIMEOUT_S = 900.0
+
+
 @dataclass(frozen=True)
 class ServeReadiness:
     """Outcome of waiting for a launched workload's head endpoint.
@@ -1707,9 +1730,9 @@ def wait_for_serve_ready(
     *,
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
-    port_max_retries: int = 120,
+    port_timeout_s: float = DEFAULT_PORT_READY_TIMEOUT_S,
     port_retry_interval: int = 2,
-    health_max_retries: int = 120,
+    health_timeout_s: float = DEFAULT_HEALTH_READY_TIMEOUT_S,
     health_retry_interval: int = 5,
     timeline: "Timeline | None" = None,
     cancel: "threading.Event | None" = None,
@@ -1724,9 +1747,9 @@ def wait_for_serve_ready(
         port=result.serve_port,
         ssh_kwargs=ssh_kwargs,
         dry_run=dry_run,
-        port_max_retries=port_max_retries,
+        port_timeout_s=port_timeout_s,
         port_retry_interval=port_retry_interval,
-        health_max_retries=health_max_retries,
+        health_timeout_s=health_timeout_s,
         health_retry_interval=health_retry_interval,
         timeline=timeline if timeline is not None else result.timeline,
         cancel=cancel,
@@ -1743,9 +1766,9 @@ def wait_for_endpoint_ready(
     port: int,
     ssh_kwargs: dict | None = None,
     dry_run: bool = False,
-    port_max_retries: int = 120,
+    port_timeout_s: float = DEFAULT_PORT_READY_TIMEOUT_S,
     port_retry_interval: int = 2,
-    health_max_retries: int = 120,
+    health_timeout_s: float = DEFAULT_HEALTH_READY_TIMEOUT_S,
     health_retry_interval: int = 5,
     timeline: "Timeline | None" = None,
     cancel: "threading.Event | None" = None,
@@ -1778,9 +1801,13 @@ def wait_for_endpoint_ready(
         port: Inference HTTP port on the head.
         ssh_kwargs: SSH parameters for probing the head host.
         dry_run: Report ready without waiting.
-        port_max_retries: Port-poll attempts (``port_retry_interval`` apart).
+        port_timeout_s: Wall-clock budget for the port stage
+            (:data:`DEFAULT_PORT_READY_TIMEOUT_S`).  ``math.inf`` polls
+            until cancelled, which is what the background watcher on
+            ``sparkrun run`` uses.
         port_retry_interval: Seconds between port polls.
-        health_max_retries: Health-poll attempts (``health_retry_interval`` apart).
+        health_timeout_s: Wall-clock budget for the health stage
+            (:data:`DEFAULT_HEALTH_READY_TIMEOUT_S`).
         health_retry_interval: Seconds between health polls.
         timeline: Span collector for the two waits.  Pass the launch's own so
             the readiness spans join its phases in one artifact.
@@ -1838,7 +1865,7 @@ def wait_for_endpoint_ready(
     port_ready = wait_for_port(
         head_host,
         port,
-        max_retries=port_max_retries,
+        timeout_s=port_timeout_s,
         retry_interval=port_retry_interval,
         ssh_kwargs=ssh_kwargs,
         dry_run=dry_run,
@@ -1861,7 +1888,7 @@ def wait_for_endpoint_ready(
     health_span = tl.begin("serve.health_ok", parent=parent, url=base.health_url) if tl else None
     healthy = wait_for_healthy(
         base.health_url,
-        max_retries=health_max_retries,
+        timeout_s=health_timeout_s,
         retry_interval=health_retry_interval,
         dry_run=dry_run,
         cancel=cancel,
@@ -1941,6 +1968,14 @@ class ReadinessWatcher:
                 # a span taken from the shared open-span stack would be closed
                 # (with the wrong status) by the next main-thread ``end()``.
                 parent=TIMELINE_ROOT,
+                # Unbounded on purpose.  A timeout here would buy nothing: the
+                # watch is observational, costs one cheap probe per interval,
+                # and `stop()` ends it when the log stream does — so its
+                # natural budget is "as long as the user is watching".  A
+                # fixed budget could only ever expire *early* and report a
+                # still-starting engine as an endpoint that never came up.
+                port_timeout_s=math.inf,
+                health_timeout_s=math.inf,
             )
         except Exception:
             # Observational only — this thread must never be why a launch
@@ -2031,7 +2066,18 @@ def post_launch_lifecycle(
     _ssh_kw = build_ssh_kwargs(config)
 
     click.echo("Waiting for server to become ready...")
-    readiness = wait_for_serve_ready(result, ssh_kwargs=_ssh_kw, dry_run=dry_run)
+    # Same budget as every other readiness wait, config-overridable.  This
+    # path blocks the CLI, which is the argument for keeping it *tight* —
+    # but the failure it would guard against (a dead workload) is already
+    # caught within one interval by the container-liveness check, so a
+    # tight budget here only ever mislabels a slow engine as a broken one.
+    readiness = wait_for_serve_ready(
+        result,
+        ssh_kwargs=_ssh_kw,
+        dry_run=dry_run,
+        port_timeout_s=config.readiness_port_timeout_s,
+        health_timeout_s=config.readiness_health_timeout_s,
+    )
     head_host = readiness.head_host
     head_ip = readiness.head_ip
     effective_port = readiness.port

@@ -588,8 +588,32 @@ Five things are load-bearing:
   span yet — this is the seam a log probe plugs into.
 
 **Time to first inference** is `serve.port_open` + `serve.health_ok`, recorded
-by `wait_for_serve_ready` (engine init / rendezvous, then weight load and
-graph capture). `benchmark` used to reimplement that two-stage wait inline
+by `wait_for_serve_ready`. Note which stage is the long pole: sglang and vLLM
+V1 start their HTTP server **after** engine init, weight load *and*
+CUDA-graph capture have all finished, so `serve.port_open` absorbs nearly the
+whole startup and `serve.health_ok` is seconds. The original budgets assumed
+the opposite (port `120×2s`, health `120×5s`) and a 30B NVFP4 spec-decode
+model on 2 Sparks — 775s to bind, 570s of it capturing target-verify graphs —
+was reported as an endpoint that never came up.
+
+Two things follow, and both are in `DEFAULT_PORT_READY_TIMEOUT_S`'s docstring:
+
+- **Budgets are wall-clock, not retry counts.** A retry count is a poor proxy
+  for time because every attempt also pays a probe: `120 × 2s` bought 240s of
+  *sleeping* but ran 321s, and the "%ds elapsed" progress line understated it
+  by the same third. `wait_for_port` / `wait_for_healthy` take `timeout_s`
+  (superseding `max_retries`, which stays for the callers that predate it);
+  `math.inf` polls until cancelled. Overridable via `readiness.port_timeout_s`
+  / `readiness.health_timeout_s`, where `0` means unbounded.
+- **A generous budget is safe, because the budget is not what detects
+  failure.** `wait_for_port` re-checks container liveness on every attempt and
+  `wait_for_healthy` gives up after `max_consecutive_refused`, so a workload
+  that actually died is caught within one interval either way. The budget's
+  only job is to bound a *hang* — which is why the background watcher on `run`
+  uses `math.inf` (it is cancelled by the log stream ending, so a fixed budget
+  there could only ever expire early and mislabel a slow engine).
+
+`benchmark` used to reimplement that two-stage wait inline
 with its own retry budgets, which would have made the figure incomparable
 between `run` and `benchmark`; both now go through
 `launcher.wait_for_endpoint_ready` (the field-based form — the `--ensure`
@@ -1453,6 +1477,11 @@ Shared helpers used across multiple modules to avoid circular imports:
 | `~/.cache/sparkrun/jobs/`            | Job metadata (cluster_id → recipe mapping)        |
 | `~/.cache/sparkrun/pending/`         | PID lock files for in-progress operations         |
 | `~/.cache/huggingface/`              | HuggingFace model cache (mounted into containers) |
+
+Readiness budgets live under `readiness:` in `config.yaml`
+(`port_timeout_s` / `health_timeout_s`, `0` = unbounded) — raise
+`port_timeout_s` for engines with long graph-capture phases; see Launch
+Timing above.
 
 ### Feature Flags (`core/features.py`)
 

@@ -26,6 +26,7 @@ These tests pin the cancellation contract the watcher depends on, the
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from unittest import mock
@@ -101,6 +102,108 @@ def test_uncancelled_waits_are_unchanged():
     """``cancel=None`` is the pre-existing path, byte for byte."""
     with mock.patch("sparkrun.orchestration.primitives.run_command_on_host", return_value=mock.Mock(success=True)):
         assert wait_for_port("h1", 8000) is True
+
+
+# ---------------------------------------------------------------------------
+# Readiness budgets
+# ---------------------------------------------------------------------------
+
+
+def test_port_budget_is_wall_clock_not_a_retry_count():
+    """A retry count is a poor proxy for time, and the gap is not small.
+
+    Every attempt also pays a probe — an SSH round trip on a remote host.
+    The old ``120 x 2s`` default bought 240s of *sleeping* but ran for 321s
+    of wall clock, then reported the shortfall as an endpoint that never
+    came up (measured against a 30B sglang launch that bound its port at
+    775s).  A wall-clock budget means what it says.
+    """
+    probes = []
+
+    def _probe(*args, **kwargs):
+        probes.append(1)
+        return mock.Mock(success=False, stdout="", stderr="")
+
+    # A retry count that would have stopped the loop immediately must not,
+    # because the wall-clock budget is what governs.
+    with mock.patch("sparkrun.orchestration.primitives.run_command_on_host", _probe):
+        assert wait_for_port("h1", 8000, max_retries=1, retry_interval=0, timeout_s=0.25) is False
+
+    assert len(probes) > 1, "max_retries still bounded a wall-clock budget"
+
+    # ...and the budget does stop it, rather than running forever.
+    elapsed_probes = len(probes)
+    assert elapsed_probes < 100_000
+
+
+def test_an_infinite_budget_polls_until_cancelled():
+    """What the background watcher uses: no budget, only the cancel."""
+    cancel = threading.Event()
+    probes = []
+
+    def _probe(*args, **kwargs):
+        probes.append(1)
+        if len(probes) == 25:
+            cancel.set()
+        return mock.Mock(success=False, stdout="", stderr="")
+
+    with mock.patch("sparkrun.orchestration.primitives.run_command_on_host", _probe):
+        ready = wait_for_port("h1", 8000, retry_interval=0, cancel=cancel, timeout_s=math.inf)
+
+    assert ready is False
+    assert len(probes) == 25, "an unbounded wait stopped on something other than its cancel"
+
+
+def test_retry_count_still_bounds_a_wait_with_no_timeout():
+    """``timeout_s=None`` is the pre-existing path and keeps its semantics."""
+    probes = []
+
+    def _probe(*args, **kwargs):
+        probes.append(1)
+        return mock.Mock(success=False, stdout="", stderr="")
+
+    with mock.patch("sparkrun.orchestration.primitives.run_command_on_host", _probe):
+        assert wait_for_port("h1", 8000, max_retries=4, retry_interval=0) is False
+
+    assert len(probes) == 4
+
+
+def test_a_dead_container_still_aborts_regardless_of_the_budget():
+    """Liveness — not the budget — is what detects a genuine failure.
+
+    This is what makes a generous (or infinite) budget safe: a workload
+    that actually died is caught within one interval either way.
+    """
+    with (
+        mock.patch("sparkrun.orchestration.primitives.run_command_on_host", return_value=mock.Mock(success=False)),
+        mock.patch("sparkrun.orchestration.health.is_container_running", return_value=False),
+    ):
+        ready = wait_for_port("h1", 8000, retry_interval=0, container_name="c0", timeout_s=math.inf)
+
+    assert ready is False
+
+
+def test_readiness_timeouts_are_configurable(tmp_path):
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.launcher import DEFAULT_HEALTH_READY_TIMEOUT_S, DEFAULT_PORT_READY_TIMEOUT_S
+
+    def _cfg(data) -> SparkrunConfig:
+        path = tmp_path / ("cfg-%d.yaml" % len(list(tmp_path.iterdir())))
+        path.write_text(yaml.safe_dump(data))
+        return SparkrunConfig(config_path=path)
+
+    default = _cfg({})
+    assert default.readiness_port_timeout_s == DEFAULT_PORT_READY_TIMEOUT_S
+    assert default.readiness_health_timeout_s == DEFAULT_HEALTH_READY_TIMEOUT_S
+
+    tuned = _cfg({"readiness": {"port_timeout_s": 4200, "health_timeout_s": 60}})
+    assert tuned.readiness_port_timeout_s == 4200.0
+    assert tuned.readiness_health_timeout_s == 60.0
+
+    # A budget can only ever expire early, so "no budget" is a legitimate ask.
+    assert _cfg({"readiness": {"port_timeout_s": 0}}).readiness_port_timeout_s == math.inf
+    # Garbage falls back rather than disabling the wait.
+    assert _cfg({"readiness": {"port_timeout_s": "soon"}}).readiness_port_timeout_s == DEFAULT_PORT_READY_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------

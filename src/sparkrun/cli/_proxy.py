@@ -630,7 +630,12 @@ def load_cmd(
             from sparkrun.orchestration.primitives import build_ssh_kwargs
 
             click.echo("Waiting for server to become ready...")
-            readiness = wait_for_serve_ready(result, ssh_kwargs=build_ssh_kwargs(config))
+            readiness = wait_for_serve_ready(
+                result,
+                ssh_kwargs=build_ssh_kwargs(config),
+                port_timeout_s=config.readiness_port_timeout_s,
+                health_timeout_s=config.readiness_health_timeout_s,
+            )
 
             if not readiness.ready:
                 _warn_not_registered(readiness, proxy_status)

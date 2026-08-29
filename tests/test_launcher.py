@@ -313,6 +313,8 @@ def test_launch_inference_threads_backends_to_runtime_run(monkeypatch, tmp_path)
         hf_cache_dir = tmp_path / "hf"
         cache_dir = tmp_path / "cache"
         missing_mount_source_policy = "fail"
+        readiness_port_timeout_s = 240.0
+        readiness_health_timeout_s = 600.0
 
         def get_registry_manager(self):
             return None
@@ -439,6 +441,8 @@ def test_launch_inference_logs_platform_warnings_without_raising(monkeypatch, tm
         hf_cache_dir = tmp_path / "hf"
         cache_dir = tmp_path / "cache"
         missing_mount_source_policy = "fail"
+        readiness_port_timeout_s = 240.0
+        readiness_health_timeout_s = 600.0
 
         def get_registry_manager(self):
             return None
@@ -548,7 +552,10 @@ def _make_launch_result(recipe, runtime):
     from sparkrun.core.launcher import LaunchResult
 
     class _Cfg:
-        pass
+        # Mirrors SparkrunConfig's readiness budgets, which
+        # ``post_launch_lifecycle`` reads before waiting.
+        readiness_port_timeout_s = 240.0
+        readiness_health_timeout_s = 600.0
 
     return LaunchResult(
         rc=0,
@@ -755,6 +762,8 @@ def test_launch_inference_save_job_metadata_failure_is_best_effort(monkeypatch, 
         hf_cache_dir = tmp_path / "hf"
         cache_dir = tmp_path / "cache"
         missing_mount_source_policy = "fail"
+        readiness_port_timeout_s = 240.0
+        readiness_health_timeout_s = 600.0
 
         def get_registry_manager(self):
             return None
@@ -968,6 +977,8 @@ def _builder_phase_harness(monkeypatch, tmp_path):
         hf_cache_dir = tmp_path / "hf"
         cache_dir = tmp_path / "cache"
         missing_mount_source_policy = "fail"
+        readiness_port_timeout_s = 240.0
+        readiness_health_timeout_s = 600.0
 
         def get_registry_manager(self):
             return None

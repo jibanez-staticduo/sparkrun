@@ -298,6 +298,43 @@ class SparkrunConfig:
         return val if val > 0 else DEFAULT_MAX_PARALLEL_SSH
 
     @property
+    def readiness_port_timeout_s(self) -> float:
+        """Wall-clock budget for "the head port is listening".
+
+        Set via ``readiness.port_timeout_s`` in ``config.yaml``.  Raise it
+        for models whose engine init runs long — sglang and vLLM V1 bind
+        their HTTP port only *after* weight load and CUDA-graph capture, so
+        this stage absorbs nearly the whole startup.  ``0`` or negative
+        means "no budget", i.e. poll until cancelled.
+        """
+        from sparkrun.core.launcher import DEFAULT_PORT_READY_TIMEOUT_S
+
+        return self._readiness_timeout("port_timeout_s", DEFAULT_PORT_READY_TIMEOUT_S)
+
+    @property
+    def readiness_health_timeout_s(self) -> float:
+        """Wall-clock budget for ``/v1/models`` answering once the port is open.
+
+        Set via ``readiness.health_timeout_s`` in ``config.yaml``.
+        """
+        from sparkrun.core.launcher import DEFAULT_HEALTH_READY_TIMEOUT_S
+
+        return self._readiness_timeout("health_timeout_s", DEFAULT_HEALTH_READY_TIMEOUT_S)
+
+    def _readiness_timeout(self, key: str, default: float) -> float:
+        import math
+
+        section = self._data.get("readiness", {})
+        raw = section.get(key) if isinstance(section, dict) else None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return default
+        # A budget can only ever expire early — liveness checks are what
+        # detect a genuine failure — so "unbounded" is a legitimate ask.
+        return val if val > 0 else math.inf
+
+    @property
     def jobs_autoprune(self) -> bool:
         """Whether ``sparkrun run`` prunes stale job metadata as it launches.
 
