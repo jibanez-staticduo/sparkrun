@@ -49,6 +49,40 @@ NFS_SAFE_ATTR_OPTS = ["--no-perms", "--no-group", "--omit-dir-times"]
 
 _DEFAULT_RSYNC_OPTIONS = ["-az", "--mkpath", "--partial", "--links", *NFS_SAFE_ATTR_OPTS]
 
+# What the automatic retry falls back to: everything in NFS_SAFE_ATTR_OPTS plus
+# file times.  Times are *not* in the default set because rsync writes via
+# temp-file+rename and so owns what it creates — but a destination file that
+# already exists and belongs to someone else still refuses ``utime``, and no
+# amount of anticipation covers every filesystem.  Equivalent to what
+# ``preserve_perms: false`` asks for, reached automatically instead of by
+# configuration.
+RSYNC_RELAXED_ATTR_OPTS = [*NFS_SAFE_ATTR_OPTS, "--no-times"]
+
+# Env kill-switch for the relaxed retry (see :func:`relax_rsync_options`).
+NO_RSYNC_RETRY_ENV = "SPARKRUN_NO_RSYNC_RETRY"
+
+
+def rsync_retry_disabled() -> bool:
+    """True when the relaxed rsync retry is switched off via the environment."""
+    return os.environ.get(NO_RSYNC_RETRY_ENV, "").strip().lower() not in ("", "0", "false", "no")
+
+
+def relax_rsync_options(rsync_options: list[str]) -> list[str]:
+    """Append :data:`RSYNC_RELAXED_ATTR_OPTS`, or return ``None``-equivalent input.
+
+    Appending rather than rewriting is deliberate: rsync resolves repeated
+    attribute flags last-wins, so ``-a … --no-times`` disables times without
+    parsing what the caller asked for — which means this works for any option
+    set, including ones added later that this function has never seen.
+    """
+    return [*rsync_options, *(o for o in RSYNC_RELAXED_ATTR_OPTS if o not in rsync_options)]
+
+
+def rsync_options_are_relaxed(rsync_options: list[str]) -> bool:
+    """True when *rsync_options* already carries every relaxation the retry adds."""
+    return all(o in rsync_options for o in RSYNC_RELAXED_ATTR_OPTS)
+
+
 # Default cap on concurrent SSH/rsync fan-out workers.  At 32+ hosts an
 # uncapped ``max_workers=len(hosts)`` spawns one SSH (or ``docker save|ssh
 # docker load`` pipeline) per host simultaneously, hitting sshd's
@@ -1161,7 +1195,50 @@ def _run_rsync_impl(
     result = _run_subprocess(cmd, host, "Rsync", timeout=timeout, detail_limit=RSYNC_FAILURE_DETAIL_LIMIT)
     if result.success:
         logger.info("  Rsync %s %s OK", direction, host)
-    return result
+        return result
+
+    # One relaxed retry when the failure was an attribute the destination
+    # refused.  NFS_SAFE_ATTR_OPTS covers the attributes we can anticipate;
+    # this covers the ones we cannot, so an unfamiliar filesystem costs a
+    # second pass rather than a failed launch and a config change.  Cheap:
+    # rsync is incremental, so the retry re-walks the tree but re-sends
+    # almost nothing.
+    #
+    # Deferred import — transfer.py imports RemoteResult from this module, so
+    # a module-level import here would be circular.
+    from sparkrun.orchestration.transfer import rsync_attribute_errors_only, rsync_has_attribute_permission_error
+
+    if rsync_attribute_errors_only(result):
+        # Every byte arrived and only attributes were refused.  The caller's
+        # mapping boundary already accepts this, so a retry would re-walk the
+        # whole tree to reach a state we are in — and on a model cache that
+        # walk is the expensive part, not the bytes.
+        return result
+    if rsync_options_are_relaxed(rsync_options) or rsync_retry_disabled():
+        return result
+    if not rsync_has_attribute_permission_error(result):
+        # A destination we cannot write to at all is not fixed by asking for
+        # fewer attributes; retrying would double the wait and change nothing.
+        return result
+
+    retry_options = relax_rsync_options(rsync_options)
+    logger.warning(
+        "  Rsync %s %s could not set file attributes on the destination; retrying without owner/group/permission/time preservation.",
+        direction,
+        host,
+    )
+    retry_cmd = ["rsync"] + retry_options + ["-e", f"ssh {ssh_opts}", source, dest]
+    logger.debug("Rsync retry command: %s", " ".join(retry_cmd))
+
+    retry = _run_subprocess(retry_cmd, host, "Rsync", timeout=timeout, detail_limit=RSYNC_FAILURE_DETAIL_LIMIT)
+    if retry.success:
+        logger.info("  Rsync %s %s OK (after relaxing attribute preservation)", direction, host)
+        return retry
+
+    # The retry is strictly more permissive, so its failure is the more
+    # informative one — reporting the first would point at attributes that are
+    # no longer being requested.
+    return retry
 
 
 def guard_rsync_delete(rsync_options: list[str], local_source: str) -> list[str]:

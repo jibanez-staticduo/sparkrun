@@ -158,6 +158,33 @@ def rsync_attribute_errors_only(result: RemoteResult) -> bool:
     return matched_attribute_error
 
 
+def rsync_has_attribute_permission_error(result: RemoteResult) -> bool:
+    """True when *any* rsync error is an attribute op refused for permissions.
+
+    The trigger for the relaxed retry (see
+    :func:`~sparkrun.orchestration.ssh.relax_rsync_options`).  Weaker than
+    :func:`rsync_attribute_errors_only` on purpose: that one answers "did
+    everything else succeed?", this one answers "is relaxing attributes worth
+    another pass?", and a transfer can have a genuine failure *and* an
+    attribute failure the retry would fix.
+
+    Requires the permission wording as well as the attribute verb, so a
+    ``chown`` that failed for some other reason (a read-only filesystem, a
+    vanished path) does not buy a retry that cannot help.
+    """
+    if result.success:
+        return False
+    for raw_line in (result.stderr or "").splitlines():
+        line = raw_line.strip().lower()
+        if not line.startswith("rsync:"):
+            continue
+        if not any(needle in line for needle in _RSYNC_ATTRIBUTE_ERROR_PATTERNS):
+            continue
+        if "operation not permitted" in line or "permission denied" in line:
+            return True
+    return False
+
+
 def rsync_transfer_ok(result: RemoteResult) -> bool:
     """``result.success``, widened to accept an attribute-only rc=23.
 
