@@ -1327,18 +1327,32 @@ def launch_inference(
         except Exception:
             logger.debug("Failed to sync tuning configs", exc_info=True)
 
-    # Distribute tuning configs to remote hosts
+    # Distribute tuning configs to remote hosts.  The tuning cache lives under
+    # the SSH user's $HOME, so it hits the same shared-filesystem conditions the
+    # model cache does; its prefs inherit `distribution.model` unless the
+    # cluster spells out a `distribution.tuning` block (see
+    # ClusterDistributionConfig.tuning_prefs).
     if not runtime.is_delegating_runtime():
         from sparkrun.tuning.distribute import distribute_tuning_to_hosts
 
+        _dist_cfg = getattr(cluster, "distribution", None)
+        _tuning_prefs = getattr(_dist_cfg, "tuning_prefs", None)
+        _tuning_enabled = getattr(_tuning_prefs, "enabled", True)
+
         try:
-            tuning_failed = distribute_tuning_to_hosts(
-                recipe.runtime,
-                host_list,
-                dry_run=dry_run,
-                transfer_mode=effective_transfer_mode,
-                **ssh_kwargs,
-            )
+            if not _tuning_enabled:
+                logger.debug("Tuning distribution disabled for this cluster; skipping")
+                tuning_failed = []
+            else:
+                tuning_failed = distribute_tuning_to_hosts(
+                    recipe.runtime,
+                    host_list,
+                    dry_run=dry_run,
+                    transfer_mode=effective_transfer_mode,
+                    preserve_perms=getattr(_tuning_prefs, "preserve_perms", True),
+                    skip_fan_out=getattr(_tuning_prefs, "skip_fan_out", False),
+                    **ssh_kwargs,
+                )
             if tuning_failed:
                 logger.warning(
                     "Tuning config distribution failed on: %s",

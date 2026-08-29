@@ -70,8 +70,8 @@ def _parse_env_file(path: str) -> dict[str, str]:
 
 
 @dataclass
-class ModelDistributionPrefs:
-    """Per-cluster model-distribution preferences.
+class ResourceDistributionPrefs:
+    """Per-cluster distribution preferences for one resource kind.
 
     Defaults reproduce the historical behavior exactly:
       * ``preserve_perms=True`` — rsync uses ``-a`` (archive) and the
@@ -84,11 +84,15 @@ class ModelDistributionPrefs:
     ``skip_fan_out=True`` skips the redundant per-host rsync because the
     model is already visible on every node once downloaded once.
 
-    ``enabled=False`` turns model distribution off entirely — no local
-    download and no per-host transfer.  Use it when the weights are already
-    present on every node (e.g. a shared NFS mount populated out-of-band), so
-    sparkrun should never fetch or copy them.  This is stronger than
-    ``skip_fan_out`` (which still downloads the model once locally).
+    ``enabled=False`` turns distribution of that resource off entirely — no
+    local download and no per-host transfer.  Use it when the resource is
+    already present on every node (e.g. a shared NFS mount populated
+    out-of-band), so sparkrun should never fetch or copy it.  This is stronger
+    than ``skip_fan_out`` (which still downloads the resource once locally).
+
+    Used for both ``distribution.model`` (the HuggingFace cache) and
+    ``distribution.tuning`` (the Triton tuning-config cache) — the questions are
+    identical, only the destination directory differs.
     """
 
     preserve_perms: bool = True
@@ -96,7 +100,7 @@ class ModelDistributionPrefs:
     enabled: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "ModelDistributionPrefs":
+    def from_dict(cls, data: dict[str, Any] | None) -> "ResourceDistributionPrefs":
         if not isinstance(data, dict):
             return cls()
         return cls(
@@ -119,26 +123,65 @@ class ModelDistributionPrefs:
         return out
 
 
+# Backwards-compatible alias: these prefs were model-only before the tuning
+# cache started using them, and the old name is part of the public surface.
+ModelDistributionPrefs = ResourceDistributionPrefs
+
+
 @dataclass
 class ClusterDistributionConfig:
     """Cluster-level resource-distribution preferences (``distribution:`` block)."""
 
-    model: ModelDistributionPrefs = field(default_factory=ModelDistributionPrefs)
+    model: ResourceDistributionPrefs = field(default_factory=ResourceDistributionPrefs)
+
+    tuning: ResourceDistributionPrefs | None = None
+    """Preferences for the Triton tuning-config cache.  ``None`` means *inherit
+    :attr:`model`*, which is what makes the common case need one setting.
+
+    The two caches are different directories (``~/.cache/huggingface`` vs
+    ``~/.cache/sparkrun/tuning``) but on almost every cluster they share one
+    filesystem — the SSH user's ``$HOME`` — so whatever made the model cache
+    need ``preserve_perms: false`` or ``skip_fan_out: true`` is true of the
+    tuning cache for exactly the same reason.  Inheriting means an existing
+    NFS cluster's ``distribution.model`` block covers tuning without the user
+    discovering a second knob after hitting the same failure twice.
+
+    Set it explicitly for the split case: an HF cache on a dedicated shared
+    mount (``cache_dir: /mnt/models``, so ``skip_fan_out: true``) while
+    ``$HOME`` stays node-local and tuning configs genuinely must fan out.
+    """
+
+    @property
+    def tuning_prefs(self) -> ResourceDistributionPrefs:
+        """Effective tuning prefs — the explicit block, else :attr:`model`."""
+        return self.tuning if self.tuning is not None else self.model
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ClusterDistributionConfig":
         if not isinstance(data, dict):
             return cls()
-        return cls(model=ModelDistributionPrefs.from_dict(data.get("model")))
+        raw_tuning = data.get("tuning")
+        return cls(
+            model=ResourceDistributionPrefs.from_dict(data.get("model")),
+            # Absent stays None (inherit); a present-but-empty block is an
+            # explicit "use the defaults for tuning", which is how a user opts
+            # *out* of inheriting a relaxed model block.
+            tuning=ResourceDistributionPrefs.from_dict(raw_tuning) if isinstance(raw_tuning, dict) else None,
+        )
 
     def is_default(self) -> bool:
-        return self.model.is_default()
+        return self.model.is_default() and self.tuning is None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
         model = self.model.to_dict()
         if model:
             out["model"] = model
+        # Serialized whenever set, *including* when it round-trips to an empty
+        # mapping: "explicitly default" and "inherit the model block" are
+        # different instructions and only differ by the key's presence.
+        if self.tuning is not None:
+            out["tuning"] = self.tuning.to_dict()
         return out
 
 

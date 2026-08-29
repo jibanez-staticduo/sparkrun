@@ -19,6 +19,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from sparkrun.utils.shell import quote, quote_list, args_list_to_shell_str, stdin_bytes
 
@@ -1163,6 +1164,39 @@ def _run_rsync_impl(
     return result
 
 
+def guard_rsync_delete(rsync_options: list[str], local_source: str) -> list[str]:
+    """Strip ``--delete*`` when *local_source* is missing or empty.
+
+    ``--delete`` makes the destination match the source, so an empty or absent
+    source turns a sync into "erase the destination".  Nothing in sparkrun ever
+    means that: an empty source directory is a bug, a race, or a resource that
+    was never staged — never an instruction to clear the far side.  The cost of
+    being wrong is asymmetric and unrecoverable (the destination is a user's
+    model or tuning cache), while the cost of the guard is a stale file that
+    the next non-empty sync prunes anyway.
+
+    Only meaningful for the push direction, where the source is local and can
+    be inspected; :func:`run_rsync_from_remote` cannot use it.
+    """
+    if not any(o.startswith("--delete") for o in rsync_options):
+        return rsync_options
+
+    src = Path(local_source)
+    try:
+        populated = src.is_dir() and any(src.iterdir())
+    except OSError:
+        # Unreadable source: we cannot show it is safe, so we do not assume it.
+        populated = False
+    if populated:
+        return rsync_options
+
+    logger.warning(
+        "  Refusing to rsync --delete from an empty or unreadable source (%s) — dropping --delete so the destination is not cleared.",
+        local_source,
+    )
+    return [o for o in rsync_options if not o.startswith("--delete")]
+
+
 def run_rsync(
     source_path: str,
     host: str,
@@ -1179,9 +1213,13 @@ def run_rsync(
 
     Runs ``rsync {rsync_options} -e "ssh {opts}" source user@host:dest``.
     Default *rsync_options* are ``["-az", "--mkpath", "--partial", "--links"]``
-    which create the destination path and preserve symlinks (important for
-    HuggingFace cache layout).
+    plus :data:`NFS_SAFE_ATTR_OPTS`, which create the destination path and
+    preserve symlinks (important for HuggingFace cache layout).
+
+    Any ``--delete`` is gated by :func:`guard_rsync_delete`.
     """
+    if rsync_options is not None:
+        rsync_options = guard_rsync_delete(rsync_options, source_path)
     src = source_path.rstrip("/") + "/"
     target = f"{ssh_user}@{host}:{dest_path}" if ssh_user else f"{host}:{dest_path}"
     return _run_rsync_impl(

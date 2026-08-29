@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from sparkrun.utils import is_local_host
 from sparkrun.tuning.sync import _get_local_tuning_dir, _get_remote_tuning_dir
@@ -18,6 +19,8 @@ def distribute_tuning_to_hosts(
     ssh_options: list[str] | None = None,
     dry_run: bool = False,
     transfer_mode: str = "local",
+    preserve_perms: bool = True,
+    skip_fan_out: bool = False,
 ) -> list[str]:
     """Distribute local tuning configs to remote hosts via rsync.
 
@@ -39,6 +42,13 @@ def distribute_tuning_to_hosts(
         dry_run: If True, log what would be done without executing.
         transfer_mode: Distribution strategy (``"local"``, ``"push"``,
             or ``"delegated"``).
+        preserve_perms: When ``False``, rsync drops owner/group/perm/time
+            preservation (``-r --links`` instead of ``-a``) — the harder
+            relaxation for a destination where even the NFS-safe default
+            set cannot apply attributes.  Mirrors the model path.
+        skip_fan_out: When ``True``, the per-host rsync is skipped entirely
+            because the tuning cache is already visible on every node (a
+            shared ``$HOME``), so copying it there is redundant.
 
     Returns:
         List of hostnames where distribution failed (empty = success).
@@ -50,6 +60,12 @@ def distribute_tuning_to_hosts(
         logger.debug("No local tuning configs for %s, skipping distribution", runtime)
         return []
 
+    # Shared-cache fast path: every host already sees this directory, so the
+    # fan-out would copy it onto itself.  Mirrors the model path's skip.
+    if skip_fan_out:
+        logger.debug("Shared tuning cache: skipping per-host tuning distribution")
+        return []
+
     # Filter out localhost — no need to rsync to self
     remote_hosts = [h for h in hosts if not is_local_host(h)]
     if not remote_hosts:
@@ -59,15 +75,33 @@ def distribute_tuning_to_hosts(
     from sparkrun.orchestration.ssh import NFS_SAFE_ATTR_OPTS, run_rsync_parallel, build_ssh_opts_string, run_remote_script
     from sparkrun.orchestration.transfer import map_transfer_failures
 
+    source = str(tuning_dir)
+    remote_dest = _get_remote_tuning_dir(runtime, ssh_user=ssh_user)
+
     # Tuning configs land in the SSH user's own cache dir, which on a shared
     # /home is routinely owned by a different uid than the one we connect as.
     # Without the NFS-safe relaxation rsync transfers every config and then
     # exits 23 setting times on the destination root.  --mkpath because the
     # per-runtime subdirectory may not exist on a host that has never tuned.
-    tuning_rsync_options = ["-az", "--delete", "--mkpath", "--partial", *NFS_SAFE_ATTR_OPTS]
+    if preserve_perms:
+        tuning_rsync_options = ["-az", "--mkpath", "--partial", *NFS_SAFE_ATTR_OPTS]
+    else:
+        tuning_rsync_options = ["-rz", "--links", "--mkpath", "--partial"]
 
-    source = str(tuning_dir)
-    remote_dest = _get_remote_tuning_dir(runtime, ssh_user=ssh_user)
+    # --delete prunes tuning configs that were removed upstream, but only when
+    # we can be sure the destination is a *different* directory.  When the
+    # remote path equals the local one (_get_remote_tuning_dir returns exactly
+    # that for a matching SSH user on Linux) a shared $HOME makes source and
+    # destination the same physical directory, and --delete against your own
+    # source is how a sync becomes a deletion.  Pruning is a convenience;
+    # not destroying the cache is not.
+    if os.path.normpath(source) != os.path.normpath(remote_dest):
+        tuning_rsync_options.append("--delete")
+    else:
+        logger.debug(
+            "Tuning source and destination paths are identical (%s); omitting --delete in case $HOME is shared",
+            source,
+        )
 
     if transfer_mode in ("push", "delegated") and len(remote_hosts) > 1:
         # Two-hop: rsync to head, then head distributes to workers
@@ -116,7 +150,11 @@ def distribute_tuning_to_hosts(
         ).format(
             source=remote_dest,
             targets=targets_str,
-            attr_flags=" ".join(tuning_rsync_options),
+            # Never --delete on this hop: it uses $SOURCE as *both* sides, so on
+            # a cluster with a shared $HOME the source and destination are one
+            # directory and --delete would prune the cache against itself.  The
+            # control→head hop above already did the pruning.
+            attr_flags=" ".join(o for o in tuning_rsync_options if not o.startswith("--delete")),
             ssh_opts=ssh_opts,
             user_prefix=user_prefix,
         )
