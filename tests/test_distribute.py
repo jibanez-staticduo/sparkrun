@@ -1042,7 +1042,7 @@ class TestDistributeModelFromLocal:
         )
         assert [f.host for f in failed] == ["mgmt2"]
 
-    @mock.patch("sparkrun.models.distribute.run_remote_scripts_parallel")
+    @mock.patch("sparkrun.models.distribute.ensure_remote_dir_ownership")
     @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_preserve_perms_default_uses_archive(self, mock_dl, mock_rsync, mock_fix):
@@ -1058,7 +1058,7 @@ class TestDistributeModelFromLocal:
         # Best-effort chown runs when preserving perms.
         mock_fix.assert_called_once()
 
-    @mock.patch("sparkrun.models.distribute.run_remote_scripts_parallel")
+    @mock.patch("sparkrun.models.distribute.ensure_remote_dir_ownership")
     @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_preserve_perms_still_omits_unownable_attributes(self, mock_dl, mock_rsync, mock_fix):
@@ -1082,7 +1082,7 @@ class TestDistributeModelFromLocal:
         # temp-file+rename, so it owns what it creates and -t cannot EPERM.
         assert "--no-times" not in opts
 
-    @mock.patch("sparkrun.models.distribute.run_remote_scripts_parallel")
+    @mock.patch("sparkrun.models.distribute.ensure_remote_dir_ownership")
     @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_no_preserve_perms_drops_archive_and_skips_chown(self, mock_dl, mock_rsync, mock_fix):
@@ -1100,7 +1100,7 @@ class TestDistributeModelFromLocal:
         # chown fix is pointless when not preserving perms — must be skipped.
         mock_fix.assert_not_called()
 
-    @mock.patch("sparkrun.models.distribute.run_remote_scripts_parallel")
+    @mock.patch("sparkrun.models.distribute.ensure_remote_dir_ownership")
     @mock.patch("sparkrun.models.distribute.run_rsync_parallel")
     @mock.patch("sparkrun.models.distribute.download_model")
     def test_skip_fan_out_downloads_but_skips_rsync(self, mock_dl, mock_rsync, mock_fix):

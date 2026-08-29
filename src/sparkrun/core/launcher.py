@@ -1335,11 +1335,32 @@ def launch_inference(
     # cluster spells out a `distribution.tuning` block (see
     # ClusterDistributionConfig.tuning_prefs).
     if not runtime.is_delegating_runtime():
-        from sparkrun.tuning.distribute import distribute_tuning_to_hosts
+        from sparkrun.tuning._common import tuning_configs_present
+        from sparkrun.tuning.distribute import distribute_tuning_to_hosts, ensure_remote_tuning_dirs
+        from sparkrun.tuning.sync import _get_local_tuning_dir
 
         _dist_cfg = getattr(cluster, "distribution", None)
         _tuning_prefs = getattr(_dist_cfg, "tuning_prefs", None)
         _tuning_enabled = getattr(_tuning_prefs, "enabled", True)
+
+        try:
+            # Create the tuning directory on every host before anything mounts
+            # it — and deliberately *outside* the enabled/skip_fan_out checks
+            # below.  Those govern whether we copy configs there; the bind
+            # mount happens either way, decided from the control node's copy,
+            # so a host missing the path has it created root-owned by the
+            # Docker daemon and is locked out of its own tuning cache from then
+            # on.  Gated by the same predicate as the mount so the two cannot
+            # drift apart.
+            if tuning_configs_present(_get_local_tuning_dir(recipe.runtime)):
+                ensure_remote_tuning_dirs(
+                    recipe.runtime,
+                    host_list,
+                    dry_run=dry_run,
+                    **ssh_kwargs,
+                )
+        except Exception:
+            logger.debug("Failed to ensure remote tuning directories", exc_info=True)
 
         try:
             if not _tuning_enabled:

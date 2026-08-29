@@ -22,6 +22,7 @@ from sparkrun.orchestration.ssh import (
     run_remote_scripts_parallel,
     run_rsync_parallel,
 )
+from sparkrun.orchestration.sudo import ensure_remote_dir_ownership
 from sparkrun.scripts import read_script
 
 from sparkrun.core.progress import PROGRESS
@@ -131,36 +132,21 @@ def _try_fix_remote_permissions(
     This tries non-interactive ``sudo -n chown`` on each host so the
     SSH user can rsync into the directory.  Failures are non-fatal —
     a warning is logged with a hint about ``--save-sudo``.
-    """
-    script = (
-        "set -euo pipefail\n"
-        'CACHE_DIR="{cache_dir}"\n'
-        '[ -d "$CACHE_DIR" ] || exit 0\n'
-        'OWNER=$(stat -c "%U" "$CACHE_DIR" 2>/dev/null || echo "")\n'
-        "ME=$(id -un)\n"
-        '[ "$OWNER" = "$ME" ] && exit 0\n'
-        'sudo -n /usr/bin/chown -R "$ME" "$CACHE_DIR" 2>/dev/null\n'
-    ).format(cache_dir=cache_dir)
 
-    results = run_remote_scripts_parallel(
+    Thin wrapper over
+    :func:`~sparkrun.orchestration.sudo.ensure_remote_dir_ownership`, which the
+    tuning cache shares: the failure is a property of a sparkrun-managed cache
+    directory, not of what happens to be stored in it.
+    """
+    ensure_remote_dir_ownership(
+        cache_dir,
         hosts,
-        script,
         ssh_user=ssh_user,
         ssh_key=ssh_key,
         ssh_options=ssh_options,
-        timeout=30,
         dry_run=dry_run,
+        resource_label="model cache",
     )
-
-    failed = [r.host for r in results if not r.success]
-    if failed:
-        logger.warning(
-            "Could not fix cache ownership on %d host(s) — rsync may fail "
-            "if Docker left root-owned files.  Run "
-            "'sparkrun setup fix-permissions --save-sudo' to enable "
-            "passwordless chown for future runs.",
-            len(failed),
-        )
 
 
 def distribute_model_from_local(
